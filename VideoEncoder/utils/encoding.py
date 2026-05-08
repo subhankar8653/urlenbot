@@ -202,12 +202,8 @@ async def encode(filepath, message, msg, audio_map=None):
     else:
         video_opts = f'{cabac} {reframe} -profile:v main  -map 0:v? -map_chapters 0 -map_metadata 0'
 
-    # Metadata Watermark
-    m = await db.get_metadata_w(message.from_user.id)
-    if m:
-        metadata = '-metadata title=sbanime -metadata:s:v title=sbanime -metadata:s:a title=sbanime'
-    else:
-        metadata = ''
+    # Metadata DISABLED - faster encoding
+    metadata = ''
 
     # Copy Subtitles
     h = await db.get_hardsub(message.from_user.id)
@@ -357,7 +353,7 @@ async def encode(filepath, message, msg, audio_map=None):
     else:
         channels = ''
 
-    finish = '-threads 8'
+    finish = '-threads 0'
 
     # Finally
     command = ['ffmpeg', '-hide_banner', '-loglevel', 'error',
