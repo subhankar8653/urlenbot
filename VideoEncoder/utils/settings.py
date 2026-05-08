@@ -135,20 +135,15 @@ async def VideoSettings(event: Message, user_id: int):
             text="Here's Your Video Settings<a href='https://ibb.co/RGx4RmDg'>:</a>",
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton(
-                        f"Basic Settings", callback_data="Watermark")],
+                    [InlineKeyboardButton(f"── Basic Settings ──", callback_data="Watermark")],
                     [InlineKeyboardButton(f"Ext: {extensions} ", callback_data="triggerextensions"),
                      InlineKeyboardButton(f"Bits: {'10' if ((await db.get_bits(user_id)) is True) else '8'}", callback_data="triggerBits")],
                     [InlineKeyboardButton(f"Codec: {'H265' if ((await db.get_hevc(user_id)) is True) else 'H264'}", callback_data="triggerHevc"),
                      InlineKeyboardButton(f"CRF: {crf}", callback_data="triggerCRF")],
-                    [InlineKeyboardButton(f"Quality", callback_data="Watermark"),
-                     InlineKeyboardButton(f"{res}", callback_data="triggerResolution")],
-                    [InlineKeyboardButton(f"Tune", callback_data="Watermark"),
-                     InlineKeyboardButton(f"{'Animation' if ((await db.get_tune(user_id)) is True) else 'Film'}", callback_data="triggertune")],
-                    [InlineKeyboardButton(
-                        f"Advanced Settings", callback_data="Watermark")],
-                    [InlineKeyboardButton(f"Preset", callback_data="Watermark"),
-                     InlineKeyboardButton(f"{pre}", callback_data="triggerPreset")],
+                    [InlineKeyboardButton(f"Quality: {res}", callback_data="triggerResolution")],
+                    [InlineKeyboardButton(f"Tune: {'Animation' if ((await db.get_tune(user_id)) is True) else 'Film'}", callback_data="triggertune")],
+                    [InlineKeyboardButton(f"── Advanced Settings ──", callback_data="Watermark")],
+                    [InlineKeyboardButton(f"Preset: {pre}", callback_data="triggerPreset")],
                     [InlineKeyboardButton(f"FPS: {frame}", callback_data="triggerframe"),
                      InlineKeyboardButton(f"Aspect: {'16:9' if ((await db.get_aspect(user_id)) is True) else 'Source'}", callback_data="triggeraspect")],
                     [InlineKeyboardButton(f"CABAC {'☑️' if ((await db.get_cabac(user_id)) is True) else ''}", callback_data="triggercabac"),
@@ -240,14 +235,10 @@ async def AudioSettings(event: Message, user_id: int):
             text="Here's Your Audio Settings<a href='https://ibb.co/RGx4RmDg'>:</a>",
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton(f"Codec", callback_data="Watermark"), InlineKeyboardButton(
-                        f"{audio}", callback_data="triggerAudioCodec")],
-                    [InlineKeyboardButton(f"Channels", callback_data="Watermark"), InlineKeyboardButton(
-                        f"{channels}", callback_data="triggerAudioChannels")],
-                    [InlineKeyboardButton(f"Sample Rate", callback_data="Watermark"), InlineKeyboardButton(
-                        f"{sample}", callback_data="triggersamplerate")],
-                    [InlineKeyboardButton(f"Bitrate", callback_data="Watermark"), InlineKeyboardButton(
-                        f"{bitrate}", callback_data="triggerbitrate")],
+                    [InlineKeyboardButton(f"Codec: {audio}", callback_data="triggerAudioCodec")],
+                    [InlineKeyboardButton(f"Channels: {channels}", callback_data="triggerAudioChannels")],
+                    [InlineKeyboardButton(f"Sample Rate: {sample}", callback_data="triggersamplerate")],
+                    [InlineKeyboardButton(f"Bitrate: {bitrate}", callback_data="triggerbitrate")],
                     [InlineKeyboardButton(
                         f"Back", callback_data="OpenSettings")]
                 ]
