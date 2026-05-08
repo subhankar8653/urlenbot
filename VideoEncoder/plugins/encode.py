@@ -84,3 +84,21 @@ async def batch_encode(app, message):
     else:
         await message.reply("📔 Waiting for queue...")
     await asyncio.sleep(1)
+
+
+@Client.on_message(filters.video | filters.document)
+async def auto_encode(app, message):
+    # Check mimetype for documents
+    if message.document:
+        if not message.document.mime_type in video_mimetype:
+            return
+    c = await check_chat(message, chat='Both')
+    if not c:
+        return
+    await AddUserToDatabase(app, message)
+    data.append(message)
+    if len(data) == 1:
+        await handle_tasks(message, 'tg')
+    else:
+        await message.reply("📔 Added to queue...")
+    await asyncio.sleep(1)
