@@ -265,14 +265,14 @@ async def ExtraSettings(event: Message, user_id: int):
                 [
                     [InlineKeyboardButton(
                         f"Subtitles Settings", callback_data="Watermark")],
-                    [InlineKeyboardButton(f"Hardsub {'☑️' if ((await db.get_hardsub(user_id)) is True) else ''}", callback_data="triggerHardsub"), InlineKeyboardButton(f"Copy {'☑️' if ((await db.get_subtitles(user_id)) is True) else ''}", callback_data="triggerSubtitles")],
+                    [InlineKeyboardButton(f"Hardsub {'✅ ON' if ((await db.get_hardsub(user_id)) is True) else '❌ OFF'}", callback_data="triggerHardsub"), InlineKeyboardButton(f"Softsub {'✅ ON' if ((await db.get_subtitles(user_id)) is True) else '❌ OFF'}", callback_data="triggerSubtitles")],
                     [InlineKeyboardButton(
                         f"Upload Settings", callback_data="Watermark")],
-                    [InlineKeyboardButton(f"{'G-Drive' if ((await db.get_drive(user_id)) is True) else 'Telegram'}", callback_data="triggerMode"),
-                     InlineKeyboardButton(f"{'Document' if ((await db.get_upload_as_doc(user_id)) is True) else 'Video'}", callback_data="triggerUploadMode")],
+                    [InlineKeyboardButton(f"Upload: {'☁️ G-Drive' if ((await db.get_drive(user_id)) is True) else '📩 Telegram'}", callback_data="triggerMode"),
+                     InlineKeyboardButton(f"As: {'📄 Doc' if ((await db.get_upload_as_doc(user_id)) is True) else '🎬 Video'}", callback_data="triggerUploadMode")],
                     [InlineKeyboardButton(
                         f"Watermark Settings", callback_data="Watermark")],
-                    [InlineKeyboardButton(f"Metadata {'☑️' if ((await db.get_metadata_w(user_id)) is True) else ''}", callback_data="triggerMetadata"), InlineKeyboardButton(f"Video {'☑️' if ((await db.get_watermark(user_id)) is True) else ''}", callback_data="triggerVideo")],
+                    [InlineKeyboardButton(f"Metadata {'✅ ON' if ((await db.get_metadata_w(user_id)) is True) else '❌ OFF'}", callback_data="triggerMetadata"), InlineKeyboardButton(f"Video WM {'✅ ON' if ((await db.get_watermark(user_id)) is True) else '❌ OFF'}", callback_data="triggerVideo")],
                     [InlineKeyboardButton(
                         f"Back", callback_data="OpenSettings")]
                 ]
