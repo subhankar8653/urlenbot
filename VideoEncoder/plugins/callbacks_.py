@@ -61,7 +61,7 @@ async def callback_handlers(bot: Client, cb: CallbackQuery):
 
         # Watermark
         elif cb.data == "Watermark":
-            await cb.answer("Sir, this button not works XD\n\nPress Bottom Buttons.", show_alert=True)
+            await cb.answer()
 
         # Metadata
         elif cb.data == "triggerMetadata":
