@@ -30,7 +30,7 @@ class Database:
             bits=False,
             channels='source',
             drive=False,
-            preset='sf',
+            preset='uf',
             metadata=True,
             hardsub=False,
             watermark=False,
@@ -191,7 +191,7 @@ class Database:
 
     async def get_preset(self, id):
         user = await self._get_user(id)
-        return user.get('preset', 'sf')
+        return user.get('preset', 'uf')
 
     # Hard Sub
     async def set_hardsub(self, id, hardsub):
@@ -244,7 +244,7 @@ class Database:
     # CRF
     async def get_crf(self, id):
         user = await self._get_user(id)
-        return user.get('crf', 18)
+        return user.get('crf', 26)
 
     async def set_crf(self, id, crf):
         await self.col.update_one({'id': id}, {'$set': {'crf': crf}}, upsert=True)
