@@ -1,0 +1,334 @@
+20-Feb-26 13:58:14 - requests_cache.backends - DEBUG - Initializing backend: sqlite C:\Users\abhin/.lk21-requests-cache
+20-Feb-26 13:58:14 - requests_cache.backends.base - DEBUG - Initialized SQLiteDict with serializer: SerializerPipeline(name=pickle, n_stages=2)
+20-Feb-26 13:58:14 - requests_cache.backends.sqlite - DEBUG - Opening connection to C:\Users\abhin\.lk21-requests-cache.sqlite:responses
+20-Feb-26 13:58:14 - requests_cache.backends.base - DEBUG - Initialized SQLiteDict with serializer: None
+20-Feb-26 13:58:14 - requests_cache.backends.sqlite - DEBUG - Opening connection to C:\Users\abhin\.lk21-requests-cache.sqlite:redirects
+20-Feb-26 13:58:14 - requests_cache.patcher - DEBUG - Patching requests.Session with class: _ConfiguredCachedSession
+20-Feb-26 13:58:15 - requests_cache.backends - DEBUG - Initializing backend: <SQLiteCache(name=C:\Users\abhin/.lk21-requests-cache)> C:\Users\abhin/.lk21-requests-cache
+20-Feb-26 13:58:16 - VideoEncoder - INFO - Imported Utils!
+20-Feb-26 13:58:54 - pyrogram.dispatcher - ERROR - Unhandled exception: m:27017: [Errno 11001] getaddrinfo failed (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms), Timeout: 30s, Topology Description: <TopologyDescription id: 69981b1f3ae5bc514e77c1ad, topology_type: Unknown, servers: [<ServerDescription ('m', 27017) server_type: Unknown, rtt: None, error=AutoReconnect('m:27017: [Errno 11001] getaddrinfo failed (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms)')>]>
+Traceback (most recent call last):
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pyrogram\dispatcher.py", line 378, in _dispatch_to_handlers
+    await self._execute_handler(handler, *args)
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pyrogram\dispatcher.py", line 405, in _execute_handler
+    await handler.callback(self.client, *args)
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pyrogram\handlers\message_handler.py", line 154, in resolve_future_or_callback
+    await self.original_callback(client, message, *args)
+  File "C:\Users\abhin\Downloads\ENCODING-BOT-master\ENCODING-BOT-master\VideoEncoder\plugins\start.py", line 32, in start_message
+    c = await check_chat(message, chat='Both')
+  File "C:\Users\abhin\Downloads\ENCODING-BOT-master\ENCODING-BOT-master\VideoEncoder\utils\helper.py", line 31, in check_chat
+    get_sudo = await db.get_sudo()
+  File "C:\Users\abhin\Downloads\ENCODING-BOT-master\ENCODING-BOT-master\VideoEncoder\utils\database\database.py", line 278, in get_sudo
+    status = await self.col2.find_one({'id': 'sudo'})
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\collection.py", line 1506, in find_one
+    for result in cursor.limit(-1):
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\cursor.py", line 1264, in next
+    if len(self.__data) or self._refresh():
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\cursor.py", line 1155, in _refresh
+    self.__session = self.__collection.database.client._ensure_session()
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\mongo_client.py", line 1823, in _ensure_session
+    return self.__start_session(True, causal_consistency=False)
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\mongo_client.py", line 1766, in __start_session
+    self._topology._check_implicit_session_support()
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\topology.py", line 573, in _check_implicit_session_support
+    self._check_session_support()
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\topology.py", line 589, in _check_session_support
+    self._select_servers_loop(
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\topology.py", line 259, in _select_servers_loop
+    raise ServerSelectionTimeoutError(
+pymongo.errors.ServerSelectionTimeoutError: m:27017: [Errno 11001] getaddrinfo failed (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms), Timeout: 30s, Topology Description: <TopologyDescription id: 69981b1f3ae5bc514e77c1ad, topology_type: Unknown, servers: [<ServerDescription ('m', 27017) server_type: Unknown, rtt: None, error=AutoReconnect('m:27017: [Errno 11001] getaddrinfo failed (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms)')>]>
+20-Feb-26 13:59:02 - pyrogram.dispatcher - ERROR - Unhandled exception: m:27017: [Errno 11001] getaddrinfo failed (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms), Timeout: 30s, Topology Description: <TopologyDescription id: 69981b1f3ae5bc514e77c1ad, topology_type: Unknown, servers: [<ServerDescription ('m', 27017) server_type: Unknown, rtt: None, error=AutoReconnect('m:27017: [Errno 11001] getaddrinfo failed (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms)')>]>
+Traceback (most recent call last):
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pyrogram\dispatcher.py", line 378, in _dispatch_to_handlers
+    await self._execute_handler(handler, *args)
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pyrogram\dispatcher.py", line 405, in _execute_handler
+    await handler.callback(self.client, *args)
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pyrogram\handlers\message_handler.py", line 154, in resolve_future_or_callback
+    await self.original_callback(client, message, *args)
+  File "C:\Users\abhin\Downloads\ENCODING-BOT-master\ENCODING-BOT-master\VideoEncoder\plugins\start.py", line 32, in start_message
+    c = await check_chat(message, chat='Both')
+  File "C:\Users\abhin\Downloads\ENCODING-BOT-master\ENCODING-BOT-master\VideoEncoder\utils\helper.py", line 31, in check_chat
+    get_sudo = await db.get_sudo()
+  File "C:\Users\abhin\Downloads\ENCODING-BOT-master\ENCODING-BOT-master\VideoEncoder\utils\database\database.py", line 278, in get_sudo
+    status = await self.col2.find_one({'id': 'sudo'})
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\collection.py", line 1506, in find_one
+    for result in cursor.limit(-1):
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\cursor.py", line 1264, in next
+    if len(self.__data) or self._refresh():
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\cursor.py", line 1155, in _refresh
+    self.__session = self.__collection.database.client._ensure_session()
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\mongo_client.py", line 1823, in _ensure_session
+    return self.__start_session(True, causal_consistency=False)
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\mongo_client.py", line 1766, in __start_session
+    self._topology._check_implicit_session_support()
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\topology.py", line 573, in _check_implicit_session_support
+    self._check_session_support()
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\topology.py", line 589, in _check_session_support
+    self._select_servers_loop(
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\topology.py", line 259, in _select_servers_loop
+    raise ServerSelectionTimeoutError(
+pymongo.errors.ServerSelectionTimeoutError: m:27017: [Errno 11001] getaddrinfo failed (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms), Timeout: 30s, Topology Description: <TopologyDescription id: 69981b1f3ae5bc514e77c1ad, topology_type: Unknown, servers: [<ServerDescription ('m', 27017) server_type: Unknown, rtt: None, error=AutoReconnect('m:27017: [Errno 11001] getaddrinfo failed (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms)')>]>
+20-Feb-26 13:59:14 - root - INFO - Stop signal received (SIGINT). Exiting...
+20-Feb-26 13:59:23 - pyrogram.dispatcher - ERROR - Unhandled exception: m:27017: [Errno 11001] getaddrinfo failed (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms), Timeout: 30s, Topology Description: <TopologyDescription id: 69981b1f3ae5bc514e77c1ad, topology_type: Unknown, servers: [<ServerDescription ('m', 27017) server_type: Unknown, rtt: None, error=AutoReconnect('m:27017: [Errno 11001] getaddrinfo failed (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms)')>]>
+Traceback (most recent call last):
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pyrogram\dispatcher.py", line 378, in _dispatch_to_handlers
+    await self._execute_handler(handler, *args)
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pyrogram\dispatcher.py", line 405, in _execute_handler
+    await handler.callback(self.client, *args)
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pyrogram\handlers\message_handler.py", line 154, in resolve_future_or_callback
+    await self.original_callback(client, message, *args)
+  File "C:\Users\abhin\Downloads\ENCODING-BOT-master\ENCODING-BOT-master\VideoEncoder\plugins\start.py", line 32, in start_message
+    c = await check_chat(message, chat='Both')
+  File "C:\Users\abhin\Downloads\ENCODING-BOT-master\ENCODING-BOT-master\VideoEncoder\utils\helper.py", line 31, in check_chat
+    get_sudo = await db.get_sudo()
+  File "C:\Users\abhin\Downloads\ENCODING-BOT-master\ENCODING-BOT-master\VideoEncoder\utils\database\database.py", line 278, in get_sudo
+    status = await self.col2.find_one({'id': 'sudo'})
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\collection.py", line 1506, in find_one
+    for result in cursor.limit(-1):
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\cursor.py", line 1264, in next
+    if len(self.__data) or self._refresh():
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\cursor.py", line 1155, in _refresh
+    self.__session = self.__collection.database.client._ensure_session()
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\mongo_client.py", line 1823, in _ensure_session
+    return self.__start_session(True, causal_consistency=False)
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\mongo_client.py", line 1766, in __start_session
+    self._topology._check_implicit_session_support()
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\topology.py", line 573, in _check_implicit_session_support
+    self._check_session_support()
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\topology.py", line 589, in _check_session_support
+    self._select_servers_loop(
+  File "C:\Users\abhin\AppData\Local\Programs\Python\Python310\lib\site-packages\pymongo\topology.py", line 259, in _select_servers_loop
+    raise ServerSelectionTimeoutError(
+pymongo.errors.ServerSelectionTimeoutError: m:27017: [Errno 11001] getaddrinfo failed (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms), Timeout: 30s, Topology Description: <TopologyDescription id: 69981b1f3ae5bc514e77c1ad, topology_type: Unknown, servers: [<ServerDescription ('m', 27017) server_type: Unknown, rtt: None, error=AutoReconnect('m:27017: [Errno 11001] getaddrinfo failed (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms)')>]>
+20-Feb-26 13:59:35 - requests_cache.backends - DEBUG - Initializing backend: sqlite C:\Users\abhin/.lk21-requests-cache
+20-Feb-26 13:59:35 - requests_cache.backends.base - DEBUG - Initialized SQLiteDict with serializer: SerializerPipeline(name=pickle, n_stages=2)
+20-Feb-26 13:59:35 - requests_cache.backends.sqlite - DEBUG - Opening connection to C:\Users\abhin\.lk21-requests-cache.sqlite:responses
+20-Feb-26 13:59:35 - requests_cache.backends.base - DEBUG - Initialized SQLiteDict with serializer: None
+20-Feb-26 13:59:35 - requests_cache.backends.sqlite - DEBUG - Opening connection to C:\Users\abhin\.lk21-requests-cache.sqlite:redirects
+20-Feb-26 13:59:35 - requests_cache.patcher - DEBUG - Patching requests.Session with class: _ConfiguredCachedSession
+20-Feb-26 13:59:36 - requests_cache.backends - DEBUG - Initializing backend: <SQLiteCache(name=C:\Users\abhin/.lk21-requests-cache)> C:\Users\abhin/.lk21-requests-cache
+20-Feb-26 13:59:36 - VideoEncoder - INFO - Imported Utils!
+20-Feb-26 14:00:12 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:00:12 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:00:12 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:00:12 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:00:12 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:00:12 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:00:12 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:00:12 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:00:12 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:00:12 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:00:12 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:00:12 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:00:12 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:00:12 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:03:00 - VideoEncoder - ERROR - Failed to get media streams: [WinError 2] The system cannot find the file specified
+20-Feb-26 14:10:11 - root - INFO - Stop signal received (SIGINT). Exiting...
+20-Feb-26 14:17:52 - requests_cache.backends - DEBUG - Initializing backend: sqlite C:\Users\abhin/.lk21-requests-cache
+20-Feb-26 14:17:52 - requests_cache.backends.base - DEBUG - Initialized SQLiteDict with serializer: SerializerPipeline(name=pickle, n_stages=2)
+20-Feb-26 14:17:52 - requests_cache.backends.sqlite - DEBUG - Opening connection to C:\Users\abhin\.lk21-requests-cache.sqlite:responses
+20-Feb-26 14:17:52 - requests_cache.backends.base - DEBUG - Initialized SQLiteDict with serializer: None
+20-Feb-26 14:17:52 - requests_cache.backends.sqlite - DEBUG - Opening connection to C:\Users\abhin\.lk21-requests-cache.sqlite:redirects
+20-Feb-26 14:17:52 - requests_cache.patcher - DEBUG - Patching requests.Session with class: _ConfiguredCachedSession
+20-Feb-26 14:17:53 - requests_cache.backends - DEBUG - Initializing backend: <SQLiteCache(name=C:\Users\abhin/.lk21-requests-cache)> C:\Users\abhin/.lk21-requests-cache
+20-Feb-26 14:17:53 - VideoEncoder - INFO - Imported Utils!
+20-Feb-26 14:18:15 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:18:15 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:18:15 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:18:15 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:18:15 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:18:15 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:18:16 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:18:16 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:18:16 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:18:16 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:18:16 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:18:16 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:18:16 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:18:16 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:19:12 - VideoEncoder - INFO - AudioSelect: Not enough audio streams
+20-Feb-26 14:22:22 - VideoEncoder - INFO - AudioSelect: Registered session for user 5756495153
+20-Feb-26 14:22:23 - VideoEncoder - INFO - AudioSelect: Waiting for event
+20-Feb-26 14:22:25 - VideoEncoder - INFO - AudioSelect: Received callback audiosel up 3
+20-Feb-26 14:22:25 - VideoEncoder - INFO - AudioSelect: Processing up for index 3 at pos 2
+20-Feb-26 14:22:26 - VideoEncoder - INFO - AudioSelect: Received callback audiosel up 3
+20-Feb-26 14:22:26 - VideoEncoder - INFO - AudioSelect: Processing up for index 3 at pos 1
+20-Feb-26 14:22:30 - VideoEncoder - INFO - AudioSelect: Received callback audiosel done
+20-Feb-26 14:22:30 - VideoEncoder - INFO - AudioSelect: Event set or timeout reached
+20-Feb-26 14:22:30 - VideoEncoder - INFO - AudioSelect: Unregistered session for user 5756495153
+20-Feb-26 14:22:30 - VideoEncoder - INFO - AudioSelect: Returning maps [3, 1, 2, 4, 5]
+20-Feb-26 14:22:30 - VideoEncoder - INFO - C:\Users\abhin\Downloads\ENCODING-BOT-master\ENCODING-BOT-master\VideoEncoder\downloads\@Anime_in_Telugus With You, Our Love Will Make IABHI.mkv
+20-Feb-26 14:22:31 - VideoEncoder - INFO - ffmpeg_process: 13000
+20-Feb-26 14:22:36 - VideoEncoder - INFO - end
+20-Feb-26 14:22:36 - VideoEncoder - INFO - 
+20-Feb-26 14:22:36 - VideoEncoder - INFO - 
+20-Feb-26 14:22:36 - VideoEncoder - WARNING - ffprobe duration failed: Command '['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', 'VideoEncoder/encodes/@Anime_in_Telugus With You, Our Love Will Make IABHI.mp4']' returned non-zero exit status 1., falling back to hachoir
+20-Feb-26 14:22:36 - VideoEncoder - ERROR - hachoir duration failed: Input size is nul (source='file:VideoEncoder/encodes/@Anime_in_Telugus With You, Our Love Will Make IABHI.mp4')!
+20-Feb-26 14:22:37 - VideoEncoder - WARNING - ffprobe width/height failed: Command '['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', 'VideoEncoder/encodes/@Anime_in_Telugus With You, Our Love Will Make IABHI.mp4']' returned non-zero exit status 1., falling back to hachoir
+20-Feb-26 14:22:37 - VideoEncoder - ERROR - hachoir width/height failed: Input size is nul (source='file:VideoEncoder/encodes/@Anime_in_Telugus With You, Our Love Will Make IABHI.mp4')!
+20-Feb-26 14:24:11 - root - INFO - Stop signal received (SIGINT). Exiting...
+20-Feb-26 14:28:15 - requests_cache.backends - DEBUG - Initializing backend: sqlite C:\Users\abhin/.lk21-requests-cache
+20-Feb-26 14:28:15 - requests_cache.backends.base - DEBUG - Initialized SQLiteDict with serializer: SerializerPipeline(name=pickle, n_stages=2)
+20-Feb-26 14:28:15 - requests_cache.backends.sqlite - DEBUG - Opening connection to C:\Users\abhin\.lk21-requests-cache.sqlite:responses
+20-Feb-26 14:28:15 - requests_cache.backends.base - DEBUG - Initialized SQLiteDict with serializer: None
+20-Feb-26 14:28:15 - requests_cache.backends.sqlite - DEBUG - Opening connection to C:\Users\abhin\.lk21-requests-cache.sqlite:redirects
+20-Feb-26 14:28:15 - requests_cache.patcher - DEBUG - Patching requests.Session with class: _ConfiguredCachedSession
+20-Feb-26 14:28:15 - requests_cache.backends - DEBUG - Initializing backend: <SQLiteCache(name=C:\Users\abhin/.lk21-requests-cache)> C:\Users\abhin/.lk21-requests-cache
+20-Feb-26 14:28:16 - VideoEncoder - INFO - Imported Utils!
+20-Feb-26 14:29:17 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:29:17 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:29:17 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:29:17 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:29:17 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:29:17 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:29:17 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:29:17 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:29:17 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:29:17 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:29:17 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:29:17 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:29:17 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:29:17 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:30:37 - VideoEncoder - INFO - AudioSelect: Registered session for user 5756495153
+20-Feb-26 14:30:37 - VideoEncoder - INFO - AudioSelect: Waiting for event
+20-Feb-26 14:30:40 - VideoEncoder - INFO - AudioSelect: Received callback audiosel up 2
+20-Feb-26 14:30:40 - VideoEncoder - INFO - AudioSelect: Processing up for index 2 at pos 1
+20-Feb-26 14:30:42 - VideoEncoder - INFO - AudioSelect: Received callback audiosel done
+20-Feb-26 14:30:42 - VideoEncoder - INFO - AudioSelect: Event set or timeout reached
+20-Feb-26 14:30:42 - VideoEncoder - INFO - AudioSelect: Unregistered session for user 5756495153
+20-Feb-26 14:30:42 - VideoEncoder - INFO - AudioSelect: Returning maps [2, 1, 3]
+20-Feb-26 14:30:42 - VideoEncoder - INFO - C:\Users\abhin\Downloads\ENCODING-BOT-master\ENCODING-BOT-master\VideoEncoder\downloads\@abcanimeworld_Wenderella's_Diary_S01E06_Wenderella'🇿 🇦 🇳 🇮 .mkv
+20-Feb-26 14:30:43 - VideoEncoder - INFO - ffmpeg_process: 25596
+20-Feb-26 14:30:48 - VideoEncoder - INFO - end
+20-Feb-26 14:30:48 - VideoEncoder - ERROR - FFmpeg stderr: [mp4 @ 0000019bd556e3c0] Could not find tag for codec subrip in stream #1, codec not currently supported in container
+[out#0/mp4 @ 0000019bd5524140] Could not write header (incorrect codec parameters ?): Invalid argument
+[vf#0:0 @ 0000019bd5d1a6c0] Error sending frames to consumers: Invalid argument
+[vf#0:0 @ 0000019bd5d1a6c0] Task finished with error code: -22 (Invalid argument)
+[vf#0:0 @ 0000019bd5d1a6c0] Terminating thread with return code -22 (Invalid argument)
+[out#0/mp4 @ 0000019bd5524140] Nothing was written into output file, because at least one of its streams received no packets.
+20-Feb-26 14:30:48 - VideoEncoder - ERROR - Encoding failed: VideoEncoder/encodes/@abcanimeworld_Wenderella's_Diary_S01E06_Wenderella'🇿 🇦 🇳 🇮 .mp4 not created or is 0 bytes.
+20-Feb-26 14:31:20 - root - INFO - Stop signal received (SIGINT). Exiting...
+20-Feb-26 14:32:34 - requests_cache.backends - DEBUG - Initializing backend: sqlite C:\Users\abhin/.lk21-requests-cache
+20-Feb-26 14:32:34 - requests_cache.backends.base - DEBUG - Initialized SQLiteDict with serializer: SerializerPipeline(name=pickle, n_stages=2)
+20-Feb-26 14:32:34 - requests_cache.backends.sqlite - DEBUG - Opening connection to C:\Users\abhin\.lk21-requests-cache.sqlite:responses
+20-Feb-26 14:32:34 - requests_cache.backends.base - DEBUG - Initialized SQLiteDict with serializer: None
+20-Feb-26 14:32:34 - requests_cache.backends.sqlite - DEBUG - Opening connection to C:\Users\abhin\.lk21-requests-cache.sqlite:redirects
+20-Feb-26 14:32:34 - requests_cache.patcher - DEBUG - Patching requests.Session with class: _ConfiguredCachedSession
+20-Feb-26 14:32:36 - requests_cache.backends - DEBUG - Initializing backend: <SQLiteCache(name=C:\Users\abhin/.lk21-requests-cache)> C:\Users\abhin/.lk21-requests-cache
+20-Feb-26 14:32:38 - VideoEncoder - INFO - Imported Utils!
+20-Feb-26 14:32:39 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:32:39 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:32:39 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:32:39 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:32:39 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:32:39 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:32:39 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:32:39 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:32:39 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:32:39 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:32:39 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:32:39 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:32:40 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:32:40 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:33:35 - VideoEncoder - INFO - C:\Users\abhin\Downloads\ENCODING-BOT-master\ENCODING-BOT-master\VideoEncoder\downloads\@abcanimeworld_Wenderella's_Diary_S01E06_Wenderella'🇿 🇦 🇳 🇮 .mkv
+20-Feb-26 14:33:35 - VideoEncoder - INFO - ffmpeg_process: 14180
+20-Feb-26 14:33:40 - VideoEncoder - INFO - end
+20-Feb-26 14:33:40 - VideoEncoder - ERROR - FFmpeg stderr: [mp4 @ 000002b1fd453780] Could not find tag for codec subrip in stream #1, codec not currently supported in container
+[out#0/mp4 @ 000002b1fd453680] Could not write header (incorrect codec parameters ?): Invalid argument
+[vf#0:0 @ 000002b1fd49e640] Error sending frames to consumers: Invalid argument
+[vf#0:0 @ 000002b1fd49e640] Task finished with error code: -22 (Invalid argument)
+[vf#0:0 @ 000002b1fd49e640] Terminating thread with return code -22 (Invalid argument)
+[out#0/mp4 @ 000002b1fd453680] Nothing was written into output file, because at least one of its streams received no packets.
+20-Feb-26 14:33:40 - VideoEncoder - ERROR - Encoding failed: VideoEncoder/encodes/@abcanimeworld_Wenderella's_Diary_S01E06_Wenderella'🇿 🇦 🇳 🇮 .mp4 not created or is 0 bytes.
+20-Feb-26 14:33:46 - root - INFO - Stop signal received (SIGINT). Exiting...
+20-Feb-26 14:33:51 - requests_cache.backends - DEBUG - Initializing backend: sqlite C:\Users\abhin/.lk21-requests-cache
+20-Feb-26 14:33:51 - requests_cache.backends.base - DEBUG - Initialized SQLiteDict with serializer: SerializerPipeline(name=pickle, n_stages=2)
+20-Feb-26 14:33:51 - requests_cache.backends.sqlite - DEBUG - Opening connection to C:\Users\abhin\.lk21-requests-cache.sqlite:responses
+20-Feb-26 14:33:51 - requests_cache.backends.base - DEBUG - Initialized SQLiteDict with serializer: None
+20-Feb-26 14:33:51 - requests_cache.backends.sqlite - DEBUG - Opening connection to C:\Users\abhin\.lk21-requests-cache.sqlite:redirects
+20-Feb-26 14:33:51 - requests_cache.patcher - DEBUG - Patching requests.Session with class: _ConfiguredCachedSession
+20-Feb-26 14:33:53 - requests_cache.backends - DEBUG - Initializing backend: <SQLiteCache(name=C:\Users\abhin/.lk21-requests-cache)> C:\Users\abhin/.lk21-requests-cache
+20-Feb-26 14:33:54 - VideoEncoder - INFO - Imported Utils!
+20-Feb-26 14:33:55 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:33:55 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:33:55 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:33:55 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:33:55 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:33:55 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:33:55 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:33:55 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:33:55 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:33:55 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:33:55 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:33:55 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:33:55 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:33:55 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:35:34 - VideoEncoder - INFO - AudioSelect: Registered session for user 5756495153
+20-Feb-26 14:35:34 - VideoEncoder - INFO - AudioSelect: Waiting for event
+20-Feb-26 14:35:38 - VideoEncoder - INFO - AudioSelect: Received callback audiosel up 2
+20-Feb-26 14:35:38 - VideoEncoder - INFO - AudioSelect: Processing up for index 2 at pos 1
+20-Feb-26 14:35:39 - VideoEncoder - INFO - AudioSelect: Received callback audiosel done
+20-Feb-26 14:35:39 - VideoEncoder - INFO - AudioSelect: Event set or timeout reached
+20-Feb-26 14:35:39 - VideoEncoder - INFO - AudioSelect: Unregistered session for user 5756495153
+20-Feb-26 14:35:39 - VideoEncoder - INFO - AudioSelect: Returning maps [2, 1, 3]
+20-Feb-26 14:35:39 - VideoEncoder - INFO - C:\Users\abhin\Downloads\ENCODING-BOT-master\ENCODING-BOT-master\VideoEncoder\downloads\@abcanimeworld_Wenderella's_Diary_S01E06_Wenderella'🇿 🇦 🇳 🇮 .mkv
+20-Feb-26 14:35:40 - VideoEncoder - INFO - ffmpeg_process: 15012
+20-Feb-26 14:38:04 - VideoEncoder - INFO - end
+20-Feb-26 14:38:04 - VideoEncoder - ERROR - FFmpeg stderr: 
+20-Feb-26 14:43:30 - root - INFO - Stop signal received (SIGINT). Exiting...
+20-Feb-26 14:45:23 - requests_cache.backends - DEBUG - Initializing backend: sqlite C:\Users\abhin/.lk21-requests-cache
+20-Feb-26 14:45:23 - requests_cache.backends.base - DEBUG - Initialized SQLiteDict with serializer: SerializerPipeline(name=pickle, n_stages=2)
+20-Feb-26 14:45:23 - requests_cache.backends.sqlite - DEBUG - Opening connection to C:\Users\abhin\.lk21-requests-cache.sqlite:responses
+20-Feb-26 14:45:23 - requests_cache.backends.base - DEBUG - Initialized SQLiteDict with serializer: None
+20-Feb-26 14:45:23 - requests_cache.backends.sqlite - DEBUG - Opening connection to C:\Users\abhin\.lk21-requests-cache.sqlite:redirects
+20-Feb-26 14:45:23 - requests_cache.patcher - DEBUG - Patching requests.Session with class: _ConfiguredCachedSession
+20-Feb-26 14:45:25 - requests_cache.backends - DEBUG - Initializing backend: <SQLiteCache(name=C:\Users\abhin/.lk21-requests-cache)> C:\Users\abhin/.lk21-requests-cache
+20-Feb-26 14:45:26 - VideoEncoder - INFO - Imported Utils!
+20-Feb-26 14:45:28 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:45:28 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:45:28 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:45:28 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:45:28 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:45:28 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:45:28 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:45:29 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:45:29 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:45:29 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:45:29 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:45:29 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:45:29 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:45:29 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:46:00 - root - INFO - Stop signal received (SIGINT). Exiting...
+20-Feb-26 14:47:08 - requests_cache.backends - DEBUG - Initializing backend: sqlite C:\Users\abhin/.lk21-requests-cache
+20-Feb-26 14:47:08 - requests_cache.backends.base - DEBUG - Initialized SQLiteDict with serializer: SerializerPipeline(name=pickle, n_stages=2)
+20-Feb-26 14:47:08 - requests_cache.backends.sqlite - DEBUG - Opening connection to C:\Users\abhin\.lk21-requests-cache.sqlite:responses
+20-Feb-26 14:47:08 - requests_cache.backends.base - DEBUG - Initialized SQLiteDict with serializer: None
+20-Feb-26 14:47:08 - requests_cache.backends.sqlite - DEBUG - Opening connection to C:\Users\abhin\.lk21-requests-cache.sqlite:redirects
+20-Feb-26 14:47:08 - requests_cache.patcher - DEBUG - Patching requests.Session with class: _ConfiguredCachedSession
+20-Feb-26 14:47:09 - requests_cache.backends - DEBUG - Initializing backend: <SQLiteCache(name=C:\Users\abhin/.lk21-requests-cache)> C:\Users\abhin/.lk21-requests-cache
+20-Feb-26 14:47:09 - VideoEncoder - INFO - Imported Utils!
+20-Feb-26 14:47:12 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:47:12 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:47:12 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:47:12 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:47:12 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:47:12 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:47:12 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:47:12 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:47:13 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:47:13 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:47:13 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:47:13 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:47:13 - pymongo.ocsp_support - DEBUG - Peer did not staple an OCSP response
+20-Feb-26 14:47:13 - pymongo.ocsp_support - DEBUG - No OCSP URI, soft fail
+20-Feb-26 14:48:24 - VideoEncoder - INFO - C:\Users\abhin\Downloads\ENCODING-BOT-master\ENCODING-BOT-master\VideoEncoder\downloads\@abcanimeworld_Wenderella's_Diary_S01E06_Wenderella'🇿 🇦 🇳 🇮 .mkv
+20-Feb-26 14:48:25 - VideoEncoder - INFO - ffmpeg_process: 22048
+20-Feb-26 14:49:58 - VideoEncoder - INFO - end
+20-Feb-26 14:49:58 - VideoEncoder - ERROR - FFmpeg stderr: 
+20-Feb-26 14:51:56 - root - INFO - Stop signal received (SIGINT). Exiting...
