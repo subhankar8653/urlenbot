@@ -11,35 +11,34 @@ from ..encoding import get_duration, get_thumbnail, get_width_height
 
 
 def build_caption(original_caption, filename, resolution):
-    """Smart caption - quality replace karo, extension fix karo, baaki sab same rakho"""
+    """Smart caption - quality replace karo, extension fix karo"""
     if not original_caption:
         return os.path.splitext(filename)[0] + ".mp4"
 
     caption = original_caption
 
-    # Step 1: Resolution replace
     res_label = {
         'OG': None, '2160': '2160p', '1080': '1080p',
         '720': '720p', '576': '576p', '480': '480p'
     }.get(str(resolution), '480p')
 
     if res_label:
-        replaced = False
         for pat in ['2160p', '1080p', '720p', '576p', '480p', '4K', 'FHD', 'HD']:
             if re.search(pat, caption, re.IGNORECASE):
                 caption = re.sub(pat, res_label, caption, count=1, flags=re.IGNORECASE)
-                replaced = True
                 break
 
-    # Step 2: Extension .mkv/.avi/.mov etc → .mp4
     caption = re.sub(r'\.(mkv|avi|mov|flv|wmv|ts|m4v)$', '.mp4', caption, flags=re.IGNORECASE)
-
     return caption.strip()
 
 
 def build_filename(caption):
-    """Caption se filename banao - special chars hata do"""
-    # Brackets aur unsafe chars ko safe banao
+    """
+    Caption se filename banao.
+    Spaces aur [] brackets rakho - sirf illegal chars hatao.
+    Example: 'Naruto S01E01 in Hindi 1080p [@SBANIME].mp4'
+             → 'Naruto S01E01 in Hindi 1080p [@SBANIME].mp4'  (same, clean)
+    """
     name = caption
     name = re.sub(r'[<>:"/\\|?*]', '', name)
     name = name.strip()
@@ -62,15 +61,13 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
     c_time = time.time()
     filename = os.path.basename(new_file)
 
-    # Smart caption build karo
     original_caption = message.caption or message.text or os.path.splitext(filename)[0]
     caption = smart_caption(original_caption, new_file, resolution)
     caption = await apply_swap(caption, message.from_user.id)
     bold_caption = f'<b>{caption}</b>'
 
-    # Filename bhi caption se match karo
+    # Clean filename - spaces aur [] sab sahi rahega
     new_filename = build_filename(caption)
-    # File rename karo
     new_path = os.path.join(os.path.dirname(new_file), new_filename)
     try:
         if new_file != new_path:
@@ -81,7 +78,6 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
 
     duration = get_duration(new_file)
 
-    # Thumbnail
     custom_thumb = await db.get_thumbnail(message.from_user.id)
     if custom_thumb:
         thumb = await app.download_media(
@@ -94,14 +90,13 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
     width, height = get_width_height(new_file)
 
     if await db.get_upload_as_doc(message.from_user.id) is True:
-        link = await upload_doc(message, msg, c_time, bold_caption, new_file)
+        link = await upload_doc(message, msg, c_time, bold_caption, new_file, new_filename)
     else:
         link = await upload_video(
             message, msg, new_file, bold_caption,
-            c_time, thumb, duration, width, height, custom_thumb
+            c_time, thumb, duration, width, height, new_filename, custom_thumb
         )
 
-    # Cleanup thumb
     if custom_thumb and thumb and os.path.isfile(thumb):
         try:
             os.remove(thumb)
@@ -111,7 +106,7 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
     return link
 
 
-async def upload_video(message, msg, new_file, caption, c_time, thumb, duration, width, height, cover=None):
+async def upload_video(message, msg, new_file, caption, c_time, thumb, duration, width, height, file_name=None, cover=None):
     send_kwargs = dict(
         supports_streaming=True,
         parse_mode=ParseMode.HTML,
@@ -120,10 +115,12 @@ async def upload_video(message, msg, new_file, caption, c_time, thumb, duration,
         duration=duration,
         width=width,
         height=height,
+        # file_name explicitly pass karo - Telegram will use this as-is
+        # Spaces aur [] brackets preserve honge
+        file_name=file_name,
         progress=progress_for_pyrogram,
         progress_args=("Uploading ...", msg, c_time)
     )
-    # Cover pic add karo agar set hai
     if cover:
         send_kwargs['cover'] = cover
 
@@ -142,9 +139,10 @@ async def upload_video(message, msg, new_file, caption, c_time, thumb, duration,
     return resp.link
 
 
-async def upload_doc(message, msg, c_time, caption, new_file):
+async def upload_doc(message, msg, c_time, caption, new_file, file_name=None):
     resp = await message.reply_document(
         new_file,
+        file_name=file_name,
         caption=caption,
         parse_mode=ParseMode.HTML,
         progress=progress_for_pyrogram,
