@@ -5,7 +5,7 @@ ENV TZ="Asia/Kolkata"
 
 # Install system packages
 RUN apt-get update && apt-get install -y \
-    ffmpeg git wget pv jq python3-dev \
+    ffmpeg git wget pv jq python3-dev megatools \
     mediainfo gcc libsm6 libxext6 \
     libfontconfig1 libxrender1 libgl1-mesa-glx \
  && rm -rf /var/lib/apt/lists/*
