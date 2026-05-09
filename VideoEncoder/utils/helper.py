@@ -69,7 +69,8 @@ async def handle_encode(filepath, message, msg, audio_map=None):
     if new_file:
         await msg.edit("<code>Video Encoded, getting metadata...</code>")
         try:
-            link = await upload_worker(new_file, message, msg)
+            resolution = await db.get_resolution(message.from_user.id)
+            link = await upload_worker(new_file, message, msg, resolution=resolution)
             await msg.edit('Video Encoded Successfully! Link: {}'.format(link))
         except Exception as e:
             await msg.edit(f"Error while uploading: {e}")
