@@ -1,38 +1,20 @@
-# Required
-pyrofork
-TgCrypto
+# ── Encode Bot Core ──────────────────────
+pyrogram
+tgcrypto
 python-dotenv
-hachoir
-beautifulsoup4==4.9.1
-bs4==0.0.1
-
-# DDL
+pymongo
+motor
+psutil
 pySmartDL
 requests
-
-# Database
-dnspython
-motor
-
-# Others
-psutil
-js2py
-cloudscraper
-lk21
-lxml
-httpx
-speedtest-cli
-
-# Fast Download
-aiohttp
-aiofiles
-
-# Google Drive
-google-api-core
-google-auth
-oauth2client<4.0.0
-google~=3.0.0
+requests-cache
 google-api-python-client
+google-auth
 google-auth-httplib2
 google-auth-oauthlib
-httplib2==0.18.0
+
+# ── RTI Downloader Plugin ─────────────────
+selenium==4.18.1
+beautifulsoup4
+lxml
+hachoir
