@@ -357,13 +357,11 @@ async def encode(filepath, message, msg, audio_map=None):
     else:
         channels = ''
 
-    finish = '-threads 0 -thread_type frame -fflags +fastseek+nobuffer -movflags +faststart'
+    finish = '-threads 8'
 
     # Finally
     command = ['ffmpeg', '-hide_banner', '-loglevel', 'error',
-               '-progress', progress, '-hwaccel', 'auto',
-               '-fflags', '+genpts+igndts',
-               '-y', '-i', filepath]
+               '-progress', progress, '-hwaccel', 'auto', '-y', '-i', filepath]
     command.extend((codec.split() + preset.split() + frame.split() + tunevideo.split() + aspect.split() + video_opts.split() + Crf.split() +
                    watermark.split() + metadata.split() + subtitles.split() + audio_opts.split() + channels.split() + finish.split()))
     proc = await asyncio.create_subprocess_exec(*command, output_filepath, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -560,4 +558,14 @@ async def handle_progress(proc, msg, message, filepath):
                     )
                 )
             except:
+                pass
+            # Cancel check
+            try:
+                with open(status, 'r') as sf:
+                    st = __import__('json').load(sf)
+                    if not st.get('running', True):
+                        proc.kill()
+                        await msg.edit("🚦 Encoding Cancelled!")
+                        return
+            except Exception:
                 pass
