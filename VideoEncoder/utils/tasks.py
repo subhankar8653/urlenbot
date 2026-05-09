@@ -1,5 +1,3 @@
-
-
 import asyncio
 import html
 import os
@@ -7,12 +5,8 @@ import time
 from datetime import datetime
 from urllib.parse import unquote_plus
 
-from httpx import delete
-from pyrogram.errors.exceptions.bad_request_400 import (MessageIdInvalid,
-                                                        MessageNotModified)
-from pyrogram.parser import html as pyrogram_html
+from pyrogram.errors.exceptions.bad_request_400 import (MessageIdInvalid, MessageNotModified)
 from pyrogram.types import Message
-from requests.utils import unquote
 
 from .. import LOGGER, data, download_dir, video_mimetype
 from .database.access_db import db
@@ -23,6 +17,8 @@ from .uploads.drive import _get_file_id
 from .uploads.drive.download import Downloader
 from .encoding import get_media_streams
 from ..video_utils.audio_selector import AudioSelect
+from .fast_download import fast_download
+
 
 async def on_task_complete():
     delete_downloads()
@@ -33,7 +29,6 @@ async def on_task_complete():
         return
     message = data[0]
 
-    # Determine text content (message text or caption)
     text_content = message.text or message.caption
 
     if text_content:
@@ -48,17 +43,12 @@ async def on_task_complete():
         elif '/af' in command:
             await handle_tasks(message, 'af')
         else:
-             # If has text but not a known command, check if it's a file
             if message.document or message.video:
-                 if message.document and not message.document.mime_type in video_mimetype:
+                if message.document and not message.document.mime_type in video_mimetype:
                     await on_task_complete()
                     return
-                 await handle_tasks(message, 'tg')
-            else:
-                 # Just text, maybe a link but without command? Or unhandled
-                 pass
+                await handle_tasks(message, 'tg')
     else:
-        # Fallback for any other file message if somehow added
         if message.document:
             if not message.document.mime_type in video_mimetype:
                 await on_task_complete()
@@ -84,7 +74,7 @@ async def handle_tasks(message, mode):
     except MessageIdInvalid:
         await msg.edit('Download Cancelled!')
     except FileNotFoundError:
-        LOGGER.error('[FileNotFoundError]: Maybe due to cancel, hmm')
+        LOGGER.error('[FileNotFoundError]: Maybe due to cancel')
         import traceback
         LOGGER.error(traceback.format_exc())
     except Exception as e:
@@ -110,23 +100,18 @@ async def af_task(message, msg):
         await msg.edit("Download failed or no file found.")
         return
 
-    # Probe for streams
     streams = get_media_streams(filepath)
     if not streams:
-         await msg.edit("Could not retrieve media streams.")
-         return
+        await msg.edit("Could not retrieve media streams.")
+        return
 
     selector = AudioSelect(message._client, message)
-    await msg.delete() # Delete the downloading message as AudioSelect will send its own interface
-
-    # AudioSelect expects streams list
+    await msg.delete()
     audio_map, _ = await selector.get_buttons(streams)
 
     if audio_map == -1:
-        # Cancelled or error
         return
 
-    # Proceed to encode with the new map
     msg = await message.reply("Encoding with new audio arrangement...")
     await handle_encode(filepath, message, msg, audio_map)
 
@@ -134,7 +119,6 @@ async def af_task(message, msg):
 async def url_task(message, msg):
     filepath = await handle_download_url(message, msg, False)
     if not filepath:
-        # Error handled in handle_download_url logic or implicit failure
         return
     await msg.edit_text("Encoding...")
     await handle_encode(filepath, message, msg)
@@ -157,16 +141,15 @@ async def batch_task(message, msg):
     if os.path.isdir(filepath):
         path = filepath
     else:
-        await msg.edit('Something went wrong, hell!')
+        await msg.edit('Something went wrong!')
         return
     await msg.edit('<b>📕 Encode Started!</b>')
     sentfiles = []
-    # Encode
     for dirpath, subdir, files_ in sorted(os.walk(path)):
         for i in sorted(files_):
             msg_ = await message.reply('Encoding')
             filepath = os.path.join(dirpath, i)
-            await msg.edit('Encode Started!\nEncoding: <code>{}</code>'.format(i))
+            await msg.edit('Encoding: <code>{}</code>'.format(i))
             try:
                 url = await handle_encode(filepath, message, msg_)
             except Exception as e:
@@ -210,7 +193,6 @@ async def handle_download_url(message, msg, batch):
         n = Downloader()
         custom_file_name = n.name(file_id)
     else:
-        # Default filename from URL basename
         custom_file_name = unquote_plus(os.path.basename(url))
 
     if "|" in url and not batch:
@@ -219,8 +201,6 @@ async def handle_download_url(message, msg, batch):
         if c_file_name:
             custom_file_name = c_file_name.strip()
     elif " " in url and not batch:
-        # Attempt to handle space-separated URL and filename
-        # This assumes the URL itself doesn't contain unencoded spaces, which is standard.
         parts = url.split()
         if len(parts) > 1:
             url = parts[0]
@@ -230,7 +210,6 @@ async def handle_download_url(message, msg, batch):
     if direct:
         url = direct
 
-    # Ensure filename is safe/valid or fallback
     if not custom_file_name:
         custom_file_name = "downloaded_file"
 
@@ -244,9 +223,10 @@ async def handle_download_url(message, msg, batch):
 
 
 async def handle_tg_down(message, msg, mode='no_reply'):
+    """Multi-threaded fast download"""
     c_time = time.time()
 
-    # Determine what to download
+    # Target message determine karo
     target_msg = message
     if message.reply_to_message and (message.reply_to_message.video or message.reply_to_message.document):
         target_msg = message.reply_to_message
@@ -255,14 +235,27 @@ async def handle_tg_down(message, msg, mode='no_reply'):
     elif mode == 'reply' and message.reply_to_message:
         target_msg = message.reply_to_message
     else:
-        # If command was just /dl without reply and without attachment, and mode is not explicit reply
         if not (message.reply_to_message and (message.reply_to_message.video or message.reply_to_message.document)):
-             return None
+            return None
         target_msg = message.reply_to_message
 
-    path = await target_msg.download(
-        file_name=os.path.join(download_dir, ""),
-        progress=progress_for_pyrogram,
-        progress_args=("Downloading...", msg, c_time))
+    # Filename determine karo
+    if target_msg.video:
+        fname = target_msg.video.file_name or f"video_{int(time.time())}.mp4"
+    elif target_msg.document:
+        fname = target_msg.document.file_name or f"file_{int(time.time())}"
+    else:
+        fname = f"file_{int(time.time())}"
+
+    file_path = os.path.join(download_dir, fname)
+
+    # Fast multi-threaded download use karo
+    path = await fast_download(
+        client=message._client,
+        message=target_msg,
+        file_name=file_path,
+        progress_callback=progress_for_pyrogram,
+        progress_args=("⚡ Downloading...", msg, c_time)
+    )
 
     return path
