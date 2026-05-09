@@ -5,6 +5,7 @@ import time
 from pyrogram.enums import ParseMode
 from ... import app, download_dir, log
 from ..database.access_db import db
+from .auto_caption import smart_caption
 from ..display_progress import progress_for_pyrogram
 from ..encoding import get_duration, get_thumbnail, get_width_height
 
@@ -63,7 +64,7 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
 
     # Smart caption build karo
     original_caption = message.caption or message.text or os.path.splitext(filename)[0]
-    caption = build_caption(original_caption, filename, resolution)
+    caption = smart_caption(original_caption, new_file, resolution)
     caption = await apply_swap(caption, message.from_user.id)
     bold_caption = f'<b>{caption}</b>'
 
