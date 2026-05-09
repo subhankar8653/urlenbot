@@ -1,11 +1,11 @@
 """
-swift_downloader.py  v3
+swift_downloader.py  v4
 ========================
-Strategy (image se pata chala):
-  - Page pe buttons ke andar direct .mp4 download links hain (href attribute)
-  - Selenium se page render karo, BeautifulSoup se sabhi href links nikalo
-  - Jo links download CDN ki hain unhe aiohttp se download karo
-  - Selenium click ki zarurat nahi — seedha link grab karo!
+FIX: IP binding issue.
+  - Page visit aur download DONO same Selenium session se hoga
+  - Same browser = same IP = same cookies = download works
+  - Chrome ko download folder set karke buttons click karayenge
+  - Chrome khud file save kar lega — koi alag HTTP request nahi
 
 Commands:
   /swift <url>        — download + upload
@@ -13,59 +13,55 @@ Commands:
 """
 
 import asyncio
+import glob
 import os
-import re
 import time
 
-import aiohttp
-import aiofiles
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from bs4 import BeautifulSoup
 
 from .. import LOGGER, download_dir
 from ..utils.helper import check_chat
-from ..utils.uploads.telegram import upload_doc, upload_video
+from ..utils.uploads.telegram import upload_video
 from ..utils.encoding import get_duration, get_thumbnail, get_width_height
 
-# ─────────────────────────────────────────────
-#  Selenium import (graceful fallback)
-# ─────────────────────────────────────────────
 try:
     from selenium import webdriver
     from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
     SELENIUM_OK = True
 except ImportError:
     SELENIUM_OK = False
 
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Referer": "https://swift.multiquality.click/",
-    "Accept": "*/*",
-}
-
-
 # ─────────────────────────────────────────────
-#  Driver setup (sirf page render ke liye)
+#  Driver — download folder set, same session
 # ─────────────────────────────────────────────
-def _make_driver():
+def _make_driver(dl_dir: str):
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless")
+    options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1280,800")
+    options.add_argument("--window-size=1920,1080")
     options.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     )
-    prefs = {"profile.managed_default_content_settings.images": 2}
+
+    # Download folder Chrome ke andar set karo
+    prefs = {
+        "download.default_directory": dl_dir,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": True,
+        "safebrowsing.disable_download_protection": True,
+        "profile.default_content_setting_values.automatic_downloads": 1,
+        "profile.content_settings.exceptions.automatic_downloads.*.setting": 1,
+    }
     options.add_experimental_option("prefs", prefs)
 
     for binary in [
@@ -78,11 +74,23 @@ def _make_driver():
             options.binary_location = binary
             break
 
-    return webdriver.Chrome(options=options)
+    driver = webdriver.Chrome(options=options)
+    driver.set_page_load_timeout(60)
+
+    # Chrome headless mein download enable karna (CDP command)
+    try:
+        driver.execute_cdp_cmd(
+            "Page.setDownloadBehavior",
+            {"behavior": "allow", "downloadPath": dl_dir},
+        )
+    except Exception:
+        pass
+
+    return driver
 
 
 # ─────────────────────────────────────────────
-#  Close popup tabs
+#  Popup tabs band karo
 # ─────────────────────────────────────────────
 def _close_popups(driver, main):
     try:
@@ -96,9 +104,9 @@ def _close_popups(driver, main):
 
 
 # ─────────────────────────────────────────────
-#  Quality label from text/URL
+#  Quality label from text
 # ─────────────────────────────────────────────
-def _quality_from_text(text: str) -> str:
+def _quality_from(text: str) -> str:
     t = text.lower()
     for q in ["1080p", "720p", "480p", "360p"]:
         if q in t:
@@ -107,74 +115,159 @@ def _quality_from_text(text: str) -> str:
 
 
 # ─────────────────────────────────────────────
-#  Page se download links extract karo
+#  Download complete hone ka wait
 # ─────────────────────────────────────────────
-def _extract_links(swift_url: str) -> list:
+def _get_done_files(dl_dir: str) -> list:
+    done = []
+    for f in glob.glob(os.path.join(dl_dir, "*")):
+        if f.endswith((".crdownload", ".part", ".tmp")):
+            continue
+        try:
+            if os.path.getsize(f) > 100 * 1024:  # > 100KB
+                done.append(f)
+        except OSError:
+            pass
+    return done
+
+
+def _in_progress(dl_dir: str) -> list:
+    return (
+        glob.glob(os.path.join(dl_dir, "*.crdownload"))
+        + glob.glob(os.path.join(dl_dir, "*.part"))
+        + glob.glob(os.path.join(dl_dir, "*.tmp"))
+    )
+
+
+# ─────────────────────────────────────────────
+#  Main scrape + download (blocking, same session)
+# ─────────────────────────────────────────────
+def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None) -> dict:
     """
-    Returns list of dicts:
-      [{"url": "https://...", "quality": "720p", "label": "720P HD"}, ...]
+    Same Selenium session mein:
+      1. Page visit karo
+      2. Download links/buttons dhundo
+      3. Har button click karo → Chrome file save kare
+      4. Files ka wait karo
+
+    Returns: {"files": [...paths], "qualities": [...], "error": str or None}
     """
     driver = None
-    links = []
+    result = {"files": [], "qualities": [], "error": None}
 
     try:
-        driver = _make_driver()
+        driver = _make_driver(dl_dir)
+        LOGGER.info(f"[Swift] Opening: {swift_url}")
         driver.get(swift_url)
         main = driver.current_window_handle
 
-        # JS render hone do — 10 sec
-        time.sleep(10)
+        # JS render hone do
+        time.sleep(8)
         _close_popups(driver, main)
 
         html = driver.page_source
-        LOGGER.info(f"[Swift] Page source length: {len(html)}")
+        LOGGER.info(f"[Swift] Page loaded, source len={len(html)}")
 
+        # ── Links dhundo (href attribute mein) ──
         soup = BeautifulSoup(html, "html.parser")
-
-        # Method 1: Sabhi <a href> tags
+        download_links = []
         seen = set()
+
         for tag in soup.find_all("a", href=True):
             href = tag.get("href", "").strip()
             label = tag.get_text(separator=" ", strip=True)
-
             if not href or href in seen:
                 continue
             if href.startswith("#") or "javascript" in href:
                 continue
-
-            # Long CDN URLs ya mp4 links
-            is_download = (
-                ".mp4" in href.lower()
-                or "download" in href.lower()
-                or len(href) > 60
-            )
-            if not is_download:
+            if len(href) < 30:
                 continue
 
-            quality = _quality_from_text(label + " " + href)
+            quality = _quality_from(label + " " + href)
             seen.add(href)
-            links.append({"url": href, "quality": quality, "label": label})
-            LOGGER.info(f"[Swift] <a> found: {quality} — {href[:80]}")
+            download_links.append({
+                "href": href, "quality": quality, "label": label, "tag": tag
+            })
+            LOGGER.info(f"[Swift] Found href: {quality} | {href[:80]}")
 
-        # Method 2: Regex on raw HTML (agar <a> se nahi mila)
-        if not links:
-            LOGGER.warning("[Swift] No <a> links, trying regex...")
-            patterns = [
-                r'https?://[a-z0-9\.\-]+/download/[A-Za-z0-9_\-/=+]{30,}',
-                r'https?://[^\s\'"<>]+\.mp4[^\s\'"<>]*',
-                r'"(https?://[^"]{60,})"',
-            ]
-            seen2 = set()
-            for pat in patterns:
-                for m in re.findall(pat, html):
-                    if m not in seen2 and "swift.multiquality" not in m:
-                        quality = _quality_from_text(m)
-                        seen2.add(m)
-                        links.append({"url": m, "quality": quality, "label": m[:50]})
-                        LOGGER.info(f"[Swift] Regex found: {m[:80]}")
+        if not download_links:
+            # Fallback: visible buttons click karo (old method)
+            LOGGER.warning("[Swift] No hrefs found, trying visible button click...")
+            qualities_to_try = ["360p", "480p", "720p", "1080p"]
+            clicked = []
+            for q in qualities_to_try:
+                try:
+                    elems = driver.find_elements(By.XPATH,
+                        f"//*[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'{q}')]"
+                    )
+                    for elem in elems:
+                        try:
+                            driver.execute_script("arguments[0].scrollIntoView();", elem)
+                            driver.execute_script("arguments[0].click();", elem)
+                            LOGGER.info(f"[Swift] Button clicked: {q}")
+                            clicked.append(q)
+                            time.sleep(3)
+                            _close_popups(driver, main)
+                            break
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            if not clicked:
+                result["error"] = "Na href links mile na buttons — page render fail"
+                return result
+
+            result["qualities"] = clicked
+
+        else:
+            # ── Same session mein JS click karo (same IP/cookies) ──
+            qualities_clicked = []
+            for lnk in download_links[:3]:
+                q = lnk["quality"]
+                href = lnk["href"]
+
+                # JS se navigate karo same session mein (ya window.open)
+                try:
+                    # window.location.href se jayenge — same session
+                    driver.execute_script(f"window.open('{href}', '_blank');")
+                    time.sleep(2)
+                    _close_popups(driver, main)
+                    qualities_clicked.append(q)
+                    LOGGER.info(f"[Swift] JS opened: {q}")
+                    time.sleep(5)
+                except Exception as e:
+                    LOGGER.warning(f"[Swift] JS open failed: {e}")
+
+            result["qualities"] = qualities_clicked
+
+        # ── Files download hone ka wait (max 20 min) ──
+        LOGGER.info("[Swift] Waiting for downloads...")
+        start = time.time()
+        expected = max(len(result["qualities"]), 1)
+
+        while True:
+            done = _get_done_files(dl_dir)
+            in_prog = _in_progress(dl_dir)
+            elapsed = int(time.time() - start)
+
+            LOGGER.info(f"[Swift] Done={len(done)}, InProg={len(in_prog)}, Elapsed={elapsed}s")
+
+            if len(done) >= expected and not in_prog:
+                break
+            if elapsed > 5 and len(done) >= 1 and not in_prog:
+                # Sab aa gaya jo aana tha
+                break
+            if elapsed > 1200:
+                LOGGER.warning("[Swift] Timeout!")
+                break
+
+            time.sleep(5)
+
+        result["files"] = _get_done_files(dl_dir)
 
     except Exception as e:
-        LOGGER.error(f"[Swift] Extract error: {e}")
+        result["error"] = str(e)
+        LOGGER.error(f"[Swift] Error: {e}")
     finally:
         if driver:
             try:
@@ -182,53 +275,11 @@ def _extract_links(swift_url: str) -> list:
             except Exception:
                 pass
 
-    return links
+    return result
 
 
 # ─────────────────────────────────────────────
-#  Async download with progress
-# ─────────────────────────────────────────────
-async def _download_file(url: str, filepath: str, msg, quality: str) -> bool:
-    try:
-        async with aiohttp.ClientSession(headers=HEADERS) as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=1800)) as resp:
-                if resp.status != 200:
-                    LOGGER.error(f"[Swift] HTTP {resp.status} for {url[:80]}")
-                    return False
-
-                total = int(resp.headers.get("Content-Length", 0))
-                downloaded = 0
-                last_edit = 0
-
-                async with aiofiles.open(filepath, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(512 * 1024):
-                        await f.write(chunk)
-                        downloaded += len(chunk)
-
-                        if time.time() - last_edit > 5:
-                            if total:
-                                pct = downloaded / total * 100
-                                bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
-                                size_mb = downloaded / (1024 * 1024)
-                                total_mb = total / (1024 * 1024)
-                                try:
-                                    await msg.edit(
-                                        f"⬇️ **Downloading {quality}...**\n\n"
-                                        f"`[{bar}]` {pct:.1f}%\n"
-                                        f"💾 `{size_mb:.1f} / {total_mb:.1f} MB`"
-                                    )
-                                except Exception:
-                                    pass
-                            last_edit = time.time()
-
-        return True
-    except Exception as e:
-        LOGGER.error(f"[Swift] Download error: {e}")
-        return False
-
-
-# ─────────────────────────────────────────────
-#  Core logic
+#  Core command logic
 # ─────────────────────────────────────────────
 async def _run_swift(client, message, swift_url: str, encode: bool):
     session_id = str(int(time.time()))
@@ -236,68 +287,79 @@ async def _run_swift(client, message, swift_url: str, encode: bool):
     os.makedirs(dl_dir, exist_ok=True)
 
     msg = await message.reply(
-        f"🔗 **Swift Downloader v3**\n\n"
+        f"🔗 **Swift Downloader v4**\n\n"
         f"🌐 `{swift_url}`\n\n"
-        f"⏳ Page se links extract ho rahe hain..."
+        f"⏳ Same session se page visit + download ho raha hai..."
     )
 
-    # Step 1: Links extract (blocking thread)
+    # Progress update thread mein chal raha hai — blocking call
     loop = asyncio.get_event_loop()
-    links = await loop.run_in_executor(None, _extract_links, swift_url)
 
-    if not links:
+    async def _progress_updater():
+        start = time.time()
+        while True:
+            done = _get_done_files(dl_dir)
+            in_prog = _in_progress(dl_dir)
+            elapsed = int(time.time() - start)
+            total_mb = sum(
+                os.path.getsize(f) for f in glob.glob(os.path.join(dl_dir, "*"))
+                if os.path.isfile(f)
+            ) / (1024 * 1024)
+            try:
+                await msg.edit(
+                    f"⬇️ **Downloading...**\n\n"
+                    f"✅ Complete : `{len(done)}`\n"
+                    f"📥 In Progress : `{len(in_prog)}`\n"
+                    f"💾 Downloaded : `{total_mb:.1f} MB`\n"
+                    f"⏱️ Elapsed : `{elapsed}s`"
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(8)
+
+    # Progress task start
+    prog_task = asyncio.create_task(_progress_updater())
+
+    # Blocking scrape+download thread mein
+    result = await loop.run_in_executor(None, _scrape_and_download, swift_url, dl_dir)
+
+    # Progress task band karo
+    prog_task.cancel()
+    try:
+        await prog_task
+    except asyncio.CancelledError:
+        pass
+
+    if result["error"] and not result["files"]:
         await msg.edit(
-            "❌ **Koi download link nahi mila!**\n\n"
-            "Page render nahi hua ya links format different hai.\n"
-            "Railway logs check karo (`[Swift]` lines)."
+            f"❌ **Failed!**\n\n"
+            f"Error: `{result['error']}`\n\n"
+            f"Railway logs mein `[Swift]` lines check karo."
         )
         return
 
-    # Unique qualities
-    seen_q = {}
-    for lnk in links:
-        q = lnk["quality"]
-        if q not in seen_q:
-            seen_q[q] = lnk
-
-    final_links = list(seen_q.values())
-
-    await msg.edit(
-        f"✅ **{len(final_links)} download links mile!**\n\n"
-        + "\n".join(f"📊 `{l['quality']}` — `{l['label'][:35]}`" for l in final_links)
-        + "\n\n⬇️ Downloading..."
-    )
-
-    # Step 2: Download each
-    downloaded_files = []
-    for lnk in final_links:
-        quality = lnk["quality"]
-        url = lnk["url"]
-        fname = f"{quality}_{session_id}.mp4"
-        filepath = os.path.join(dl_dir, fname)
-
-        ok = await _download_file(url, filepath, msg, quality)
-        if ok and os.path.exists(filepath) and os.path.getsize(filepath) > 1024:
-            downloaded_files.append((filepath, quality))
-        else:
-            await message.reply(f"⚠️ Download failed: `{quality}`")
-
-    if not downloaded_files:
+    files = result["files"]
+    if not files:
         await msg.edit("❌ **Koi file download nahi hui!**")
         return
 
-    # Step 3: Upload / Encode
+    await msg.edit(
+        f"✅ **{len(files)} file(s) mili!**\n\n"
+        f"📤 Upload ho raha hai..."
+    )
+
     c_time = time.time()
     uploaded = 0
 
-    for filepath, quality in downloaded_files:
+    for filepath in sorted(files):
         fname = os.path.basename(filepath)
+        quality = _quality_from(fname)
         size_mb = os.path.getsize(filepath) / (1024 * 1024)
 
         await msg.edit(
             f"📤 **Uploading `{quality}`...**\n"
-            f"💾 Size: `{size_mb:.1f} MB`\n"
-            f"✅ Done: `{uploaded}/{len(downloaded_files)}`"
+            f"📁 `{fname}`\n"
+            f"💾 `{size_mb:.1f} MB`"
         )
 
         try:
@@ -315,15 +377,15 @@ async def _run_swift(client, message, swift_url: str, encode: bool):
                 )
             uploaded += 1
         except Exception as e:
-            LOGGER.error(f"[Swift] Upload error {quality}: {e}")
-            await message.reply(f"⚠️ Upload failed `{quality}`: `{e}`")
+            LOGGER.error(f"[Swift] Upload error: {e}")
+            await message.reply(f"⚠️ Upload failed `{fname}`: `{e}`")
 
         await asyncio.sleep(1)
 
     await msg.edit(
         f"🎉 **Complete!**\n\n"
-        f"✅ Uploaded : `{uploaded}/{len(downloaded_files)}`\n"
-        f"📊 Qualities: `{', '.join(q for _, q in downloaded_files)}`"
+        f"✅ Uploaded : `{uploaded}/{len(files)}`\n"
+        f"📊 Qualities : `{', '.join(_quality_from(f) for f in sorted(files))}`"
     )
 
     try:
@@ -334,52 +396,33 @@ async def _run_swift(client, message, swift_url: str, encode: bool):
 
 
 # ─────────────────────────────────────────────
-#  /swift command
+#  Commands
 # ─────────────────────────────────────────────
 @Client.on_message(filters.command(["swift", "swiftdl"]))
 async def swift_command(client: Client, message: Message):
     c = await check_chat(message, chat="Sudo")
     if not c:
         return
-
     if not SELENIUM_OK:
-        await message.reply(
-            "❌ **Selenium install nahi hai!**\n\n"
-            "`pip install selenium`\n"
-            "`apt-get install -y chromium chromium-driver`"
-        )
+        await message.reply("❌ Selenium install nahi hai!\n`pip install selenium`\n`apt-get install -y chromium chromium-driver`")
         return
-
     parts = message.text.split(None, 1)
     if len(parts) < 2 or not parts[1].strip():
-        await message.reply(
-            "⚠️ **Usage:**\n"
-            "`/swift https://swift.multiquality.click/downlead/XXXXXXXX/`"
-        )
+        await message.reply("⚠️ Usage:\n`/swift https://swift.multiquality.click/downlead/XXXXXXXX/`")
         return
-
     await _run_swift(client, message, parts[1].strip(), encode=False)
 
 
-# ─────────────────────────────────────────────
-#  /swiftencode command
-# ─────────────────────────────────────────────
 @Client.on_message(filters.command("swiftencode"))
 async def swift_encode_command(client: Client, message: Message):
     c = await check_chat(message, chat="Sudo")
     if not c:
         return
-
     if not SELENIUM_OK:
         await message.reply("❌ Selenium install nahi hai!")
         return
-
     parts = message.text.split(None, 1)
     if len(parts) < 2 or not parts[1].strip():
-        await message.reply(
-            "⚠️ **Usage:**\n"
-            "`/swiftencode https://swift.multiquality.click/downlead/XXXXXXXX/`"
-        )
+        await message.reply("⚠️ Usage:\n`/swiftencode https://swift.multiquality.click/downlead/XXXXXXXX/`")
         return
-
     await _run_swift(client, message, parts[1].strip(), encode=True)
