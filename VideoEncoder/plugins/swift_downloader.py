@@ -55,11 +55,27 @@ def _sort_by_size(files: list) -> list:
 # ─────────────────────────────────────────────
 def _make_driver(dl_dir: str):
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
+
+    # headless=new renderer crash karta hai Railway pe — old headless zyada stable
+    options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--disable-sync")
+    options.add_argument("--disable-translate")
+    options.add_argument("--hide-scrollbars")
+    options.add_argument("--metrics-recording-only")
+    options.add_argument("--mute-audio")
+    options.add_argument("--no-first-run")
+    options.add_argument("--safebrowsing-disable-auto-update")
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--window-size=1280,720")
+    # Shared memory limit increase — renderer timeout fix
+    options.add_argument("--shm-size=2gb")
     options.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -70,10 +86,12 @@ def _make_driver(dl_dir: str):
         "download.default_directory": dl_dir,
         "download.prompt_for_download": False,
         "download.directory_upgrade": True,
-        "safebrowsing.enabled": True,
+        "safebrowsing.enabled": False,
         "safebrowsing.disable_download_protection": True,
         "profile.default_content_setting_values.automatic_downloads": 1,
         "profile.content_settings.exceptions.automatic_downloads.*.setting": 1,
+        # Images load mat karo — page faster load hoga
+        "profile.managed_default_content_settings.images": 2,
     }
     options.add_experimental_option("prefs", prefs)
 
@@ -88,7 +106,9 @@ def _make_driver(dl_dir: str):
             break
 
     driver = webdriver.Chrome(options=options)
-    driver.set_page_load_timeout(60)
+    # Page load timeout badha diya — slow Railway server ke liye
+    driver.set_page_load_timeout(90)
+    driver.set_script_timeout(30)
 
     try:
         driver.execute_cdp_cmd(
@@ -248,10 +268,27 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None) -> dict:
     try:
         driver = _make_driver(dl_dir)
         LOGGER.info(f"[Swift] Opening: {swift_url}")
-        driver.get(swift_url)
+
+        # Page load with retry — renderer timeout se bachne ke liye
+        loaded = False
+        for attempt in range(3):
+            try:
+                driver.get(swift_url)
+                loaded = True
+                LOGGER.info(f"[Swift] Page load OK (attempt {attempt+1})")
+                break
+            except Exception as e:
+                LOGGER.warning(f"[Swift] Page load attempt {attempt+1} failed: {e}")
+                time.sleep(5)
+
+        if not loaded:
+            result["error"] = "Page load 3 baar fail hua — Chrome renderer timeout"
+            return result
+
         main = driver.current_window_handle
 
-        time.sleep(8)
+        # JS render hone do — 12 sec (8 se zyada, slow pages ke liye)
+        time.sleep(12)
         _close_popups(driver, main)
 
         html = driver.page_source
