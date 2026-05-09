@@ -1,103 +1,128 @@
 """
-Multi-threaded Telegram file downloader
-Pyrogram ke default downloader se 3-4x fast
+Optimized Multi-threaded Telegram file downloader
 """
 import asyncio
 import os
 import time
 import math
+import aiohttp
+import aiofiles
 
 from pyrogram import Client
 from pyrogram.types import Message
 
-CHUNK_SIZE = 1024 * 1024  # 1MB per chunk
-MAX_WORKERS = 4            # 4 parallel threads
+# Config
+CHUNK_SIZE = 512 * 1024   # 512KB per chunk
+MAX_WORKERS = 8            # 8 parallel download workers
+MIN_SIZE_FOR_MULTI = 5 * 1024 * 1024  # 5MB+ ke liye multi-thread
 
 
-async def fast_download(client: Client, message: Message, file_name: str, progress_callback=None, progress_args=()):
+async def fast_download(client: Client, message: Message, file_name: str,
+                         progress_callback=None, progress_args=()):
     """
-    Multi-threaded file downloader
-    File ko chunks mein divide karke parallel download karta hai
+    8-thread parallel Telegram downloader
     """
-    # Target message determine karo
+    # Media determine karo
     if message.video:
         media = message.video
     elif message.document:
         media = message.document
     else:
-        return await message.download(file_name=file_name)
+        return await _fallback_download(message, file_name, progress_callback, progress_args)
 
-    file_size = media.file_size
-    if not file_size:
-        return await message.download(file_name=file_name)
+    file_size = getattr(media, 'file_size', 0) or 0
 
-    # Chhoti files ke liye normal download
-    if file_size < 10 * 1024 * 1024:  # 10MB se chhota
-        return await message.download(file_name=file_name)
+    # Chhoti files — normal download
+    if file_size < MIN_SIZE_FOR_MULTI:
+        return await _fallback_download(message, file_name, progress_callback, progress_args)
 
-    # Chunks calculate karo
-    num_chunks = min(MAX_WORKERS, math.ceil(file_size / (10 * 1024 * 1024)))
-    chunk_size = math.ceil(file_size / num_chunks)
+    os.makedirs(os.path.dirname(os.path.abspath(file_name)), exist_ok=True)
 
-    os.makedirs(os.path.dirname(file_name) if os.path.dirname(file_name) else '.', exist_ok=True)
+    # Chunks divide karo
+    num_workers = min(MAX_WORKERS, max(2, file_size // (10 * 1024 * 1024) + 1))
+    chunk_size = math.ceil(file_size / num_workers)
 
-    # Temp chunk files
-    chunk_files = [f"{file_name}.part{i}" for i in range(num_chunks)]
-    downloaded = [0] * num_chunks
+    downloaded_bytes = [0] * num_workers
     start_time = time.time()
+    chunk_files = [f"{file_name}.part{i}" for i in range(num_workers)]
+    success = [False] * num_workers
 
-    async def download_chunk(chunk_idx, offset, length):
-        """Ek chunk download karo"""
+    async def update_progress():
+        """Progress bar update karo"""
+        while True:
+            await asyncio.sleep(2)
+            if progress_callback:
+                total = sum(downloaded_bytes)
+                try:
+                    await progress_callback(total, file_size, *progress_args)
+                except Exception:
+                    pass
+            if all(success):
+                break
+
+    async def download_worker(idx, offset, size):
+        """Single worker — ek chunk download karta hai"""
         try:
-            chunk_path = chunk_files[chunk_idx]
-            async with client.stream_media(media, offset=offset, limit=length) as stream:
-                with open(chunk_path, 'wb') as f:
-                    async for chunk in stream:
-                        f.write(chunk)
-                        downloaded[chunk_idx] += len(chunk)
+            chunk_path = chunk_files[idx]
+            byte_count = 0
 
-                        # Progress update
-                        if progress_callback:
-                            total_downloaded = sum(downloaded)
-                            elapsed = time.time() - start_time
-                            speed = total_downloaded / elapsed if elapsed > 0 else 0
-                            await progress_callback(
-                                total_downloaded, file_size,
-                                *progress_args
-                            )
-        except Exception:
-            # Fallback - normal download karo
-            pass
+            async with aiofiles.open(chunk_path, 'wb') as f:
+                async for chunk in client.stream_media(media, offset=offset, limit=size):
+                    await f.write(chunk)
+                    byte_count += len(chunk)
+                    downloaded_bytes[idx] = byte_count
 
-    # Check karo ki stream_media available hai
-    has_stream = hasattr(client, 'stream_media')
+            if byte_count > 0:
+                success[idx] = True
+        except Exception as e:
+            success[idx] = False
 
-    if has_stream and num_chunks > 1:
-        # Parallel chunks download karo
-        tasks = []
-        for i in range(num_chunks):
-            offset = i * chunk_size
-            length = min(chunk_size, file_size - offset)
-            tasks.append(download_chunk(i, offset, length))
+    # Workers launch karo
+    tasks = []
+    for i in range(num_workers):
+        offset = i * chunk_size
+        size = min(chunk_size, file_size - offset)
+        if size > 0:
+            tasks.append(download_worker(i, offset, size))
 
-        await asyncio.gather(*tasks)
+    progress_task = asyncio.create_task(update_progress())
 
-        # Chunks ko merge karo
-        all_exist = all(os.path.exists(f) and os.path.getsize(f) > 0 for f in chunk_files)
+    await asyncio.gather(*tasks, return_exceptions=True)
+    progress_task.cancel()
 
-        if all_exist:
-            with open(file_name, 'wb') as outfile:
-                for chunk_file in chunk_files:
-                    with open(chunk_file, 'rb') as infile:
-                        outfile.write(infile.read())
-                    os.remove(chunk_file)
-            return file_name
+    # Sab chunks successful?
+    all_ok = all(
+        success[i] and os.path.exists(chunk_files[i]) and os.path.getsize(chunk_files[i]) > 0
+        for i in range(len(tasks))
+    )
 
-    # Fallback: Normal pyrogram download
+    if all_ok:
+        # Merge karo
+        async with aiofiles.open(file_name, 'wb') as outfile:
+            for i in range(len(tasks)):
+                async with aiofiles.open(chunk_files[i], 'rb') as infile:
+                    await outfile.write(await infile.read())
+                os.remove(chunk_files[i])
+
+        # Final progress
+        if progress_callback:
+            try:
+                await progress_callback(file_size, file_size, *progress_args)
+            except Exception:
+                pass
+
+        return file_name
+
+    # Cleanup aur fallback
     for f in chunk_files:
         if os.path.exists(f):
             os.remove(f)
 
+    return await _fallback_download(message, file_name, progress_callback, progress_args)
+
+
+async def _fallback_download(message, file_name, progress_callback, progress_args):
+    """Normal pyrogram download fallback"""
     c_time = time.time()
     path = await message.download(
         file_name=file_name,

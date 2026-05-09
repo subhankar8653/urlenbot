@@ -202,8 +202,12 @@ async def encode(filepath, message, msg, audio_map=None):
     else:
         video_opts = f'{cabac} {reframe} -profile:v main  -map 0:v? -map_chapters 0 -map_metadata 0'
 
-    # Metadata DISABLED - faster encoding
-    metadata = ''
+    # Metadata Watermark
+    m = await db.get_metadata_w(message.from_user.id)
+    if m:
+        metadata = '-metadata title=Cantarellabots -metadata:s:v title=Cantarellabots -metadata:s:a title=Cantarellabots'
+    else:
+        metadata = ''
 
     # Copy Subtitles
     h = await db.get_hardsub(message.from_user.id)
@@ -228,7 +232,7 @@ async def encode(filepath, message, msg, audio_map=None):
 
 #    ffmpeg_filter = ':'.join([
 #        'drawtext=fontfile=/app/bot/utils/watermark/font.ttf',
-#        f"text='sbanime'",
+#        f"text='Cantarellabots'",
 #        f'fontcolor=white',
 #        'fontsize=main_h/20',
 #        f'x=40:y=40'
@@ -353,11 +357,13 @@ async def encode(filepath, message, msg, audio_map=None):
     else:
         channels = ''
 
-    finish = '-threads 0'
+    finish = '-threads 0 -thread_type frame -fflags +fastseek+nobuffer -movflags +faststart'
 
     # Finally
     command = ['ffmpeg', '-hide_banner', '-loglevel', 'error',
-               '-progress', progress, '-hwaccel', 'auto', '-y', '-i', filepath]
+               '-progress', progress, '-hwaccel', 'auto',
+               '-fflags', '+genpts+igndts',
+               '-y', '-i', filepath]
     command.extend((codec.split() + preset.split() + frame.split() + tunevideo.split() + aspect.split() + video_opts.split() + Crf.split() +
                    watermark.split() + metadata.split() + subtitles.split() + audio_opts.split() + channels.split() + finish.split()))
     proc = await asyncio.create_subprocess_exec(*command, output_filepath, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
