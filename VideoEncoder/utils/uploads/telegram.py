@@ -5,7 +5,7 @@ import time
 from pyrogram.enums import ParseMode
 from ... import app, download_dir, log
 from ..database.access_db import db
-from .auto_caption import smart_caption
+from ..auto_caption import smart_caption
 from ..display_progress import progress_for_pyrogram
 from ..encoding import get_duration, get_thumbnail, get_width_height
 
