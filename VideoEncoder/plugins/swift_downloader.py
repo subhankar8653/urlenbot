@@ -103,33 +103,98 @@ def _close_popups(driver, main_handle):
 
 # ─────────────────────────────────────────────
 #  Page mein available qualities check
+#  (4 methods try karta hai - JS rendered content bhi handle hoga)
 # ─────────────────────────────────────────────
 def _check_qualities(driver) -> list:
+    targets = ["360p", "480p", "720p", "1080p"]
+    found = set()
+
+    # Method 1: body.text (visible text)
     try:
         body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-        return [q for q in ["360p", "480p", "720p", "1080p"] if q in body_text]
+        for q in targets:
+            if q in body_text:
+                found.add(q)
     except Exception:
-        return []
+        pass
+
+    # Method 2: full page_source HTML (JS rendered elements bhi)
+    try:
+        src = driver.page_source.lower()
+        for q in targets:
+            if q in src:
+                found.add(q)
+    except Exception:
+        pass
+
+    # Method 3: JS innerText (Shadow DOM / dynamic content)
+    try:
+        inner = driver.execute_script(
+            "return document.documentElement.innerText || '';"
+        ).lower()
+        for q in targets:
+            if q in inner:
+                found.add(q)
+    except Exception:
+        pass
+
+    # Method 4: Sabhi elements ka text scan
+    try:
+        for tag in ["a", "button", "div", "span", "p"]:
+            for elem in driver.find_elements(By.TAG_NAME, tag):
+                try:
+                    txt = (elem.text or "").lower()
+                    for q in targets:
+                        if q in txt:
+                            found.add(q)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return list(found)
 
 
 # ─────────────────────────────────────────────
 #  Quality button click
 # ─────────────────────────────────────────────
 def _click_quality(driver, quality: str) -> bool:
+    q_lower = quality.lower()
+
+    # Sabhi clickable tags try karo
+    for tag in ["a", "button", "div", "span"]:
+        try:
+            for elem in driver.find_elements(By.TAG_NAME, tag):
+                try:
+                    txt = (elem.text or "").lower()
+                    if q_lower in txt:
+                        driver.execute_script("arguments[0].scrollIntoView();", elem)
+                        driver.execute_script("arguments[0].click();", elem)
+                        LOGGER.info(f"[Swift] Clicked <{tag}>: {quality}")
+                        return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Fallback: Pure JS se click
     try:
-        for elem in driver.find_elements(By.TAG_NAME, "a"):
-            if quality.lower() in elem.text.lower():
-                driver.execute_script("arguments[0].click();", elem)
-                LOGGER.info(f"[Swift] Clicked: {quality}")
-                return True
-        # button tag bhi try karo
-        for elem in driver.find_elements(By.TAG_NAME, "button"):
-            if quality.lower() in elem.text.lower():
-                driver.execute_script("arguments[0].click();", elem)
-                LOGGER.info(f"[Swift] Clicked button: {quality}")
-                return True
+        clicked = driver.execute_script(f"""
+            var tags = document.querySelectorAll('a, button, div, span');
+            for (var i = 0; i < tags.length; i++) {{
+                if (tags[i].innerText && tags[i].innerText.toLowerCase().includes('{q_lower}')) {{
+                    tags[i].click();
+                    return true;
+                }}
+            }}
+            return false;
+        """)
+        if clicked:
+            LOGGER.info(f"[Swift] JS fallback clicked: {quality}")
+            return True
     except Exception as e:
-        LOGGER.warning(f"[Swift] Click error for {quality}: {e}")
+        LOGGER.warning(f"[Swift] JS click error: {e}")
+
     return False
 
 
@@ -194,8 +259,8 @@ def _scrape_swift(swift_url: str, dl_dir: str) -> dict:
     Returns:
       {
         "success": bool,
-        "qualities": ["360p", "720p", "1080p"],   # found on page
-        "clicked": ["360p", "720p", "1080p"],      # actually clicked
+        "qualities": ["360p", "720p", "1080p"],
+        "clicked": ["360p", "720p", "1080p"],
         "error": str or None
       }
     """
@@ -207,34 +272,41 @@ def _scrape_swift(swift_url: str, dl_dir: str) -> dict:
         driver.get(swift_url)
         main_handle = driver.current_window_handle
 
-        # Page load hone do (max 30 sec wait for quality buttons)
-        for attempt in range(15):
-            qualities = _check_qualities(driver)
-            if len(qualities) >= 1:
-                break
-            time.sleep(2)
-            try:
-                driver.refresh()
-                time.sleep(3)
-                _close_popups(driver, main_handle)
-            except Exception:
-                pass
+        # JS render hone do — 8 sec wait
+        time.sleep(8)
+        _close_popups(driver, main_handle)
 
-        qualities = _check_qualities(driver)
+        # Max 60 sec tak quality buttons dhundho (har 3 sec mein check)
+        qualities = []
+        for attempt in range(20):
+            _close_popups(driver, main_handle)
+            qualities = _check_qualities(driver)
+            LOGGER.info(f"[Swift] Attempt {attempt+1}: found {qualities}")
+            if qualities:
+                break
+            time.sleep(3)
+
         result["qualities"] = qualities
 
         if not qualities:
+            # Debug ke liye page source ka kuch hissa log karo
+            try:
+                snippet = driver.page_source[:500]
+                LOGGER.error(f"[Swift] Page source snippet: {snippet}")
+            except Exception:
+                pass
             result["error"] = "Page pe koi quality nahi mili (360p/720p/1080p)"
             return result
 
-        # Download karo (max 3 qualities)
+        # Download karo — max 3 qualities
         clicked = []
         for q in qualities[:3]:
+            time.sleep(1)
             if _click_quality(driver, q):
                 clicked.append(q)
-            time.sleep(2)
+            time.sleep(3)
             _close_popups(driver, main_handle)
-            time.sleep(6)
+            time.sleep(5)
 
         result["clicked"] = clicked
         result["success"] = True
