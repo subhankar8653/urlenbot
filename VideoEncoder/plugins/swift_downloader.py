@@ -370,18 +370,38 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
         # Custom thumbnail check (user ne /setpic se set kiya ho)
         user_id = message.from_user.id
         custom_thumb_id = await db.get_thumbnail(user_id)
+        thumb = None
+        custom_thumb_used = False
 
         if custom_thumb_id:
-            # Telegram se download karo thumb
-            thumb = await app.download_media(
-                custom_thumb_id,
-                file_name=os.path.join(dl_dir, f"thumb_{int(time.time())}.jpg")
-            )
-        else:
+            try:
+                thumb_path = os.path.join(dl_dir, f"thumb_{int(time.time())}.jpg")
+                downloaded = await app.download_media(
+                    custom_thumb_id,
+                    file_name=thumb_path
+                )
+                # download_media actual path return karta hai (kabhi .temp hoti hai)
+                # Isliye returned path use karo, not the requested path
+                if downloaded and os.path.isfile(downloaded) and os.path.getsize(downloaded) > 0:
+                    thumb = downloaded
+                    custom_thumb_used = True
+                elif thumb_path and os.path.isfile(thumb_path) and os.path.getsize(thumb_path) > 0:
+                    thumb = thumb_path
+                    custom_thumb_used = True
+                else:
+                    LOGGER.warning(f"[Swift] Custom thumb download failed, using auto-thumb")
+                    thumb = None
+            except Exception as e:
+                LOGGER.warning(f"[Swift] Thumb download error: {e}, using auto-thumb")
+                thumb = None
+
+        if not thumb:
+            # Fallback: video se auto thumbnail
             thumb = get_thumbnail(filepath, dl_dir, duration / 4 if duration else 0)
+            custom_thumb_used = False
 
         # Cover pic — same as thumb (Pyrogram v2+ supports cover= param)
-        cover = thumb  # same image cover ke liye bhi
+        cover = thumb if thumb and os.path.isfile(thumb) else None
 
         width, height = get_width_height(filepath)
         caption = f"<b>{fname}</b>"
@@ -393,8 +413,8 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
             cover=cover          # cover pic lagao
         )
 
-        # Thumb cleanup (sirf agar auto-generated tha)
-        if not custom_thumb_id and thumb and os.path.isfile(thumb):
+        # Thumb cleanup (sirf agar auto-generated tha, custom thumb rakho)
+        if not custom_thumb_used and thumb and os.path.isfile(thumb):
             try:
                 os.remove(thumb)
             except Exception:
