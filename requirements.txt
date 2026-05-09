@@ -1,34 +1,38 @@
-# ── Pyrogram Core ─────────────────────────
-pyrogram
-tgcrypto
-
-# ── Encode Bot Core ───────────────────────
+# Required
+pyrofork
+TgCrypto
 python-dotenv
-pymongo
-motor
-psutil
+hachoir
+beautifulsoup4==4.9.1
+bs4==0.0.1
+
+# DDL
 pySmartDL
 requests
-requests-cache
-aiohttp
-Pillow
-pymediainfo
-ffmpeg-python
-yt-dlp
-patool
 
-# ── Link Generators ───────────────────────
+# Database
+dnspython
+motor
+
+# Others
+psutil
+js2py
 cloudscraper
 lk21
+lxml
+httpx
+speedtest-cli
 
-# ── Google Drive ──────────────────────────
-google-api-python-client
+# Fast Download
+aiohttp
+aiofiles
+
+# Google Drive
+google-api-core
 google-auth
+oauth2client<4.0.0
+google~=3.0.0
+google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
-
-# ── RTI Downloader Plugin ─────────────────
-selenium==4.18.1
-beautifulsoup4
-lxml
-hachoir
+httplib2==0.18.0
