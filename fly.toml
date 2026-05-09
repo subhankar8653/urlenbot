@@ -1,0 +1,14 @@
+app = "sbanime-encode-bot"
+primary_region = "sin"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DOWNLOAD_DIR = "VideoEncoder/downloads/"
+  ENCODE_DIR = "VideoEncoder/encodes/"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512
