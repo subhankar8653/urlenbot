@@ -1,7 +1,7 @@
 """
 Auto Caption Generator
-Filename se anime info detect karke caption banata hai
-Format: AnimeName S02E03 in Hindi 1080p [@SBANIME].mp4
+Filename se anime name detect karo, metadata se quality/language.
+Format: AnimeName S02E06 in Hindi 1080p [@SBANIME].mp4
 """
 import re
 import subprocess
@@ -19,7 +19,7 @@ LANG_MAP = {
     'ita': 'Italian', 'zho': 'Chinese', 'ind': 'Indonesian',
 }
 
-# Filename brackets ke andar language words
+# Sirf yeh exact words brackets mein milein toh language maano
 LANG_WORDS = {
     'hindi': 'Hindi', 'japanese': 'Japanese', 'english': 'English',
     'telugu': 'Telugu', 'tamil': 'Tamil', 'bengali': 'Bengali',
@@ -54,128 +54,163 @@ def get_media_metadata(filepath):
         return {}
 
 
+def _is_language_bracket(content):
+    """
+    Check karo kya bracket ka content sirf language word hai.
+    [Hindi]           -> True
+    [Rare ToonsIndia] -> False  (group name hai)
+    [Dual Audio]      -> True
+    [SubsPlease]      -> False
+    """
+    c = content.strip().lower()
+    if c in LANG_WORDS:
+        return True
+    words = c.split()
+    if len(words) == 1 and words[0] in LANG_WORDS:
+        return True
+    return False
+
+
 def detect_language_from_filename(filename):
     """
-    Filename ke brackets se language detect karo.
-    Example: 'Naruto S01E01 [Hindi].mkv'  -> ['Hindi']
-    Example: 'One Piece (Dual Audio).mkv' -> ['Dual Audio']
+    Filename ke brackets se SIRF language words detect karo.
+    [Hindi]           -> ['Hindi']
+    [Rare ToonsIndia] -> []   (group name, skip)
+    [Dual Audio]      -> ['Dual Audio']
     """
     langs = []
     name = os.path.splitext(os.path.basename(filename))[0]
 
-    # [] aur () ke andar content nikalo
     bracket_contents = re.findall(r'[\[\(]([^\]\)]+)[\]\)]', name)
     for content in bracket_contents:
-        content_lower = content.strip().lower()
-        # Full phrase match pehle (e.g. "dual audio")
-        if content_lower in LANG_WORDS:
-            lang_name = LANG_WORDS[content_lower]
-            if lang_name not in langs:
+        if _is_language_bracket(content):
+            c = content.strip().lower()
+            lang_name = LANG_WORDS.get(c)
+            if not lang_name:
+                for word in c.split():
+                    if word in LANG_WORDS:
+                        lang_name = LANG_WORDS[word]
+                        break
+            if lang_name and lang_name not in langs:
                 langs.append(lang_name)
-        else:
-            # Word by word check
-            for word, lang_name in LANG_WORDS.items():
-                if word in content_lower.split():
-                    if lang_name not in langs:
-                        langs.append(lang_name)
 
     return langs
 
 
 def detect_language_from_metadata(metadata):
-    """Audio stream se language detect karo"""
+    """
+    Audio stream se language detect karo.
+    SIRF 'language' field use karo - title tag ignore karo
+    (title mein 'Visit - RareToonsIndia' jaisi garbage hoti hai)
+    """
     streams = metadata.get('streams', [])
     langs = []
     for s in streams:
         if s.get('codec_type') == 'audio':
-            lang = s.get('tags', {}).get('language', '')
-            if lang and lang in LANG_MAP:
-                name = LANG_MAP[lang]
-                if name not in langs:
-                    langs.append(name)
+            # SIRF language code field use karo, title NAHI
+            lang_code = s.get('tags', {}).get('language', '').strip().lower()
+            if lang_code and lang_code in LANG_MAP:
+                lang_name = LANG_MAP[lang_code]
+                if lang_name not in langs:
+                    langs.append(lang_name)
     return langs
 
 
 def detect_language(filename, metadata):
     """
-    Priority order:
-    1. Filename brackets [Hindi], (Dual Audio) etc
-    2. Metadata audio stream language tag
-    3. Metadata title tag
+    Priority:
+    1. Filename brackets [Hindi], (Dual Audio)
+    2. Metadata audio stream 'language' field (NOT title)
     """
-    # 1. Filename se (sabse reliable for anime)
+    # 1. Filename se
     langs = detect_language_from_filename(filename)
     if langs:
         return langs
 
-    # 2. Metadata audio stream se
+    # 2. Metadata audio language code se
     langs = detect_language_from_metadata(metadata)
     if langs:
         return langs
 
-    # 3. Metadata title tag se
-    title = metadata.get('format', {}).get('tags', {}).get('title', '')
-    for word, lang_name in LANG_WORDS.items():
-        if word in title.lower():
-            if lang_name not in langs:
-                langs.append(lang_name)
-
     return langs
+
+
+def detect_quality_from_metadata(metadata):
+    """
+    ffprobe metadata se actual video quality detect karo.
+    Width/Height se - title tag IGNORE karo.
+    """
+    streams = metadata.get('streams', [])
+    for s in streams:
+        if s.get('codec_type') == 'video':
+            height = str(s.get('height', ''))
+            width = str(s.get('width', ''))
+            # Height se detect (most reliable)
+            if height in ['2160', '1080', '720', '576', '480', '360', '240']:
+                return f'{height}p'
+            # Width se fallback
+            if width in QUALITY_MAP:
+                return QUALITY_MAP[width]
+    return None
 
 
 def detect_quality(metadata, current_resolution=None):
     """
-    Quality detect karo - bina brackets ke return karo (1080p, 720p)
+    Quality detect karo.
+    - OG ya None: ffprobe se actual quality nikalo
+    - Encode resolution (720, 1080 etc): use karo as-is
     """
     if current_resolution and current_resolution != 'OG':
+        # Encode kiya gaya resolution use karo
         res_map = {
             '2160': '2160p', '1080': '1080p', '720': '720p',
             '576': '576p', '480': '480p', '360': '360p',
         }
         return res_map.get(str(current_resolution), f'{current_resolution}p')
 
-    streams = metadata.get('streams', [])
-    for s in streams:
-        if s.get('codec_type') == 'video':
-            width = str(s.get('width', ''))
-            height = str(s.get('height', ''))
-            if height in ['2160', '1080', '720', '576', '480', '360', '240']:
-                return f'{height}p'
-            if width in QUALITY_MAP:
-                return QUALITY_MAP[width]
-    return None
+    # OG ya None: metadata se actual quality detect karo
+    return detect_quality_from_metadata(metadata)
 
 
 def extract_anime_info(filename, metadata):
-    """Filename aur metadata se anime name, season, episode extract karo"""
-    tags = metadata.get('format', {}).get('tags', {})
-
-    # Filename clean karo
+    """
+    Anime name HAMESHA filename se lo.
+    Metadata title IGNORE - woh group ka promo text ho sakta hai.
+    """
     name = os.path.splitext(os.path.basename(filename))[0]
 
-    # [@SBANIME] type channel tags remove karo
-    name = re.sub(r'\[@[^\]]+\]', '', name).strip()
-    # Starting mein [GroupName] remove karo
+    # Step 1: Starting group tag remove [SubsPlease], [Erai-raws] etc
     name = re.sub(r'^\[[^\]]+\]', '', name).strip()
-    # Language brackets remove karo [Hindi], (Dual Audio) etc
-    name = re.sub(
-        r'[\[\(](Hindi|Japanese|English|Telugu|Tamil|Bengali|Malayalam|Kannada|'
-        r'Dual Audio|Multi Audio|Dual|Multi|Eng|Hin|Jpn|Korean|Chinese|Arabic)[\]\)]',
-        '', name, flags=re.IGNORECASE
-    ).strip()
 
-    # Season/Episode detect
+    # Step 2: [@Channel] tags remove
+    name = re.sub(r'\[@[^\]]+\]', '', name).strip()
+
+    # Step 3: Language brackets remove - SIRF wahi jo actual language ho
+    def remove_lang_brackets(text):
+        text = re.sub(
+            r'\[([^\]]+)\]',
+            lambda m: '' if _is_language_bracket(m.group(1)) else m.group(0),
+            text
+        )
+        text = re.sub(
+            r'\(([^\)]+)\)',
+            lambda m: '' if _is_language_bracket(m.group(1)) else m.group(0),
+            text
+        )
+        return text.strip()
+
+    name = remove_lang_brackets(name)
+
+    # Step 4: Season/Episode detect
     season = None
     episode = None
 
-    # S01E01 pattern (most common)
     m = re.search(r'[Ss](\d+)[Ee](\d+)', name)
     if m:
         season = int(m.group(1))
         episode = int(m.group(2))
         anime_name = name[:m.start()].strip(' .-_')
     else:
-        # Standalone episode number - E01 ya just 01
         m = re.search(r'[\s\-_](\d{2,3})[\s\-_\.]', name)
         if m:
             episode = int(m.group(1))
@@ -183,19 +218,15 @@ def extract_anime_info(filename, metadata):
         else:
             anime_name = name
 
-    # Metadata title better ho toh use karo
-    meta_title = tags.get('title', '') or tags.get('show', '')
-    if meta_title and len(meta_title) > 3:
-        meta_clean = re.sub(
-            r'(1080p|720p|480p|4K|HEVC|x264|x265|WEB-DL|BluRay|HDRip)',
-            '', meta_title, flags=re.IGNORECASE
-        ).strip()
-        if meta_clean:
-            anime_name = meta_clean
+    # Step 5: Remaining group brackets remove from end
+    anime_name = re.sub(r'\[[^\]]+\]\s*$', '', anime_name).strip()
+    anime_name = re.sub(r'\([^\)]+\)\s*$', '', anime_name).strip()
 
-    # Final cleanup
-    anime_name = re.sub(r'(1080p|720p|480p|4K|HEVC|x264|x265|WEB-DL|BluRay|HDRip)',
-                        '', anime_name, flags=re.IGNORECASE)
+    # Step 6: Quality tags naam se remove
+    anime_name = re.sub(
+        r'(2160p|1080p|720p|480p|4K|HEVC|x264|x265|WEB-DL|BluRay|HDRip)',
+        '', anime_name, flags=re.IGNORECASE
+    )
     anime_name = re.sub(r'\s+', ' ', anime_name).strip(' .-_')
 
     return anime_name, season, episode
@@ -203,8 +234,11 @@ def extract_anime_info(filename, metadata):
 
 def build_auto_caption(filepath, resolution=None, channel='@SBANIME'):
     """
-    Final caption banao.
-    Format: AnimeName S02E03 in Hindi 1080p [@SBANIME].mp4
+    Format: AnimeName S02E06 in Hindi 1080p [@SBANIME].mp4
+
+    resolution:
+      - None / 'OG' : ffprobe se actual quality detect karo
+      - '720','1080' : encode ki gai quality use karo
     """
     metadata = get_media_metadata(filepath)
     filename = os.path.basename(filepath)
@@ -219,21 +253,21 @@ def build_auto_caption(filepath, resolution=None, channel='@SBANIME'):
     if anime_name:
         parts.append(anime_name)
 
-    # 2. S02E03
+    # 2. S02E06
     if season and episode:
         parts.append(f'S{season:02d}E{episode:02d}')
     elif episode:
         parts.append(f'E{episode:02d}')
 
-    # 3. in Hindi / in Japanese etc
+    # 3. in Hindi
     if langs:
         parts.append(f'in {" + ".join(langs)}')
 
-    # 4. Quality - bina brackets (1080p, not (1080p))
+    # 4. 1080p (bina brackets)
     if quality:
         parts.append(quality)
 
-    # 5. Channel tag
+    # 5. [@SBANIME]
     parts.append(f'[{channel}]')
 
     return ' '.join(parts) + '.mp4'
@@ -241,8 +275,8 @@ def build_auto_caption(filepath, resolution=None, channel='@SBANIME'):
 
 def smart_caption(original_caption, filepath, resolution=None, channel='@SBANIME'):
     """
-    Agar original caption mein quality info hai toh wahi use karo,
-    warna filename/metadata se auto generate karo.
+    Original caption mein quality info hai toh use karo,
+    warna auto generate karo.
     """
     if not original_caption:
         return build_auto_caption(filepath, resolution, channel)
