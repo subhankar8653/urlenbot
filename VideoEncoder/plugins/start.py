@@ -48,6 +48,8 @@ async def help_message(app, message):
 - Autodetect Telegram File.
 - /ddl - encode through DDL
 - /batch - encode in batch
+- /mega - download from mega.nz
+- /meganow - mega download + upload + encode
 - /queue - check queue
 - /settings - settings
 - /vset - view settings
