@@ -72,26 +72,25 @@ async def download_mega(url, dest_dir, msg):
     return files[0]
 
 
-async def clean_metadata(filepath, msg):
+async def clean_and_rename(filepath, proper_filename, msg):
     """
-    ffmpeg se metadata clean karo:
-    - Title tag hatao (Visit - RareToonsIndia jaisi garbage)
-    - Language code sirf rakho (hin, jpn etc)
-    - Video/Audio stream data same rakho (re-encode nahi)
+    ffmpeg se 2 kaam ek saath karo:
+    1. RareToons/group title metadata hatao
+    2. File ka naam spaces ke saath proper rakho
+    Output file: proper_filename (spaces aur [] ke saath)
     """
     await msg.edit("🧹 **Metadata clean ho raha hai...**")
 
     dir_name = os.path.dirname(filepath)
-    basename = os.path.basename(filepath)
-    name, ext = os.path.splitext(basename)
-    cleaned_path = os.path.join(dir_name, f"{name}_clean{ext}")
+    # Proper naam se save karo - spaces aur [] bilkul sahi
+    cleaned_path = os.path.join(dir_name, proper_filename)
 
     cmd = [
         'ffmpeg', '-y',
         '-i', filepath,
-        '-map', '0',           # Saare streams copy karo
-        '-c', 'copy',          # Re-encode mat karo (fast)
-        # Global title hatao
+        '-map', '0',        # Saare streams copy karo
+        '-c', 'copy',       # Re-encode nahi - fast
+        # Global metadata clean
         '-metadata', 'title=',
         '-metadata', 'comment=',
         '-metadata', 'description=',
@@ -112,18 +111,15 @@ async def clean_metadata(filepath, msg):
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
     except asyncio.TimeoutError:
         proc.kill()
-        # Clean fail hui toh original use karo
-        return filepath
+        return filepath  # fail toh original
 
     if proc.returncode == 0 and os.path.exists(cleaned_path):
-        # Original hatao, cleaned use karo
-        os.remove(filepath)
+        os.remove(filepath)  # purana underscore wala hatao
         return cleaned_path
     else:
-        # Fail hua toh original se kaam chalao
         if os.path.exists(cleaned_path):
             os.remove(cleaned_path)
-        return filepath
+        return filepath  # fail toh original
 
 
 @Client.on_message(filters.command("mega"))
@@ -160,15 +156,31 @@ async def mega_handler(client, message: Message):
 
     fname = os.path.basename(filepath)
     size_mb = os.path.getsize(filepath) / (1024 * 1024)
-    await msg.edit(f"✅ **Downloaded:** `{fname}`\n📦 Size: {size_mb:.1f} MB\n\n🧹 Metadata clean ho raha hai...")
-
-    # Metadata clean karo - RareToons/group title hatao
-    filepath = await clean_metadata(filepath, msg)
-
-    await msg.edit(f"✅ **Downloaded:** `{fname}`\n📦 Size: {size_mb:.1f} MB\n\n⏳ Uploading...")
 
     # Mega files hamesha OG quality - ffprobe se actual quality detect hogi
     resolution = 'OG'
+
+    # Caption banao (filename se anime name, metadata se language/quality)
+    caption = build_auto_caption(filepath, resolution=resolution)
+
+    # Proper filename banao caption se - spaces aur [] preserve karo
+    # Sirf illegal chars hatao
+    proper_filename = re.sub(r'[<>:"/\\|?*]', '', caption).strip()
+
+    await msg.edit(
+        f"✅ **Downloaded:** `{fname}`\n"
+        f"📦 Size: {size_mb:.1f} MB\n\n"
+        f"🧹 Metadata clean aur rename ho raha hai..."
+    )
+
+    # Metadata clean karo + proper naam se save karo
+    filepath = await clean_and_rename(filepath, proper_filename, msg)
+
+    await msg.edit(
+        f"✅ **Downloaded & Cleaned**\n"
+        f"📦 Size: {size_mb:.1f} MB\n\n"
+        f"⏳ Uploading..."
+    )
 
     # Upload karo
     try:
