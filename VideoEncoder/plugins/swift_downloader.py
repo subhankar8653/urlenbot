@@ -155,28 +155,40 @@ def _in_progress(dl_dir: str) -> list:
 # ─────────────────────────────────────────────
 async def _auto_rename(filepath: str, dl_dir: str) -> str:
     """
-    build_auto_caption se proper naam banao aur ffmpeg se metadata clean karo.
+    build_auto_caption se proper naam banao aur ffmpeg se metadata SET karo.
+    - title tag = clean filename (external player mein dikhega)
+    - Parallel uploads ke liye unique temp paths
     Returns renamed filepath.
     """
-    # Quality detect from filename
+    import random
     quality = _quality_from(os.path.basename(filepath))
     resolution = quality.replace("p", "") if quality != "unknown" else "OG"
 
     caption = build_auto_caption(filepath, resolution=resolution if resolution != "OG" else None)
+    # proper_filename: spaces rakho, sirf illegal chars hatao
     proper_filename = re.sub(r'[<>:"/\\|?*]', '', caption).strip()
 
-    out_path = os.path.join(dl_dir, proper_filename)
+    # title tag: extension hatao, [@channel] hatao — clean readable naam
+    title_tag = re.sub(r'\[@[^\]]+\]', '', os.path.splitext(proper_filename)[0]).strip()
 
-    # ffmpeg se metadata clean + rename
+    # Unique temp path — parallel uploads mein conflict avoid karo
+    unique_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+    temp_out = os.path.join(dl_dir, f"_tmp_{unique_id}.mp4")
+    final_out = os.path.join(dl_dir, proper_filename)
+
+    # ffmpeg: title SET karo (external player mein naam dikhega), garbage clear karo
     cmd = [
         'ffmpeg', '-y', '-i', filepath,
         '-map', '0', '-c', 'copy',
-        '-metadata', 'title=',
+        '-metadata', f'title={title_tag}',
         '-metadata', 'comment=',
         '-metadata', 'description=',
+        '-metadata', 'encoder=',
         '-metadata:s:v:0', 'title=',
+        '-metadata:s:v:0', 'handler_name=VideoHandler',
         '-metadata:s:a:0', 'title=',
-        out_path
+        '-metadata:s:a:0', 'handler_name=SoundHandler',
+        temp_out
     ]
 
     try:
@@ -187,14 +199,32 @@ async def _auto_rename(filepath: str, dl_dir: str) -> str:
         )
         await asyncio.wait_for(proc.communicate(), timeout=600)
 
-        if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        if proc.returncode == 0 and os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
             try:
                 os.remove(filepath)
             except Exception:
                 pass
-            return out_path
+            try:
+                os.rename(temp_out, final_out)
+                return final_out
+            except Exception:
+                return temp_out
+        else:
+            if os.path.exists(temp_out):
+                try: os.remove(temp_out)
+                except Exception: pass
     except Exception as e:
-        LOGGER.warning(f"[Swift] Rename/clean failed: {e}")
+        LOGGER.warning(f"[Swift] ffmpeg rename failed: {e}")
+        if os.path.exists(temp_out):
+            try: os.remove(temp_out)
+            except Exception: pass
+
+    # Fallback: sirf rename karo (metadata nahi badlega)
+    try:
+        os.rename(filepath, final_out)
+        return final_out
+    except Exception:
+        pass
 
     return filepath
 
@@ -375,45 +405,61 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
 
         if custom_thumb_id:
             try:
-                thumb_path = os.path.join(dl_dir, f"thumb_{int(time.time())}.jpg")
+                import random
+                # Unique path per file — parallel uploads mein conflict nahi hoga
+                unique_id = f"{int(time.time())}_{random.randint(1000,9999)}"
+                thumb_dir = os.path.join(dl_dir, "thumbs")
+                os.makedirs(thumb_dir, exist_ok=True)
+                thumb_path = os.path.join(thumb_dir, f"thumb_{unique_id}.jpg")
+
                 downloaded = await app.download_media(
                     custom_thumb_id,
                     file_name=thumb_path
                 )
-                # download_media actual path return karta hai (kabhi .temp hoti hai)
-                # Isliye returned path use karo, not the requested path
-                if downloaded and os.path.isfile(downloaded) and os.path.getsize(downloaded) > 0:
-                    thumb = downloaded
+                # Pyrogram returned path use karo (actual saved location)
+                actual_path = downloaded if downloaded else thumb_path
+
+                # .temp extension handle karo — Pyrogram kabhi kabhi aise save karta hai
+                if actual_path and actual_path.endswith(".temp"):
+                    renamed = actual_path.replace(".temp", ".jpg")
+                    try:
+                        os.rename(actual_path, renamed)
+                        actual_path = renamed
+                    except Exception:
+                        pass
+
+                if actual_path and os.path.isfile(actual_path) and os.path.getsize(actual_path) > 0:
+                    thumb = actual_path
                     custom_thumb_used = True
-                elif thumb_path and os.path.isfile(thumb_path) and os.path.getsize(thumb_path) > 0:
-                    thumb = thumb_path
-                    custom_thumb_used = True
+                    LOGGER.info(f"[Swift] Custom thumb ready: {actual_path}")
                 else:
-                    LOGGER.warning(f"[Swift] Custom thumb download failed, using auto-thumb")
-                    thumb = None
+                    LOGGER.warning(f"[Swift] Custom thumb not found at {actual_path}, using auto-thumb")
             except Exception as e:
                 LOGGER.warning(f"[Swift] Thumb download error: {e}, using auto-thumb")
-                thumb = None
 
         if not thumb:
-            # Fallback: video se auto thumbnail
+            # Fallback: video frame se auto thumbnail
             thumb = get_thumbnail(filepath, dl_dir, duration / 4 if duration else 0)
             custom_thumb_used = False
 
-        # Cover pic — same as thumb (Pyrogram v2+ supports cover= param)
+        # Cover pic — same as thumb
         cover = thumb if thumb and os.path.isfile(thumb) else None
 
         width, height = get_width_height(filepath)
         caption = f"<b>{fname}</b>"
 
+        # file_name MUST match actual filename on disk
+        # Telegram isi se external player mein naam dikhata hai
+        disk_fname = os.path.basename(filepath)
+
         await upload_video(
             message, msg, filepath, caption,
             c_time, thumb, duration, width, height,
-            file_name=fname,
-            cover=cover          # cover pic lagao
+            file_name=disk_fname,
+            cover=cover
         )
 
-        # Thumb cleanup (sirf agar auto-generated tha, custom thumb rakho)
+        # Thumb cleanup — custom thumb rakho (db mein hai), auto-generated hatao
         if not custom_thumb_used and thumb and os.path.isfile(thumb):
             try:
                 os.remove(thumb)
