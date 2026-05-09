@@ -3,7 +3,6 @@ FROM python:3.10-slim-bullseye
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ="Asia/Kolkata"
 
-
 # Install system packages
 RUN apt-get update && apt-get install -y \
     ffmpeg git wget pv jq python3-dev \
@@ -14,8 +13,8 @@ RUN apt-get update && apt-get install -y \
 COPY . .
 
 # Install Python dependencies
-RUN python3 -m pip install --upgrade pip && \
-    pip3 install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir --upgrade pip --trusted-host pypi.org --trusted-host files.pythonhosted.org && \
+    pip3 install --no-cache-dir -r requirements.txt --trusted-host pypi.org --trusted-host files.pythonhosted.org
 
 # Run the bot
 CMD ["python3", "-m", "VideoEncoder"]
