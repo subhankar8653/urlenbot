@@ -23,6 +23,10 @@ lxml
 httpx
 speedtest-cli
 
+# Fast Download
+aiohttp
+aiofiles
+
 # Google Drive
 google-api-core
 google-auth
@@ -32,4 +36,3 @@ google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
 httplib2==0.18.0
-aiofiles
