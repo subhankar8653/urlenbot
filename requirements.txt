@@ -1,6 +1,8 @@
-# ── Encode Bot Core ──────────────────────
+# ── Pyrogram Core ─────────────────────────
 pyrogram
 tgcrypto
+
+# ── Encode Bot Core ───────────────────────
 python-dotenv
 pymongo
 motor
@@ -8,11 +10,22 @@ psutil
 pySmartDL
 requests
 requests-cache
+aiohttp
+Pillow
+pymediainfo
+ffmpeg-python
+yt-dlp
+patool
+
+# ── Link Generators ───────────────────────
+cloudscraper
+lk21
+
+# ── Google Drive ──────────────────────────
 google-api-python-client
 google-auth
 google-auth-httplib2
 google-auth-oauthlib
-lk21
 
 # ── RTI Downloader Plugin ─────────────────
 selenium==4.18.1
