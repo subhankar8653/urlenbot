@@ -152,7 +152,12 @@ def _quality_from(text: str) -> str:
 def _get_done_files(dl_dir: str) -> list:
     done = []
     for f in glob.glob(os.path.join(dl_dir, "*")):
+        if not os.path.isfile(f):  # directories skip karo (thumbs/ folder etc)
+            continue
         if f.endswith((".crdownload", ".part", ".tmp")):
+            continue
+        basename = os.path.basename(f)
+        if basename.startswith("_tmp_"):  # temp rename files skip
             continue
         try:
             if os.path.getsize(f) > 100 * 1024:  # > 100KB
@@ -606,15 +611,10 @@ async def _run_swift(client, message, swift_url: str, encode: bool):
                 pass
         return success
 
-    # Sequential upload (Telegram flood control ke liye)
-    # Parallel rename + upload hoga via asyncio tasks
-    tasks = [
-        asyncio.create_task(_upload_task(fp, um))
-        for fp, um in zip(files, upload_messages)
-    ]
-
-    # asyncio.gather se sab saath chalaao — Telegram flood control handle hoga internally
-    await asyncio.gather(*tasks, return_exceptions=True)
+    # Sequential upload — Telegram flood + file conflict avoid karne ke liye
+    for fp, um in zip(files, upload_messages):
+        await _upload_task(fp, um)
+        await asyncio.sleep(2)
 
     qualities_done = [_quality_from(f) for f in files]
     await msg.edit(
