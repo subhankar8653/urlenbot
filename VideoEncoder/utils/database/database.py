@@ -292,3 +292,25 @@ class Database:
     async def get_thumbnail(self, id):
         user = await self._get_user(id)
         return user.get('thumbnail', None)
+
+    # Swap Rules
+    async def set_swap(self, id, rules: dict):
+        await self.col.update_one({'id': id}, {'$set': {'swap_rules': rules}}, upsert=True)
+
+    async def get_swap(self, id):
+        user = await self._get_user(id)
+        return user.get('swap_rules', {})
+
+    async def clear_swap(self, id):
+        await self.col.update_one({'id': id}, {'$set': {'swap_rules': {}}}, upsert=True)
+
+    # Cover Pic
+    async def set_coverpic(self, id, file_id):
+        await self.col.update_one({'id': id}, {'$set': {'coverpic': file_id}}, upsert=True)
+
+    async def get_coverpic(self, id):
+        user = await self._get_user(id)
+        return user.get('coverpic', None)
+
+    async def clear_coverpic(self, id):
+        await self.col.update_one({'id': id}, {'$set': {'coverpic': None}}, upsert=True)
