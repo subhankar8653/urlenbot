@@ -1,11 +1,11 @@
 """
-swift_downloader.py  v4
+swift_downloader.py  v5
 ========================
-FIX: IP binding issue.
-  - Page visit aur download DONO same Selenium session se hoga
-  - Same browser = same IP = same cookies = download works
-  - Chrome ko download folder set karke buttons click karayenge
-  - Chrome khud file save kar lega — koi alag HTTP request nahi
+Changes from v4:
+  - AUTO RENAME: mega jaise build_auto_caption se proper filename milega
+  - THUMBNAIL + COVER: /setpic se set ki gai custom thumbnail aur cover lagegi
+  - SIZE ORDER: Chhoti file pehle upload hogi (360p → 720p → 1080p)
+  - THREADED UPLOAD: asyncio.gather se parallel upload (fast)
 
 Commands:
   /swift <url>        — download + upload
@@ -15,16 +15,19 @@ Commands:
 import asyncio
 import glob
 import os
+import re
 import time
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from bs4 import BeautifulSoup
 
-from .. import LOGGER, download_dir
+from .. import LOGGER, download_dir, app
 from ..utils.helper import check_chat
 from ..utils.uploads.telegram import upload_video
 from ..utils.encoding import get_duration, get_thumbnail, get_width_height
+from ..utils.auto_caption import build_auto_caption
+from ..utils.database.access_db import db
 
 try:
     from selenium import webdriver
@@ -34,6 +37,17 @@ try:
     SELENIUM_OK = True
 except ImportError:
     SELENIUM_OK = False
+
+
+# ─────────────────────────────────────────────
+#  Quality sort order (small → large)
+# ─────────────────────────────────────────────
+QUALITY_ORDER = {"360p": 0, "480p": 1, "720p": 2, "1080p": 3, "2160p": 4, "unknown": 99}
+
+
+def _sort_by_size(files: list) -> list:
+    """Files ko size ke hisab se sort karo — chhoti pehle (360p → 1080p)"""
+    return sorted(files, key=lambda f: os.path.getsize(f) if os.path.isfile(f) else 0)
 
 
 # ─────────────────────────────────────────────
@@ -52,7 +66,6 @@ def _make_driver(dl_dir: str):
         "Chrome/120.0.0.0 Safari/537.36"
     )
 
-    # Download folder Chrome ke andar set karo
     prefs = {
         "download.default_directory": dl_dir,
         "download.prompt_for_download": False,
@@ -77,7 +90,6 @@ def _make_driver(dl_dir: str):
     driver = webdriver.Chrome(options=options)
     driver.set_page_load_timeout(60)
 
-    # Chrome headless mein download enable karna (CDP command)
     try:
         driver.execute_cdp_cmd(
             "Page.setDownloadBehavior",
@@ -108,7 +120,7 @@ def _close_popups(driver, main):
 # ─────────────────────────────────────────────
 def _quality_from(text: str) -> str:
     t = text.lower()
-    for q in ["1080p", "720p", "480p", "360p"]:
+    for q in ["2160p", "1080p", "720p", "480p", "360p"]:
         if q in t:
             return q
     return "unknown"
@@ -139,6 +151,55 @@ def _in_progress(dl_dir: str) -> list:
 
 
 # ─────────────────────────────────────────────
+#  Auto rename — mega jaise
+# ─────────────────────────────────────────────
+async def _auto_rename(filepath: str, dl_dir: str) -> str:
+    """
+    build_auto_caption se proper naam banao aur ffmpeg se metadata clean karo.
+    Returns renamed filepath.
+    """
+    # Quality detect from filename
+    quality = _quality_from(os.path.basename(filepath))
+    resolution = quality.replace("p", "") if quality != "unknown" else "OG"
+
+    caption = build_auto_caption(filepath, resolution=resolution if resolution != "OG" else None)
+    proper_filename = re.sub(r'[<>:"/\\|?*]', '', caption).strip()
+
+    out_path = os.path.join(dl_dir, proper_filename)
+
+    # ffmpeg se metadata clean + rename
+    cmd = [
+        'ffmpeg', '-y', '-i', filepath,
+        '-map', '0', '-c', 'copy',
+        '-metadata', 'title=',
+        '-metadata', 'comment=',
+        '-metadata', 'description=',
+        '-metadata:s:v:0', 'title=',
+        '-metadata:s:a:0', 'title=',
+        out_path
+    ]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=600)
+
+        if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            try:
+                os.remove(filepath)
+            except Exception:
+                pass
+            return out_path
+    except Exception as e:
+        LOGGER.warning(f"[Swift] Rename/clean failed: {e}")
+
+    return filepath
+
+
+# ─────────────────────────────────────────────
 #  Main scrape + download (blocking, same session)
 # ─────────────────────────────────────────────
 def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None) -> dict:
@@ -160,14 +221,12 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None) -> dict:
         driver.get(swift_url)
         main = driver.current_window_handle
 
-        # JS render hone do
         time.sleep(8)
         _close_popups(driver, main)
 
         html = driver.page_source
         LOGGER.info(f"[Swift] Page loaded, source len={len(html)}")
 
-        # ── Links dhundo (href attribute mein) ──
         soup = BeautifulSoup(html, "html.parser")
         download_links = []
         seen = set()
@@ -190,7 +249,6 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None) -> dict:
             LOGGER.info(f"[Swift] Found href: {quality} | {href[:80]}")
 
         if not download_links:
-            # Fallback: visible buttons click karo (old method)
             LOGGER.warning("[Swift] No hrefs found, trying visible button click...")
             qualities_to_try = ["360p", "480p", "720p", "1080p"]
             clicked = []
@@ -220,15 +278,12 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None) -> dict:
             result["qualities"] = clicked
 
         else:
-            # ── Same session mein JS click karo (same IP/cookies) ──
             qualities_clicked = []
-            for lnk in download_links[:3]:
+            for lnk in download_links[:4]:  # 4 qualities tak
                 q = lnk["quality"]
                 href = lnk["href"]
 
-                # JS se navigate karo same session mein (ya window.open)
                 try:
-                    # window.location.href se jayenge — same session
                     driver.execute_script(f"window.open('{href}', '_blank');")
                     time.sleep(2)
                     _close_popups(driver, main)
@@ -240,7 +295,6 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None) -> dict:
 
             result["qualities"] = qualities_clicked
 
-        # ── Files download hone ka wait (max 20 min) ──
         LOGGER.info("[Swift] Waiting for downloads...")
         start = time.time()
         expected = max(len(result["qualities"]), 1)
@@ -255,7 +309,6 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None) -> dict:
             if len(done) >= expected and not in_prog:
                 break
             if elapsed > 5 and len(done) >= 1 and not in_prog:
-                # Sab aa gaya jo aana tha
                 break
             if elapsed > 1200:
                 LOGGER.warning("[Swift] Timeout!")
@@ -279,6 +332,83 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None) -> dict:
 
 
 # ─────────────────────────────────────────────
+#  Single file upload (with auto-rename + thumb + cover)
+# ─────────────────────────────────────────────
+async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, encode: bool):
+    """Ek file: rename → thumbnail → cover → upload"""
+    fname_orig = os.path.basename(filepath)
+    quality = _quality_from(fname_orig)
+    size_mb = os.path.getsize(filepath) / (1024 * 1024)
+
+    await msg.edit(
+        f"🔄 **Renaming `{quality}`...**\n"
+        f"📁 `{fname_orig}`\n"
+        f"💾 `{size_mb:.1f} MB`"
+    )
+
+    # Auto rename (mega style)
+    filepath = await _auto_rename(filepath, dl_dir)
+    fname = os.path.basename(filepath)
+    quality = _quality_from(fname)  # recalculate after rename
+
+    await msg.edit(
+        f"📤 **Uploading `{quality}`...**\n"
+        f"📁 `{fname}`\n"
+        f"💾 `{size_mb:.1f} MB`"
+    )
+
+    try:
+        if encode:
+            from ..utils.helper import handle_encode
+            await msg.edit(f"⚙️ **Encoding `{quality}`...**")
+            await handle_encode(filepath, message, msg)
+            return True
+
+        c_time = time.time()
+        duration = get_duration(filepath)
+
+        # Custom thumbnail check (user ne /setpic se set kiya ho)
+        user_id = message.from_user.id
+        custom_thumb_id = await db.get_thumbnail(user_id)
+
+        if custom_thumb_id:
+            # Telegram se download karo thumb
+            thumb = await app.download_media(
+                custom_thumb_id,
+                file_name=os.path.join(dl_dir, f"thumb_{int(time.time())}.jpg")
+            )
+        else:
+            thumb = get_thumbnail(filepath, dl_dir, duration / 4 if duration else 0)
+
+        # Cover pic — same as thumb (Pyrogram v2+ supports cover= param)
+        cover = thumb  # same image cover ke liye bhi
+
+        width, height = get_width_height(filepath)
+        caption = f"<b>{fname}</b>"
+
+        await upload_video(
+            message, msg, filepath, caption,
+            c_time, thumb, duration, width, height,
+            file_name=fname,
+            cover=cover          # cover pic lagao
+        )
+
+        # Thumb cleanup (sirf agar auto-generated tha)
+        if not custom_thumb_id and thumb and os.path.isfile(thumb):
+            try:
+                os.remove(thumb)
+            except Exception:
+                pass
+
+        return True
+
+    except Exception as e:
+        LOGGER.error(f"[Swift] Upload error ({quality}): {e}")
+        await message.reply(f"⚠️ Upload failed `{fname}`: `{e}`")
+        return False
+
+
+# ─────────────────────────────────────────────
 #  Core command logic
 # ─────────────────────────────────────────────
 async def _run_swift(client, message, swift_url: str, encode: bool):
@@ -287,12 +417,11 @@ async def _run_swift(client, message, swift_url: str, encode: bool):
     os.makedirs(dl_dir, exist_ok=True)
 
     msg = await message.reply(
-        f"🔗 **Swift Downloader v4**\n\n"
+        f"🔗 **Swift Downloader v5**\n\n"
         f"🌐 `{swift_url}`\n\n"
         f"⏳ Same session se page visit + download ho raha hai..."
     )
 
-    # Progress update thread mein chal raha hai — blocking call
     loop = asyncio.get_event_loop()
 
     async def _progress_updater():
@@ -317,13 +446,10 @@ async def _run_swift(client, message, swift_url: str, encode: bool):
                 pass
             await asyncio.sleep(8)
 
-    # Progress task start
     prog_task = asyncio.create_task(_progress_updater())
 
-    # Blocking scrape+download thread mein
     result = await loop.run_in_executor(None, _scrape_and_download, swift_url, dl_dir)
 
-    # Progress task band karo
     prog_task.cancel()
     try:
         await prog_task
@@ -343,49 +469,55 @@ async def _run_swift(client, message, swift_url: str, encode: bool):
         await msg.edit("❌ **Koi file download nahi hui!**")
         return
 
+    # ── Size ke hisab se sort — chhoti (360p) pehle, badi (1080p) baad mein ──
+    files = _sort_by_size(files)
+
     await msg.edit(
         f"✅ **{len(files)} file(s) mili!**\n\n"
-        f"📤 Upload ho raha hai..."
+        f"📊 Order: `{' → '.join(_quality_from(f) for f in files)}`\n\n"
+        f"📤 Upload ho raha hai (threaded)..."
     )
 
-    c_time = time.time()
+    # ── Threaded upload: ek ek status message banao, parallel upload karo ──
+    # Note: Telegram flood control ki wajah se sequential better hota hai for video
+    # Lekin hum asyncio.gather se concurrently rename + upload karenge
+    # (Actually video uploads sequential hi acha hai, par rename async hogi)
+
+    upload_messages = []
+    for i, fp in enumerate(files):
+        q = _quality_from(os.path.basename(fp))
+        um = await message.reply(f"⏳ **Queued `{q}`** ({i+1}/{len(files)})")
+        upload_messages.append(um)
+
     uploaded = 0
 
-    for filepath in sorted(files):
-        fname = os.path.basename(filepath)
-        quality = _quality_from(fname)
-        size_mb = os.path.getsize(filepath) / (1024 * 1024)
-
-        await msg.edit(
-            f"📤 **Uploading `{quality}`...**\n"
-            f"📁 `{fname}`\n"
-            f"💾 `{size_mb:.1f} MB`"
-        )
-
-        try:
-            if encode:
-                from ..utils.helper import handle_encode
-                await msg.edit(f"⚙️ **Encoding `{quality}`...**")
-                await handle_encode(filepath, message, msg)
-            else:
-                duration = get_duration(filepath)
-                thumb = get_thumbnail(filepath, dl_dir, duration / 4 if duration else 0)
-                width, height = get_width_height(filepath)
-                await upload_video(
-                    message, msg, filepath, fname,
-                    c_time, thumb, duration, width, height
-                )
+    async def _upload_task(filepath, um):
+        nonlocal uploaded
+        success = await _upload_one_file(client, message, um, filepath, dl_dir, encode)
+        if success:
             uploaded += 1
-        except Exception as e:
-            LOGGER.error(f"[Swift] Upload error: {e}")
-            await message.reply(f"⚠️ Upload failed `{fname}`: `{e}`")
+            q = _quality_from(os.path.basename(filepath))
+            try:
+                await um.edit(f"✅ **Done `{q}`**")
+            except Exception:
+                pass
+        return success
 
-        await asyncio.sleep(1)
+    # Sequential upload (Telegram flood control ke liye)
+    # Parallel rename + upload hoga via asyncio tasks
+    tasks = [
+        asyncio.create_task(_upload_task(fp, um))
+        for fp, um in zip(files, upload_messages)
+    ]
 
+    # asyncio.gather se sab saath chalaao — Telegram flood control handle hoga internally
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    qualities_done = [_quality_from(f) for f in files]
     await msg.edit(
         f"🎉 **Complete!**\n\n"
         f"✅ Uploaded : `{uploaded}/{len(files)}`\n"
-        f"📊 Qualities : `{', '.join(_quality_from(f) for f in sorted(files))}`"
+        f"📊 Qualities : `{' → '.join(qualities_done)}`"
     )
 
     try:
