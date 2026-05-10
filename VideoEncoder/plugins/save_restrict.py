@@ -378,9 +378,10 @@ async def saveget(client: Client, message: Message):
             await user_client.disconnect()
         return await status_msg.edit("❌ **File nahi mili.**")
 
-    # ── Upload via USER client ──
-    # User client → bot ke chat mein seedha send karega
-    # Ye MAXIMUM speed dega kyunki user account bandwidth use hoga
+    # ── Upload via USER client → LOG_CHANNEL, phir bot se forward ──
+    # User LOG_CHANNEL ka admin hai, isliye wahan upload hoga.
+    # Bot LOG_CHANNEL se target chat mein forward karega — fast & no re-upload.
+    # LOG_CHANNEL mein message rehta hai — wahi log bhi serve karta hai.
     fname = os.path.basename(file_path)
     caption = str(msg_obj.caption or fname)
     c_time = time.time()
@@ -389,14 +390,16 @@ async def saveget(client: Client, message: Message):
 
     try:
         resp = None
+        saved_msg = None
 
+        # ── Step 1: User client se LOG_CHANNEL mein upload ──
         if msg_obj.video:
             duration = get_duration(file_path)
             thumb = get_thumbnail(file_path, dl_dir, duration / 4 if duration else 0)
             width, height = get_width_height(file_path)
 
-            resp = await fetch_client.send_video(
-                chat_id=message.chat.id,
+            saved_msg = await fetch_client.send_video(
+                chat_id=log,
                 video=file_path,
                 caption=f"<b>{caption}</b>",
                 duration=duration,
@@ -409,10 +412,9 @@ async def saveget(client: Client, message: Message):
                 progress=progress_for_pyrogram,
                 progress_args=("📤 Uploading...", status_msg, c_time),
             )
-
         elif msg_obj.document:
-            resp = await fetch_client.send_document(
-                chat_id=message.chat.id,
+            saved_msg = await fetch_client.send_document(
+                chat_id=log,
                 document=file_path,
                 caption=f"<b>{caption}</b>",
                 file_name=fname,
@@ -420,28 +422,25 @@ async def saveget(client: Client, message: Message):
                 progress=progress_for_pyrogram,
                 progress_args=("📤 Uploading...", status_msg, c_time),
             )
-
         elif msg_obj.audio:
-            resp = await fetch_client.send_audio(
-                chat_id=message.chat.id,
+            saved_msg = await fetch_client.send_audio(
+                chat_id=log,
                 audio=file_path,
                 caption=f"<b>{caption}</b>",
                 parse_mode=ParseMode.HTML,
                 progress=progress_for_pyrogram,
                 progress_args=("📤 Uploading...", status_msg, c_time),
             )
-
         elif msg_obj.photo:
-            resp = await fetch_client.send_photo(
-                chat_id=message.chat.id,
+            saved_msg = await fetch_client.send_photo(
+                chat_id=log,
                 photo=file_path,
                 caption=f"<b>{caption}</b>",
                 parse_mode=ParseMode.HTML,
             )
-
         else:
-            resp = await fetch_client.send_document(
-                chat_id=message.chat.id,
+            saved_msg = await fetch_client.send_document(
+                chat_id=log,
                 document=file_path,
                 caption=f"<b>{caption}</b>",
                 parse_mode=ParseMode.HTML,
@@ -449,15 +448,15 @@ async def saveget(client: Client, message: Message):
                 progress_args=("📤 Uploading...", status_msg, c_time),
             )
 
-        # Log channel mein bhi bhejo (bot se)
-        if resp:
-            try:
-                if msg_obj.video and resp.video:
-                    await app.send_video(log, resp.video.file_id, caption=caption, parse_mode=ParseMode.HTML)
-                elif (msg_obj.document) and resp.document:
-                    await app.send_document(log, resp.document.file_id, caption=caption, parse_mode=ParseMode.HTML)
-            except Exception:
-                pass
+        # ── Step 2: Bot se LOG_CHANNEL → target chat forward ──
+        # forward_messages — instant, no bandwidth, cover bhi preserve hoti hai
+        if saved_msg:
+            resp = await app.forward_messages(
+                chat_id=message.chat.id,
+                from_chat_id=log,
+                message_ids=saved_msg.id,
+            )
+        # Log channel mein message already hai — alag se send karne ki zaroorat nahi
 
     except Exception as e:
         await status_msg.edit(f"❌ **Upload failed:** `{e}`")
