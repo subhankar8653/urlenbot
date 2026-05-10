@@ -4,9 +4,10 @@ save_restrict.py
 Save Restricted Content — Encode Bot ke liye.
 
 KEY FEATURE:
-  Download AND Upload DONO user account (string session) se hote hain.
-  Bot account sirf final message forward karta hai user ko.
-  Isliye speed MAXIMUM milti hai — user account ka bandwidth use hota hai.
+  User account (string session) se DOWNLOAD hota hai — restricted content access.
+  Upload bhi user account se LOG_CHANNEL mein hota hai (user admin hai wahan).
+  Bot LOG_CHANNEL se target chat mein forward karta hai — instant, no re-upload.
+  Isliye speed MAXIMUM milti hai aur member restriction ka issue bhi nahi aata.
 
 Commands:
   /savelogin   — Apna Telegram account connect karo
@@ -82,8 +83,8 @@ async def _set_user_session(user_id: int, session_str):
 # ──────────────────────────────────────────────
 def _make_user_client(session_str: str) -> Client:
     """
-    User account ka Client banao — upload/download dono ke liye.
-    max_concurrent_transmissions=20 → 20 parallel parts ek saath
+    User account ka Client — download ke liye.
+    max_concurrent_transmissions=10 → parallel parts
     """
     return Client(
         "sr_user",
@@ -91,8 +92,8 @@ def _make_user_client(session_str: str) -> Client:
         api_id=api_id,
         api_hash=api_hash,
         in_memory=True,
-        max_concurrent_transmissions=20,
-        workers=32,
+        max_concurrent_transmissions=10,
+        workers=16,
         sleep_threshold=60,
     )
 
@@ -262,7 +263,7 @@ async def _finalize_login(msg: Message, tmp_client, user_id: int):
             "🎉 **Login Successful!**\n\n"
             "✅ Phone → ✅ OTP → ✅ Password\n\n"
             "Ab `/saveget <link>` se restricted content save karo!\n"
-            "⚡ **Download + Upload dono teri account se hoga — max speed!**",
+            "⚡ **Download user account se, Upload bhi user account se — max speed!**",
             reply_markup=remove_kb,
         )
     except Exception as e:
@@ -271,7 +272,7 @@ async def _finalize_login(msg: Message, tmp_client, user_id: int):
 
 
 # ──────────────────────────────────────────────
-#  /saveget — DOWNLOAD + UPLOAD via USER CLIENT
+#  /saveget — Main handler
 # ──────────────────────────────────────────────
 @Client.on_message(filters.command("saveget"))
 async def saveget(client: Client, message: Message):
@@ -308,7 +309,8 @@ async def saveget(client: Client, message: Message):
 
     status_msg = await message.reply("⏳ **Fetching...**")
 
-    # ── User client connect karo ──
+    # ── User client banao (download ke liye) ──
+    user_client = None
     if user_session:
         try:
             user_client = _make_user_client(user_session)
@@ -317,9 +319,9 @@ async def saveget(client: Client, message: Message):
             return await status_msg.edit(
                 f"❌ **Session invalid/expired.**\n`{e}`\n\nDobara `/savelogin` karo."
             )
-    else:
-        user_client = None
 
+    # Download = user client (restricted access)
+    # Upload   = bot (app) — LOG_CHANNEL ka bot admin hai, forward bhi bot karega
     fetch_client = user_client if user_client else client
 
     # ── Message fetch ──
@@ -351,7 +353,7 @@ async def saveget(client: Client, message: Message):
             await user_client.disconnect()
         return await status_msg.edit("❌ **Unsupported content.**")
 
-    # ── Download via USER client ──
+    # ── DOWNLOAD via USER client ──
     session_id = str(int(time.time()))
     dl_dir = os.path.join(download_dir, f"sr_{session_id}")
     os.makedirs(dl_dir, exist_ok=True)
@@ -372,16 +374,21 @@ async def saveget(client: Client, message: Message):
             await user_client.disconnect()
         return await status_msg.edit(f"❌ **Download failed:** `{e}`")
 
+    # User client ka kaam download ke baad khatam — disconnect karo
+    if user_client:
+        try:
+            await user_client.disconnect()
+        except Exception:
+            pass
+        user_client = None
+
     if not file_path or not os.path.exists(file_path):
         shutil.rmtree(dl_dir, ignore_errors=True)
-        if user_client:
-            await user_client.disconnect()
         return await status_msg.edit("❌ **File nahi mili.**")
 
-    # ── Upload via USER client → LOG_CHANNEL, phir bot se forward ──
-    # User LOG_CHANNEL ka admin hai, isliye wahan upload hoga.
-    # Bot LOG_CHANNEL se target chat mein forward karega — fast & no re-upload.
-    # LOG_CHANNEL mein message rehta hai — wahi log bhi serve karta hai.
+    # ── UPLOAD via BOT (app) → LOG_CHANNEL, phir forward ──
+    # Bot LOG_CHANNEL ka admin hai → upload guaranteed works
+    # forward_messages() → instant, no re-upload, no bandwidth, cover bhi safe
     fname = os.path.basename(file_path)
     caption = str(msg_obj.caption or fname)
     c_time = time.time()
@@ -389,16 +396,14 @@ async def saveget(client: Client, message: Message):
     await status_msg.edit("📤 **Uploading...**")
 
     try:
-        resp = None
         saved_msg = None
 
-        # ── Step 1: User client se LOG_CHANNEL mein upload ──
         if msg_obj.video:
             duration = get_duration(file_path)
             thumb = get_thumbnail(file_path, dl_dir, duration / 4 if duration else 0)
             width, height = get_width_height(file_path)
 
-            saved_msg = await fetch_client.send_video(
+            saved_msg = await app.send_video(
                 chat_id=log,
                 video=file_path,
                 caption=f"<b>{caption}</b>",
@@ -412,8 +417,9 @@ async def saveget(client: Client, message: Message):
                 progress=progress_for_pyrogram,
                 progress_args=("📤 Uploading...", status_msg, c_time),
             )
+
         elif msg_obj.document:
-            saved_msg = await fetch_client.send_document(
+            saved_msg = await app.send_document(
                 chat_id=log,
                 document=file_path,
                 caption=f"<b>{caption}</b>",
@@ -422,8 +428,9 @@ async def saveget(client: Client, message: Message):
                 progress=progress_for_pyrogram,
                 progress_args=("📤 Uploading...", status_msg, c_time),
             )
+
         elif msg_obj.audio:
-            saved_msg = await fetch_client.send_audio(
+            saved_msg = await app.send_audio(
                 chat_id=log,
                 audio=file_path,
                 caption=f"<b>{caption}</b>",
@@ -431,15 +438,17 @@ async def saveget(client: Client, message: Message):
                 progress=progress_for_pyrogram,
                 progress_args=("📤 Uploading...", status_msg, c_time),
             )
+
         elif msg_obj.photo:
-            saved_msg = await fetch_client.send_photo(
+            saved_msg = await app.send_photo(
                 chat_id=log,
                 photo=file_path,
                 caption=f"<b>{caption}</b>",
                 parse_mode=ParseMode.HTML,
             )
+
         else:
-            saved_msg = await fetch_client.send_document(
+            saved_msg = await app.send_document(
                 chat_id=log,
                 document=file_path,
                 caption=f"<b>{caption}</b>",
@@ -448,25 +457,18 @@ async def saveget(client: Client, message: Message):
                 progress_args=("📤 Uploading...", status_msg, c_time),
             )
 
-        # ── Step 2: Bot se LOG_CHANNEL → target chat forward ──
-        # forward_messages — instant, no bandwidth, cover bhi preserve hoti hai
+        # ── Forward: LOG_CHANNEL → target chat (instant!) ──
         if saved_msg:
-            resp = await app.forward_messages(
+            await app.forward_messages(
                 chat_id=message.chat.id,
                 from_chat_id=log,
                 message_ids=saved_msg.id,
             )
-        # Log channel mein message already hai — alag se send karne ki zaroorat nahi
+        # LOG_CHANNEL mein message pehle se hai — alag log send karne ki zaroorat nahi
 
     except Exception as e:
         await status_msg.edit(f"❌ **Upload failed:** `{e}`")
     finally:
-        # Cleanup
-        if user_client:
-            try:
-                await user_client.disconnect()
-            except Exception:
-                pass
         shutil.rmtree(dl_dir, ignore_errors=True)
         try:
             await status_msg.delete()
