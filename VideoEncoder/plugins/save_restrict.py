@@ -3,16 +3,14 @@ save_restrict.py
 ================
 Save Restricted Content — Encode Bot ke liye.
 
-KEY FEATURE:
-  User account (string session) se DOWNLOAD hota hai — restricted content access.
-  Upload bhi user account se LOG_CHANNEL mein hota hai (user admin hai wahan).
-  Bot LOG_CHANNEL se target chat mein forward karta hai — instant, no re-upload.
-  Isliye speed MAXIMUM milti hai aur member restriction ka issue bhi nahi aata.
+FLOW:
+  1. User account se DOWNLOAD (restricted content access)
+  2. User account se LOG_CHANNEL mein UPLOAD (user admin hai, max speed)
+  3. Bot se LOG_CHANNEL → target chat FORWARD (instant, no re-upload)
 
-Commands:
-  /savelogin   — Apna Telegram account connect karo
-  /savelogout  — Session hatao
-  /saveget <link> — Restricted/private channel ka content save karo
+KEY TRICK:
+  User client pehle bot se LOG_CHANNEL ka InputPeer leta hai (resolve karta hai).
+  Bina resolve ke unknown peer error aata hai even with integer chat_id.
 """
 
 import asyncio
@@ -79,13 +77,9 @@ async def _set_user_session(user_id: int, session_str):
 
 
 # ──────────────────────────────────────────────
-#  User Client builder — max speed settings
+#  User Client builder — max speed
 # ──────────────────────────────────────────────
 def _make_user_client(session_str: str) -> Client:
-    """
-    User account ka Client — download ke liye.
-    max_concurrent_transmissions=10 → parallel parts
-    """
     return Client(
         "sr_user",
         session_string=session_str,
@@ -96,6 +90,21 @@ def _make_user_client(session_str: str) -> Client:
         workers=16,
         sleep_threshold=60,
     )
+
+
+async def _resolve_log_channel(uc: Client) -> int:
+    """
+    User client ke liye LOG_CHANNEL resolve karo.
+    Pyrogram integer peer bhi tabhi accept karta hai jab uska InputPeer
+    session cache mein ho. get_chat() se resolve + cache ho jaata hai.
+    Returns resolved chat_id (int) — same as log.
+    """
+    try:
+        chat = await uc.get_chat(log)
+        return chat.id
+    except Exception:
+        # Fallback: shayad already cached ho
+        return log
 
 
 # ──────────────────────────────────────────────
@@ -263,7 +272,7 @@ async def _finalize_login(msg: Message, tmp_client, user_id: int):
             "🎉 **Login Successful!**\n\n"
             "✅ Phone → ✅ OTP → ✅ Password\n\n"
             "Ab `/saveget <link>` se restricted content save karo!\n"
-            "⚡ **Download user account se, Upload bhi user account se — max speed!**",
+            "⚡ **Download + Upload dono user account se — max speed!**",
             reply_markup=remove_kb,
         )
     except Exception as e:
@@ -299,7 +308,6 @@ async def saveget(client: Client, message: Message):
     except Exception:
         return await message.reply("❌ **Invalid link!**")
 
-    # Session check
     user_session = await _get_user_session(user_id)
     if not user_session and is_private:
         return await message.reply(
@@ -309,7 +317,7 @@ async def saveget(client: Client, message: Message):
 
     status_msg = await message.reply("⏳ **Fetching...**")
 
-    # ── User client banao (download ke liye) ──
+    # ── User client banao ──
     user_client = None
     if user_session:
         try:
@@ -320,8 +328,6 @@ async def saveget(client: Client, message: Message):
                 f"❌ **Session invalid/expired.**\n`{e}`\n\nDobara `/savelogin` karo."
             )
 
-    # Download = user client (restricted access)
-    # Upload   = bot (app) — LOG_CHANNEL ka bot admin hai, forward bhi bot karega
     fetch_client = user_client if user_client else client
 
     # ── Message fetch ──
@@ -353,7 +359,7 @@ async def saveget(client: Client, message: Message):
             await user_client.disconnect()
         return await status_msg.edit("❌ **Unsupported content.**")
 
-    # ── DOWNLOAD via USER client ──
+    # ── DOWNLOAD via user client ──
     session_id = str(int(time.time()))
     dl_dir = os.path.join(download_dir, f"sr_{session_id}")
     os.makedirs(dl_dir, exist_ok=True)
@@ -374,26 +380,36 @@ async def saveget(client: Client, message: Message):
             await user_client.disconnect()
         return await status_msg.edit(f"❌ **Download failed:** `{e}`")
 
-    # User client ka kaam download ke baad khatam — disconnect karo
-    if user_client:
-        try:
-            await user_client.disconnect()
-        except Exception:
-            pass
-        user_client = None
-
     if not file_path or not os.path.exists(file_path):
         shutil.rmtree(dl_dir, ignore_errors=True)
+        if user_client:
+            await user_client.disconnect()
         return await status_msg.edit("❌ **File nahi mili.**")
 
-    # ── UPLOAD via BOT (app) → LOG_CHANNEL, phir forward ──
-    # Bot LOG_CHANNEL ka admin hai → upload guaranteed works
-    # forward_messages() → instant, no re-upload, no bandwidth, cover bhi safe
+    # ── UPLOAD via user client → LOG_CHANNEL ──
+    # KEY: pehle LOG_CHANNEL resolve karo user client se
+    # get_chat() → InputPeer cache mein store ho jaata hai → phir send works
     fname = os.path.basename(file_path)
     caption = str(msg_obj.caption or fname)
     c_time = time.time()
 
     await status_msg.edit("📤 **Uploading...**")
+
+    # Upload client decide karo:
+    # - user_client available → user se upload (fast!)
+    # - nahi → bot se upload (fallback)
+    upload_client = user_client if user_client else app
+    resolved_log = log  # default
+
+    if user_client:
+        try:
+            # CRITICAL: LOG_CHANNEL resolve karo user client se
+            # Bina iske "unknown peer" error aata hai
+            resolved_log = await _resolve_log_channel(user_client)
+        except Exception:
+            # Resolve fail → bot se upload karo
+            upload_client = app
+            resolved_log = log
 
     try:
         saved_msg = None
@@ -403,8 +419,8 @@ async def saveget(client: Client, message: Message):
             thumb = get_thumbnail(file_path, dl_dir, duration / 4 if duration else 0)
             width, height = get_width_height(file_path)
 
-            saved_msg = await app.send_video(
-                chat_id=log,
+            saved_msg = await upload_client.send_video(
+                chat_id=resolved_log,
                 video=file_path,
                 caption=f"<b>{caption}</b>",
                 duration=duration,
@@ -419,8 +435,8 @@ async def saveget(client: Client, message: Message):
             )
 
         elif msg_obj.document:
-            saved_msg = await app.send_document(
-                chat_id=log,
+            saved_msg = await upload_client.send_document(
+                chat_id=resolved_log,
                 document=file_path,
                 caption=f"<b>{caption}</b>",
                 file_name=fname,
@@ -430,8 +446,8 @@ async def saveget(client: Client, message: Message):
             )
 
         elif msg_obj.audio:
-            saved_msg = await app.send_audio(
-                chat_id=log,
+            saved_msg = await upload_client.send_audio(
+                chat_id=resolved_log,
                 audio=file_path,
                 caption=f"<b>{caption}</b>",
                 parse_mode=ParseMode.HTML,
@@ -440,16 +456,16 @@ async def saveget(client: Client, message: Message):
             )
 
         elif msg_obj.photo:
-            saved_msg = await app.send_photo(
-                chat_id=log,
+            saved_msg = await upload_client.send_photo(
+                chat_id=resolved_log,
                 photo=file_path,
                 caption=f"<b>{caption}</b>",
                 parse_mode=ParseMode.HTML,
             )
 
         else:
-            saved_msg = await app.send_document(
-                chat_id=log,
+            saved_msg = await upload_client.send_document(
+                chat_id=resolved_log,
                 document=file_path,
                 caption=f"<b>{caption}</b>",
                 parse_mode=ParseMode.HTML,
@@ -457,18 +473,24 @@ async def saveget(client: Client, message: Message):
                 progress_args=("📤 Uploading...", status_msg, c_time),
             )
 
-        # ── Forward: LOG_CHANNEL → target chat (instant!) ──
+        # ── Forward: LOG_CHANNEL → target chat ──
+        # Bot se forward karo — instant, no re-upload, cover safe
         if saved_msg:
             await app.forward_messages(
                 chat_id=message.chat.id,
                 from_chat_id=log,
                 message_ids=saved_msg.id,
             )
-        # LOG_CHANNEL mein message pehle se hai — alag log send karne ki zaroorat nahi
+        # LOG_CHANNEL mein already hai — alag log send karne ki zaroorat nahi
 
     except Exception as e:
         await status_msg.edit(f"❌ **Upload failed:** `{e}`")
     finally:
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
         shutil.rmtree(dl_dir, ignore_errors=True)
         try:
             await status_msg.delete()
