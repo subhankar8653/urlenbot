@@ -133,22 +133,6 @@ async def apply_swap(caption, user_id):
 
 
 # ─────────────────────────────────────────────
-#  Chunk size patch
-# ─────────────────────────────────────────────
-def _patch_chunk_size():
-    try:
-        import pyrogram.utils as pu
-        if hasattr(pu, 'MIN_CHUNK_SIZE'):
-            pu.MIN_CHUNK_SIZE = 4 * 1024 * 1024
-        if hasattr(pu, 'MAX_CHUNK_SIZE'):
-            pu.MAX_CHUNK_SIZE = 4 * 1024 * 1024
-    except Exception:
-        pass
-
-_patch_chunk_size()
-
-
-# ─────────────────────────────────────────────
 #  upload_to_tg
 # ─────────────────────────────────────────────
 async def upload_to_tg(new_file, message, msg, resolution='480'):
