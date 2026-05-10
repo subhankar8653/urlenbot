@@ -56,8 +56,8 @@ def _sort_by_size(files: list) -> list:
 def _make_driver(dl_dir: str):
     options = webdriver.ChromeOptions()
 
-    # headless=new renderer crash karta hai Railway pe — old headless zyada stable
-    options.add_argument("--headless")
+    # Railway pe headless=new better JS rendering karta hai (old headless JS execute karta hai)
+    options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -73,7 +73,9 @@ def _make_driver(dl_dir: str):
     options.add_argument("--no-first-run")
     options.add_argument("--safebrowsing-disable-auto-update")
     options.add_argument("--ignore-certificate-errors")
-    options.add_argument("--window-size=1280,720")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--enable-javascript")
+    options.add_argument("--allow-running-insecure-content")
     # Shared memory limit increase — renderer timeout fix
     options.add_argument("--shm-size=2gb")
     options.add_argument(
@@ -254,16 +256,56 @@ async def _auto_rename(filepath: str, dl_dir: str) -> str:
     return filepath
 
 
+def _try_requests_scrape(swift_url: str) -> list:
+    """
+    Pehle requests se static HTML try karo — JS-heavy page nahi hai toh
+    Selenium se tez aur reliable hoga.
+    Returns list of download hrefs, ya empty list agar fail hua.
+    """
+    try:
+        import requests as req_lib
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        r = req_lib.get(swift_url, headers=headers, timeout=20)
+        if r.status_code != 200:
+            return []
+        soup = BeautifulSoup(r.text, "html.parser")
+        links = []
+        seen = set()
+        for tag in soup.find_all("a", href=True):
+            href = tag.get("href", "").strip()
+            if not href or href in seen:
+                continue
+            if href.startswith("#") or "javascript" in href:
+                continue
+            if len(href) < 10:
+                continue
+            label = tag.get_text(separator=" ", strip=True)
+            quality = _quality_from(label + " " + href)
+            seen.add(href)
+            links.append({"href": href, "quality": quality, "label": label})
+            LOGGER.info(f"[Swift/requests] Found: {quality} | {href[:80]}")
+        return links
+    except Exception as e:
+        LOGGER.warning(f"[Swift/requests] Failed: {e}")
+        return []
+
+
 # ─────────────────────────────────────────────
 #  Main scrape + download (blocking, same session)
 # ─────────────────────────────────────────────
 def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None) -> dict:
     """
     Same Selenium session mein:
-      1. Page visit karo
-      2. Download links/buttons dhundo
-      3. Har button click karo → Chrome file save kare
-      4. Files ka wait karo
+      1. Pehle requests se try karo (fast path)
+      2. Agar fail → Selenium se page visit karo
+      3. Download links/buttons dhundo
+      4. Har button click karo → Chrome file save kare
+      5. Files ka wait karo
 
     Returns: {"files": [...paths], "qualities": [...], "error": str or None}
     """
@@ -292,9 +334,31 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None) -> dict:
 
         main = driver.current_window_handle
 
-        # JS render hone do — 12 sec (8 se zyada, slow pages ke liye)
-        time.sleep(12)
+        # Step 1: Basic wait
+        time.sleep(5)
         _close_popups(driver, main)
+
+        # Step 2: Dynamic link detect hone tak wait (max 25 sec)
+        try:
+            WebDriverWait(driver, 25).until(
+                EC.presence_of_element_located((By.TAG_NAME, "a"))
+            )
+            LOGGER.info("[Swift] Links detected via WebDriverWait")
+        except Exception:
+            LOGGER.warning("[Swift] WebDriverWait timeout — proceeding anyway")
+
+        # Step 3: SPA/React pages ke liye extra render time
+        time.sleep(8)
+        _close_popups(driver, main)
+
+        # Step 4: Scroll — lazy-loaded content trigger karne ke liye
+        try:
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(3)
+            driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(2)
+        except Exception:
+            pass
 
         html = driver.page_source
         LOGGER.info(f"[Swift] Page loaded, source len={len(html)}")
@@ -310,7 +374,7 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None) -> dict:
                 continue
             if href.startswith("#") or "javascript" in href:
                 continue
-            if len(href) < 30:
+            if len(href) < 10:  # sirf bahut chote anchors skip karo
                 continue
 
             quality = _quality_from(label + " " + href)
