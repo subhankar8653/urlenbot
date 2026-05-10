@@ -1,22 +1,10 @@
 """
-rti_downloader.py
-==================
-RTI (RareAnimes) Download Plugin for Encode Bot
-
-Command:
-  /rti <url> <ep1> <ep2> ...
-
-Example:
-  /rti https://rareanimes.buzz/wistoria-wand-and-sword-season-2-hindi-dubbed-episodes-download-hd/ 01 02
-
-Flow:
-  1. URL page open karo (requests/BeautifulSoup)
-  2. Episode number ke liye [WatchMultQuality] link dhundo (Hindi priority)
-  3. WatchMultQuality page open karo (Selenium)
-  4. Inspect → iframe → argon.razorshell.space/embed wala link nikalo
-  5. Unique code extract karo (e.g. 7FFijEtn3e9zJMU)
-  6. Swift link banao: https://swift.multiquality.click/downlead/<code>
-  7. Existing /swift logic se download + upload karo
+rti_downloader.py  v3
+======================
+Commands:
+  /rti <url>                -> Latest episode auto-detect + download
+  /rti <url> <start> <end>  -> Episode range download
+  /rti <url> 5 5            -> Sirf episode 5
 """
 
 import asyncio
@@ -28,7 +16,7 @@ from bs4 import BeautifulSoup
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-from .. import LOGGER, app
+from .. import LOGGER, download_dir, app
 from ..utils.helper import check_chat
 
 try:
@@ -40,11 +28,8 @@ try:
 except ImportError:
     SELENIUM_OK = False
 
-# ─────────────────────────────────────────────
-#  Constants
-# ─────────────────────────────────────────────
 ARGON_DOMAIN = "argon.razorshell.space/embed"
-SWIFT_BASE = "https://swift.multiquality.click/downlead/"
+SWIFT_BASE   = "https://swift.multiquality.click/downlead/"
 
 HEADERS = {
     "User-Agent": (
@@ -54,56 +39,44 @@ HEADERS = {
     )
 }
 
-# Audio priority — Hindi pehle
 AUDIO_PRIORITY = ["hindi", "dual", "multi", "english", "japanese", "sub", "unknown"]
 
 
 # ─────────────────────────────────────────────
-#  Step 1: Page se episode ka WatchMultQuality link nikalo
+#  Audio detection helpers
 # ─────────────────────────────────────────────
 def _detect_audio(link_el, context_text: str) -> str:
-    """Link ke aas-paas ke text se audio type detect karo."""
-    # Previous sibling check
     prev = link_el.previous_sibling
     if prev:
         t = str(prev).strip().lower()
-        for kw, label in [
-            ("hindi", "hindi"), ("dual", "dual"), ("multi", "multi"),
-            ("english", "english"), ("japanese", "japanese"), ("sub", "sub"),
-        ]:
+        for kw, label in [("hindi","hindi"),("dual","dual"),("multi","multi"),
+                           ("english","english"),("japanese","japanese"),("sub","sub")]:
             if kw in t:
                 return label
 
-    # Parent text check
     parent = link_el.find_parent()
     if parent:
         pt = parent.get_text(" ", strip=True).lower()
         lt = link_el.get_text(strip=True).lower()
         if lt in pt:
             before = pt.split(lt)[0][-80:]
-            for kw, label in [
-                ("hindi", "hindi"), ("dual", "dual"), ("multi", "multi"),
-                ("english", "english"), ("japanese", "japanese"), ("sub", "sub"),
-            ]:
+            for kw, label in [("hindi","hindi"),("dual","dual"),("multi","multi"),
+                               ("english","english"),("japanese","japanese"),("sub","sub")]:
                 if kw in before:
                     return label
 
-    # Context text fallback
     ct = context_text.lower()
-    patterns = [
-        (r"hindi\s*[-–—]\s*\[?watch", "hindi"),
-        (r"english\s*[-–—]\s*\[?watch", "english"),
-        (r"japanese\s*[-–—]\s*\[?watch", "japanese"),
-        (r"dual\s*audio\s*[-–—]\s*\[?watch", "dual"),
-    ]
-    for pat, label in patterns:
+    for pat, label in [
+        (r"hindi\s*[-\u2013\u2014]\s*\[?watch", "hindi"),
+        (r"english\s*[-\u2013\u2014]\s*\[?watch", "english"),
+        (r"japanese\s*[-\u2013\u2014]\s*\[?watch", "japanese"),
+        (r"dual\s*audio\s*[-\u2013\u2014]\s*\[?watch", "dual"),
+    ]:
         if re.search(pat, ct):
             return label
 
-    for kw, label in [
-        ("hindi", "hindi"), ("dual", "dual"), ("multi", "multi"),
-        ("english", "english"), ("japanese", "japanese"), ("sub", "sub"),
-    ]:
+    for kw, label in [("hindi","hindi"),("dual","dual"),("multi","multi"),
+                      ("english","english"),("japanese","japanese"),("sub","sub")]:
         if kw in ct:
             return label
 
@@ -111,7 +84,6 @@ def _detect_audio(link_el, context_text: str) -> str:
 
 
 def _find_wmq_links(element) -> list:
-    """Element mein WatchMultQuality links dhundo."""
     links = []
     ctx = element.get_text(" ", strip=True)
     for a in element.find_all("a", href=True):
@@ -120,12 +92,10 @@ def _find_wmq_links(element) -> list:
         if "watchmultquality" in text or "watchmultquality" in href.lower() or "multiquality" in text:
             audio = _detect_audio(a, ctx)
             links.append({"href": href, "audio": audio})
-            LOGGER.info(f"[RTI] WMQ link found — audio: {audio}")
     return links
 
 
-def _best_link(links: list) -> dict | None:
-    """Priority ke hisab se best link choose karo."""
+def _best_link(links: list):
     for priority in AUDIO_PRIORITY:
         for lnk in links:
             if lnk["audio"] == priority:
@@ -133,26 +103,59 @@ def _best_link(links: list) -> dict | None:
     return links[0] if links else None
 
 
-def get_watchmult_link(page_url: str, episode_num: int) -> tuple[str | None, str | None]:
+# ─────────────────────────────────────────────
+#  NEW: Latest episode number nikalo
+# ─────────────────────────────────────────────
+def get_latest_episode(page_url: str):
     """
-    Page URL aur episode number se WatchMultQuality link nikalo.
-    Returns: (watchmult_href, anime_title)
+    Page ke sabse latest (highest number) episode detect karo.
+    Returns: (latest_ep_num, anime_title) or (None, None)
     """
     try:
         r = requests.get(page_url, headers=HEADERS, timeout=15)
         r.raise_for_status()
         soup = BeautifulSoup(r.content, "html.parser")
 
-        # Anime title
         title_tag = soup.find("h1", class_="entry-title")
         anime_title = title_tag.text.strip() if title_tag else "Unknown Anime"
 
-        # Episode paragraphs scan karo
+        # Saare episode numbers collect karo
+        ep_numbers = []
+        for p in soup.find_all("p"):
+            text = p.get_text(" ", strip=True)
+            match = re.search(r"Episode\s*(\d+)", text, re.IGNORECASE)
+            if match:
+                ep_numbers.append(int(match.group(1)))
+
+        if not ep_numbers:
+            LOGGER.warning("[RTI] No episodes found on page")
+            return None, None
+
+        latest = max(ep_numbers)
+        LOGGER.info(f"[RTI] Latest episode detected: {latest}")
+        return latest, anime_title
+
+    except Exception as e:
+        LOGGER.error(f"[RTI] get_latest_episode error: {e}")
+        return None, None
+
+
+# ─────────────────────────────────────────────
+#  Step 1: Page → WatchMultQuality link
+# ─────────────────────────────────────────────
+def get_watchmult_link(page_url: str, episode_num: int):
+    try:
+        r = requests.get(page_url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.content, "html.parser")
+
+        title_tag = soup.find("h1", class_="entry-title")
+        anime_title = title_tag.text.strip() if title_tag else "Unknown Anime"
+
         for p in soup.find_all("p"):
             text = p.get_text(" ", strip=True)
             match = re.search(r"Episode\s*(\d+)", text, re.IGNORECASE)
             if match and int(match.group(1)) == episode_num:
-                # Is episode ke links collect karo (next 8 siblings tak)
                 all_links = list(_find_wmq_links(p))
                 for idx, sibling in enumerate(p.find_next_siblings()):
                     if idx > 8:
@@ -165,22 +168,18 @@ def get_watchmult_link(page_url: str, episode_num: int) -> tuple[str | None, str
 
                 best = _best_link(all_links)
                 if best:
-                    LOGGER.info(f"[RTI] Ep {episode_num}: selected audio={best['audio']}")
                     return best["href"], anime_title
 
-        LOGGER.warning(f"[RTI] Episode {episode_num} not found on page")
         return None, None
-
     except Exception as e:
         LOGGER.error(f"[RTI] Page scrape error: {e}")
         return None, None
 
 
 # ─────────────────────────────────────────────
-#  Step 2: WatchMultQuality → argon iframe link
+#  Step 2: WatchMultQuality -> Argon embed link
 # ─────────────────────────────────────────────
 def _make_selenium_driver():
-    """Headless Chrome driver banao."""
     options = webdriver.ChromeOptions()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -189,7 +188,7 @@ def _make_selenium_driver():
     options.add_argument("--window-size=1920,1080")
     options.add_argument(f"user-agent={HEADERS['User-Agent']}")
     options.add_experimental_option("prefs", {
-        "profile.managed_default_content_settings.images": 2  # Images disable
+        "profile.managed_default_content_settings.images": 2
     })
     options.page_load_strategy = "eager"
     driver = webdriver.Chrome(options=options)
@@ -197,45 +196,31 @@ def _make_selenium_driver():
     return driver
 
 
-def _extract_argon_from_iframes(driver) -> str | None:
-    """
-    Page ke iframes inspect karo aur argon.razorshell.space/embed wala src nikalo.
-    """
+def _extract_argon_from_iframes(driver):
     try:
         soup = BeautifulSoup(driver.page_source, "html.parser")
-        # Direct iframe tags check
         for iframe in soup.find_all("iframe"):
             src = iframe.get("src", "")
             if ARGON_DOMAIN in src:
-                LOGGER.info(f"[RTI] Argon iframe found: {src}")
                 return src
 
-        # JavaScript mein embedded src check
-        page_src = driver.page_source
         matches = re.findall(
             r'https?://argon\.razorshell\.space/embed/[A-Za-z0-9_-]+',
-            page_src
+            driver.page_source
         )
         if matches:
-            LOGGER.info(f"[RTI] Argon link from JS: {matches[0]}")
             return matches[0]
 
-        # Selenium se iframes directly check karo
-        iframes = driver.find_elements(By.TAG_NAME, "iframe")
-        for iframe in iframes:
+        for iframe in driver.find_elements(By.TAG_NAME, "iframe"):
             src = iframe.get_attribute("src") or ""
             if ARGON_DOMAIN in src:
-                LOGGER.info(f"[RTI] Argon iframe (selenium): {src}")
                 return src
-
     except Exception as e:
         LOGGER.error(f"[RTI] Argon extract error: {e}")
-
     return None
 
 
 def _close_popups(driver, main_window):
-    """Extra popup windows band karo."""
     try:
         if len(driver.window_handles) > 1:
             for handle in driver.window_handles:
@@ -247,26 +232,20 @@ def _close_popups(driver, main_window):
         pass
 
 
-def get_argon_link(watchmult_url: str) -> str | None:
-    """
-    WatchMultQuality URL open karo → argon embed link nikalo.
-    """
+def get_argon_link(watchmult_url: str):
     driver = None
     try:
         driver = _make_selenium_driver()
-        LOGGER.info(f"[RTI] Opening WMQ: {watchmult_url}")
         driver.get(watchmult_url)
         main = driver.current_window_handle
         time.sleep(5)
         driver.execute_script("window.stop();")
         _close_popups(driver, main)
 
-        # Pehle normal page check karo
         argon = _extract_argon_from_iframes(driver)
         if argon:
             return argon
 
-        # Agar page mein redirect button ho to click karo
         try:
             wait = WebDriverWait(driver, 10)
             for btn_text in ["Get Download Link", "Download", "Get Link", "Click Here"]:
@@ -286,9 +265,7 @@ def get_argon_link(watchmult_url: str) -> str | None:
         except Exception:
             pass
 
-        LOGGER.warning("[RTI] Argon link not found in WMQ page")
         return None
-
     except Exception as e:
         LOGGER.error(f"[RTI] get_argon_link error: {e}")
         return None
@@ -301,118 +278,96 @@ def get_argon_link(watchmult_url: str) -> str | None:
 
 
 # ─────────────────────────────────────────────
-#  Step 3: Argon link → Swift link
+#  Step 3: Argon -> Swift URL
 # ─────────────────────────────────────────────
-def argon_to_swift(argon_url: str) -> str | None:
-    """
-    argon.razorshell.space/embed/UNIQUECODE  →  swift.multiquality.click/downlead/UNIQUECODE
-    
-    Unique code = URL ke last segment mein jo hai
-    Example:
-      https://argon.razorshell.space/embed/7FFijEtn3e9zJMU
-      →  https://swift.multiquality.click/downlead/7FFijEtn3e9zJMU
-    """
+def argon_to_swift(argon_url: str):
     try:
-        # Last non-empty segment extract karo
         parts = [p for p in argon_url.rstrip("/").split("/") if p]
         unique_code = parts[-1]
-
         if len(unique_code) < 5:
-            LOGGER.warning(f"[RTI] Unique code too short: {unique_code}")
             return None
-
-        swift_url = SWIFT_BASE + unique_code
-        LOGGER.info(f"[RTI] Swift URL: {swift_url}")
-        return swift_url
-
+        return SWIFT_BASE + unique_code
     except Exception as e:
         LOGGER.error(f"[RTI] argon_to_swift error: {e}")
         return None
 
 
 # ─────────────────────────────────────────────
-#  Step 4: Full episode pipeline
+#  Step 4: Download + Sequential upload
 # ─────────────────────────────────────────────
-async def _process_rti_episode(
-    client, message: Message,
-    page_url: str, episode_num: int
-) -> bool:
-    """
-    Ek episode ka poora RTI flow:
-    1. WatchMultQuality link nikalo
-    2. Argon embed link nikalo
-    3. Swift link banao
-    4. /swift command ki tarah download + upload karo
-    """
-    from .swift_downloader import _run_swift  # Existing swift logic reuse
-
-    # Status message
-    status = await message.reply(
-        f"🎌 **RTI — Episode {episode_num}**\n\n"
-        f"🔍 Step 1/3: WatchMultQuality link dhundh raha hoon..."
+async def _run_rti_swift(client, message: Message, swift_url: str, status_msg, ep_num: int, total_eps: int):
+    from .swift_downloader import (
+        _scrape_and_download, _sort_by_size,
+        _quality_from, _upload_one_file
     )
+    import os, shutil
 
-    # Step 1: WMQ link
+    session_id = str(int(time.time()))
+    dl_dir = os.path.join(download_dir, f"rti_{session_id}")
+    os.makedirs(dl_dir, exist_ok=True)
+
+    try:
+        await status_msg.edit(f"⬇️ **Ep {ep_num}/{total_eps}** — Downloading...")
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, _scrape_and_download, swift_url, dl_dir)
+
+        if result.get("error") and not result.get("files"):
+            await status_msg.edit(f"❌ **Ep {ep_num}** — Download failed: `{result['error']}`")
+            return False
+
+        files = result.get("files", [])
+        if not files:
+            await status_msg.edit(f"❌ **Ep {ep_num}** — Koi file nahi mili.")
+            return False
+
+        files = _sort_by_size(files)
+
+        for i, filepath in enumerate(files, 1):
+            quality = _quality_from(os.path.basename(filepath))
+            await status_msg.edit(
+                f"📤 **Ep {ep_num}/{total_eps}** — Uploading `{quality}` ({i}/{len(files)})"
+            )
+            await _upload_one_file(client, message, status_msg, filepath, dl_dir, encode=False)
+            await asyncio.sleep(2)
+
+        return True
+
+    except Exception as e:
+        LOGGER.error(f"[RTI] _run_rti_swift error: {e}")
+        await status_msg.edit(f"❌ **Ep {ep_num}** — Error: `{str(e)[:100]}`")
+        return False
+    finally:
+        try:
+            shutil.rmtree(dl_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────
+#  Single episode pipeline
+# ─────────────────────────────────────────────
+async def _process_episode(client, message, page_url, episode_num, total_episodes, status_msg):
     loop = asyncio.get_event_loop()
-    wmq_link, anime_title = await loop.run_in_executor(
-        None, get_watchmult_link, page_url, episode_num
-    )
 
+    await status_msg.edit(f"🔍 **Ep {episode_num}/{total_episodes}** — Link dhundh raha hoon...")
+    wmq_link, _ = await loop.run_in_executor(None, get_watchmult_link, page_url, episode_num)
     if not wmq_link:
-        await status.edit(
-            f"❌ **RTI Failed — Episode {episode_num}**\n\n"
-            f"WatchMultQuality link nahi mila!\n"
-            f"Check karo ki episode page pe hai ya nahi."
-        )
+        await status_msg.edit(f"❌ **Ep {episode_num}** — WatchMultQuality link nahi mila.")
         return False
 
-    await status.edit(
-        f"🎌 **RTI — Episode {episode_num}**\n\n"
-        f"✅ WMQ link mila!\n"
-        f"🔍 Step 2/3: Argon iframe extract ho raha hai...\n\n"
-        f"🔗 `{wmq_link[:60]}...`"
-    )
-
-    # Step 2: Argon link (blocking selenium, run in executor)
+    await status_msg.edit(f"🔍 **Ep {episode_num}/{total_episodes}** — Argon link extract ho raha hai...")
     argon_link = await loop.run_in_executor(None, get_argon_link, wmq_link)
-
     if not argon_link:
-        await status.edit(
-            f"❌ **RTI Failed — Episode {episode_num}**\n\n"
-            f"Argon embed link nahi mila!\n"
-            f"WMQ page pe iframe load nahi hua."
-        )
+        await status_msg.edit(f"❌ **Ep {episode_num}** — Argon iframe nahi mila.")
         return False
 
-    await status.edit(
-        f"🎌 **RTI — Episode {episode_num}**\n\n"
-        f"✅ Argon link mila!\n"
-        f"🔍 Step 3/3: Swift link convert ho raha hai...\n\n"
-        f"🔗 `{argon_link}`"
-    )
-
-    # Step 3: Swift URL
     swift_url = argon_to_swift(argon_link)
-
     if not swift_url:
-        await status.edit(
-            f"❌ **RTI Failed — Episode {episode_num}**\n\n"
-            f"Argon se Swift conversion fail!\n"
-            f"Argon URL: `{argon_link}`"
-        )
+        await status_msg.edit(f"❌ **Ep {episode_num}** — Swift URL fail.")
         return False
 
-    await status.edit(
-        f"🎌 **RTI — Episode {episode_num}**\n\n"
-        f"✅ Swift link ready!\n"
-        f"📺 Anime: `{anime_title}`\n\n"
-        f"⬇️ Download + Upload start ho raha hai...\n\n"
-        f"🔗 `{swift_url}`"
-    )
-
-    # Step 4: Swift download + upload (existing logic reuse)
-    await _run_swift(client, message, swift_url, encode=False)
-    return True
+    return await _run_rti_swift(client, message, swift_url, status_msg, ep_num=episode_num, total_eps=total_episodes)
 
 
 # ─────────────────────────────────────────────
@@ -421,85 +376,124 @@ async def _process_rti_episode(
 @Client.on_message(filters.command("rti"))
 async def rti_command(client: Client, message: Message):
     """
-    Usage: /rti <url> <ep1> [ep2] [ep3] ...
-    
-    Example:
-      /rti https://rareanimes.buzz/wistoria-wand-and-sword-season-2/ 01 02
-      /rti https://rareanimes.buzz/some-anime/ 5 6 7
+    /rti <url>               -> Latest episode auto-download
+    /rti <url> <start> <end> -> Episode range
+    /rti <url> 5 5           -> Sirf episode 5
     """
     c = await check_chat(message, chat="Sudo")
     if not c:
         return
 
     if not SELENIUM_OK:
-        await message.reply(
-            "❌ Selenium install nahi hai!\n"
-            "`pip install selenium`\n"
-            "`apt-get install -y chromium chromium-driver`"
-        )
+        await message.reply("❌ Selenium install nahi hai! `pip install selenium`")
         return
 
-    # Parse command
     parts = message.text.split()
-    # /rti <url> <ep1> [ep2] ...
-    if len(parts) < 3:
+
+    # Minimum: /rti <url>
+    if len(parts) < 2:
         await message.reply(
-            "⚠️ **RTI Downloader — Usage:**\n\n"
-            "`/rti <url> <episode_numbers...>`\n\n"
-            "**Example:**\n"
-            "`/rti https://rareanimes.buzz/wistoria-wand-and-sword-season-2/ 01 02`\n"
-            "`/rti https://rareanimes.buzz/some-anime/ 5 6 7 8`\n\n"
-            "**Flow:**\n"
-            "1. Page se WatchMultQuality link nikalta hai\n"
-            "2. Argon iframe link extract karta hai\n"
-            "3. Swift link banata hai\n"
-            "4. Download + Upload karta hai 🎉"
+            "**Usage:**\n"
+            "`/rti <url>` — Latest episode auto-download\n"
+            "`/rti <url> <start> <end>` — Episode range\n\n"
+            "**Examples:**\n"
+            "`/rti https://rareanimes.buzz/wistoria/` — Latest\n"
+            "`/rti https://rareanimes.buzz/wistoria/ 01 10` — Ep 1 to 10\n"
+            "`/rti https://rareanimes.buzz/wistoria/ 5 5` — Sirf Ep 5"
         )
         return
 
     page_url = parts[1].strip()
 
-    # Episode numbers parse karo
-    episode_nums = []
-    for ep_str in parts[2:]:
-        try:
-            episode_nums.append(int(ep_str))
-        except ValueError:
-            await message.reply(f"❌ Invalid episode number: `{ep_str}`")
-            return
-
     if not page_url.startswith("http"):
-        await message.reply("❌ Valid URL dalo (http/https se shuru hona chahiye)")
+        await message.reply("❌ Valid URL dalo.")
         return
 
-    # Start processing
-    await message.reply(
-        f"🎌 **RTI Downloader Started!**\n\n"
-        f"🌐 URL: `{page_url[:60]}...`\n"
-        f"🎬 Episodes: `{', '.join(str(e) for e in episode_nums)}`\n"
-        f"📊 Total: `{len(episode_nums)}`\n\n"
-        f"⏳ Processing..."
+    # ── AUTO LATEST MODE: sirf URL diya, koi number nahi ──
+    if len(parts) == 2:
+        status_msg = await message.reply("🔍 Latest episode detect ho raha hai...")
+
+        loop = asyncio.get_event_loop()
+        latest_ep, anime_title = await loop.run_in_executor(None, get_latest_episode, page_url)
+
+        if not latest_ep:
+            await status_msg.edit("❌ Page se koi episode nahi mila. URL check karo.")
+            return
+
+        await status_msg.edit(
+            f"🎌 **RTI** — Latest Ep `{latest_ep}` detected\n"
+            f"📺 `{anime_title}`\n"
+            f"⏳ Starting..."
+        )
+
+        try:
+            success = await _process_episode(
+                client, message, page_url,
+                episode_num=latest_ep,
+                total_episodes=1,
+                status_msg=status_msg,
+            )
+        except Exception as e:
+            LOGGER.error(f"[RTI] Latest ep error: {e}")
+            await status_msg.edit(f"❌ Error: `{str(e)[:100]}`")
+            return
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        return
+
+    # ── RANGE MODE: /rti <url> <start> <end> ──
+    if len(parts) < 4:
+        await message.reply(
+            "❌ Range ke liye do numbers chahiye.\n"
+            "Example: `/rti <url> 1 10`"
+        )
+        return
+
+    try:
+        start_ep = int(parts[2])
+        end_ep   = int(parts[3])
+    except ValueError:
+        await message.reply("❌ Episode number valid nahi.\nExample: `/rti <url> 1 10`")
+        return
+
+    if start_ep > end_ep:
+        await message.reply("❌ Start > End nahi ho sakta.")
+        return
+
+    if end_ep - start_ep > 50:
+        await message.reply("❌ Max 50 episodes ek baar mein.")
+        return
+
+    total_eps    = end_ep - start_ep + 1
+    episode_list = list(range(start_ep, end_ep + 1))
+
+    status_msg = await message.reply(
+        f"🎌 **RTI** — Ep `{start_ep}` to `{end_ep}` (Total: `{total_eps}`)\n"
+        f"⏳ Starting..."
     )
 
     success_count = 0
-    for i, ep_num in enumerate(episode_nums, 1):
-        LOGGER.info(f"[RTI] Processing episode {ep_num} ({i}/{len(episode_nums)})")
-
+    for i, ep_num in enumerate(episode_list, 1):
         try:
-            success = await _process_rti_episode(client, message, page_url, ep_num)
+            success = await _process_episode(
+                client, message, page_url,
+                episode_num=ep_num,
+                total_episodes=total_eps,
+                status_msg=status_msg,
+            )
             if success:
                 success_count += 1
         except Exception as e:
-            LOGGER.error(f"[RTI] Episode {ep_num} error: {e}")
-            await message.reply(f"❌ Episode {ep_num} mein error: `{str(e)[:100]}`")
+            LOGGER.error(f"[RTI] Ep {ep_num} error: {e}")
+            await status_msg.edit(f"❌ Ep {ep_num} error: `{str(e)[:100]}`")
 
-        # Multiple episodes ke beech gap
-        if i < len(episode_nums):
-            await asyncio.sleep(5)
+        if i < total_eps:
+            await asyncio.sleep(3)
 
-    # Final summary
-    await message.reply(
-        f"🎉 **RTI Complete!**\n\n"
-        f"✅ Success: `{success_count}/{len(episode_nums)}`\n"
-        f"📊 Episodes: `{', '.join(str(e) for e in episode_nums)}`"
-    )
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
