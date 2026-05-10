@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 # ── Tunable constants ──────────────────────────────────────────────────────────
 # 2MB chunks — Telegram max allowed per part for non-premium (premium = 4MB)
 # Zyada = zyada data per TCP round-trip = faster
-_PART_SIZE = 2 * 1024 * 1024   # 2 MB
+_PART_SIZE = 512 * 1024   # 512 KB — Telegram default, bot + user dono ke liye safe
 
 
 async def save_file(
