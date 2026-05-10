@@ -1,24 +1,17 @@
 """
 save_restrict.py
 ================
-Save Restricted Content feature — Encode Bot ke liye.
+Save Restricted Content — Encode Bot ke liye.
+
+KEY FEATURE:
+  Download AND Upload DONO user account (string session) se hote hain.
+  Bot account sirf final message forward karta hai user ko.
+  Isliye speed MAXIMUM milti hai — user account ka bandwidth use hota hai.
 
 Commands:
-  /savelogin   — Apna Telegram account connect karo (restricted content save karne ke liye)
+  /savelogin   — Apna Telegram account connect karo
   /savelogout  — Session hatao
-  /saveget <link> — Kisi bhi restricted/private channel ka content save karo
-
-Flow:
-  1. User /savelogin karta hai → phone → OTP → password (agar 2FA ho)
-  2. Session string MongoDB mein save hoti hai (existing db use hoga)
-  3. /saveget <t.me/c/...> → user ke session se download → bot se upload
-
-NOTE:
-  - Bot ka session (BOT_TOKEN) sirf public channels ke liye use hota hai.
-  - Restricted content ke liye USER ka string session use hota hai.
-  - Isliye /savelogin zaroori hai restricted links ke liye.
-  - Apna khud ka session lagane se download/upload speed BADH JAEGI
-    kyunki user account ka bandwidth bot account se zyada hota hai.
+  /saveget <link> — Restricted/private channel ka content save karo
 """
 
 import asyncio
@@ -28,7 +21,6 @@ import time
 
 from pyrogram import Client, filters
 from pyrogram.errors import (
-    ApiIdInvalid,
     PhoneNumberInvalid,
     PhoneCodeInvalid,
     PhoneCodeExpired,
@@ -41,16 +33,17 @@ from pyrogram.types import (
     KeyboardButton,
     ReplyKeyboardRemove,
 )
+from pyrogram.enums import ParseMode
 
-from .. import LOGGER, download_dir, api_id, api_hash, app
+from .. import LOGGER, download_dir, api_id, api_hash, app, log
 from ..utils.database.access_db import db
 from ..utils.helper import check_chat
-from ..utils.uploads.telegram import upload_video, upload_doc
 from ..utils.encoding import get_duration, get_thumbnail, get_width_height
 from ..utils.display_progress import progress_for_pyrogram
 
+
 # ──────────────────────────────────────────────
-#  Login state tracker (in-memory)
+#  Login state (in-memory)
 # ──────────────────────────────────────────────
 LOGIN_STATE = {}
 
@@ -69,16 +62,14 @@ STEPS = {
 
 
 # ──────────────────────────────────────────────
-#  DB helpers — user_session field use karenge
+#  DB helpers
 # ──────────────────────────────────────────────
 async def _get_user_session(user_id: int):
-    """MongoDB se user ka saved session string laao."""
     user = await db._get_user(user_id)
     return user.get("user_session", None)
 
 
 async def _set_user_session(user_id: int, session_str):
-    """MongoDB mein user session string save karo."""
     await db.col.update_one(
         {"id": user_id},
         {"$set": {"user_session": session_str}},
@@ -87,7 +78,27 @@ async def _set_user_session(user_id: int, session_str):
 
 
 # ──────────────────────────────────────────────
-#  /savelogin — start
+#  User Client builder — max speed settings
+# ──────────────────────────────────────────────
+def _make_user_client(session_str: str) -> Client:
+    """
+    User account ka Client banao — upload/download dono ke liye.
+    max_concurrent_transmissions=20 → 20 parallel parts ek saath
+    """
+    return Client(
+        "sr_user",
+        session_string=session_str,
+        api_id=api_id,
+        api_hash=api_hash,
+        in_memory=True,
+        max_concurrent_transmissions=20,
+        workers=32,
+        sleep_threshold=60,
+    )
+
+
+# ──────────────────────────────────────────────
+#  /savelogin
 # ──────────────────────────────────────────────
 @Client.on_message(filters.command("savelogin"))
 async def savelogin_start(client: Client, message: Message):
@@ -97,15 +108,14 @@ async def savelogin_start(client: Client, message: Message):
     if existing:
         return await message.reply(
             "✅ **Tum pehle se logged in ho!**\n\n"
-            "Agar account change karna hai toh pehle `/savelogout` karo."
+            "Account change karne ke liye pehle `/savelogout` karo."
         )
 
     LOGIN_STATE[user_id] = {"step": "WAITING_PHONE", "data": {}}
-
     await message.reply(
         f"👋 **Save Restrict Login**\n\n"
         f"_{STEPS['WAITING_PHONE']}_\n\n"
-        "📞 Apna **Telegram phone number** bhejo (country code ke saath).\n\n"
+        "📞 Apna **phone number** bhejo (country code ke saath).\n"
         "`Example: +919876543210`\n\n"
         "❌ Cancel karne ke liye button dabaao.",
         reply_markup=cancel_kb,
@@ -131,12 +141,13 @@ async def savelogout(client: Client, message: Message):
     await _set_user_session(user_id, None)
     await message.reply(
         "🚪 **Logout ho gaya!**\n\n"
-        "Session clear kar diya. Dobara login ke liye `/savelogin` karo."
+        "Session clear. Dobara login ke liye `/savelogin` karo.",
+        reply_markup=remove_kb,
     )
 
 
 # ──────────────────────────────────────────────
-#  Cancel filter
+#  Login state filter
 # ──────────────────────────────────────────────
 async def _in_login(_, __, message):
     return message.from_user and message.from_user.id in LOGIN_STATE
@@ -145,7 +156,7 @@ login_filter = filters.create(_in_login)
 
 
 # ──────────────────────────────────────────────
-#  Login handler — phone → OTP → password
+#  Login flow handler
 # ──────────────────────────────────────────────
 @Client.on_message(
     filters.private & filters.text & login_filter
@@ -157,7 +168,6 @@ async def savelogin_handler(client: Client, message: Message):
     state = LOGIN_STATE[user_id]
     step = state["step"]
 
-    # Cancel check
     if text.lower() in ["❌ cancel", "/cancel"]:
         try:
             c = state.get("data", {}).get("client")
@@ -166,12 +176,9 @@ async def savelogin_handler(client: Client, message: Message):
         except Exception:
             pass
         LOGIN_STATE.pop(user_id, None)
-        return await message.reply(
-            "❌ **Login cancel kar diya.**",
-            reply_markup=remove_kb,
-        )
+        return await message.reply("❌ **Login cancel.**", reply_markup=remove_kb)
 
-    # ── Step 1: Phone Number ──
+    # ── Phone ──
     if step == "WAITING_PHONE":
         phone = text.replace(" ", "")
         tmp = Client(
@@ -194,45 +201,35 @@ async def savelogin_handler(client: Client, message: Message):
         except Exception as e:
             await tmp.disconnect()
             LOGIN_STATE.pop(user_id, None)
-            return await msg.edit(f"❌ **Error:** `{e}`\nDobara `/savelogin` karo.")
+            return await msg.edit(f"❌ **Error:** `{e}`")
 
-        state["data"] = {
-            "client": tmp,
-            "phone": phone,
-            "hash": code.phone_code_hash,
-        }
+        state["data"] = {"client": tmp, "phone": phone, "hash": code.phone_code_hash}
         state["step"] = "WAITING_CODE"
         await msg.edit(
             f"📩 **OTP bhej diya!**\n_{STEPS['WAITING_CODE']}_\n\n"
-            "Telegram app mein code dekho aur yahan bhejo.\n"
-            "`Example: 1 2 3 4 5` (spaces ke saath bhejo — auto-delete se bachne ke liye)",
+            "Code spaces ke saath bhejo:\n`1 2 3 4 5`",
             reply_markup=cancel_kb,
         )
 
-    # ── Step 2: OTP ──
+    # ── OTP ──
     elif step == "WAITING_CODE":
-        code = text.replace(" ", "")
+        code_val = text.replace(" ", "")
         tmp = state["data"]["client"]
-        phone = state["data"]["phone"]
-        ph_hash = state["data"]["hash"]
-
-        msg = await message.reply(
-            f"🔍 Verifying...\n_{STEPS['WAITING_CODE']}_"
-        )
+        msg = await message.reply(f"🔍 Verifying...\n_{STEPS['WAITING_CODE']}_")
         try:
-            await tmp.sign_in(phone, ph_hash, code)
+            await tmp.sign_in(state["data"]["phone"], state["data"]["hash"], code_val)
             await _finalize_login(msg, tmp, user_id)
         except PhoneCodeInvalid:
             await msg.edit("❌ **Wrong OTP!** Dobara try karo.")
         except PhoneCodeExpired:
             await tmp.disconnect()
             LOGIN_STATE.pop(user_id, None)
-            await msg.edit("⏰ **OTP expire ho gaya.** Dobara `/savelogin` karo.")
+            await msg.edit("⏰ **OTP expire.** Dobara `/savelogin` karo.")
         except SessionPasswordNeeded:
             state["step"] = "WAITING_PASS"
             await msg.edit(
-                f"🔐 **2-Step Verification on hai!**\n_{STEPS['WAITING_PASS']}_\n\n"
-                "Apna **account password** bhejo.",
+                f"🔐 **2-Step Verification!**\n_{STEPS['WAITING_PASS']}_\n\n"
+                "Account **password** bhejo.",
                 reply_markup=cancel_kb,
             )
         except Exception as e:
@@ -240,17 +237,15 @@ async def savelogin_handler(client: Client, message: Message):
             LOGIN_STATE.pop(user_id, None)
             await msg.edit(f"❌ **Error:** `{e}`")
 
-    # ── Step 3: Password ──
+    # ── Password ──
     elif step == "WAITING_PASS":
         tmp = state["data"]["client"]
-        msg = await message.reply(
-            f"🔑 Checking password...\n_{STEPS['WAITING_PASS']}_"
-        )
+        msg = await message.reply(f"🔑 Checking...\n_{STEPS['WAITING_PASS']}_")
         try:
             await tmp.check_password(password=text)
             await _finalize_login(msg, tmp, user_id)
         except PasswordHashInvalid:
-            await msg.edit("❌ **Wrong password!** Dobara try karo.")
+            await msg.edit("❌ **Wrong password!**")
         except Exception as e:
             await tmp.disconnect()
             LOGIN_STATE.pop(user_id, None)
@@ -266,16 +261,17 @@ async def _finalize_login(msg: Message, tmp_client, user_id: int):
         await msg.edit(
             "🎉 **Login Successful!**\n\n"
             "✅ Phone → ✅ OTP → ✅ Password\n\n"
-            "Ab tum `/saveget <link>` se restricted content save kar sakte ho! 🚀",
+            "Ab `/saveget <link>` se restricted content save karo!\n"
+            "⚡ **Download + Upload dono teri account se hoga — max speed!**",
             reply_markup=remove_kb,
         )
     except Exception as e:
         LOGIN_STATE.pop(user_id, None)
-        await msg.edit(f"❌ **Session save nahi hua:** `{e}`\nDobara `/savelogin` karo.")
+        await msg.edit(f"❌ **Session save nahi hua:** `{e}`")
 
 
 # ──────────────────────────────────────────────
-#  /saveget <link> — restricted content save
+#  /saveget — DOWNLOAD + UPLOAD via USER CLIENT
 # ──────────────────────────────────────────────
 @Client.on_message(filters.command("saveget"))
 async def saveget(client: Client, message: Message):
@@ -294,87 +290,74 @@ async def saveget(client: Client, message: Message):
 
     link = parts[1].strip()
     user_id = message.from_user.id
-
-    # Link parse karo
-    datas = link.split("/")
     is_private = "t.me/c/" in link
 
+    datas = link.split("/")
     try:
         msg_id = int(datas[-1].replace("?single", ""))
     except Exception:
-        return await message.reply("❌ **Invalid link format!**")
+        return await message.reply("❌ **Invalid link!**")
 
     # Session check
     user_session = await _get_user_session(user_id)
-    if user_session is None and is_private:
+    if not user_session and is_private:
         return await message.reply(
             "🔒 **Login required!**\n\n"
-            "Private/restricted channel ke liye pehle `/savelogin` karo."
+            "Private link ke liye `/savelogin` karo."
         )
 
-    status_msg = await message.reply("⏳ **Fetching content...**")
+    status_msg = await message.reply("⏳ **Fetching...**")
 
-    # User client banao (user session) ya bot client use karo
+    # ── User client connect karo ──
     if user_session:
         try:
-            user_client = Client(
-                "sr_download",
-                session_string=user_session,
-                api_id=api_id,
-                api_hash=api_hash,
-                in_memory=True,
-                max_concurrent_transmissions=10,
-            )
+            user_client = _make_user_client(user_session)
             await user_client.connect()
         except Exception as e:
             return await status_msg.edit(
-                f"❌ **Session expired ya invalid hai.**\n"
-                f"`{e}`\n\nDobara `/savelogin` karo."
+                f"❌ **Session invalid/expired.**\n`{e}`\n\nDobara `/savelogin` karo."
             )
-        fetch_client = user_client
     else:
-        fetch_client = client  # public link — bot client use karo
+        user_client = None
 
+    fetch_client = user_client if user_client else client
+
+    # ── Message fetch ──
     try:
-        if is_private:
-            chat_id = int("-100" + datas[4])
-        else:
-            chat_id = datas[3]  # username
-
+        chat_id = int("-100" + datas[4]) if is_private else datas[3]
         msg_obj = await fetch_client.get_messages(chat_id, msg_id)
     except Exception as e:
-        await status_msg.edit(f"❌ **Message fetch nahi hua:** `{e}`")
-        if user_session:
+        await status_msg.edit(f"❌ **Fetch failed:** `{e}`")
+        if user_client:
             await user_client.disconnect()
         return
 
     if msg_obj.empty:
-        if user_session:
+        if user_client:
             await user_client.disconnect()
-        return await status_msg.edit("❌ **Message empty ya deleted hai.**")
+        return await status_msg.edit("❌ **Message empty/deleted.**")
 
-    # File type detect
+    if msg_obj.text:
+        if user_client:
+            await user_client.disconnect()
+        return await client.send_message(message.chat.id, msg_obj.text)
+
     media = (
         msg_obj.document or msg_obj.video or msg_obj.audio
         or msg_obj.photo or msg_obj.voice or msg_obj.video_note
     )
-    if not media and not msg_obj.text:
-        if user_session:
+    if not media:
+        if user_client:
             await user_client.disconnect()
-        return await status_msg.edit("❌ **Unsupported content type.**")
+        return await status_msg.edit("❌ **Unsupported content.**")
 
-    if msg_obj.text:
-        if user_session:
-            await user_client.disconnect()
-        return await client.send_message(message.chat.id, msg_obj.text)
-
-    # Download
+    # ── Download via USER client ──
     session_id = str(int(time.time()))
-    dl_dir = os.path.join(download_dir, f"saverestrict_{session_id}")
+    dl_dir = os.path.join(download_dir, f"sr_{session_id}")
     os.makedirs(dl_dir, exist_ok=True)
 
-    await status_msg.edit("⬇️ **Downloading...**")
     c_time = time.time()
+    await status_msg.edit("⬇️ **Downloading...**")
 
     try:
         file_path = await fetch_client.download_media(
@@ -385,57 +368,106 @@ async def saveget(client: Client, message: Message):
         )
     except Exception as e:
         shutil.rmtree(dl_dir, ignore_errors=True)
-        if user_session:
+        if user_client:
             await user_client.disconnect()
         return await status_msg.edit(f"❌ **Download failed:** `{e}`")
 
-    if user_session:
-        try:
-            await user_client.disconnect()
-        except Exception:
-            pass
-
     if not file_path or not os.path.exists(file_path):
         shutil.rmtree(dl_dir, ignore_errors=True)
-        return await status_msg.edit("❌ **File download nahi hua.**")
+        if user_client:
+            await user_client.disconnect()
+        return await status_msg.edit("❌ **File nahi mili.**")
 
-    # Upload
-    await status_msg.edit("📤 **Uploading...**")
+    # ── Upload via USER client ──
+    # User client → bot ke chat mein seedha send karega
+    # Ye MAXIMUM speed dega kyunki user account bandwidth use hoga
     fname = os.path.basename(file_path)
+    caption = str(msg_obj.caption or fname)
     c_time = time.time()
 
+    await status_msg.edit("📤 **Uploading...**")
+
     try:
+        resp = None
+
         if msg_obj.video:
             duration = get_duration(file_path)
             thumb = get_thumbnail(file_path, dl_dir, duration / 4 if duration else 0)
             width, height = get_width_height(file_path)
-            caption = msg_obj.caption or fname
-            await upload_video(
-                message, status_msg, file_path, caption,
-                c_time, thumb, duration, width, height,
+
+            resp = await fetch_client.send_video(
+                chat_id=message.chat.id,
+                video=file_path,
+                caption=f"<b>{caption}</b>",
+                duration=duration,
+                width=width,
+                height=height,
+                thumb=thumb,
+                supports_streaming=True,
                 file_name=fname,
+                parse_mode=ParseMode.HTML,
+                progress=progress_for_pyrogram,
+                progress_args=("📤 Uploading...", status_msg, c_time),
             )
-        elif msg_obj.document or msg_obj.audio:
-            caption = msg_obj.caption or fname
-            await upload_doc(message, status_msg, c_time, fname, file_path)
-        elif msg_obj.photo:
-            caption = msg_obj.caption or ""
-            await client.send_photo(
-                message.chat.id,
-                photo=file_path,
-                caption=caption,
-                reply_to_message_id=message.id,
-            )
-        else:
-            await client.send_document(
-                message.chat.id,
+
+        elif msg_obj.document:
+            resp = await fetch_client.send_document(
+                chat_id=message.chat.id,
                 document=file_path,
-                caption=msg_obj.caption or fname,
-                reply_to_message_id=message.id,
+                caption=f"<b>{caption}</b>",
+                file_name=fname,
+                parse_mode=ParseMode.HTML,
+                progress=progress_for_pyrogram,
+                progress_args=("📤 Uploading...", status_msg, c_time),
             )
+
+        elif msg_obj.audio:
+            resp = await fetch_client.send_audio(
+                chat_id=message.chat.id,
+                audio=file_path,
+                caption=f"<b>{caption}</b>",
+                parse_mode=ParseMode.HTML,
+                progress=progress_for_pyrogram,
+                progress_args=("📤 Uploading...", status_msg, c_time),
+            )
+
+        elif msg_obj.photo:
+            resp = await fetch_client.send_photo(
+                chat_id=message.chat.id,
+                photo=file_path,
+                caption=f"<b>{caption}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        else:
+            resp = await fetch_client.send_document(
+                chat_id=message.chat.id,
+                document=file_path,
+                caption=f"<b>{caption}</b>",
+                parse_mode=ParseMode.HTML,
+                progress=progress_for_pyrogram,
+                progress_args=("📤 Uploading...", status_msg, c_time),
+            )
+
+        # Log channel mein bhi bhejo (bot se)
+        if resp:
+            try:
+                if msg_obj.video and resp.video:
+                    await app.send_video(log, resp.video.file_id, caption=caption, parse_mode=ParseMode.HTML)
+                elif (msg_obj.document) and resp.document:
+                    await app.send_document(log, resp.document.file_id, caption=caption, parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+
     except Exception as e:
         await status_msg.edit(f"❌ **Upload failed:** `{e}`")
     finally:
+        # Cleanup
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
         shutil.rmtree(dl_dir, ignore_errors=True)
         try:
             await status_msg.delete()

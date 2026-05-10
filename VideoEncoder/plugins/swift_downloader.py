@@ -24,7 +24,7 @@ from bs4 import BeautifulSoup
 
 from .. import LOGGER, download_dir, app
 from ..utils.helper import check_chat
-from ..utils.uploads.telegram import upload_video
+from ..utils.uploads.telegram import upload_video, _make_uploader_client
 from ..utils.encoding import get_duration, get_thumbnail, get_width_height
 from ..utils.auto_caption import build_auto_caption
 from ..utils.database.access_db import db
@@ -558,12 +558,21 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
         # Telegram isi se external player mein naam dikhata hai
         disk_fname = os.path.basename(filepath)
 
-        await upload_video(
-            message, msg, filepath, caption,
-            c_time, thumb, duration, width, height,
-            file_name=disk_fname,
-            cover=cover
-        )
+        uc = await _make_uploader_client(message.from_user.id)
+        try:
+            await upload_video(
+                message, msg, filepath, caption,
+                c_time, thumb, duration, width, height,
+                file_name=disk_fname,
+                cover=cover,
+                uploader_client=uc,
+            )
+        finally:
+            if uc:
+                try:
+                    await uc.disconnect()
+                except Exception:
+                    pass
 
         # Thumb cleanup — custom thumb rakho (db mein hai), auto-generated hatao
         if not custom_thumb_used and thumb and os.path.isfile(thumb):
