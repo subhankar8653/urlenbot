@@ -4,6 +4,7 @@ import time
 
 from pyrogram import Client
 from pyrogram.enums import ParseMode
+from pyrogram.errors import ChannelInvalid, ChannelPrivate, ChatIdInvalid, PeerIdInvalid
 from ... import app, download_dir, log, api_id, api_hash
 from ..database.access_db import db
 from ..auto_caption import smart_caption
@@ -15,16 +16,11 @@ from ..encoding import get_duration, get_thumbnail, get_width_height
 #  User session DB helpers
 # ─────────────────────────────────────────────
 async def _get_user_session(user_id: int):
-    """save_restrict mein jo session save hua tha woh laao"""
     user = await db._get_user(user_id)
     return user.get("user_session", None)
 
 
 async def _make_uploader_client(user_id: int):
-    """
-    User ka saved session hai toh uska Client banao — nahi hai toh None.
-    Caller ko connect() aur disconnect() khud karna hoga.
-    """
     session_str = await _get_user_session(user_id)
     if not session_str:
         return None
@@ -43,6 +39,75 @@ async def _make_uploader_client(user_id: int):
         return uc
     except Exception:
         return None
+
+
+# ─────────────────────────────────────────────
+#  User client se upload karo — 
+#  Strategy: user client se "Saved Messages" mein
+#  upload karo (always works), phir bot se
+#  us file_id ko group mein forward karo.
+#  Isse user bandwidth use hoti hai (fast upload)
+#  aur CHANNEL_INVALID error bhi nahi aata.
+# ─────────────────────────────────────────────
+async def _upload_via_user_then_forward(
+    uc, message, msg, new_file, send_kwargs, media_type="video"
+):
+    """
+    1. User client se apne Saved Messages (self) mein upload karo
+    2. Bot se woh message group mein forward karo
+    3. Saved Messages wala message delete karo (cleanup)
+    """
+    try:
+        # Step 1: User ke "me" (Saved Messages) mein upload
+        if media_type == "video":
+            saved = await uc.send_video(
+                chat_id="me",
+                video=new_file,
+                **{k: v for k, v in send_kwargs.items()
+                   if k not in ("reply_to_message_id",)},
+            )
+        else:
+            saved = await uc.send_document(
+                chat_id="me",
+                document=new_file,
+                **{k: v for k, v in send_kwargs.items()
+                   if k not in ("reply_to_message_id",)},
+            )
+
+        # Step 2: Bot se group mein forward karo (file_id se — instant, no bandwidth)
+        if media_type == "video" and saved.video:
+            resp = await app.send_video(
+                chat_id=message.chat.id,
+                video=saved.video.file_id,
+                caption=send_kwargs.get("caption", ""),
+                duration=send_kwargs.get("duration"),
+                width=send_kwargs.get("width"),
+                height=send_kwargs.get("height"),
+                thumb=send_kwargs.get("thumb"),
+                supports_streaming=True,
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=message.id,
+            )
+        else:
+            resp = await app.send_document(
+                chat_id=message.chat.id,
+                document=saved.document.file_id,
+                caption=send_kwargs.get("caption", ""),
+                file_name=send_kwargs.get("file_name"),
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=message.id,
+            )
+
+        # Step 3: Saved Messages se delete karo
+        try:
+            await uc.delete_messages("me", saved.id)
+        except Exception:
+            pass
+
+        return resp
+
+    except Exception as e:
+        raise e
 
 
 # ─────────────────────────────────────────────
@@ -98,7 +163,7 @@ _patch_chunk_size()
 
 
 # ─────────────────────────────────────────────
-#  upload_to_tg — encode/mega/swift ke baad call
+#  upload_to_tg
 # ─────────────────────────────────────────────
 async def upload_to_tg(new_file, message, msg, resolution='480'):
     c_time = time.time()
@@ -131,7 +196,6 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
 
     width, height = get_width_height(new_file)
 
-    # ── User client banao — milta hai toh usse upload hoga ──
     uc = await _make_uploader_client(message.from_user.id)
 
     try:
@@ -147,7 +211,6 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
                 uploader_client=uc
             )
     finally:
-        # User client disconnect
         if uc:
             try:
                 await uc.disconnect()
@@ -165,8 +228,6 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
 
 # ─────────────────────────────────────────────
 #  upload_video
-#  uploader_client = user account client (fast)
-#                  = None means bot (fallback)
 # ─────────────────────────────────────────────
 async def upload_video(message, msg, new_file, caption, c_time, thumb,
                        duration, width, height, file_name=None, cover=None,
@@ -187,16 +248,20 @@ async def upload_video(message, msg, new_file, caption, c_time, thumb,
     if cover:
         send_kwargs['cover'] = cover
 
+    resp = None
+
     if uploader_client:
-        # ── User account se upload — FAST ──
-        resp = await uploader_client.send_video(
-            chat_id=message.chat.id,
-            video=new_file,
-            reply_to_message_id=message.id,
-            **send_kwargs,
-        )
-    else:
-        # ── Fallback: bot se upload ──
+        try:
+            # User se "Saved Messages" mein upload → bot se group mein forward
+            resp = await _upload_via_user_then_forward(
+                uploader_client, message, msg, new_file, send_kwargs, media_type="video"
+            )
+        except Exception as e:
+            # Koi bhi error aaye — bot se fallback
+            resp = None
+
+    if resp is None:
+        # Bot fallback
         resp = await message.reply_video(new_file, **send_kwargs)
 
     if resp:
@@ -207,7 +272,6 @@ async def upload_video(message, msg, new_file, caption, c_time, thumb,
         )
         if cover:
             log_kwargs['cover'] = cover
-        # Log channel mein file_id se bhejo — bandwidth zero
         try:
             await app.send_video(log, resp.video.file_id, **log_kwargs)
         except Exception:
@@ -230,16 +294,18 @@ async def upload_doc(message, msg, c_time, caption, new_file, file_name=None,
         progress_args=("📤 Uploading...", msg, c_time),
     )
 
+    resp = None
+
     if uploader_client:
-        # ── User account se upload — FAST ──
-        resp = await uploader_client.send_document(
-            chat_id=message.chat.id,
-            document=new_file,
-            reply_to_message_id=message.id,
-            **send_kwargs,
-        )
-    else:
-        # ── Fallback: bot se upload ──
+        try:
+            resp = await _upload_via_user_then_forward(
+                uploader_client, message, msg, new_file, send_kwargs, media_type="doc"
+            )
+        except Exception:
+            resp = None
+
+    if resp is None:
+        # Bot fallback
         resp = await message.reply_document(new_file, **send_kwargs)
 
     if resp:
