@@ -378,14 +378,11 @@ async def saveget(client: Client, message: Message):
             await user_client.disconnect()
         return await status_msg.edit("❌ **File nahi mili.**")
 
-    # ── Upload directly to user chat ──
+    # ── Upload via BOT (user client sirf download ke liye tha) ──
     fname = os.path.basename(file_path)
     caption = str(msg_obj.caption or fname)
     bold_caption = f"<b>{caption}</b>"
     c_time = time.time()
-
-    # fetch_client = user client (agar session hai), warna bot client
-    uploader = fetch_client if fetch_client else app
 
     await status_msg.edit("📤 **Uploading...**")
 
@@ -395,7 +392,7 @@ async def saveget(client: Client, message: Message):
             thumb = get_thumbnail(file_path, dl_dir, duration / 4 if duration else 0)
             width, height = get_width_height(file_path)
 
-            await uploader.send_video(
+            await app.send_video(
                 chat_id=message.chat.id,
                 video=file_path,
                 caption=bold_caption,
@@ -411,7 +408,7 @@ async def saveget(client: Client, message: Message):
             )
 
         elif msg_obj.document:
-            await uploader.send_document(
+            await app.send_document(
                 chat_id=message.chat.id,
                 document=file_path,
                 caption=bold_caption,
@@ -422,7 +419,7 @@ async def saveget(client: Client, message: Message):
             )
 
         elif msg_obj.audio:
-            await uploader.send_audio(
+            await app.send_audio(
                 chat_id=message.chat.id,
                 audio=file_path,
                 caption=bold_caption,
@@ -432,7 +429,7 @@ async def saveget(client: Client, message: Message):
             )
 
         elif msg_obj.photo:
-            await uploader.send_photo(
+            await app.send_photo(
                 chat_id=message.chat.id,
                 photo=file_path,
                 caption=bold_caption,
@@ -440,7 +437,7 @@ async def saveget(client: Client, message: Message):
             )
 
         else:
-            await uploader.send_document(
+            await app.send_document(
                 chat_id=message.chat.id,
                 document=file_path,
                 caption=bold_caption,
