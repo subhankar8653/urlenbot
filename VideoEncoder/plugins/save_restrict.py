@@ -378,27 +378,27 @@ async def saveget(client: Client, message: Message):
             await user_client.disconnect()
         return await status_msg.edit("❌ **File nahi mili.**")
 
-    # ── Upload via USER client ──
-    # User client → bot ke chat mein seedha send karega
-    # Ye MAXIMUM speed dega kyunki user account bandwidth use hoga
+    # ── Upload directly to user chat ──
     fname = os.path.basename(file_path)
     caption = str(msg_obj.caption or fname)
+    bold_caption = f"<b>{caption}</b>"
     c_time = time.time()
+
+    # fetch_client = user client (agar session hai), warna bot client
+    uploader = fetch_client if fetch_client else app
 
     await status_msg.edit("📤 **Uploading...**")
 
     try:
-        resp = None
-
         if msg_obj.video:
             duration = get_duration(file_path)
             thumb = get_thumbnail(file_path, dl_dir, duration / 4 if duration else 0)
             width, height = get_width_height(file_path)
 
-            resp = await fetch_client.send_video(
+            await uploader.send_video(
                 chat_id=message.chat.id,
                 video=file_path,
-                caption=f"<b>{caption}</b>",
+                caption=bold_caption,
                 duration=duration,
                 width=width,
                 height=height,
@@ -411,10 +411,10 @@ async def saveget(client: Client, message: Message):
             )
 
         elif msg_obj.document:
-            resp = await fetch_client.send_document(
+            await uploader.send_document(
                 chat_id=message.chat.id,
                 document=file_path,
-                caption=f"<b>{caption}</b>",
+                caption=bold_caption,
                 file_name=fname,
                 parse_mode=ParseMode.HTML,
                 progress=progress_for_pyrogram,
@@ -422,42 +422,32 @@ async def saveget(client: Client, message: Message):
             )
 
         elif msg_obj.audio:
-            resp = await fetch_client.send_audio(
+            await uploader.send_audio(
                 chat_id=message.chat.id,
                 audio=file_path,
-                caption=f"<b>{caption}</b>",
+                caption=bold_caption,
                 parse_mode=ParseMode.HTML,
                 progress=progress_for_pyrogram,
                 progress_args=("📤 Uploading...", status_msg, c_time),
             )
 
         elif msg_obj.photo:
-            resp = await fetch_client.send_photo(
+            await uploader.send_photo(
                 chat_id=message.chat.id,
                 photo=file_path,
-                caption=f"<b>{caption}</b>",
+                caption=bold_caption,
                 parse_mode=ParseMode.HTML,
             )
 
         else:
-            resp = await fetch_client.send_document(
+            await uploader.send_document(
                 chat_id=message.chat.id,
                 document=file_path,
-                caption=f"<b>{caption}</b>",
+                caption=bold_caption,
                 parse_mode=ParseMode.HTML,
                 progress=progress_for_pyrogram,
                 progress_args=("📤 Uploading...", status_msg, c_time),
             )
-
-        # Log channel mein bhi bhejo (bot se)
-        if resp:
-            try:
-                if msg_obj.video and resp.video:
-                    await app.send_video(log, resp.video.file_id, caption=caption, parse_mode=ParseMode.HTML)
-                elif (msg_obj.document) and resp.document:
-                    await app.send_document(log, resp.document.file_id, caption=caption, parse_mode=ParseMode.HTML)
-            except Exception:
-                pass
 
     except Exception as e:
         await status_msg.edit(f"❌ **Upload failed:** `{e}`")
