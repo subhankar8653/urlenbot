@@ -42,68 +42,54 @@ async def _make_uploader_client(user_id: int):
 
 
 # ─────────────────────────────────────────────
-#  User client se upload karo — 
-#  Strategy: user client se "Saved Messages" mein
-#  upload karo (always works), phir bot se
-#  us file_id ko group mein forward karo.
-#  Isse user bandwidth use hoti hai (fast upload)
-#  aur CHANNEL_INVALID error bhi nahi aata.
+#  User client se upload karo —
+#  Strategy:
+#    1. User client → LOG_CHANNEL mein upload karo
+#       (user already admin hai wahan)
+#    2. Bot → LOG_CHANNEL se target chat mein forward karo
+#       (instant, no re-upload, no bandwidth)
+#    3. LOG_CHANNEL ka message rehne do — wahi log bhi hai!
+#       (alag se log send karne ki zaroorat nahi)
 # ─────────────────────────────────────────────
 async def _upload_via_user_then_forward(
     uc, message, msg, new_file, send_kwargs, media_type="video"
 ):
     """
-    1. User client se apne Saved Messages (self) mein upload karo
-    2. Bot se woh message group mein forward karo
-    3. Saved Messages wala message delete karo (cleanup)
+    1. User client → log channel mein upload (user admin hai)
+    2. Bot → log channel se target chat mein forward_messages
+    3. No cleanup needed — log channel mein rehna chahiye file
     """
+    # Strip progress & reply_to from kwargs — log channel ko nahi chahiye
+    safe_kwargs = {k: v for k, v in send_kwargs.items()
+                   if k not in ("reply_to_message_id", "progress", "progress_args")}
+
     try:
-        # Step 1: User ke "me" (Saved Messages) mein upload
+        # ── Step 1: User client se LOG_CHANNEL mein upload ──
         if media_type == "video":
             saved = await uc.send_video(
-                chat_id="me",
+                chat_id=log,
                 video=new_file,
-                **{k: v for k, v in send_kwargs.items()
-                   if k not in ("reply_to_message_id",)},
+                progress=send_kwargs.get("progress"),
+                progress_args=send_kwargs.get("progress_args"),
+                **safe_kwargs,
             )
         else:
             saved = await uc.send_document(
-                chat_id="me",
+                chat_id=log,
                 document=new_file,
-                **{k: v for k, v in send_kwargs.items()
-                   if k not in ("reply_to_message_id",)},
+                progress=send_kwargs.get("progress"),
+                progress_args=send_kwargs.get("progress_args"),
+                **safe_kwargs,
             )
 
-        # Step 2: Bot se group mein forward karo (file_id se — instant, no bandwidth)
-        if media_type == "video" and saved.video:
-            resp = await app.send_video(
-                chat_id=message.chat.id,
-                video=saved.video.file_id,
-                caption=send_kwargs.get("caption", ""),
-                duration=send_kwargs.get("duration"),
-                width=send_kwargs.get("width"),
-                height=send_kwargs.get("height"),
-                thumb=send_kwargs.get("thumb"),
-                supports_streaming=True,
-                parse_mode=ParseMode.HTML,
-                reply_to_message_id=message.id,
-            )
-        else:
-            resp = await app.send_document(
-                chat_id=message.chat.id,
-                document=saved.document.file_id,
-                caption=send_kwargs.get("caption", ""),
-                file_name=send_kwargs.get("file_name"),
-                parse_mode=ParseMode.HTML,
-                reply_to_message_id=message.id,
-            )
+        # ── Step 2: Bot se LOG_CHANNEL → target chat forward ──
+        resp = await app.forward_messages(
+            chat_id=message.chat.id,
+            from_chat_id=log,
+            message_ids=saved.id,
+        )
 
-        # Step 3: Saved Messages se delete karo
-        try:
-            await uc.delete_messages("me", saved.id)
-        except Exception:
-            pass
-
+        # Log channel mein message already hai — alag se send karne ki zaroorat nahi
         return resp
 
     except Exception as e:
@@ -252,30 +238,30 @@ async def upload_video(message, msg, new_file, caption, c_time, thumb,
 
     if uploader_client:
         try:
-            # User se "Saved Messages" mein upload → bot se group mein forward
+            # User → log channel upload, bot → log channel se forward
             resp = await _upload_via_user_then_forward(
                 uploader_client, message, msg, new_file, send_kwargs, media_type="video"
             )
-        except Exception as e:
-            # Koi bhi error aaye — bot se fallback
+        except Exception:
             resp = None
 
     if resp is None:
-        # Bot fallback
+        # Bot fallback — directly upload
         resp = await message.reply_video(new_file, **send_kwargs)
 
-    if resp:
-        log_kwargs = dict(
-            thumb=thumb, caption=caption,
-            duration=duration, width=width,
-            height=height, parse_mode=ParseMode.HTML,
-        )
-        if cover:
-            log_kwargs['cover'] = cover
-        try:
-            await app.send_video(log, resp.video.file_id, **log_kwargs)
-        except Exception:
-            pass
+        # Log channel mein bhi bhejo (bot fallback case mein, cover bhi include)
+        if resp:
+            log_kwargs = dict(
+                thumb=thumb, caption=caption,
+                duration=duration, width=width,
+                height=height, parse_mode=ParseMode.HTML,
+            )
+            if cover:
+                log_kwargs['cover'] = cover
+            try:
+                await app.send_video(log, resp.video.file_id, **log_kwargs)
+            except Exception:
+                pass
 
     return resp.link
 
@@ -305,16 +291,17 @@ async def upload_doc(message, msg, c_time, caption, new_file, file_name=None,
             resp = None
 
     if resp is None:
-        # Bot fallback
+        # Bot fallback — directly upload
         resp = await message.reply_document(new_file, **send_kwargs)
 
-    if resp:
-        try:
-            await app.send_document(
-                log, resp.document.file_id,
-                caption=caption, parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
+        # Log channel mein bhi bhejo (bot fallback case mein)
+        if resp:
+            try:
+                await app.send_document(
+                    log, resp.document.file_id,
+                    caption=caption, parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
 
     return resp.link
