@@ -4,12 +4,14 @@ custompic.py
 Keyword-based custom thumbnail plugin.
 
 Commands:
-  /setpic <keyword>  (photo ke saath)  → Save karo
-  /delpic <keyword>                    → Delete karo
-  /listpic                             → Sabke list
+  /setpic              (photo reply karke, bina keyword)  → Default thumbnail save karo
+  /setpic <keyword>    (photo reply karke ya caption mein) → Keyword wali custom pic save karo
+  /deletepic <keyword>                                     → Delete karo (alias: /delpic)
+  /delpic <keyword>                                        → Delete karo
+  /listpic                                                 → Sabke list
 
 Auto-apply:
-  Jab bhi koi file upload hogi aur uske filename mein keyword match hoga
+  Jab bhi koi file upload hogi aur uske filename/caption mein keyword match hoga
   (case-insensitive), to woh keyword ki saved pic thumbnail ban jayegi.
 
 Helper function (swift_downloader se call hogi):
@@ -17,7 +19,6 @@ Helper function (swift_downloader se call hogi):
 """
 
 import logging
-import re
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -73,9 +74,16 @@ async def get_custompic_for_file(user_id: int, filename: str) -> str | None:
 @Client.on_message(filters.command("setpic"))
 async def setpic_command(client: Client, message: Message):
     """
-    Usage:
-      Photo bhejo aur caption mein: /setpic Naruto
-      Ya photo reply karke: /setpic Naruto
+    2 modes:
+
+    Mode 1 — Bina keyword (default thumbnail):
+      Kisi bhi image ko reply karke: /setpic
+      → Woh image default thumbnail ban jaegi
+
+    Mode 2 — Keyword ke saath (custom keyword thumbnail):
+      Kisi image ko reply karke: /setpic Naruto
+      → "Naruto" keyword ke liye woh pic save hogi
+      → Jab bhi file caption mein "Naruto" hoga, auto-apply hoga
     """
     c = await check_chat(message, chat="Sudo")
     if not c:
@@ -83,18 +91,11 @@ async def setpic_command(client: Client, message: Message):
 
     user_id = message.from_user.id
 
-    # Keyword extract karo
-    parts = message.text.split(None, 1) if message.text else []
+    # Keyword extract karo (optional hai)
+    # message.text ya message.caption dono check karo (photo ke saath caption bhi ho sakta hai)
+    cmd_text = message.text or message.caption or ""
+    parts = cmd_text.split(None, 1)
     keyword = parts[1].strip() if len(parts) > 1 else None
-
-    if not keyword:
-        await message.reply(
-            "**Usage:** `/setpic <keyword>` — photo ke saath caption mein\n\n"
-            "**Example:**\n"
-            "Photo bhejo, caption: `/setpic Naruto`\n\n"
-            "Jab bhi file mein 'Naruto' hoga, yeh pic thumbnail ban jayegi."
-        )
-        return
 
     # Photo dhundo — ya current message mein ya replied message mein
     photo = None
@@ -103,31 +104,47 @@ async def setpic_command(client: Client, message: Message):
     elif message.reply_to_message and message.reply_to_message.photo:
         photo = message.reply_to_message.photo
     else:
-        await message.reply(
-            f"❌ Photo nahi mili!\n\n"
-            f"Photo ke saath caption mein `/setpic {keyword}` likho."
-        )
+        if keyword:
+            await message.reply(
+                f"❌ Photo nahi mili!\n\n"
+                f"Kisi photo ko **reply** karke `/setpic {keyword}` bhejo."
+            )
+        else:
+            await message.reply(
+                "❌ Photo nahi mili!\n\n"
+                "**Usage:**\n"
+                "• Kisi photo ko reply karke `/setpic` — default thumbnail save hoga\n"
+                "• Kisi photo ko reply karke `/setpic Naruto` — keyword wali pic save hogi"
+            )
         return
 
     file_id = photo.file_id
 
-    # Save karo
-    await db.set_custompic(user_id, keyword, file_id)
-
-    await message.reply(
-        f"✅ **Custom Pic Saved!**\n\n"
-        f"🔑 Keyword: `{keyword}`\n"
-        f"📁 Jab bhi filename mein `{keyword}` hoga, yeh pic auto-thumbnail ban jayegi."
-    )
+    if keyword:
+        # Mode 2: Keyword ke saath — custom pic save karo
+        await db.set_custompic(user_id, keyword, file_id)
+        await message.reply(
+            f"✅ **Custom Pic Saved!**\n\n"
+            f"🔑 Keyword: `{keyword}`\n"
+            f"📁 Jab bhi file/caption mein `{keyword}` hoga, yeh pic auto-thumbnail ban jayegi."
+        )
+    else:
+        # Mode 1: Bina keyword — default thumbnail save karo
+        await db.set_thumbnail(user_id, file_id)
+        await message.reply(
+            "✅ **Default Thumbnail Saved!**\n\n"
+            "📌 Yeh pic ab default thumbnail ke roop mein use hogi."
+        )
 
 
 # ─────────────────────────────────────────────
-#  /delpic command
+#  /deletepic & /delpic command (dono kaam karenge)
 # ─────────────────────────────────────────────
-@Client.on_message(filters.command("delpic"))
-async def delpic_command(client: Client, message: Message):
+@Client.on_message(filters.command(["deletepic", "delpic"]))
+async def deletepic_command(client: Client, message: Message):
     """
-    Usage: /delpic Naruto
+    Usage: /deletepic Naruto   ya   /delpic Naruto
+    Keyword wali custom pic delete karo.
     """
     c = await check_chat(message, chat="Sudo")
     if not c:
@@ -137,7 +154,10 @@ async def delpic_command(client: Client, message: Message):
     parts = message.text.split(None, 1)
 
     if len(parts) < 2 or not parts[1].strip():
-        await message.reply("**Usage:** `/delpic <keyword>`\nExample: `/delpic Naruto`")
+        await message.reply(
+            "**Usage:** `/deletepic <keyword>` ya `/delpic <keyword>`\n"
+            "**Example:** `/deletepic Naruto`"
+        )
         return
 
     keyword = parts[1].strip()
