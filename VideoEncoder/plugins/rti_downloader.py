@@ -367,6 +367,13 @@ async def _process_episode(client, message, page_url, episode_num, total_episode
         await status_msg.edit(f"❌ **Ep {episode_num}** — Swift URL fail.")
         return False
 
+    # Swift URL milne ke baad message mein show karo
+    await message.reply(
+        f"🔗 **Ep {episode_num} — Swift Link**\n\n"
+        f"`{swift_url}`\n\n"
+        f"⬇️ Ab download shuru ho raha hai..."
+    )
+
     return await _run_rti_swift(client, message, swift_url, status_msg, ep_num=episode_num, total_eps=total_episodes)
 
 

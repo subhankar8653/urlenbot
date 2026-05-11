@@ -298,7 +298,7 @@ def _try_requests_scrape(swift_url: str) -> list:
 # ─────────────────────────────────────────────
 #  Main scrape + download (blocking, same session)
 # ─────────────────────────────────────────────
-def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None) -> dict:
+def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_filter: str = None) -> dict:
     """
     Same Selenium session mein:
       1. Pehle requests se try karo (fast path)
@@ -307,6 +307,7 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None) -> dict:
       4. Har button click karo → Chrome file save kare
       5. Files ka wait karo
 
+    quality_filter: "1080p" / "720p" / "480p" etc — sirf wahi click karo
     Returns: {"files": [...paths], "qualities": [...], "error": str or None}
     """
     driver = None
@@ -386,7 +387,7 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None) -> dict:
 
         if not download_links:
             LOGGER.warning("[Swift] No hrefs found, trying visible button click...")
-            qualities_to_try = ["360p", "480p", "720p", "1080p"]
+            qualities_to_try = [quality_filter] if quality_filter else ["360p", "480p", "720p", "1080p"]
             clicked = []
             for q in qualities_to_try:
                 try:
@@ -414,6 +415,15 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None) -> dict:
             result["qualities"] = clicked
 
         else:
+            # Quality filter apply karo — sirf requested quality ke links click karo
+            if quality_filter:
+                filtered_links = [l for l in download_links if l["quality"] == quality_filter]
+                if filtered_links:
+                    download_links = filtered_links
+                    LOGGER.info(f"[Swift] Quality filter `{quality_filter}` → {len(download_links)} link(s)")
+                else:
+                    LOGGER.warning(f"[Swift] Quality `{quality_filter}` nahi mila, sab try karte hain")
+
             qualities_clicked = []
             for lnk in download_links[:4]:  # 4 qualities tak
                 q = lnk["quality"]
@@ -592,14 +602,15 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
 # ─────────────────────────────────────────────
 #  Core command logic
 # ─────────────────────────────────────────────
-async def _run_swift(client, message, swift_url: str, encode: bool):
+async def _run_swift(client, message, swift_url: str, encode: bool, quality_filter: str = None):
     session_id = str(int(time.time()))
     dl_dir = os.path.join(download_dir, f"swift_{session_id}")
     os.makedirs(dl_dir, exist_ok=True)
 
+    filter_text = f" | Filter: `{quality_filter}`" if quality_filter else ""
     msg = await message.reply(
         f"🔗 **Swift Downloader v5**\n\n"
-        f"🌐 `{swift_url}`\n\n"
+        f"🌐 `{swift_url}`{filter_text}\n\n"
         f"⏳ Same session se page visit + download ho raha hai..."
     )
 
@@ -629,7 +640,7 @@ async def _run_swift(client, message, swift_url: str, encode: bool):
 
     prog_task = asyncio.create_task(_progress_updater())
 
-    result = await loop.run_in_executor(None, _scrape_and_download, swift_url, dl_dir)
+    result = await loop.run_in_executor(None, _scrape_and_download, swift_url, dl_dir, None, quality_filter)
 
     prog_task.cancel()
     try:
@@ -652,6 +663,24 @@ async def _run_swift(client, message, swift_url: str, encode: bool):
 
     # ── Size ke hisab se sort — chhoti (360p) pehle, badi (1080p) baad mein ──
     files = _sort_by_size(files)
+
+    # ── Quality filter: agar diya gaya toh sirf wahi quality rakhna ──
+    if quality_filter:
+        filtered = [f for f in files if _quality_from(os.path.basename(f)) == quality_filter.lower()]
+        if not filtered:
+            available = [_quality_from(os.path.basename(f)) for f in files]
+            await msg.edit(
+                f"❌ **`{quality_filter}` nahi mili!**\n\n"
+                f"📦 Available: `{' | '.join(available)}`\n\n"
+                f"Sahi quality likhke dobara try karo."
+            )
+            try:
+                import shutil
+                shutil.rmtree(dl_dir, ignore_errors=True)
+            except Exception:
+                pass
+            return
+        files = filtered
 
     await msg.edit(
         f"✅ **{len(files)} file(s) mili!**\n\n"
@@ -714,11 +743,27 @@ async def swift_command(client: Client, message: Message):
     if not SELENIUM_OK:
         await message.reply("❌ Selenium install nahi hai!\n`pip install selenium`\n`apt-get install -y chromium chromium-driver`")
         return
-    parts = message.text.split(None, 1)
+    parts = message.text.split()
     if len(parts) < 2 or not parts[1].strip():
-        await message.reply("⚠️ Usage:\n`/swift https://swift.multiquality.click/downlead/XXXXXXXX/`")
+        await message.reply(
+            "⚠️ **Usage:**\n"
+            "`/swift <url>` — sabhi qualities\n"
+            "`/swift <url> 1080p` — sirf 1080p\n"
+            "`/swift <url> 720p` — sirf 720p\n"
+            "`/swift <url> 480p` — sirf 480p"
+        )
         return
-    await _run_swift(client, message, parts[1].strip(), encode=False)
+
+    swift_url = parts[1].strip()
+
+    # Optional quality filter: 360p / 480p / 720p / 1080p / 2160p
+    quality_filter = None
+    if len(parts) >= 3:
+        candidate = parts[2].strip().lower()
+        if re.match(r"^\d{3,4}p$", candidate):
+            quality_filter = candidate
+
+    await _run_swift(client, message, swift_url, encode=False, quality_filter=quality_filter)
 
 
 @Client.on_message(filters.command("swiftencode"))
@@ -729,8 +774,16 @@ async def swift_encode_command(client: Client, message: Message):
     if not SELENIUM_OK:
         await message.reply("❌ Selenium install nahi hai!")
         return
-    parts = message.text.split(None, 1)
+    parts = message.text.split()
     if len(parts) < 2 or not parts[1].strip():
-        await message.reply("⚠️ Usage:\n`/swiftencode https://swift.multiquality.click/downlead/XXXXXXXX/`")
+        await message.reply("⚠️ Usage:\n`/swiftencode https://swift.multiquality.click/downlead/XXXXXXXX/`\n`/swiftencode <url> 1080p` — sirf 1080p encode")
         return
-    await _run_swift(client, message, parts[1].strip(), encode=True)
+
+    swift_url = parts[1].strip()
+    quality_filter = None
+    if len(parts) >= 3:
+        candidate = parts[2].strip().lower()
+        if re.match(r"^\d{3,4}p$", candidate):
+            quality_filter = candidate
+
+    await _run_swift(client, message, swift_url, encode=True, quality_filter=quality_filter)
