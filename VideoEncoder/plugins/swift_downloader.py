@@ -848,35 +848,48 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
             return
         files = filtered
 
+    qualities_list = ' → '.join(_quality_from(os.path.basename(f)) for f in files)
     await msg.edit(
         f"✅ **{len(files)} file(s) mili!**\n\n"
-        f"📊 Order: `{' → '.join(_quality_from(os.path.basename(f)) for f in files)}`\n\n"
-        f"📤 Sab parallel upload ho rahe hain..."
+        f"📊 `{qualities_list}`\n\n"
+        f"📤 Upload ho raha hai..."
     )
 
-    # ── Parallel upload — har file ke liye alag status message, sab ek saath ──
-    upload_messages = []
-    for i, fp in enumerate(files):
-        q = _quality_from(os.path.basename(fp))
-        um = await message.reply(f"⏳ **Queued `{q}`** ({i+1}/{len(files)})")
-        upload_messages.append(um)
+    # ── Semaphore: max 2 concurrent uploads ──
+    # Pehle 360p + 720p ek saath, jab koi bhi finish ho tab 1080p start
+    sem = asyncio.Semaphore(2)
 
-    # asyncio.gather — sab ek saath upload karo
-    async def _upload_task(filepath, um):
-        success, sent_msg, quality = await _upload_one_file(client, message, um, filepath, dl_dir, encode)
-        if success:
+    # Ek dummy status message — sirf ek, clean look
+    # _upload_one_file ko ek msg chahiye progress edit ke liye
+    # Hum ek shared status msg use karenge jo baad mein delete ho jaega
+    _dummy_msgs = {}
+    for fp in files:
+        q = _quality_from(os.path.basename(fp))
+        try:
+            dm = await message.reply(f"📤 **Uploading `{q}`...**")
+            _dummy_msgs[fp] = dm
+        except Exception:
+            _dummy_msgs[fp] = msg  # fallback
+
+    async def _upload_task(filepath):
+        async with sem:
+            um = _dummy_msgs.get(filepath, msg)
+            success, sent_msg, quality = await _upload_one_file(
+                client, message, um, filepath, dl_dir, encode
+            )
+            # Status message delete karo — clean chat
             try:
-                await um.edit(f"✅ **Done `{quality}`**")
+                await um.delete()
             except Exception:
                 pass
-        return success, sent_msg, quality
+            return success, sent_msg, quality
 
     results = await asyncio.gather(
-        *[_upload_task(fp, um) for fp, um in zip(files, upload_messages)],
+        *[_upload_task(fp) for fp in files],
         return_exceptions=True
     )
 
-    # Results parse karo — (success, sent_msg, quality)
+    # Results parse karo
     uploaded_results = []  # [(quality, sent_message), ...]
     uploaded_count = 0
     for r in results:
@@ -888,23 +901,18 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
             uploaded_count += 1
             uploaded_results.append((quality, sent_msg))
 
-    qualities_done = [q for q, _ in uploaded_results]
-    await msg.edit(
-        f"🎉 **Upload Complete!**\n\n"
-        f"✅ Uploaded : `{uploaded_count}/{len(files)}`\n"
-        f"📊 Order uploaded: `{' → '.join(qualities_done) or 'N/A'}`\n\n"
-        f"🔀 Order check ho raha hai..."
-    )
-
     # ── Reorder check — agar order galat tha toh fix karo ──
     await _reorder_if_needed(client, message, uploaded_results)
 
-    # Final summary update
-    expected_order = sorted(qualities_done, key=lambda q: QUALITY_ORDER.get(q, 99))
+    # Final summary — sirf ek clean message
+    expected_order = sorted(
+        [q for q, _ in uploaded_results],
+        key=lambda q: QUALITY_ORDER.get(q, 99)
+    )
     await msg.edit(
         f"🎉 **Complete!**\n\n"
         f"✅ Uploaded : `{uploaded_count}/{len(files)}`\n"
-        f"📊 Final order: `{' → '.join(expected_order) or 'N/A'}`"
+        f"📊 `{' → '.join(expected_order) or 'N/A'}`"
     )
 
     try:
