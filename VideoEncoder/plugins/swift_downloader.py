@@ -339,16 +339,25 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
         time.sleep(2)
         _close_popups(driver, main)
 
-        # Step 2: Dynamic link detect hone tak wait (max 12 sec — 25 se kam)
+        # Step 2: JS-rendered download links appear hone tak wait
+        # argon page pe links JS se inject hoti hain — pehle d-none hoti hain
+        # download-options div ke visible hone ka wait karo (max 12 sec)
         try:
             WebDriverWait(driver, 12).until(
-                EC.presence_of_element_located((By.TAG_NAME, "a"))
+                EC.presence_of_element_located((By.CSS_SELECTOR, "a.dl-btn"))
             )
-            LOGGER.info("[Swift] Links detected via WebDriverWait")
+            LOGGER.info("[Swift] Download buttons detected via WebDriverWait")
         except Exception:
-            LOGGER.warning("[Swift] WebDriverWait timeout — proceeding anyway")
+            # Fallback: generic <a> tag wait
+            try:
+                WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "a"))
+                )
+                LOGGER.info("[Swift] Generic links detected via WebDriverWait")
+            except Exception:
+                LOGGER.warning("[Swift] WebDriverWait timeout — proceeding anyway")
 
-        # Step 3: SPA/React pages ke liye extra render time (8 → 3 sec)
+        # Step 3: JS render time (3 sec)
         time.sleep(3)
         _close_popups(driver, main)
 
@@ -373,9 +382,18 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
             label = tag.get_text(separator=" ", strip=True)
             if not href or href in seen:
                 continue
+            # Skip clearly useless hrefs
             if href.startswith("#") or "javascript" in href:
                 continue
-            if len(href) < 10:  # sirf bahut chote anchors skip karo
+            if href.startswith("about:"):  # BUG FIX: about:blank skip karo
+                continue
+            if len(href) < 10:
+                continue
+
+            # BUG FIX: d-none (hidden) elements skip karo — JS ne abhi render nahi kiya
+            tag_classes = tag.get("class", [])
+            if "d-none" in tag_classes:
+                LOGGER.info(f"[Swift] Skipping d-none link: {href[:60]}")
                 continue
 
             quality = _quality_from(label + " " + href)
@@ -384,6 +402,27 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
                 "href": href, "quality": quality, "label": label, "tag": tag
             })
             LOGGER.info(f"[Swift] Found href: {quality} | {href[:80]}")
+
+        if not download_links:
+            # BUG FIX: Sab links d-none thi ya nahi mili — Selenium se visible dl-btn elements dhundo
+            LOGGER.warning("[Swift] No visible hrefs found, trying Selenium dl-btn elements...")
+            try:
+                dl_btns = driver.find_elements(By.CSS_SELECTOR, "a.dl-btn")
+                for btn in dl_btns:
+                    try:
+                        href = btn.get_attribute("href") or ""
+                        label = btn.text.strip()
+                        if not href or href.startswith("about:") or len(href) < 10:
+                            continue
+                        quality = _quality_from(label + " " + href)
+                        if href not in seen:
+                            seen.add(href)
+                            download_links.append({"href": href, "quality": quality, "label": label, "tag": None})
+                            LOGGER.info(f"[Swift] Selenium dl-btn: {quality} | {href[:80]}")
+                    except Exception:
+                        pass
+            except Exception as e:
+                LOGGER.warning(f"[Swift] Selenium dl-btn search failed: {e}")
 
         if not download_links:
             LOGGER.warning("[Swift] No hrefs found, trying visible button click...")
