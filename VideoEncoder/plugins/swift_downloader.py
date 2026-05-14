@@ -1,7 +1,11 @@
 """
-swift_downloader.py  v5
+swift_downloader.py  v6
 ========================
-Changes from v4:
+Changes from v5:
+  - SCAN-FIRST: Page open hone ke baad immediately download nahi hoga
+  - 360p GATE: Har 1 second pe scan karo — jab tak 360p button visible na ho
+  - 20s TIMEOUT: 20 seconds baad bhi 360p nahi mila to process cancel
+  - MISSING QUALITY SKIP: Jo quality page pe nahi hai usse download + upload skip
   - AUTO RENAME: mega jaise build_auto_caption se proper filename milega
   - THUMBNAIL + COVER: /setpic se set ki gai custom thumbnail aur cover lagegi
   - SIZE ORDER: Chhoti file pehle upload hogi (360p → 720p → 1080p)
@@ -298,20 +302,133 @@ def _try_requests_scrape(swift_url: str) -> list:
 # ─────────────────────────────────────────────
 #  Main scrape + download (blocking, same session)
 # ─────────────────────────────────────────────
+def _scan_for_360p(driver) -> bool:
+    """
+    Current page pe 360p button/link visible hai ya nahi check karo.
+    Returns True agar 360p mil gaya (visible, non-hidden element).
+    """
+    try:
+        # Method 1: a.dl-btn elements mein 360p text dhundo
+        dl_btns = driver.find_elements(By.CSS_SELECTOR, "a.dl-btn")
+        for btn in dl_btns:
+            try:
+                label = btn.text.strip().lower()
+                href = btn.get_attribute("href") or ""
+                classes = btn.get_attribute("class") or ""
+                if "d-none" in classes:
+                    continue
+                if "360p" in label or "360p" in href.lower():
+                    LOGGER.info(f"[Swift] 360p found via dl-btn: {label or href[:60]}")
+                    return True
+            except Exception:
+                pass
+
+        # Method 2: XPATH se koi bhi element jo 360p text contain kare
+        elems = driver.find_elements(By.XPATH,
+            "//*[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'360p')]"
+        )
+        for elem in elems:
+            try:
+                if elem.is_displayed():
+                    LOGGER.info(f"[Swift] 360p found via XPATH: {elem.tag_name}")
+                    return True
+            except Exception:
+                pass
+
+        # Method 3: BeautifulSoup se page source parse karo
+        html = driver.page_source
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup.find_all(["a", "button", "span", "div"]):
+            classes = tag.get("class", [])
+            if "d-none" in classes:
+                continue
+            text = tag.get_text(separator=" ", strip=True).lower()
+            href = tag.get("href", "").lower()
+            if "360p" in text or "360p" in href:
+                LOGGER.info(f"[Swift] 360p found via BS4: {tag.name}")
+                return True
+
+    except Exception as e:
+        LOGGER.warning(f"[Swift] 360p scan error: {e}")
+
+    return False
+
+
+def _collect_visible_links(driver) -> list:
+    """
+    Page pe saare visible download links collect karo.
+    Returns list of {"href", "quality", "label"} — sirf jo page pe actually present hain.
+    """
+    html = driver.page_source
+    soup = BeautifulSoup(html, "html.parser")
+    download_links = []
+    seen = set()
+
+    # Pass 1: BeautifulSoup se visible anchors
+    for tag in soup.find_all("a", href=True):
+        href = tag.get("href", "").strip()
+        label = tag.get_text(separator=" ", strip=True)
+        if not href or href in seen:
+            continue
+        if href.startswith("#") or "javascript" in href or href.startswith("about:"):
+            continue
+        if len(href) < 10:
+            continue
+        tag_classes = tag.get("class", [])
+        if "d-none" in tag_classes:
+            LOGGER.info(f"[Swift] Skipping d-none: {href[:60]}")
+            continue
+        quality = _quality_from(label + " " + href)
+        seen.add(href)
+        download_links.append({"href": href, "quality": quality, "label": label})
+        LOGGER.info(f"[Swift] Collected: {quality} | {href[:80]}")
+
+    # Pass 2: Selenium se visible dl-btn (JS rendered ones)
+    if not download_links:
+        try:
+            dl_btns = driver.find_elements(By.CSS_SELECTOR, "a.dl-btn")
+            for btn in dl_btns:
+                try:
+                    href = btn.get_attribute("href") or ""
+                    label = btn.text.strip()
+                    classes = btn.get_attribute("class") or ""
+                    if not href or href.startswith("about:") or len(href) < 10:
+                        continue
+                    if "d-none" in classes:
+                        continue
+                    quality = _quality_from(label + " " + href)
+                    if href not in seen:
+                        seen.add(href)
+                        download_links.append({"href": href, "quality": quality, "label": label})
+                        LOGGER.info(f"[Swift] Selenium dl-btn: {quality} | {href[:80]}")
+                except Exception:
+                    pass
+        except Exception as e:
+            LOGGER.warning(f"[Swift] Selenium dl-btn collect failed: {e}")
+
+    return download_links
+
+
 def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_filter: str = None) -> dict:
     """
     Same Selenium session mein:
-      1. Pehle requests se try karo (fast path)
-      2. Agar fail → Selenium se page visit karo
-      3. Download links/buttons dhundo
-      4. Har button click karo → Chrome file save kare
-      5. Files ka wait karo
+      1. Page visit karo — immediately download mat karo
+      2. Har 1 second pe scan karo — 360p visible hone ka wait karo (max 20s)
+      3. 20s baad bhi nahi mila → cancel
+      4. 360p milte hi saari visible qualities collect karo
+      5. Jo quality page pe nahi hai (missing) → click mat karo (skip)
+      6. Click karo → Chrome file save kare
+      7. Downloads complete hone ka wait karo
 
     quality_filter: "1080p" / "720p" / "480p" etc — sirf wahi click karo
     Returns: {"files": [...paths], "qualities": [...], "error": str or None}
     """
     driver = None
     result = {"files": [], "qualities": [], "error": None}
+
+    # ── Scan constants ──
+    SCAN_INTERVAL = 1       # seconds between each scan
+    SCAN_MAX_TRIES = 20     # max 20 tries = 20 seconds timeout
 
     try:
         driver = _make_driver(dl_dir)
@@ -334,77 +451,53 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
             return result
 
         main = driver.current_window_handle
-
         _close_popups(driver, main)
 
-        # dl-btn visible hone tak wait karo (max 15 sec) — fixed sleep ki jagah smart wait
-        try:
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "a.dl-btn"))
+        # ── STEP 1: 360p gate — har 1 second pe scan karo ──
+        LOGGER.info("[Swift] Starting 360p scan loop (max 20s)...")
+        found_360p = False
+        for scan_num in range(1, SCAN_MAX_TRIES + 1):
+            _close_popups(driver, main)
+            if _scan_for_360p(driver):
+                LOGGER.info(f"[Swift] ✅ 360p gate PASSED at scan #{scan_num} ({scan_num}s)")
+                found_360p = True
+                break
+            LOGGER.info(f"[Swift] Scan #{scan_num}/{SCAN_MAX_TRIES} — 360p not yet visible")
+            time.sleep(SCAN_INTERVAL)
+
+        if not found_360p:
+            result["error"] = (
+                f"⏰ 360p button {SCAN_MAX_TRIES} seconds tak nahi mila — "
+                f"page render fail ya content unavailable"
             )
-            LOGGER.info("[Swift] dl-btn detected via WebDriverWait")
-        except Exception:
-            # fallback: thoda wait karo
-            time.sleep(3)
-            LOGGER.warning("[Swift] dl-btn wait timeout — proceeding anyway")
+            LOGGER.warning(f"[Swift] ❌ 360p gate FAILED after {SCAN_MAX_TRIES}s")
+            return result
 
+        # ── STEP 2: Visible links collect karo ──
         _close_popups(driver, main)
+        download_links = _collect_visible_links(driver)
+        LOGGER.info(f"[Swift] Total visible links collected: {len(download_links)}")
 
-        html = driver.page_source
-        LOGGER.info(f"[Swift] Page loaded, source len={len(html)}")
+        # ── STEP 3: Quality filter apply karo (agar diya gaya) ──
+        if quality_filter:
+            filtered = [l for l in download_links if l["quality"] == quality_filter]
+            if filtered:
+                download_links = filtered
+                LOGGER.info(f"[Swift] Quality filter `{quality_filter}` → {len(download_links)} link(s)")
+            else:
+                # Missing quality — page pe hai hi nahi
+                available = list({l["quality"] for l in download_links})
+                result["error"] = (
+                    f"❌ `{quality_filter}` page pe missing hai!\n"
+                    f"Page pe sirf yeh qualities hain: `{' | '.join(available) or 'none'}`"
+                )
+                LOGGER.warning(f"[Swift] Quality `{quality_filter}` missing. Available: {available}")
+                return result
 
-        soup = BeautifulSoup(html, "html.parser")
-        download_links = []
-        seen = set()
-
-        for tag in soup.find_all("a", href=True):
-            href = tag.get("href", "").strip()
-            label = tag.get_text(separator=" ", strip=True)
-            if not href or href in seen:
-                continue
-            if href.startswith("#") or "javascript" in href:
-                continue
-            if href.startswith("about:"):  # about:blank skip karo
-                continue
-            if len(href) < 10:  # sirf bahut chote anchors skip karo
-                continue
-
-            # d-none (hidden) elements skip karo — JS ne abhi render nahi kiya
-            tag_classes = tag.get("class", [])
-            if "d-none" in tag_classes:
-                LOGGER.info(f"[Swift] Skipping d-none link: {href[:60]}")
-                continue
-
-            quality = _quality_from(label + " " + href)
-            seen.add(href)
-            download_links.append({
-                "href": href, "quality": quality, "label": label, "tag": tag
-            })
-            LOGGER.info(f"[Swift] Found href: {quality} | {href[:80]}")
-
-        # Agar sab d-none the toh Selenium se visible dl-btn elements dhundo
+        # ── STEP 4: Sirf page pe present qualities click karo ──
         if not download_links:
-            LOGGER.warning("[Swift] No visible hrefs, trying Selenium dl-btn elements...")
-            try:
-                dl_btns = driver.find_elements(By.CSS_SELECTOR, "a.dl-btn")
-                for btn in dl_btns:
-                    try:
-                        href = btn.get_attribute("href") or ""
-                        label = btn.text.strip()
-                        if not href or href.startswith("about:") or len(href) < 10:
-                            continue
-                        quality = _quality_from(label + " " + href)
-                        if href not in seen:
-                            seen.add(href)
-                            download_links.append({"href": href, "quality": quality, "label": label, "tag": None})
-                            LOGGER.info(f"[Swift] Selenium dl-btn: {quality} | {href[:80]}")
-                    except Exception:
-                        pass
-            except Exception as e:
-                LOGGER.warning(f"[Swift] Selenium dl-btn search failed: {e}")
-
-        if not download_links:
-            LOGGER.warning("[Swift] No hrefs found, trying visible button click...")
+            # Fallback: XPATH button click try karo
+            LOGGER.warning("[Swift] No hrefs found after 360p gate — trying XPATH button click...")
             qualities_to_try = [quality_filter] if quality_filter else ["360p", "480p", "720p", "1080p"]
             clicked = []
             for q in qualities_to_try:
@@ -414,9 +507,11 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
                     )
                     for elem in elems:
                         try:
+                            if not elem.is_displayed():
+                                continue
                             driver.execute_script("arguments[0].scrollIntoView();", elem)
                             driver.execute_script("arguments[0].click();", elem)
-                            LOGGER.info(f"[Swift] Button clicked: {q}")
+                            LOGGER.info(f"[Swift] XPATH button clicked: {q}")
                             clicked.append(q)
                             time.sleep(3)
                             _close_popups(driver, main)
@@ -427,39 +522,30 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
                     pass
 
             if not clicked:
-                result["error"] = "Na href links mile na buttons — page render fail"
+                result["error"] = "Page pe 360p dikh gaya par download links nahi mile — DOM issue"
                 return result
 
             result["qualities"] = clicked
 
         else:
-            # Quality filter apply karo — sirf requested quality ke links click karo
-            if quality_filter:
-                filtered_links = [l for l in download_links if l["quality"] == quality_filter]
-                if filtered_links:
-                    download_links = filtered_links
-                    LOGGER.info(f"[Swift] Quality filter `{quality_filter}` → {len(download_links)} link(s)")
-                else:
-                    LOGGER.warning(f"[Swift] Quality `{quality_filter}` nahi mila, sab try karte hain")
-
             qualities_clicked = []
-            for lnk in download_links[:4]:  # 4 qualities tak
+            for lnk in download_links[:4]:  # max 4 qualities
                 q = lnk["quality"]
                 href = lnk["href"]
-
                 try:
                     driver.execute_script(f"window.open('{href}', '_blank');")
                     time.sleep(1)
                     _close_popups(driver, main)
                     qualities_clicked.append(q)
-                    LOGGER.info(f"[Swift] JS opened: {q}")
+                    LOGGER.info(f"[Swift] JS opened: {q} | {href[:60]}")
                     time.sleep(2)
                 except Exception as e:
-                    LOGGER.warning(f"[Swift] JS open failed: {e}")
+                    LOGGER.warning(f"[Swift] JS open failed for {q}: {e}")
 
             result["qualities"] = qualities_clicked
 
-        LOGGER.info("[Swift] Waiting for downloads...")
+        # ── STEP 5: Downloads complete hone ka wait ──
+        LOGGER.info("[Swift] Waiting for downloads to complete...")
         start = time.time()
         expected = max(len(result["qualities"]), 1)
 
@@ -475,7 +561,7 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
             if elapsed > 5 and len(done) >= 1 and not in_prog:
                 break
             if elapsed > 1200:
-                LOGGER.warning("[Swift] Timeout!")
+                LOGGER.warning("[Swift] Download timeout (1200s)!")
                 break
 
             time.sleep(5)
@@ -627,9 +713,9 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
 
     filter_text = f" | Filter: `{quality_filter}`" if quality_filter else ""
     msg = await message.reply(
-        f"🔗 **Swift Downloader v5**\n\n"
+        f"🔗 **Swift Downloader v6**\n\n"
         f"🌐 `{swift_url}`{filter_text}\n\n"
-        f"⏳ Same session se page visit + download ho raha hai..."
+        f"🔍 Page open ho raha hai... 360p button ka wait karega (max 20s scan)"
     )
 
     loop = asyncio.get_event_loop()
