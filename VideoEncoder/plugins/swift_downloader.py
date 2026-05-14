@@ -582,10 +582,14 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
 
 
 # ─────────────────────────────────────────────
-#  Single file upload (with auto-rename + thumb + cover)
+#  Single file upload — returns sent Message object (for reorder)
 # ─────────────────────────────────────────────
 async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, encode: bool):
-    """Ek file: rename → thumbnail → cover → upload"""
+    """
+    Ek file upload karo.
+    Returns: (success: bool, sent_message: Message | None, quality: str)
+    sent_message = Telegram pe jo actual video message gaya (reorder ke liye chahiye)
+    """
     fname_orig = os.path.basename(filepath)
     quality = _quality_from(fname_orig)
     size_mb = os.path.getsize(filepath) / (1024 * 1024)
@@ -596,10 +600,9 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
         f"💾 `{size_mb:.1f} MB`"
     )
 
-    # Auto rename (mega style)
     filepath = await _auto_rename(filepath, dl_dir)
     fname = os.path.basename(filepath)
-    quality = _quality_from(fname)  # recalculate after rename
+    quality = _quality_from(fname)
 
     await msg.edit(
         f"📤 **Uploading `{quality}`...**\n"
@@ -612,12 +615,11 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
             from ..utils.helper import handle_encode
             await msg.edit(f"⚙️ **Encoding `{quality}`...**")
             await handle_encode(filepath, message, msg)
-            return True
+            return True, None, quality
 
         c_time = time.time()
         duration = get_duration(filepath)
 
-        # Custom thumbnail check (user ne /setpic se set kiya ho)
         user_id = message.from_user.id
         custom_thumb_id = await db.get_thumbnail(user_id)
         thumb = None
@@ -626,20 +628,14 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
         if custom_thumb_id:
             try:
                 import random
-                # Unique path per file — parallel uploads mein conflict nahi hoga
                 unique_id = f"{int(time.time())}_{random.randint(1000,9999)}"
                 thumb_dir = os.path.join(dl_dir, "thumbs")
                 os.makedirs(thumb_dir, exist_ok=True)
                 thumb_path = os.path.join(thumb_dir, f"thumb_{unique_id}.jpg")
 
-                downloaded = await app.download_media(
-                    custom_thumb_id,
-                    file_name=thumb_path
-                )
-                # Pyrogram returned path use karo (actual saved location)
+                downloaded = await app.download_media(custom_thumb_id, file_name=thumb_path)
                 actual_path = downloaded if downloaded else thumb_path
 
-                # .temp extension handle karo — Pyrogram kabhi kabhi aise save karta hai
                 if actual_path and actual_path.endswith(".temp"):
                     renamed = actual_path.replace(".temp", ".jpg")
                     try:
@@ -653,28 +649,23 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
                     custom_thumb_used = True
                     LOGGER.info(f"[Swift] Custom thumb ready: {actual_path}")
                 else:
-                    LOGGER.warning(f"[Swift] Custom thumb not found at {actual_path}, using auto-thumb")
+                    LOGGER.warning(f"[Swift] Custom thumb not found, using auto-thumb")
             except Exception as e:
                 LOGGER.warning(f"[Swift] Thumb download error: {e}, using auto-thumb")
 
         if not thumb:
-            # Fallback: video frame se auto thumbnail
             thumb = get_thumbnail(filepath, dl_dir, duration / 4 if duration else 0)
             custom_thumb_used = False
 
-        # Cover pic — same as thumb
         cover = thumb if thumb and os.path.isfile(thumb) else None
-
         width, height = get_width_height(filepath)
         caption = f"<b>{fname}</b>"
-
-        # file_name MUST match actual filename on disk
-        # Telegram isi se external player mein naam dikhata hai
         disk_fname = os.path.basename(filepath)
 
         uc = await _make_uploader_client(message.from_user.id)
+        sent_msg = None
         try:
-            await upload_video(
+            sent_msg = await upload_video(
                 message, msg, filepath, caption,
                 c_time, thumb, duration, width, height,
                 file_name=disk_fname,
@@ -688,19 +679,93 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
                 except Exception:
                     pass
 
-        # Thumb cleanup — custom thumb rakho (db mein hai), auto-generated hatao
         if not custom_thumb_used and thumb and os.path.isfile(thumb):
             try:
                 os.remove(thumb)
             except Exception:
                 pass
 
-        return True
+        return True, sent_msg, quality
 
     except Exception as e:
         LOGGER.error(f"[Swift] Upload error ({quality}): {e}")
         await message.reply(f"⚠️ Upload failed `{fname}`: `{e}`")
-        return False
+        return False, None, quality
+
+
+# ─────────────────────────────────────────────
+#  Reorder helper — galat order ko sahi karo
+# ─────────────────────────────────────────────
+async def _reorder_if_needed(client, message, uploaded_results: list):
+    """
+    uploaded_results = [(quality, sent_message), ...]  — jis order mein upload hua
+
+    1. Check karo — kya order already sahi hai? (360p → 480p → 720p → 1080p)
+    2. Agar sahi → kuch nahi karo
+    3. Agar galat → sahi order mein forward karo → purane messages delete karo
+    """
+    # Sirf woh entries lo jahan sent_message actually mila
+    valid = [(q, m) for q, m in uploaded_results if m is not None]
+    if len(valid) <= 1:
+        return  # 1 ya 0 files — reorder ka koi matlab nahi
+
+    # Current order
+    current_qualities = [q for q, _ in valid]
+
+    # Expected order — QUALITY_ORDER ke hisab se sort
+    expected_qualities = sorted(current_qualities, key=lambda q: QUALITY_ORDER.get(q, 99))
+
+    if current_qualities == expected_qualities:
+        LOGGER.info(f"[Swift] Order already correct: {' → '.join(current_qualities)}")
+        return  # Sab theek hai, kuch karna nahi
+
+    LOGGER.info(f"[Swift] Reorder needed! Got: {current_qualities} → Want: {expected_qualities}")
+
+    # Quality → message mapping
+    q_to_msg = {q: m for q, m in valid}
+
+    # Sahi order mein forward karo
+    chat_id = message.chat.id
+    forwarded = []
+    for q in expected_qualities:
+        old_msg = q_to_msg.get(q)
+        if not old_msg:
+            continue
+        try:
+            # copy_message = same chat mein bhejo (forward without "Forwarded from" tag)
+            new_msg = await client.copy_message(
+                chat_id=chat_id,
+                from_chat_id=chat_id,
+                message_id=old_msg.id,
+            )
+            forwarded.append(new_msg)
+            LOGGER.info(f"[Swift] Reordered: {q} → new msg_id={new_msg.id}")
+            await asyncio.sleep(1)  # flood control
+        except Exception as e:
+            LOGGER.warning(f"[Swift] Forward failed for {q}: {e}")
+
+    if not forwarded:
+        LOGGER.warning("[Swift] Reorder: no messages forwarded, skipping delete")
+        return
+
+    # Purane messages delete karo
+    for q, old_msg in valid:
+        try:
+            await client.delete_messages(chat_id=chat_id, message_ids=old_msg.id)
+            LOGGER.info(f"[Swift] Deleted old msg: {q} id={old_msg.id}")
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            LOGGER.warning(f"[Swift] Delete failed for {q} id={old_msg.id}: {e}")
+
+    reordered_str = " → ".join(expected_qualities)
+    try:
+        await message.reply(
+            f"🔀 **Reordered!**\n\n"
+            f"✅ Sahi order: `{reordered_str}`\n"
+            f"🗑️ Purane {len(valid)} messages delete kar diye"
+        )
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────
@@ -713,7 +778,7 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
 
     filter_text = f" | Filter: `{quality_filter}`" if quality_filter else ""
     msg = await message.reply(
-        f"🔗 **Swift Downloader v6**\n\n"
+        f"🔗 **Swift Downloader v7**\n\n"
         f"🌐 `{swift_url}`{filter_text}\n\n"
         f"🔍 Page open ho raha hai... 360p button ka wait karega (max 20s scan)"
     )
@@ -743,9 +808,7 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
             await asyncio.sleep(8)
 
     prog_task = asyncio.create_task(_progress_updater())
-
     result = await loop.run_in_executor(None, _scrape_and_download, swift_url, dl_dir, None, quality_filter)
-
     prog_task.cancel()
     try:
         await prog_task
@@ -765,10 +828,9 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
         await msg.edit("❌ **Koi file download nahi hui!**")
         return
 
-    # ── Size ke hisab se sort — chhoti (360p) pehle, badi (1080p) baad mein ──
+    # Size ke hisab se sort — chhoti pehle
     files = _sort_by_size(files)
 
-    # ── Quality filter: agar diya gaya toh sirf wahi quality rakhna ──
     if quality_filter:
         filtered = [f for f in files if _quality_from(os.path.basename(f)) == quality_filter.lower()]
         if not filtered:
@@ -788,45 +850,61 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
 
     await msg.edit(
         f"✅ **{len(files)} file(s) mili!**\n\n"
-        f"📊 Order: `{' → '.join(_quality_from(f) for f in files)}`\n\n"
-        f"📤 Upload ho raha hai (threaded)..."
+        f"📊 Order: `{' → '.join(_quality_from(os.path.basename(f)) for f in files)}`\n\n"
+        f"📤 Sab parallel upload ho rahe hain..."
     )
 
-    # ── Threaded upload: ek ek status message banao, parallel upload karo ──
-    # Note: Telegram flood control ki wajah se sequential better hota hai for video
-    # Lekin hum asyncio.gather se concurrently rename + upload karenge
-    # (Actually video uploads sequential hi acha hai, par rename async hogi)
-
+    # ── Parallel upload — har file ke liye alag status message, sab ek saath ──
     upload_messages = []
     for i, fp in enumerate(files):
         q = _quality_from(os.path.basename(fp))
         um = await message.reply(f"⏳ **Queued `{q}`** ({i+1}/{len(files)})")
         upload_messages.append(um)
 
-    uploaded = 0
-
+    # asyncio.gather — sab ek saath upload karo
     async def _upload_task(filepath, um):
-        nonlocal uploaded
-        success = await _upload_one_file(client, message, um, filepath, dl_dir, encode)
+        success, sent_msg, quality = await _upload_one_file(client, message, um, filepath, dl_dir, encode)
         if success:
-            uploaded += 1
-            q = _quality_from(os.path.basename(filepath))
             try:
-                await um.edit(f"✅ **Done `{q}`**")
+                await um.edit(f"✅ **Done `{quality}`**")
             except Exception:
                 pass
-        return success
+        return success, sent_msg, quality
 
-    # Sequential upload — Telegram flood + file conflict avoid karne ke liye
-    for fp, um in zip(files, upload_messages):
-        await _upload_task(fp, um)
-        await asyncio.sleep(2)
+    results = await asyncio.gather(
+        *[_upload_task(fp, um) for fp, um in zip(files, upload_messages)],
+        return_exceptions=True
+    )
 
-    qualities_done = [_quality_from(f) for f in files]
+    # Results parse karo — (success, sent_msg, quality)
+    uploaded_results = []  # [(quality, sent_message), ...]
+    uploaded_count = 0
+    for r in results:
+        if isinstance(r, Exception):
+            LOGGER.error(f"[Swift] Upload task exception: {r}")
+            continue
+        success, sent_msg, quality = r
+        if success:
+            uploaded_count += 1
+            uploaded_results.append((quality, sent_msg))
+
+    qualities_done = [q for q, _ in uploaded_results]
+    await msg.edit(
+        f"🎉 **Upload Complete!**\n\n"
+        f"✅ Uploaded : `{uploaded_count}/{len(files)}`\n"
+        f"📊 Order uploaded: `{' → '.join(qualities_done) or 'N/A'}`\n\n"
+        f"🔀 Order check ho raha hai..."
+    )
+
+    # ── Reorder check — agar order galat tha toh fix karo ──
+    await _reorder_if_needed(client, message, uploaded_results)
+
+    # Final summary update
+    expected_order = sorted(qualities_done, key=lambda q: QUALITY_ORDER.get(q, 99))
     await msg.edit(
         f"🎉 **Complete!**\n\n"
-        f"✅ Uploaded : `{uploaded}/{len(files)}`\n"
-        f"📊 Qualities : `{' → '.join(qualities_done)}`"
+        f"✅ Uploaded : `{uploaded_count}/{len(files)}`\n"
+        f"📊 Final order: `{' → '.join(expected_order) or 'N/A'}`"
     )
 
     try:
