@@ -776,7 +776,7 @@ async def swift_encode_command(client: Client, message: Message):
         return
     parts = message.text.split()
     if len(parts) < 2 or not parts[1].strip():
-        await message.reply("⚠️ Usage:\n`/swiftencode https://swift.multiquality.click/downlead/XXXXXXXX/`\n`/swiftencode <url> 1080p` — sirf 1080p encode")
+        await message.reply("⚠️ Usage:\n`/swiftencode https://argon.razorshell.space/downlead/XXXXXXXX/`\n`/swiftencode <url> 1080p` — sirf 1080p encode")
         return
 
     swift_url = parts[1].strip()

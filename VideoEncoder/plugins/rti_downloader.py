@@ -29,7 +29,7 @@ except ImportError:
     SELENIUM_OK = False
 
 ARGON_DOMAIN = "argon.razorshell.space/embed"
-SWIFT_BASE   = "https://swift.multiquality.click/downlead/"
+SWIFT_BASE   = "https://argon.razorshell.space/downlead/"
 
 HEADERS = {
     "User-Agent": (
