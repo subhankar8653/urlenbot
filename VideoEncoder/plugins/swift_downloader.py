@@ -224,8 +224,7 @@ async def _auto_rename(filepath: str, dl_dir: str) -> str:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        # BUG FIX: timeout 600s → 120s (2 min kaafi hai copy-only ffmpeg ke liye)
-        await asyncio.wait_for(proc.communicate(), timeout=120)
+        await asyncio.wait_for(proc.communicate(), timeout=600)
 
         if proc.returncode == 0 and os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
             try:
@@ -336,38 +335,29 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
 
         main = driver.current_window_handle
 
-        # Step 1: Basic wait — 2s kaafi hai initial render ke liye
-        time.sleep(2)
+        # Step 1: Basic wait
+        time.sleep(5)
         _close_popups(driver, main)
 
-        # Step 2: JS-rendered download links appear hone tak wait
-        # argon page pe links JS se inject hoti hain — pehle d-none hoti hain
-        # download-options div ke visible hone ka wait karo (max 12 sec)
+        # Step 2: Dynamic link detect hone tak wait (max 25 sec)
         try:
-            WebDriverWait(driver, 12).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "a.dl-btn"))
+            WebDriverWait(driver, 25).until(
+                EC.presence_of_element_located((By.TAG_NAME, "a"))
             )
-            LOGGER.info("[Swift] Download buttons detected via WebDriverWait")
+            LOGGER.info("[Swift] Links detected via WebDriverWait")
         except Exception:
-            # Fallback: generic <a> tag wait
-            try:
-                WebDriverWait(driver, 5).until(
-                    EC.presence_of_element_located((By.TAG_NAME, "a"))
-                )
-                LOGGER.info("[Swift] Generic links detected via WebDriverWait")
-            except Exception:
-                LOGGER.warning("[Swift] WebDriverWait timeout — proceeding anyway")
+            LOGGER.warning("[Swift] WebDriverWait timeout — proceeding anyway")
 
-        # Step 3: JS render time (3 sec)
-        time.sleep(3)
+        # Step 3: SPA/React pages ke liye extra render time
+        time.sleep(8)
         _close_popups(driver, main)
 
         # Step 4: Scroll — lazy-loaded content trigger karne ke liye
         try:
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1)
+            time.sleep(3)
             driver.execute_script("window.scrollTo(0, 0);")
-            time.sleep(1)
+            time.sleep(2)
         except Exception:
             pass
 
@@ -383,15 +373,14 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
             label = tag.get_text(separator=" ", strip=True)
             if not href or href in seen:
                 continue
-            # Skip clearly useless hrefs
             if href.startswith("#") or "javascript" in href:
                 continue
-            if href.startswith("about:"):  # BUG FIX: about:blank skip karo
+            if href.startswith("about:"):  # about:blank skip karo
                 continue
-            if len(href) < 10:
+            if len(href) < 10:  # sirf bahut chote anchors skip karo
                 continue
 
-            # BUG FIX: d-none (hidden) elements skip karo — JS ne abhi render nahi kiya
+            # d-none (hidden) elements skip karo — JS ne abhi render nahi kiya
             tag_classes = tag.get("class", [])
             if "d-none" in tag_classes:
                 LOGGER.info(f"[Swift] Skipping d-none link: {href[:60]}")
@@ -404,9 +393,9 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
             })
             LOGGER.info(f"[Swift] Found href: {quality} | {href[:80]}")
 
+        # Agar sab d-none the toh Selenium se visible dl-btn elements dhundo
         if not download_links:
-            # BUG FIX: Sab links d-none thi ya nahi mili — Selenium se visible dl-btn elements dhundo
-            LOGGER.warning("[Swift] No visible hrefs found, trying Selenium dl-btn elements...")
+            LOGGER.warning("[Swift] No visible hrefs, trying Selenium dl-btn elements...")
             try:
                 dl_btns = driver.find_elements(By.CSS_SELECTOR, "a.dl-btn")
                 for btn in dl_btns:
@@ -471,11 +460,11 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
 
                 try:
                     driver.execute_script(f"window.open('{href}', '_blank');")
-                    time.sleep(1)
+                    time.sleep(2)
                     _close_popups(driver, main)
                     qualities_clicked.append(q)
                     LOGGER.info(f"[Swift] JS opened: {q}")
-                    time.sleep(3)
+                    time.sleep(5)
                 except Exception as e:
                     LOGGER.warning(f"[Swift] JS open failed: {e}")
 
@@ -500,7 +489,9 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
                 LOGGER.warning("[Swift] Timeout!")
                 break
 
-            time.sleep(2)
+            time.sleep(5)
+
+        result["files"] = _get_done_files(dl_dir)
 
     except Exception as e:
         result["error"] = str(e)
@@ -524,8 +515,6 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
     quality = _quality_from(fname_orig)
     size_mb = os.path.getsize(filepath) / (1024 * 1024)
 
-    LOGGER.info(f"[Swift] _upload_one_file START: {fname_orig} ({size_mb:.1f} MB)")
-
     await msg.edit(
         f"🔄 **Renaming `{quality}`...**\n"
         f"📁 `{fname_orig}`\n"
@@ -533,11 +522,9 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
     )
 
     # Auto rename (mega style)
-    LOGGER.info(f"[Swift] Starting auto_rename for: {fname_orig}")
     filepath = await _auto_rename(filepath, dl_dir)
     fname = os.path.basename(filepath)
     quality = _quality_from(fname)  # recalculate after rename
-    LOGGER.info(f"[Swift] Rename done → {fname}")
 
     await msg.edit(
         f"📤 **Uploading `{quality}`...**\n"
