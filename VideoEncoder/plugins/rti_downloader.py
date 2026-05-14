@@ -326,11 +326,12 @@ async def _run_rti_swift(client, message: Message, swift_url: str, status_msg, e
 
         for i, filepath in enumerate(files, 1):
             quality = _quality_from(os.path.basename(filepath))
+            LOGGER.info(f"[RTI] Uploading file {i}/{len(files)}: {quality} — {os.path.basename(filepath)}")
             await status_msg.edit(
                 f"📤 **Ep {ep_num}/{total_eps}** — Uploading `{quality}` ({i}/{len(files)})"
             )
             await _upload_one_file(client, message, status_msg, filepath, dl_dir, encode=False)
-            await asyncio.sleep(2)
+            LOGGER.info(f"[RTI] Upload done: {quality} ({i}/{len(files)})")
 
         return True
 

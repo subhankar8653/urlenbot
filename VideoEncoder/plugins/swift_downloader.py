@@ -224,7 +224,8 @@ async def _auto_rename(filepath: str, dl_dir: str) -> str:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        await asyncio.wait_for(proc.communicate(), timeout=600)
+        # BUG FIX: timeout 600s → 120s (2 min kaafi hai copy-only ffmpeg ke liye)
+        await asyncio.wait_for(proc.communicate(), timeout=120)
 
         if proc.returncode == 0 and os.path.exists(temp_out) and os.path.getsize(temp_out) > 0:
             try:
@@ -523,6 +524,8 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
     quality = _quality_from(fname_orig)
     size_mb = os.path.getsize(filepath) / (1024 * 1024)
 
+    LOGGER.info(f"[Swift] _upload_one_file START: {fname_orig} ({size_mb:.1f} MB)")
+
     await msg.edit(
         f"🔄 **Renaming `{quality}`...**\n"
         f"📁 `{fname_orig}`\n"
@@ -530,9 +533,11 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
     )
 
     # Auto rename (mega style)
+    LOGGER.info(f"[Swift] Starting auto_rename for: {fname_orig}")
     filepath = await _auto_rename(filepath, dl_dir)
     fname = os.path.basename(filepath)
     quality = _quality_from(fname)  # recalculate after rename
+    LOGGER.info(f"[Swift] Rename done → {fname}")
 
     await msg.edit(
         f"📤 **Uploading `{quality}`...**\n"
