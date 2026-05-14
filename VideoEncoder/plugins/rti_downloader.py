@@ -297,58 +297,11 @@ def argon_to_swift(argon_url: str):
 #  Step 4: Download + Sequential upload
 # ─────────────────────────────────────────────
 async def _run_rti_swift(client, message: Message, swift_url: str, status_msg, ep_num: int, total_eps: int):
-    from .swift_downloader import (
-        _scrape_and_download, _sort_by_size,
-        _quality_from, _upload_one_file
-    )
-    import os, shutil
+    from .swift_downloader import _run_swift
+    # /swift wala exact flow use karo — download + queued messages + sequential upload
+    await _run_swift(client, message, swift_url, encode=False)
+    return True
 
-    session_id = str(int(time.time()))
-    dl_dir = os.path.join(download_dir, f"rti_{session_id}")
-    os.makedirs(dl_dir, exist_ok=True)
-
-    try:
-        await status_msg.edit(f"⬇️ **Ep {ep_num}/{total_eps}** — Downloading...")
-
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, _scrape_and_download, swift_url, dl_dir)
-
-        if result.get("error") and not result.get("files"):
-            await status_msg.edit(f"❌ **Ep {ep_num}** — Download failed: `{result['error']}`")
-            return False
-
-        files = result.get("files", [])
-        if not files:
-            await status_msg.edit(f"❌ **Ep {ep_num}** — Koi file nahi mili.")
-            return False
-
-        files = _sort_by_size(files)
-
-        for i, filepath in enumerate(files, 1):
-            quality = _quality_from(os.path.basename(filepath))
-            LOGGER.info(f"[RTI] Uploading file {i}/{len(files)}: {quality} — {os.path.basename(filepath)}")
-            await status_msg.edit(
-                f"📤 **Ep {ep_num}/{total_eps}** — Uploading `{quality}` ({i}/{len(files)})"
-            )
-            await _upload_one_file(client, message, status_msg, filepath, dl_dir, encode=False)
-            LOGGER.info(f"[RTI] Upload done: {quality} ({i}/{len(files)})")
-
-        return True
-
-    except Exception as e:
-        LOGGER.error(f"[RTI] _run_rti_swift error: {e}")
-        await status_msg.edit(f"❌ **Ep {ep_num}** — Error: `{str(e)[:100]}`")
-        return False
-    finally:
-        try:
-            shutil.rmtree(dl_dir, ignore_errors=True)
-        except Exception:
-            pass
-
-
-# ─────────────────────────────────────────────
-#  Single episode pipeline
-# ─────────────────────────────────────────────
 async def _process_episode(client, message, page_url, episode_num, total_episodes, status_msg):
     loop = asyncio.get_event_loop()
 
