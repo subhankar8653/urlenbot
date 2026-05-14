@@ -335,31 +335,20 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
 
         main = driver.current_window_handle
 
-        # Step 1: Basic wait
-        time.sleep(5)
         _close_popups(driver, main)
 
-        # Step 2: Dynamic link detect hone tak wait (max 25 sec)
+        # dl-btn visible hone tak wait karo (max 15 sec) — fixed sleep ki jagah smart wait
         try:
-            WebDriverWait(driver, 25).until(
-                EC.presence_of_element_located((By.TAG_NAME, "a"))
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "a.dl-btn"))
             )
-            LOGGER.info("[Swift] Links detected via WebDriverWait")
+            LOGGER.info("[Swift] dl-btn detected via WebDriverWait")
         except Exception:
-            LOGGER.warning("[Swift] WebDriverWait timeout — proceeding anyway")
-
-        # Step 3: SPA/React pages ke liye extra render time
-        time.sleep(8)
-        _close_popups(driver, main)
-
-        # Step 4: Scroll — lazy-loaded content trigger karne ke liye
-        try:
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            # fallback: thoda wait karo
             time.sleep(3)
-            driver.execute_script("window.scrollTo(0, 0);")
-            time.sleep(2)
-        except Exception:
-            pass
+            LOGGER.warning("[Swift] dl-btn wait timeout — proceeding anyway")
+
+        _close_popups(driver, main)
 
         html = driver.page_source
         LOGGER.info(f"[Swift] Page loaded, source len={len(html)}")
@@ -460,11 +449,11 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
 
                 try:
                     driver.execute_script(f"window.open('{href}', '_blank');")
-                    time.sleep(2)
+                    time.sleep(1)
                     _close_popups(driver, main)
                     qualities_clicked.append(q)
                     LOGGER.info(f"[Swift] JS opened: {q}")
-                    time.sleep(5)
+                    time.sleep(2)
                 except Exception as e:
                     LOGGER.warning(f"[Swift] JS open failed: {e}")
 
