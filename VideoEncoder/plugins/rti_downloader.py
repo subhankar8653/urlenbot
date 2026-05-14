@@ -238,7 +238,8 @@ def get_argon_link(watchmult_url: str):
         driver = _make_selenium_driver()
         driver.get(watchmult_url)
         main = driver.current_window_handle
-        time.sleep(5)
+        # Pehle 2s mein hi argon iframe aa jata hai mostly
+        time.sleep(2)
         driver.execute_script("window.stop();")
         _close_popups(driver, main)
 
@@ -247,14 +248,14 @@ def get_argon_link(watchmult_url: str):
             return argon
 
         try:
-            wait = WebDriverWait(driver, 10)
+            wait = WebDriverWait(driver, 8)
             for btn_text in ["Get Download Link", "Download", "Get Link", "Click Here"]:
                 try:
                     btn = wait.until(EC.element_to_be_clickable(
                         (By.XPATH, f"//a[contains(translate(text(),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'), '{btn_text.upper()}')]")
                     ))
                     btn.click()
-                    time.sleep(4)
+                    time.sleep(2)
                     _close_popups(driver, main)
                     argon = _extract_argon_from_iframes(driver)
                     if argon:

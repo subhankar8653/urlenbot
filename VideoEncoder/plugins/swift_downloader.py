@@ -335,29 +335,29 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
 
         main = driver.current_window_handle
 
-        # Step 1: Basic wait
-        time.sleep(5)
+        # Step 1: Basic wait — 2s kaafi hai initial render ke liye
+        time.sleep(2)
         _close_popups(driver, main)
 
-        # Step 2: Dynamic link detect hone tak wait (max 25 sec)
+        # Step 2: Dynamic link detect hone tak wait (max 12 sec — 25 se kam)
         try:
-            WebDriverWait(driver, 25).until(
+            WebDriverWait(driver, 12).until(
                 EC.presence_of_element_located((By.TAG_NAME, "a"))
             )
             LOGGER.info("[Swift] Links detected via WebDriverWait")
         except Exception:
             LOGGER.warning("[Swift] WebDriverWait timeout — proceeding anyway")
 
-        # Step 3: SPA/React pages ke liye extra render time
-        time.sleep(8)
+        # Step 3: SPA/React pages ke liye extra render time (8 → 3 sec)
+        time.sleep(3)
         _close_popups(driver, main)
 
         # Step 4: Scroll — lazy-loaded content trigger karne ke liye
         try:
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(3)
+            time.sleep(1)
             driver.execute_script("window.scrollTo(0, 0);")
-            time.sleep(2)
+            time.sleep(1)
         except Exception:
             pass
 
@@ -431,11 +431,11 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
 
                 try:
                     driver.execute_script(f"window.open('{href}', '_blank');")
-                    time.sleep(2)
+                    time.sleep(1)
                     _close_popups(driver, main)
                     qualities_clicked.append(q)
                     LOGGER.info(f"[Swift] JS opened: {q}")
-                    time.sleep(5)
+                    time.sleep(3)
                 except Exception as e:
                     LOGGER.warning(f"[Swift] JS open failed: {e}")
 
@@ -460,9 +460,7 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
                 LOGGER.warning("[Swift] Timeout!")
                 break
 
-            time.sleep(5)
-
-        result["files"] = _get_done_files(dl_dir)
+            time.sleep(2)
 
     except Exception as e:
         result["error"] = str(e)
