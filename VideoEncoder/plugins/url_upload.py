@@ -3,7 +3,7 @@ URL Uploader Plugin for Encode Bot
 Features:
   - /url <link>           → Download + auto-apply saved settings → upload
   - /url <link> -vt       → Download + show manual option buttons (old behavior)
-  - /url <link> -e        → Download zip/archive → unzip → auto-apply settings → upload
+  - /url <link> -e        → Download zip/archive → unzip → auto-apply settings → upload ALL files
   - /url <link> -e -vt    → Download zip/archive → unzip → show manual option buttons
   - /url <link> | <name>  → Custom filename (all flags still work)
 
@@ -55,8 +55,8 @@ async def url_upload_cmd(bot: Client, message: Message):
     Usage:
       /url <link>              → auto-process (saved settings ke hisaab se)
       /url <link> -vt          → manual options buttons dikhao
-      /url <link> -e           → zip/archive download → unzip → auto-process
-      /url <link> -e -vt       → zip/archive download → unzip → manual options
+      /url <link> -e           → zip/archive download → unzip → ALL files auto-process
+      /url <link> -e -vt       → zip/archive download → unzip → manual options (first file)
       /url <link> | <filename> → custom filename (flags bhi kaam karte hain)
     """
     c = await check_chat(message, chat="Both")
@@ -69,7 +69,7 @@ async def url_upload_cmd(bot: Client, message: Message):
             "<b>Usage:</b>\n"
             "• <code>/url &lt;link&gt;</code> – Auto-process with saved settings\n"
             "• <code>/url &lt;link&gt; -vt</code> – Show manual option buttons\n"
-            "• <code>/url &lt;link&gt; -e</code> – Unzip then auto-process\n"
+            "• <code>/url &lt;link&gt; -e</code> – Unzip then auto-process ALL files\n"
             "• <code>/url &lt;link&gt; -e -vt</code> – Unzip then show buttons\n"
             "• <code>/url &lt;link&gt; | &lt;filename&gt;</code> – Custom filename\n\n"
             "Auto-settings configure karo: /urlpreset"
@@ -116,12 +116,45 @@ async def url_upload_cmd(bot: Client, message: Message):
     # ── ZIP/Archive extract ────────────────────────────────────────────────────
     if extract_zip:
         await msg.edit("<b>📦 Extracting archive...</b>")
-        extracted_path = await _extract_archive(filepath, msg)
-        if not extracted_path:
-            # Error already shown in _extract_archive
+        # FIX: ab ALL files return hongi (list), sirf ek nahi
+        all_files = await _extract_archive_all(filepath, msg)
+        if not all_files:
             return
-        filepath = extracted_path
 
+        total = len(all_files)
+
+        if show_buttons:
+            # -vt mode: sirf pehli file ke liye buttons dikhao
+            filepath = all_files[0]
+            user_id = message.from_user.id
+            _url_sessions[user_id] = {
+                "filepath": filepath,
+                "msg": msg,
+                "orig_name": os.path.basename(filepath),
+                "message": message,
+                # Remaining files queue mein
+                "zip_queue": all_files[1:],
+            }
+            await _show_url_options(msg, user_id, filepath)
+        else:
+            # Auto mode: SAARI files process + upload karo
+            await msg.edit(f"<b>📦 Extracted {total} files! Processing...</b>")
+            user_id = message.from_user.id
+            for idx, fp in enumerate(all_files, 1):
+                status_msg = await message.reply(
+                    f"<b>⚙️ [{idx}/{total}] Processing:</b> <code>{os.path.basename(fp)}</code>"
+                )
+                _url_sessions[user_id] = {
+                    "filepath": fp,
+                    "msg": status_msg,
+                    "orig_name": os.path.basename(fp),
+                    "message": message,
+                }
+                await _auto_process_and_upload(bot, user_id, status_msg, message)
+            await msg.delete()
+        return
+
+    # ── Single file flow (no zip) ──────────────────────────────────────────────
     user_id = message.from_user.id
     _url_sessions[user_id] = {
         "filepath": filepath,
@@ -130,7 +163,6 @@ async def url_upload_cmd(bot: Client, message: Message):
         "message": message,
     }
 
-    # ── Show buttons ya auto-process ──────────────────────────────────────────
     if show_buttons:
         await _show_url_options(msg, user_id, filepath)
     else:
@@ -141,7 +173,6 @@ async def url_upload_cmd(bot: Client, message: Message):
 async def _auto_process_and_upload(bot: Client, user_id: int, msg: Message, original_message: Message):
     """
     User ki saved URL auto-settings ke hisaab se file process karo aur upload karo.
-    Koi button nahi — seedha kaam ho jaayega.
     """
     session = _url_sessions.get(user_id)
     if not session:
@@ -189,6 +220,7 @@ async def _auto_process_and_upload(bot: Client, user_id: int, msg: Message, orig
             await asyncio.sleep(2)
 
     # ── 4. Name Swap ──
+    # FIX: pehle swap rules fetch karo, phir check karo
     if auto.get("name_swap"):
         swap_rules = await db.get_swap(user_id)
         if swap_rules:
@@ -196,14 +228,32 @@ async def _auto_process_and_upload(bot: Client, user_id: int, msg: Message, orig
             new_name = apply_name_swap(old_name, swap_rules)
             if new_name != old_name:
                 new_path = os.path.join(os.path.dirname(filepath), new_name)
-                os.rename(filepath, new_path)
-                filepath = new_path
-                session["filepath"] = filepath
-                _url_sessions[user_id] = session
+                try:
+                    os.rename(filepath, new_path)
+                    filepath = new_path
+                    session["filepath"] = filepath
+                    _url_sessions[user_id] = session
+                    LOGGER.info(f"Name swap: {old_name} → {new_name}")
+                except Exception as e:
+                    LOGGER.error(f"Name swap rename failed: {e}")
+            else:
+                LOGGER.info(f"Name swap: no match found in '{old_name}'")
+        else:
+            LOGGER.info("Name swap ON but no rules set — skipping")
 
     # ── 5. Apply Metadata ──
+    # FIX: get_url_metadata aur get_full_metadata dono check karo
     if auto.get("apply_metadata"):
         meta = await db.get_url_metadata(user_id)
+        # Full metadata bhi check karo agar url_metadata empty hai
+        if not any(meta.values()):
+            full_meta = await db.get_full_metadata(user_id)
+            if full_meta.get("enabled"):
+                meta = {
+                    "video_title": full_meta.get("video_title", ""),
+                    "audio_title": full_meta.get("audio_title", ""),
+                    "show_title": full_meta.get("comment", ""),
+                }
         if any(meta.values()):
             await msg.edit("<b>🔄 Applying metadata (auto)...</b>")
             new_path = await _apply_metadata(filepath, meta, msg)
@@ -217,11 +267,11 @@ async def _auto_process_and_upload(bot: Client, user_id: int, msg: Message, orig
     _url_sessions.pop(user_id, None)
 
 
-# ─── Archive Extract ───────────────────────────────────────────────────────────
-async def _extract_archive(filepath: str, msg: Message) -> str | None:
+# ─── Archive Extract (ALL files) ──────────────────────────────────────────────
+async def _extract_archive_all(filepath: str, msg: Message) -> list:
     """
-    ZIP/TAR archive ko extract karo — nested ZIPs bhi handle hoti hain.
-    Sabse badi video file return hogi.
+    ZIP/TAR archive ko extract karo — saari video files return karo (list).
+    FIX: pehle sirf ek file return karta tha, ab saari return hoti hain.
     """
     VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".m4v", ".wmv", ".webm"}
     ARCHIVE_EXTS = {".zip", ".tar", ".gz", ".bz2", ".xz"}
@@ -230,7 +280,6 @@ async def _extract_archive(filepath: str, msg: Message) -> str | None:
     os.makedirs(extract_dir, exist_ok=True)
 
     def _extract_one(src_path: str, dst_dir: str) -> bool:
-        """Ek archive extract karo. True = success."""
         try:
             if zipfile.is_zipfile(src_path):
                 with zipfile.ZipFile(src_path, "r") as zf:
@@ -257,7 +306,7 @@ async def _extract_archive(filepath: str, msg: Message) -> str | None:
             "Supported: .zip, .tar, .tar.gz, .tar.bz2, .tar.xz"
         )
         shutil.rmtree(extract_dir, ignore_errors=True)
-        return None
+        return []
 
     # Step 2: Nested archives bhi extract karo (max 3 levels deep)
     for _level in range(3):
@@ -275,14 +324,13 @@ async def _extract_archive(filepath: str, msg: Message) -> str | None:
                             os.remove(nested_path)
                         except Exception:
                             pass
-                        # Move extracted files up
                         for item in os.listdir(nested_dir):
                             shutil.move(os.path.join(nested_dir, item), root)
                         shutil.rmtree(nested_dir, ignore_errors=True)
         if not nested_found:
             break
 
-    # Step 3: Video files dhundo (recursively)
+    # Step 3: SAARI video files dhundo (recursively)
     video_files = []
     for root, dirs, files in os.walk(extract_dir):
         for f in files:
@@ -298,29 +346,45 @@ async def _extract_archive(filepath: str, msg: Message) -> str | None:
             f"Extracted files: {all_files[:10]}"
         )
         shutil.rmtree(extract_dir, ignore_errors=True)
-        return None
+        return []
 
-    # Sort by size — badi wali main file hoti hai
-    video_files.sort(key=lambda x: os.path.getsize(x), reverse=True)
-    chosen = video_files[0]
+    # Episode number se sort karo (natural sort)
+    def _natural_key(path):
+        name = os.path.basename(path)
+        parts = re.split(r'(\d+)', name)
+        return [int(p) if p.isdigit() else p.lower() for p in parts]
 
-    dest = os.path.join(download_dir, os.path.basename(chosen))
-    shutil.move(chosen, dest)
+    video_files.sort(key=_natural_key)
+
+    # Saari files download_dir mein move karo
+    dest_files = []
+    for vf in video_files:
+        dest = os.path.join(download_dir, os.path.basename(vf))
+        # Same name conflict handle karo
+        if os.path.exists(dest):
+            base, ext = os.path.splitext(os.path.basename(vf))
+            dest = os.path.join(download_dir, f"{base}_{int(time.time())}{ext}")
+        shutil.move(vf, dest)
+        dest_files.append(dest)
+
     shutil.rmtree(extract_dir, ignore_errors=True)
 
-    if len(video_files) > 1:
-        await msg.edit(
-            f"📦 <b>Extracted!</b> {len(video_files)} video files mili.\n"
-            f"Processing: <code>{os.path.basename(dest)}</code> (largest)"
-        )
-        await asyncio.sleep(2)
+    await msg.edit(
+        f"📦 <b>Extracted!</b> {len(dest_files)} video files mili.\n"
+        f"Processing all in order..."
+    )
+    await asyncio.sleep(2)
 
-    return dest
+    return dest_files
 
 
 # ─── Show options keyboard ────────────────────────────────────────────────────
 async def _show_url_options(msg: Message, user_id: int, filepath: str):
     fname = os.path.basename(filepath)
+    session = _url_sessions.get(user_id, {})
+    queue = session.get("zip_queue", [])
+    queue_info = f"\n<i>({len(queue)} more files in queue)</i>" if queue else ""
+
     kb = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🚫 Remove Subs",      callback_data=f"url_rmsub_{user_id}"),
@@ -339,7 +403,7 @@ async def _show_url_options(msg: Message, user_id: int, filepath: str):
         ],
     ])
     await msg.edit(
-        f"✅ <b>Downloaded:</b> <code>{fname}</code>\n\nChoose what to do before uploading:",
+        f"✅ <b>Downloaded:</b> <code>{fname}</code>{queue_info}\n\nChoose what to do before uploading:",
         reply_markup=kb,
     )
 
@@ -379,7 +443,8 @@ async def url_upload_callbacks(bot: Client, cb: CallbackQuery):
     if action == "upload":
         await cb.answer()
         await _do_upload(bot, filepath, original_message, msg)
-        _url_sessions.pop(owner_id, None)
+        # FIX: zip_queue process karo upload ke baad
+        await _process_zip_queue(bot, owner_id, original_message)
 
     # ── Cancel ────────────────────────────────────────────────────────────────
     elif action == "cancel":
@@ -388,6 +453,12 @@ async def url_upload_callbacks(bot: Client, cb: CallbackQuery):
             os.remove(filepath)
         except Exception:
             pass
+        # Queue mein baaki files bhi delete karo
+        for qf in session.get("zip_queue", []):
+            try:
+                os.remove(qf)
+            except Exception:
+                pass
         _url_sessions.pop(owner_id, None)
         await msg.edit("🚫 Cancelled.")
 
@@ -562,6 +633,35 @@ async def url_upload_callbacks(bot: Client, cb: CallbackQuery):
             session["filepath"] = new_path
             _url_sessions[owner_id] = session
         await _show_url_options(msg, owner_id, session["filepath"])
+
+
+# ─── ZIP Queue processor (after -vt upload) ───────────────────────────────────
+async def _process_zip_queue(bot: Client, user_id: int, original_message: Message):
+    """
+    -vt mode mein pehli file upload hone ke baad
+    zip_queue mein baaki files auto-process karo.
+    """
+    session = _url_sessions.pop(user_id, None)
+    if not session:
+        return
+    queue = session.get("zip_queue", [])
+    if not queue:
+        return
+
+    total = len(queue)
+    for idx, fp in enumerate(queue, 1):
+        if not os.path.isfile(fp):
+            continue
+        status_msg = await original_message.reply(
+            f"<b>⚙️ [{idx}/{total}] Processing queue:</b> <code>{os.path.basename(fp)}</code>"
+        )
+        _url_sessions[user_id] = {
+            "filepath": fp,
+            "msg": status_msg,
+            "orig_name": os.path.basename(fp),
+            "message": original_message,
+        }
+        await _auto_process_and_upload(bot, user_id, status_msg, original_message)
 
 
 # ─── Text handler for metadata input ─────────────────────────────────────────
