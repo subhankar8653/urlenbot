@@ -18,6 +18,7 @@ from .. import LOGGER
 from ..utils.database.access_db import db
 from ..utils.database.add_user import AddUserToDatabase
 from ..utils.helper import check_chat, output
+import asyncio
 
 # ─── Active setmeta sessions ──────────────────────────────────────────────────
 # { user_id: 'field_key' }  e.g. { 123: 'video_title' }
@@ -472,4 +473,3 @@ async def metadata_cmd(bot: Client, message: Message):
     await _show_setmeta_panel(message, message.from_user.id, is_new=True)
 
 
-import asyncio
