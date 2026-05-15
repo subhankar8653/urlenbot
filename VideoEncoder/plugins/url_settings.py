@@ -1,7 +1,8 @@
 """
 URL Uploader Settings Commands
   /urlsettings  - Show current URL uploader settings
-  /urlpreset    - Configure auto-processing settings (kya seedha ho, kya buttons se)
+  /urlpreset    - Configure auto-processing settings
+  /setmeta      - Interactive button panel for metadata
   /clearmeta    - Clear saved metadata settings
 """
 
@@ -18,16 +19,14 @@ from ..utils.database.access_db import db
 from ..utils.database.add_user import AddUserToDatabase
 from ..utils.helper import check_chat, output
 
+# ─── Active setmeta sessions ──────────────────────────────────────────────────
+# { user_id: 'field_key' }  e.g. { 123: 'video_title' }
+_setmeta_sessions: dict = {}
+
 
 # ─── /urlpreset — Auto-processing settings ────────────────────────────────────
 @Client.on_message(filters.command("urlpreset"))
 async def url_preset_cmd(bot: Client, message: Message):
-    """
-    /urlpreset — URL auto-processing settings configure karo.
-
-    Ye settings /url <link> command mein automatically apply honge
-    (bina buttons ke). Manual buttons ke liye /url <link> -vt use karo.
-    """
     c = await check_chat(message, chat="Both")
     if not c:
         return
@@ -36,7 +35,6 @@ async def url_preset_cmd(bot: Client, message: Message):
 
 
 async def _show_preset_panel(event, user_id: int, is_new: bool = False):
-    """Auto-processing preset panel dikhao."""
     auto = await db.get_url_auto_settings(user_id)
 
     def tick(key):
@@ -83,7 +81,7 @@ async def _show_preset_panel(event, user_id: int, is_new: bool = False):
         f"• Name Swap: <b>{'ON' if auto.get('name_swap') else 'OFF'}</b>\n"
         f"  ↳ (Rules set karo: /addswap)\n"
         f"• Apply Metadata: <b>{'ON' if auto.get('apply_metadata') else 'OFF'}</b>\n"
-        f"  ↳ (Metadata set karo: /urlsettings)\n"
+        f"  ↳ (Metadata set karo: /setmeta)\n"
     )
 
     if is_new:
@@ -97,15 +95,13 @@ async def _show_preset_panel(event, user_id: int, is_new: bool = False):
 
 @Client.on_callback_query(filters.regex(r"^urlp_"))
 async def url_preset_callbacks(bot: Client, cb: CallbackQuery):
-    """URL preset toggle callbacks."""
     parts = cb.data.split("_")
-    # urlp_toggle_<key>_<user_id>
     if len(parts) < 4:
         await cb.answer()
         return
 
-    action = parts[1]   # "toggle"
-    key_raw = parts[2]  # "rmsub", "rmaudio", "hindionly", "nameswap", "metadata"
+    action = parts[1]
+    key_raw = parts[2]
     try:
         owner_id = int(parts[3])
     except ValueError:
@@ -116,7 +112,6 @@ async def url_preset_callbacks(bot: Client, cb: CallbackQuery):
         await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
         return
 
-    # Map short key to db key
     key_map = {
         "rmsub":     "rm_sub",
         "rmaudio":   "rm_audio",
@@ -132,7 +127,6 @@ async def url_preset_callbacks(bot: Client, cb: CallbackQuery):
     auto = await db.get_url_auto_settings(owner_id)
     auto[db_key] = not auto.get(db_key, False)
 
-    # Hindi Only aur Remove Audio ek saath ON nahi ho sakte (conflicting)
     if db_key == "rm_audio" and auto["rm_audio"]:
         auto["hindi_only"] = False
     elif db_key == "hindi_only" and auto["hindi_only"]:
@@ -146,22 +140,15 @@ async def url_preset_callbacks(bot: Client, cb: CallbackQuery):
 # ─── /urlsettings ─────────────────────────────────────────────────────────────
 @Client.on_message(filters.command("urlsettings"))
 async def url_settings_cmd(bot: Client, message: Message):
-    """Show current URL uploader settings."""
     c = await check_chat(message, chat="Both")
     if not c:
         return
     await AddUserToDatabase(bot, message)
 
     user_id = message.from_user.id
-    meta = await db.get_url_metadata(user_id)
+    meta = await db.get_full_metadata(user_id)
     swap_rules = await db.get_swap(user_id)
     auto = await db.get_url_auto_settings(user_id)
-
-    meta_text = (
-        f"  🎬 Video Title: <code>{meta.get('video_title') or 'not set'}</code>\n"
-        f"  🔊 Audio Title: <code>{meta.get('audio_title') or 'not set'}</code>\n"
-        f"  📺 Show Title:  <code>{meta.get('show_title') or 'not set'}</code>"
-    )
 
     swap_text = ""
     if swap_rules:
@@ -178,24 +165,28 @@ async def url_settings_cmd(bot: Client, message: Message):
         f"Metadata: {'✅' if auto.get('apply_metadata') else '❌'}"
     )
 
+    status = "✅ Enabled" if meta.get("enabled") else "❌ Disabled"
     text = (
         "<b>⚙️ URL Uploader Settings</b>\n\n"
         "<b>🤖 Auto-Processing:</b>\n"
         f"{auto_text}\n\n"
-        "<b>🏷️ Saved Metadata:</b>\n"
-        f"{meta_text}\n\n"
+        "<b>🏷️ Metadata:</b> " + status + "\n"
+        f"  🎬 Video Title: <code>{meta.get('video_title') or 'not set'}</code>\n"
+        f"  🔊 Audio Title: <code>{meta.get('audio_title') or 'not set'}</code>\n"
+        f"     ↳ <i>{{audiolang}} = actual language name auto fill hoga</i>\n"
+        f"  📝 Sub Title:   <code>{meta.get('subtitle_title') or 'not set'}</code>\n"
+        f"  💬 Comment:     <code>{meta.get('comment') or 'not set'}</code>\n\n"
         "<b>🔄 Name Swap Rules:</b>\n"
         f"{swap_text}\n\n"
         "<b>Commands:</b>\n"
-        "• <code>/url &lt;link&gt;</code> – Auto-process\n"
-        "• <code>/url &lt;link&gt; -vt</code> – Manual buttons\n"
-        "• <code>/url &lt;link&gt; -e</code> – Unzip + auto-process\n"
-        "• <code>/urlpreset</code> – Configure auto-processing\n"
+        "• <code>/setmeta</code> – Interactive metadata panel\n"
+        "• <code>/urlpreset</code> – Auto-processing toggle\n"
         "• <code>/addswap &lt;from&gt; &lt;to&gt;</code> – Add swap rule\n"
-        "• <code>/clearmeta</code> – Reset saved metadata"
+        "• <code>/clearmeta</code> – Reset metadata"
     )
     kb = InlineKeyboardMarkup([
         [
+            InlineKeyboardButton("🏷️ Edit Metadata", callback_data=f"urlset_setmeta_{user_id}"),
             InlineKeyboardButton("⚙️ Auto-Processing", callback_data=f"urlset_preset_{user_id}"),
         ],
         [
@@ -219,7 +210,6 @@ async def clear_meta_cmd(bot: Client, message: Message):
 @Client.on_callback_query(filters.regex(r"^urlset_"))
 async def url_settings_callbacks(bot: Client, cb: CallbackQuery):
     parts = cb.data.split("_")
-    # urlset_action_userid
     if len(parts) < 3:
         await cb.answer()
         return
@@ -249,63 +239,66 @@ async def url_settings_callbacks(bot: Client, cb: CallbackQuery):
         await cb.answer()
         await _show_preset_panel(cb.message, owner_id, is_new=False)
 
+    elif action == "setmeta":
+        await cb.answer()
+        await _show_setmeta_panel(cb.message, owner_id, is_new=False)
 
-# ─── /metadata — Mirror Leech style full metadata settings ───────────────────
-@Client.on_message(filters.command("metadata"))
-async def metadata_cmd(bot: Client, message: Message):
-    """Full metadata settings — Mirror Leech jaisi."""
+
+# ─── /setmeta — Interactive button panel ──────────────────────────────────────
+@Client.on_message(filters.command("setmeta"))
+async def setmeta_cmd(bot: Client, message: Message):
+    """/setmeta → Interactive button panel for metadata."""
     c = await check_chat(message, chat="Both")
     if not c:
         return
     await AddUserToDatabase(bot, message)
-    await _show_metadata_panel(message, message.from_user.id, is_new=True)
+    await _show_setmeta_panel(message, message.from_user.id, is_new=True)
 
 
-async def _show_metadata_panel(event, user_id: int, is_new: bool = False):
+async def _show_setmeta_panel(event, user_id: int, is_new: bool = False):
+    """Interactive metadata panel — har field pe button, click karo aur naam bhejo."""
     meta = await db.get_full_metadata(user_id)
 
-    status = "✅ Enabled" if meta.get('enabled') else "❌ Disabled"
-    strip = "✅ ON" if meta.get('strip_attachments') else "❌ OFF"
-    clear = "✅ ON" if meta.get('clear_metadata') else "❌ OFF"
+    enabled = meta.get("enabled", False)
+    toggle_label = "✅ Disable Metadata" if enabled else "❌ Enable Metadata"
 
-    text = (
-        "<b>🏷️ Metadata Settings</b>\n\n"
-        f"• Status: <b>{status}</b>\n"
-        f"• Video Title: <code>{meta.get('video_title') or 'not set'}</code>\n"
-        f"• Audio Title: <code>{meta.get('audio_title') or 'not set'}</code>\n"
-        f"  ↳ <i>{{audiolang}} = auto detect (Hindi, Japanese...)</i>\n"
-        f"• Subtitle Title: <code>{meta.get('subtitle_title') or 'not set'}</code>\n"
-        f"  ↳ <i>{{sublang}} = auto detect</i>\n"
-        f"• Comment: <code>{meta.get('comment') or 'not set'}</code>\n"
-        f"• Strip Attachments: <b>{strip}</b>\n"
-        f"• Clear Metadata: <b>{clear}</b>\n\n"
-        "<b>Commands:</b>\n"
-        "• <code>/setmeta video &lt;title&gt;</code> — Video stream title\n"
-        "• <code>/setmeta audio &lt;title&gt;</code> — Audio stream title\n"
-        "• <code>/setmeta sub &lt;title&gt;</code> — Subtitle stream title\n"
-        "• <code>/setmeta comment &lt;text&gt;</code> — File comment\n"
-        "• <code>/setmeta reset</code> — Reset to defaults\n"
-    )
+    def val(key):
+        v = meta.get(key, "")
+        return v if v else "not set"
 
     kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(
-                f"{'✅ Disable' if meta.get('enabled') else '❌ Enable'} Metadata",
-                callback_data=f"meta_toggle_enabled_{user_id}"
-            )
+            InlineKeyboardButton(toggle_label, callback_data=f"sm_toggle_enabled_{user_id}")
         ],
         [
-            InlineKeyboardButton(
-                f"Strip Attachments: {'✅' if meta.get('strip_attachments') else '❌'}",
-                callback_data=f"meta_toggle_strip_{user_id}"
-            ),
-            InlineKeyboardButton(
-                f"Clear Metadata: {'✅' if meta.get('clear_metadata') else '❌'}",
-                callback_data=f"meta_toggle_clear_{user_id}"
-            ),
+            InlineKeyboardButton(f"🎬 Video: {val('video_title')}", callback_data=f"sm_edit_video_title_{user_id}"),
         ],
-        [InlineKeyboardButton("❌ Close", callback_data="closeMeh")],
+        [
+            InlineKeyboardButton(f"🔊 Audio: {val('audio_title')}", callback_data=f"sm_edit_audio_title_{user_id}"),
+        ],
+        [
+            InlineKeyboardButton(f"📝 Sub: {val('subtitle_title')}", callback_data=f"sm_edit_subtitle_title_{user_id}"),
+        ],
+        [
+            InlineKeyboardButton(f"💬 Comment: {val('comment')}", callback_data=f"sm_edit_comment_{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Reset Defaults", callback_data=f"sm_reset_{user_id}"),
+            InlineKeyboardButton("❌ Close", callback_data="closeMeh"),
+        ],
     ])
+
+    text = (
+        "<b>🏷️ Metadata Settings</b>\n\n"
+        f"Status: <b>{'✅ Enabled' if enabled else '❌ Disabled'}</b>\n\n"
+        f"🎬 <b>Video Title:</b> <code>{val('video_title')}</code>\n"
+        f"🔊 <b>Audio Title:</b> <code>{val('audio_title')}</code>\n"
+        f"   ↳ <i>{{audiolang}} likhne se actual language name auto fill hoga</i>\n"
+        f"📝 <b>Sub Title:</b>   <code>{val('subtitle_title')}</code>\n"
+        f"   ↳ <i>{{sublang}} likhne se subtitle language auto fill hoga</i>\n"
+        f"💬 <b>Comment:</b>     <code>{val('comment')}</code>\n\n"
+        "<i>Kisi bhi button pe tap karo → naam type karke bhejo → ho gaya!</i>"
+    )
 
     if is_new:
         await event.reply(text, reply_markup=kb)
@@ -316,93 +309,167 @@ async def _show_metadata_panel(event, user_id: int, is_new: bool = False):
             pass
 
 
-@Client.on_message(filters.command("setmeta"))
-async def setmeta_cmd(bot: Client, message: Message):
-    """/setmeta video <title> | audio <title> | sub <title> | comment <text> | reset"""
+@Client.on_callback_query(filters.regex(r"^sm_"))
+async def setmeta_callbacks(bot: Client, cb: CallbackQuery):
+    """Setmeta panel ke saare callbacks."""
+    parts = cb.data.split("_")
+    # sm_action_field_userid  OR  sm_action_userid
+    if len(parts) < 3:
+        await cb.answer()
+        return
+
+    action = parts[1]
+
+    # sm_toggle_enabled_userid  (3 parts after split: toggle, enabled, userid)
+    # sm_edit_video_title_userid (4 parts: edit, video, title, userid)
+    # sm_reset_userid (2 parts: reset, userid)
+
+    if action == "toggle":
+        # parts: sm toggle enabled userid
+        try:
+            owner_id = int(parts[3])
+        except (IndexError, ValueError):
+            await cb.answer()
+            return
+        if cb.from_user.id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+        meta = await db.get_full_metadata(owner_id)
+        meta["enabled"] = not meta.get("enabled", False)
+        await db.set_full_metadata(owner_id, meta)
+        await cb.answer(f"{'✅ Enabled' if meta['enabled'] else '❌ Disabled'}")
+        await _show_setmeta_panel(cb.message, owner_id, is_new=False)
+
+    elif action == "reset":
+        # parts: sm reset userid
+        try:
+            owner_id = int(parts[2])
+        except (IndexError, ValueError):
+            await cb.answer()
+            return
+        if cb.from_user.id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+        await db.set_full_metadata(owner_id, {
+            "enabled": True,
+            "video_title": "Sbanime",
+            "audio_title": "{audiolang}",
+            "subtitle_title": "{sublang}",
+            "comment": "",
+            "strip_attachments": False,
+            "clear_metadata": False,
+        })
+        await cb.answer("✅ Defaults restored!")
+        await _show_setmeta_panel(cb.message, owner_id, is_new=False)
+
+    elif action == "edit":
+        # parts: sm edit <field1> <field2_maybe> <userid>
+        # field can be: video_title, audio_title, subtitle_title, comment
+        # callback_data format: sm_edit_video_title_userid
+        try:
+            owner_id = int(parts[-1])
+        except (IndexError, ValueError):
+            await cb.answer()
+            return
+        if cb.from_user.id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+
+        # field = everything between "edit" and last part (owner_id)
+        field_key = "_".join(parts[2:-1])  # e.g. "video_title", "audio_title"
+
+        field_labels = {
+            "video_title":    "🎬 Video Stream Title",
+            "audio_title":    "🔊 Audio Stream Title",
+            "subtitle_title": "📝 Subtitle Stream Title",
+            "comment":        "💬 Comment / Description",
+        }
+        field_hints = {
+            "video_title":    "e.g. <code>Sbanime</code>",
+            "audio_title":    "e.g. <code>{audiolang}</code> ya <code>Hindi</code>",
+            "subtitle_title": "e.g. <code>{sublang}</code> ya <code>English</code>",
+            "comment":        "e.g. <code>@SBANIME</code>",
+        }
+
+        if field_key not in field_labels:
+            await cb.answer("Unknown field", show_alert=True)
+            return
+
+        # Session store karo
+        _setmeta_sessions[owner_id] = field_key
+
+        await cb.answer()
+        await cb.message.edit(
+            f"<b>✏️ {field_labels[field_key]}</b>\n\n"
+            f"Hint: {field_hints[field_key]}\n\n"
+            "Ab yeh title type karke bhejo.\n"
+            "Send <code>-</code> (dash) to clear this field.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Back", callback_data=f"sm_back_{owner_id}")
+            ]])
+        )
+
+    elif action == "back":
+        try:
+            owner_id = int(parts[2])
+        except (IndexError, ValueError):
+            await cb.answer()
+            return
+        _setmeta_sessions.pop(owner_id, None)
+        await cb.answer()
+        await _show_setmeta_panel(cb.message, owner_id, is_new=False)
+
+
+# ─── Text handler: setmeta field input ────────────────────────────────────────
+@Client.on_message(filters.text & filters.private, group=1)
+async def setmeta_text_input(bot: Client, message: Message):
+    """Setmeta panel ka text input — user ne field naam type kiya."""
+    user_id = message.from_user.id
+    field_key = _setmeta_sessions.get(user_id)
+    if not field_key:
+        return  # Hamara kaam nahi
+
+    _setmeta_sessions.pop(user_id)
+
+    value = message.text.strip()
+    if value == "-":
+        value = ""
+
+    meta = await db.get_full_metadata(user_id)
+    meta[field_key] = value
+    await db.set_full_metadata(user_id, meta)
+
+    field_labels = {
+        "video_title":    "Video Title",
+        "audio_title":    "Audio Title",
+        "subtitle_title": "Subtitle Title",
+        "comment":        "Comment",
+    }
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    confirm = await message.reply(
+        f"✅ <b>{field_labels.get(field_key, field_key)}</b> set to: "
+        f"<code>{value or '(cleared)'}</code>"
+    )
+    await asyncio.sleep(2)
+
+    # Panel wapas dikhao
+    await _show_setmeta_panel(confirm, user_id, is_new=True)
+
+
+# ─── /metadata — panel shortcut ───────────────────────────────────────────────
+@Client.on_message(filters.command("metadata"))
+async def metadata_cmd(bot: Client, message: Message):
+    """/metadata → same as /setmeta."""
     c = await check_chat(message, chat="Both")
     if not c:
         return
     await AddUserToDatabase(bot, message)
-
-    args = message.command[1:]
-    if len(args) < 1:
-        await message.reply(
-            "Usage:\n"
-            "• <code>/setmeta video Sbanime hindi</code>\n"
-            "• <code>/setmeta audio {audiolang}</code>\n"
-            "• <code>/setmeta sub {sublang}</code>\n"
-            "• <code>/setmeta comment Some comment</code>\n"
-            "• <code>/setmeta reset</code>"
-        )
-        return
-
-    user_id = message.from_user.id
-    field = args[0].lower()
-    value = " ".join(args[1:]).strip() if len(args) > 1 else ""
-
-    if field == "reset":
-        await db.set_full_metadata(user_id, {
-            'enabled': False,
-            'video_title': 'Sbanime hindi',
-            'audio_title': '{audiolang}',
-            'subtitle_title': '{sublang}',
-            'comment': '',
-            'strip_attachments': False,
-            'clear_metadata': False,
-        })
-        await message.reply("✅ Metadata defaults restored!")
-        return
-
-    field_map = {
-        'video': 'video_title',
-        'audio': 'audio_title',
-        'sub': 'subtitle_title',
-        'subtitle': 'subtitle_title',
-        'comment': 'comment',
-    }
-
-    db_key = field_map.get(field)
-    if not db_key:
-        await message.reply(f"❌ Unknown field: <code>{field}</code>\nOptions: video, audio, sub, comment, reset")
-        return
-
-    meta = await db.get_full_metadata(user_id)
-    meta[db_key] = value
-    await db.set_full_metadata(user_id, meta)
-    await message.reply(f"✅ <b>{field.title()} title</b> set to: <code>{value or '(empty)'}</code>")
+    await _show_setmeta_panel(message, message.from_user.id, is_new=True)
 
 
-@Client.on_callback_query(filters.regex(r"^meta_toggle_"))
-async def meta_toggle_cb(bot: Client, cb: CallbackQuery):
-    parts = cb.data.split("_")
-    # meta_toggle_<key>_<user_id>
-    if len(parts) < 4:
-        await cb.answer()
-        return
-
-    key = parts[2]
-    try:
-        owner_id = int(parts[3])
-    except ValueError:
-        await cb.answer()
-        return
-
-    if cb.from_user.id != owner_id:
-        await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
-        return
-
-    key_map = {
-        'enabled': 'enabled',
-        'strip': 'strip_attachments',
-        'clear': 'clear_metadata',
-    }
-    db_key = key_map.get(key)
-    if not db_key:
-        await cb.answer("Unknown key")
-        return
-
-    meta = await db.get_full_metadata(owner_id)
-    meta[db_key] = not meta.get(db_key, False)
-    await db.set_full_metadata(owner_id, meta)
-    await cb.answer(f"{'✅ ON' if meta[db_key] else '❌ OFF'}")
-    await _show_metadata_panel(cb.message, owner_id, is_new=False)
+import asyncio

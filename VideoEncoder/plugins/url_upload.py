@@ -201,13 +201,13 @@ async def _auto_process_and_upload(bot: Client, user_id: int, msg: Message, orig
             _url_sessions[user_id] = session
 
     # ── 3. Hindi Audio Only (rm_audio off ho toh hi) ──
+    # FIX: sirf 'language' field se detect karo (title se nahi)
     elif auto.get("hindi_only"):
         await msg.edit("<b>🔄 Keeping Hindi audio only (auto)...</b>")
         audio_streams = get_audio_streams(filepath)
         hindi_indices = [
             s["index"] for s in audio_streams
-            if any(tag in (s.get("lang", "") + s.get("title", "")).lower()
-                   for tag in ["hin", "hindi", "hin2", "hi", "dub"])
+            if _is_hindi_stream(s)
         ]
         if hindi_indices:
             new_path = await _keep_audio_streams(filepath, hindi_indices, msg)
@@ -216,11 +216,17 @@ async def _auto_process_and_upload(bot: Client, user_id: int, msg: Message, orig
                 session["filepath"] = filepath
                 _url_sessions[user_id] = session
         else:
-            await msg.edit("<b>⚠️ Hindi audio nahi mila, sab streams rakh rahe hain...</b>")
-            await asyncio.sleep(2)
+            stream_info = ", ".join(
+                f"#{s['index']}:{s.get('lang','?')}" for s in audio_streams
+            )
+            await msg.edit(
+                f"<b>⚠️ Hindi audio nahi mila!</b>\n"
+                f"Streams found: <code>{stream_info}</code>\n"
+                "Sab streams rakh rahe hain..."
+            )
+            await asyncio.sleep(3)
 
     # ── 4. Name Swap ──
-    # FIX: pehle swap rules fetch karo, phir check karo
     if auto.get("name_swap"):
         swap_rules = await db.get_swap(user_id)
         if swap_rules:
@@ -237,26 +243,25 @@ async def _auto_process_and_upload(bot: Client, user_id: int, msg: Message, orig
                 except Exception as e:
                     LOGGER.error(f"Name swap rename failed: {e}")
             else:
-                LOGGER.info(f"Name swap: no match found in '{old_name}'")
+                LOGGER.info(f"Name swap: no match in '{old_name}'")
         else:
             LOGGER.info("Name swap ON but no rules set — skipping")
 
     # ── 5. Apply Metadata ──
-    # FIX: get_url_metadata aur get_full_metadata dono check karo
+    # FIX: get_full_metadata use karo (yahi /setmeta se set hota hai)
+    # {audiolang} aur {sublang} ko actual language names se replace karo
     if auto.get("apply_metadata"):
-        meta = await db.get_url_metadata(user_id)
-        # Full metadata bhi check karo agar url_metadata empty hai
-        if not any(meta.values()):
-            full_meta = await db.get_full_metadata(user_id)
-            if full_meta.get("enabled"):
-                meta = {
-                    "video_title": full_meta.get("video_title", ""),
-                    "audio_title": full_meta.get("audio_title", ""),
-                    "show_title": full_meta.get("comment", ""),
-                }
-        if any(meta.values()):
+        full_meta = await db.get_full_metadata(user_id)
+        if full_meta.get("enabled") and any([
+            full_meta.get("video_title"),
+            full_meta.get("audio_title"),
+            full_meta.get("subtitle_title"),
+            full_meta.get("comment"),
+        ]):
             await msg.edit("<b>🔄 Applying metadata (auto)...</b>")
-            new_path = await _apply_metadata(filepath, meta, msg)
+            # {audiolang}/{sublang} resolve karo
+            resolved = _resolve_meta_placeholders(full_meta, filepath)
+            new_path = await _apply_full_metadata(filepath, resolved, msg)
             if new_path:
                 filepath = new_path
                 session["filepath"] = filepath
@@ -265,6 +270,88 @@ async def _auto_process_and_upload(bot: Client, user_id: int, msg: Message, orig
     # ── Upload ──
     await _do_upload(bot, filepath, original_message, msg)
     _url_sessions.pop(user_id, None)
+
+
+# ─── Hindi stream detection ────────────────────────────────────────────────────
+def _is_hindi_stream(stream: dict) -> bool:
+    """
+    Stream Hindi hai ya nahi — sirf 'language' metadata field se check karo.
+    ffprobe 'lang' field = ISO 639 code (hin) ya full name (Hindi).
+    """
+    lang = stream.get("lang", "").lower().strip()
+    HINDI_CODES = {"hin", "hi", "hindi", "hin2", "hin-in"}
+    return lang in HINDI_CODES
+
+
+# ─── Placeholder resolver ─────────────────────────────────────────────────────
+def _resolve_meta_placeholders(meta: dict, filepath: str) -> dict:
+    """
+    {audiolang} → actual audio language name (e.g. Hindi, Japanese)
+    {sublang}   → actual subtitle language name
+    File ke streams se actual language fetch karke replace karo.
+    """
+    resolved = dict(meta)
+
+    audio_title = meta.get("audio_title", "")
+    sub_title = meta.get("subtitle_title", "")
+
+    needs_audio_lang = "{audiolang}" in audio_title
+    needs_sub_lang = "{sublang}" in sub_title
+
+    if not (needs_audio_lang or needs_sub_lang):
+        return resolved
+
+    # ffprobe se streams lo
+    try:
+        import json, subprocess
+        cmd = [
+            "ffprobe", "-hide_banner", "-print_format", "json",
+            "-show_streams", filepath
+        ]
+        output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+        streams = json.loads(output.decode()).get("streams", [])
+    except Exception:
+        return resolved
+
+    # Language code → human readable name
+    LANG_MAP = {
+        "hin": "Hindi", "hi": "Hindi", "hindi": "Hindi",
+        "jpn": "Japanese", "ja": "Japanese",
+        "eng": "English", "en": "English",
+        "tam": "Tamil", "tel": "Telugu",
+        "kan": "Kannada", "mal": "Malayalam",
+        "ben": "Bengali", "mar": "Marathi",
+        "chi": "Chinese", "zho": "Chinese",
+        "kor": "Korean", "ko": "Korean",
+        "ara": "Arabic", "spa": "Spanish",
+        "fre": "French", "fra": "French",
+        "ger": "German", "deu": "German",
+        "rus": "Russian", "por": "Portuguese",
+        "ita": "Italian", "dub": "Dubbed",
+        "und": "Unknown", "": "Unknown",
+    }
+
+    if needs_audio_lang:
+        # Pehla audio stream ki language lo
+        for s in streams:
+            if s.get("codec_type") == "audio":
+                tags = s.get("tags", {})
+                lang_code = tags.get("language", tags.get("LANGUAGE", "")).lower()
+                lang_name = LANG_MAP.get(lang_code, lang_code.title() if lang_code else "Audio")
+                resolved["audio_title"] = audio_title.replace("{audiolang}", lang_name)
+                break
+
+    if needs_sub_lang:
+        # Pehla subtitle stream ki language lo
+        for s in streams:
+            if s.get("codec_type") == "subtitle":
+                tags = s.get("tags", {})
+                lang_code = tags.get("language", tags.get("LANGUAGE", "")).lower()
+                lang_name = LANG_MAP.get(lang_code, lang_code.title() if lang_code else "Sub")
+                resolved["subtitle_title"] = sub_title.replace("{sublang}", lang_name)
+                break
+
+    return resolved
 
 
 # ─── Archive Extract (ALL files) ──────────────────────────────────────────────
@@ -916,6 +1003,7 @@ async def _keep_audio_streams(filepath: str, stream_indices: list, msg: Message)
 
 
 async def _apply_metadata(filepath: str, meta: dict, msg: Message) -> str | None:
+    """Legacy wrapper for -vt mode manual metadata."""
     out = _make_output_path(filepath, "_meta")
     meta_args = ["-map", "0", "-c", "copy"]
     if meta.get("show_title"):
@@ -924,6 +1012,36 @@ async def _apply_metadata(filepath: str, meta: dict, msg: Message) -> str | None
         meta_args += ["-metadata:s:v:0", f"title={meta['video_title']}"]
     if meta.get("audio_title"):
         meta_args += ["-metadata:s:a", f"title={meta['audio_title']}"]
+    return await _ffmpeg_process(filepath, out, meta_args, msg)
+
+
+async def _apply_full_metadata(filepath: str, meta: dict, msg: Message) -> str | None:
+    """
+    /setmeta wale full_metadata se apply karo.
+    video_title, audio_title, subtitle_title, comment, strip_attachments, clear_metadata.
+    {audiolang}/{sublang} pehle se resolve ho chuke hain.
+    """
+    out = _make_output_path(filepath, "_meta")
+
+    if meta.get("strip_attachments"):
+        base_map = ["-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-c", "copy"]
+    else:
+        base_map = ["-map", "0", "-c", "copy"]
+
+    meta_args = base_map[:]
+
+    if meta.get("clear_metadata"):
+        meta_args += ["-map_metadata", "-1"]
+
+    if meta.get("comment"):
+        meta_args += ["-metadata", f"comment={meta['comment']}"]
+    if meta.get("video_title"):
+        meta_args += ["-metadata:s:v:0", f"title={meta['video_title']}"]
+    if meta.get("audio_title"):
+        meta_args += ["-metadata:s:a", f"title={meta['audio_title']}"]
+    if meta.get("subtitle_title"):
+        meta_args += ["-metadata:s:s", f"title={meta['subtitle_title']}"]
+
     return await _ffmpeg_process(filepath, out, meta_args, msg)
 
 
