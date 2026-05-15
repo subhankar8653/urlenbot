@@ -13,19 +13,12 @@ from ..utils.database.access_db import db
 from ..utils.settings import (AudioSettings, ExtraSettings, OpenSettings,
                               VideoSettings)
 from .start import showw_status
-try:
-    from ..video_utils.audio_selector import sessions
-except ImportError:
-    sessions = {}
+from ..video_utils.audio_selector import sessions
 
 
 @app.on_callback_query()
 async def callback_handlers(bot: Client, cb: CallbackQuery):
     try:
-        # asw_ callbacks are handled by dedicated handler in url_upload.py — skip here
-        if cb.data and cb.data.startswith("asw_"):
-            return
-
         # Close Button
 
         if cb.data == "closeMeh":
