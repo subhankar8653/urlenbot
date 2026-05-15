@@ -803,70 +803,266 @@ async def url_meta_text_input(bot: Client, message: Message):
     )
 
 
-# ─── /addswap command ─────────────────────────────────────────────────────────
+# ─── /addswap — Interactive button panel (like /setmeta) ──────────────────────
+# { user_id: 'awaiting_from' | 'awaiting_to' | from_value }
+# We store state as a dict:  { 'step': 'from'|'to', 'from': str }
+_addswap_sessions: dict = {}
+
+
 @Client.on_message(filters.command("addswap"))
 async def add_swap_rule(bot: Client, message: Message):
     """
-    /addswap <from> <to>
-    Ya Mirror Leech style pipe format:
-    /addswap find1:change1|find2:change2|find3:change3
-    Example: /addswap HindiAnimeZone.com:@SBANIME|RareToonsIndia:@SBANIME
+    /addswap  → Interactive button panel jisme existing rules dikh'te hain
+               aur "➕ Add New Rule" button se naya rule add kar sakte hain.
+
+    Old text format bhi kaam karta hai:
+      /addswap old_text new_text
+      /addswap find1:change1|find2:change2
     """
     c = await check_chat(message, chat="Both")
     if not c:
         return
 
     args = message.text.split(None, 1)
-    if len(args) < 2 or not args[1].strip():
+
+    # ── Agar inline args diye hain toh seedha add karo (backwards compat) ──
+    if len(args) >= 2 and args[1].strip():
+        raw = args[1].strip()
+        rules = await db.get_swap(message.from_user.id)
+        added = []
+
+        if "|" in raw or (":" in raw and len(raw.split(None)) == 1):
+            for pair in raw.split("|"):
+                pair = pair.strip()
+                if ":" not in pair:
+                    continue
+                from_text, to_text = pair.split(":", 1)
+                from_text, to_text = from_text.strip(), to_text.strip()
+                if from_text:
+                    rules[from_text] = to_text
+                    added.append((from_text, to_text))
+        else:
+            parts = raw.split(None, 1)
+            if len(parts) < 2:
+                await message.reply(
+                    "❌ <b>2 arguments chahiye!</b>\n"
+                    "<code>/addswap old_text new_text</code>"
+                )
+                return
+            from_text, to_text = parts[0].strip(), parts[1].strip()
+            rules[from_text] = to_text
+            added.append((from_text, to_text))
+
+        await db.set_swap(message.from_user.id, rules)
+        lines = "\n".join(f"• <code>{f}</code> → <code>{t}</code>" for f, t in added)
         await message.reply(
-            "<b>Usage:</b>\n"
-            "• Simple: <code>/addswap old_text new_text</code>\n"
-            "• Pipe format: <code>/addswap find1:change1|find2:change2</code>\n\n"
-            "<b>Examples:</b>\n"
-            "<code>/addswap HindiAnimeZone.com @SBANIME</code>\n"
-            "<code>/addswap HindiAnimeZone.com:@SBANIME|RareToonsIndia:@SBANIME</code>"
+            f"✅ <b>{len(added)} swap rule(s) added:</b>\n{lines}\n\n"
+            f"Total rules: <b>{len(rules)}</b>",
+            reply_markup=output,
         )
         return
 
-    raw = args[1].strip()
-    rules = await db.get_swap(message.from_user.id)
-    added = []
+    # ── No args → show interactive panel ──
+    await _show_addswap_panel(message, message.from_user.id, is_new=True)
 
-    # Pipe format: find1:change1|find2:change2
-    if "|" in raw or (":" in raw and len(raw.split(None)) == 1):
-        pairs = raw.split("|")
-        for pair in pairs:
-            pair = pair.strip()
-            if ":" not in pair:
-                continue
-            from_text, to_text = pair.split(":", 1)
-            from_text = from_text.strip()
-            to_text = to_text.strip()
-            if from_text:
-                rules[from_text] = to_text
-                added.append((from_text, to_text))
+
+async def _show_addswap_panel(event, user_id: int, is_new: bool = False):
+    """Interactive swap rules panel — existing rules dikhao + add/delete buttons."""
+    rules = await db.get_swap(user_id)
+
+    # Build rule buttons (each rule = one row with a ❌ delete button)
+    rule_rows = []
+    for from_text, to_text in rules.items():
+        label = f"🔄 {from_text} → {to_text}"
+        # Truncate label agar bahut lamba ho
+        if len(label) > 48:
+            label = label[:45] + "…"
+        rule_rows.append([
+            InlineKeyboardButton(label, callback_data=f"asw_noop_{user_id}"),
+            InlineKeyboardButton("🗑️", callback_data=f"asw_del_{from_text}_{user_id}"),
+        ])
+
+    bottom_row = [
+        InlineKeyboardButton("➕ Add New Rule", callback_data=f"asw_add_{user_id}"),
+    ]
+    if rules:
+        bottom_row.append(
+            InlineKeyboardButton("🗑️ Clear All", callback_data=f"asw_clearall_{user_id}")
+        )
+    bottom_row.append(InlineKeyboardButton("❌ Close", callback_data="closeMeh"))
+
+    kb = InlineKeyboardMarkup(rule_rows + [bottom_row])
+
+    if rules:
+        rules_text = "\n".join(f"• <code>{k}</code> → <code>{v}</code>" for k, v in rules.items())
     else:
-        # Simple space format: /addswap old new
-        parts = raw.split(None, 1)
-        if len(parts) < 2:
-            await message.reply(
-                "❌ <b>2 arguments chahiye!</b>\n"
-                "<code>/addswap old_text new_text</code>"
-            )
-            return
-        from_text = parts[0].strip()
-        to_text = parts[1].strip()
-        rules[from_text] = to_text
-        added.append((from_text, to_text))
+        rules_text = "  <i>Koi rule set nahi hai</i>"
 
-    await db.set_swap(message.from_user.id, rules)
-
-    lines = "\n".join(f"• <code>{f}</code> → <code>{t}</code>" for f, t in added)
-    await message.reply(
-        f"✅ <b>{len(added)} swap rule(s) added:</b>\n{lines}\n\n"
-        f"Total rules: <b>{len(rules)}</b>",
-        reply_markup=output,
+    text = (
+        "<b>🔄 Name Swap Rules</b>\n\n"
+        f"{rules_text}\n\n"
+        f"Total rules: <b>{len(rules)}</b>\n\n"
+        "<i>➕ Add New Rule pe tap karo → pehle 'find text' bhejo → phir 'replace text' bhejo → done!</i>\n"
+        "<i>🗑️ button se koi bhi rule delete kar sakte ho.</i>"
     )
+
+    if is_new:
+        await event.reply(text, reply_markup=kb)
+    else:
+        try:
+            await event.edit(text, reply_markup=kb)
+        except Exception:
+            pass
+
+
+@Client.on_callback_query(filters.regex(r"^asw_"))
+async def addswap_callbacks(bot: Client, cb: CallbackQuery):
+    """Addswap panel ke saare callbacks."""
+    data = cb.data  # e.g. asw_add_123 | asw_del_HindiZone_123 | asw_clearall_123
+
+    # ── asw_noop (rule label button — sirf display, kuch nahi karna) ──
+    if data.startswith("asw_noop_"):
+        await cb.answer("Ye rule ka naam hai. Delete karne ke liye 🗑️ dabao.", show_alert=False)
+        return
+
+    # ── asw_add_<userid> ──
+    if data.startswith("asw_add_"):
+        try:
+            owner_id = int(data.split("_")[-1])
+        except ValueError:
+            await cb.answer()
+            return
+        if cb.from_user.id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+        # Session start: step 1 — "from" text maango
+        _addswap_sessions[owner_id] = {"step": "from", "from": ""}
+        await cb.answer()
+        await cb.message.edit(
+            "<b>➕ New Swap Rule — Step 1/2</b>\n\n"
+            "Wo <b>text</b> bhejo jo <b>find</b> karna hai (purana text).\n\n"
+            "<b>Example:</b> <code>HindiAnimeZone.com</code>\n\n"
+            "<i>Send <code>-</code> (dash) to cancel.</i>",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Back", callback_data=f"asw_back_{owner_id}")
+            ]])
+        )
+        return
+
+    # ── asw_del_<from_text>_<userid> ──
+    if data.startswith("asw_del_"):
+        # format: asw_del_<from_text>_<userid>
+        # from_text mein _ ho sakti hai, isliye last part = userid
+        parts = data.split("_")
+        # parts[0]=asw, parts[1]=del, parts[-1]=userid, parts[2:-1]=from_text
+        try:
+            owner_id = int(parts[-1])
+        except ValueError:
+            await cb.answer()
+            return
+        if cb.from_user.id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+        from_key = "_".join(parts[2:-1])
+        rules = await db.get_swap(owner_id)
+        if from_key in rules:
+            del rules[from_key]
+            await db.set_swap(owner_id, rules)
+            await cb.answer(f"✅ Rule deleted: {from_key}")
+        else:
+            await cb.answer("Rule nahi mila!", show_alert=True)
+        await _show_addswap_panel(cb.message, owner_id, is_new=False)
+        return
+
+    # ── asw_clearall_<userid> ──
+    if data.startswith("asw_clearall_"):
+        try:
+            owner_id = int(data.split("_")[-1])
+        except ValueError:
+            await cb.answer()
+            return
+        if cb.from_user.id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+        await db.clear_swap(owner_id)
+        await cb.answer("✅ All rules cleared!")
+        await _show_addswap_panel(cb.message, owner_id, is_new=False)
+        return
+
+    # ── asw_back_<userid> ──
+    if data.startswith("asw_back_"):
+        try:
+            owner_id = int(data.split("_")[-1])
+        except ValueError:
+            await cb.answer()
+            return
+        _addswap_sessions.pop(owner_id, None)
+        await cb.answer()
+        await _show_addswap_panel(cb.message, owner_id, is_new=False)
+        return
+
+    await cb.answer()
+
+
+# ─── Text handler: addswap step input ─────────────────────────────────────────
+@Client.on_message(filters.text & filters.private, group=2)
+async def addswap_text_input(bot: Client, message: Message):
+    """Addswap panel ka text input — 2 step: from text, phir to text."""
+    user_id = message.from_user.id
+    session = _addswap_sessions.get(user_id)
+    if not session:
+        return  # Hamara kaam nahi
+
+    text = message.text.strip()
+
+    # Cancel
+    if text == "-":
+        _addswap_sessions.pop(user_id, None)
+        confirm = await message.reply("❌ Cancelled.")
+        await asyncio.sleep(1)
+        await _show_addswap_panel(confirm, user_id, is_new=True)
+        return
+
+    if session["step"] == "from":
+        # Step 1 done — "from" text mila, ab "to" maango
+        _addswap_sessions[user_id] = {"step": "to", "from": text}
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await message.reply(
+            "<b>➕ New Swap Rule — Step 2/2</b>\n\n"
+            f"Find text: <code>{text}</code>\n\n"
+            "Ab <b>replacement text</b> bhejo (naya text kya hoga).\n\n"
+            "<b>Example:</b> <code>@SBANIME</code>\n\n"
+            "<i>Send <code>-</code> (dash) to cancel.</i>",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Back", callback_data=f"asw_back_{user_id}")
+            ]])
+        )
+
+    elif session["step"] == "to":
+        # Step 2 done — rule complete
+        from_text = session["from"]
+        to_text = text
+        _addswap_sessions.pop(user_id)
+
+        rules = await db.get_swap(user_id)
+        rules[from_text] = to_text
+        await db.set_swap(user_id, rules)
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        confirm = await message.reply(
+            f"✅ <b>Swap rule added!</b>\n"
+            f"<code>{from_text}</code> → <code>{to_text}</code>\n\n"
+            f"Total rules: <b>{len(rules)}</b>"
+        )
+        await asyncio.sleep(2)
+        await _show_addswap_panel(confirm, user_id, is_new=True)
 
 
 @Client.on_message(filters.command("swaplist"))
@@ -891,135 +1087,6 @@ async def clear_swap_rules(bot: Client, message: Message):
         return
     await db.clear_swap(message.from_user.id)
     await message.reply("✅ All swap rules cleared.")
-
-
-# ─── /nameswap command ────────────────────────────────────────────────────────
-@Client.on_message(filters.command("nameswap"))
-async def nameswap_command(bot: Client, message: Message):
-    """
-    /nameswap                        → Current rules list dikhata hai
-    /nameswap BBANIME:SBANIME        → Ek rule add karo
-    /nameswap A:B|C:D|E:F            → Multiple rules ek saath
-    /nameswap BBANIME SBANIME        → Space format bhi kaam karta hai
-    /nameswap del BBANIME            → Ek rule delete karo
-    /nameswap clear                  → Sab rules delete karo
-    """
-    c = await check_chat(message, chat="Both")
-    if not c:
-        return
-
-    args = message.text.split(None, 2)
-
-    # ── Sirf /nameswap → list dikhao ─────────────────────────────────────────
-    if len(args) == 1:
-        rules = await db.get_swap(message.from_user.id)
-        if not rules:
-            await message.reply(
-                "📭 <b>Koi Name Swap rule set nahi hai!</b>\n\n"
-                "<b>Rule add karne ke liye:</b>\n"
-                "• <code>/nameswap BBANIME SBANIME</code>\n"
-                "• <code>/nameswap BBANIME:SBANIME</code>\n"
-                "• <code>/nameswap A:B|C:D|E:F</code>  (multiple)\n\n"
-                "<b>Delete karne ke liye:</b>\n"
-                "• <code>/nameswap del BBANIME</code>  (ek rule)\n"
-                "• <code>/nameswap clear</code>  (sab rules)"
-            )
-            return
-        text = "🔤 <b>Name Swap Rules:</b>\n\n"
-        for k, v in rules.items():
-            text += f"• <code>{k}</code>  →  <code>{v}</code>\n"
-        text += f"\n<i>Total: {len(rules)} rule(s)</i>"
-        await message.reply(text)
-        return
-
-    sub = args[1].strip()
-
-    # ── /nameswap clear → sab delete ─────────────────────────────────────────
-    if sub.lower() == "clear":
-        await db.clear_swap(message.from_user.id)
-        await message.reply("✅ <b>Sab Name Swap rules delete ho gaye!</b>")
-        return
-
-    # ── /nameswap del <key> → ek rule delete ─────────────────────────────────
-    if sub.lower() == "del":
-        if len(args) < 3:
-            await message.reply("❌ <b>Konsa rule delete karein?</b>\n<code>/nameswap del BBANIME</code>")
-            return
-        key = args[2].strip()
-        rules = await db.get_swap(message.from_user.id)
-        # Case-insensitive match
-        matched_key = next((k for k in rules if k.lower() == key.lower()), None)
-        if not matched_key:
-            await message.reply(
-                f"⚠️ Rule <code>{key}</code> nahi mila!\n\n"
-                f"Current rules dekhne ke liye: <code>/nameswap</code>"
-            )
-            return
-        del rules[matched_key]
-        await db.set_swap(message.from_user.id, rules)
-        await message.reply(
-            f"🗑️ Rule delete ho gaya: <code>{matched_key}</code>\n\n"
-            f"Baaki rules: <b>{len(rules)}</b>"
-        )
-        return
-
-    # ── Add rules ─────────────────────────────────────────────────────────────
-    raw = message.text.split(None, 1)[1].strip()  # full text after /nameswap
-    rules = await db.get_swap(message.from_user.id)
-    added = []
-
-    # Pipe / colon format: BBANIME:SBANIME|ToonWeb:SBANIME
-    if "|" in raw or (":" in raw and len(raw.split()) == 1):
-        for pair in raw.split("|"):
-            pair = pair.strip()
-            if ":" not in pair:
-                continue
-            from_text, to_text = pair.split(":", 1)
-            from_text, to_text = from_text.strip(), to_text.strip()
-            if from_text:
-                rules[from_text] = to_text
-                added.append((from_text, to_text))
-
-    # Space format: BBANIME SBANIME
-    elif len(raw.split(None, 1)) == 2:
-        parts = raw.split(None, 1)
-        from_text, to_text = parts[0].strip(), parts[1].strip()
-        rules[from_text] = to_text
-        added.append((from_text, to_text))
-
-    else:
-        await message.reply(
-            "❌ <b>Galat format!</b>\n\n"
-            "<b>Sahi tarike:</b>\n"
-            "• <code>/nameswap BBANIME SBANIME</code>\n"
-            "• <code>/nameswap BBANIME:SBANIME</code>\n"
-            "• <code>/nameswap A:B|C:D</code>"
-        )
-        return
-
-    if not added:
-        await message.reply("❌ Koi valid rule nahi mila. Format check karo.")
-        return
-
-    await db.set_swap(message.from_user.id, rules)
-
-    lines = "\n".join(f"• <code>{f}</code>  →  <code>{t}</code>" for f, t in added)
-    # Preview example
-    preview_from = added[0][0]
-    preview_to   = added[0][1]
-    example_old  = f"Anime S01E01 [@{preview_from}].mkv"
-    example_new  = f"Anime S01E01 [@{preview_to}].mkv"
-
-    await message.reply(
-        f"✅ <b>{len(added)} rule(s) add ho gaya:</b>\n{lines}\n\n"
-        f"📝 <b>Example preview:</b>\n"
-        f"<code>{example_old}</code>\n"
-        f"⬇️\n"
-        f"<code>{example_new}</code>\n\n"
-        f"📦 Total rules: <b>{len(rules)}</b>\n"
-        f"💡 <i>Name Swap ON karo: /urlpreset → Name Swap toggle</i>",
-        reply_markup=output,
-    )
 
 
 # ─── Helper functions ─────────────────────────────────────────────────────────
