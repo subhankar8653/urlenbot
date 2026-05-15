@@ -233,22 +233,30 @@ def extract_anime_info(filename, metadata):
     return anime_name, season, episode
 
 
-def build_auto_caption(filepath, resolution=None, channel='@SBANIME'):
+def build_auto_caption(filepath, resolution=None, channel='@SBANIME', override_filename=None):
     """
     Format: AnimeName S02E06 in Hindi 1080p [@SBANIME].mp4
 
     resolution:
       - None / 'OG' : ffprobe se actual quality detect karo
       - '720','1080' : encode ki gai quality use karo
+
+    override_filename:
+      - Cleaned naam pass karo (garbage remove karne ke baad)
+      - Language detect ke liye actual filepath bhi use hoga
     """
     metadata = get_media_metadata(filepath)
-    filename = os.path.basename(filepath)
+    # override_filename diya toh usse parse karo, warna actual file ka naam
+    filename = override_filename if override_filename else os.path.basename(filepath)
     # Extension strip karo pehle (double .mp4 problem fix)
     base_filename = os.path.splitext(filename)[0]
 
     anime_name, season, episode = extract_anime_info(filename, metadata)
     quality = detect_quality(metadata, resolution)
+    # Language detect: pehle override_filename se, phir actual filepath se
     langs = detect_language(filename, metadata)
+    if not langs:
+        langs = detect_language(os.path.basename(filepath), metadata)
 
     parts = []
 
@@ -283,23 +291,98 @@ def build_auto_caption(filepath, resolution=None, channel='@SBANIME'):
     return caption
 
 
+def clean_caption(caption):
+    """
+    Original caption/filename se sab garbage remove karo:
+    - URLs / hyperlinks  →  hata do
+    - [GroupName.com] / [HindiAnimeZone.com] jaise site tags  →  hata do
+    - [@Channel] tags  →  hata do  (hum apna lagaenge)
+    - Trailing junk suffixes: _hindiaudio_meta, _Esub, _hindiaudio, etc.
+    - Codec tags jo naam mein ghus jaate hain: x264, x265, WEB-DL, HEVC, HDRip, BluRay
+    - Extra whitespace / dots / dashes clean karo
+    """
+    text = caption.strip()
+
+    # 1. URLs hata do  (http/https/www se shuru hone wale)
+    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'www\.\S+', '', text)
+
+    # 2. Site-name brackets hata do: [HindiAnimeZone.com], (AnimeKaizoku.com) etc.
+    #    Pehchaan: bracket ke andar dot ke saath koi bhi word (domain pattern)
+    text = re.sub(r'[\[\(][^\]\)]*\.[a-zA-Z]{2,6}[^\]\)]*[\]\)]', '', text)
+
+    # 3. [@ChannelName] hata do — hum apna lagaenge
+    text = re.sub(r'\[@[^\]]+\]', '', text)
+
+    # 4. Trailing garbage suffixes hata do (extension se pehle)
+    #    Pattern: _hindiaudio_meta, _Esub, _hindiaudio, _dual, _sub, _dubbed, etc.
+    #    Yeh usually extension ke bilkul pehle aate hain
+    JUNK_SUFFIXES = [
+        r'_?hindiaudio_?meta', r'_?Esub', r'_?esub',
+        r'_?hindiaudio', r'_?hindi_?audio',
+        r'_?dual_?audio', r'_?dualaudio',
+        r'_?multi_?audio', r'_?dubbed',
+        r'_?subbed', r'_?sub',
+        r'_?meta', r'_?extras?',
+    ]
+    junk_pattern = r'(' + '|'.join(JUNK_SUFFIXES) + r')+(\.(mp4|mkv|avi|mov|flv|wmv|ts|m4v|webm))?$'
+    text = re.sub(junk_pattern, '', text, flags=re.IGNORECASE).strip()
+
+    # 5. Inline codec/source tags hata do (naam ke beech se)
+    #    WEB-DL, x264, x265, HEVC, HDRip, BluRay, BRRip, DVDRip, AMZN, NF etc.
+    CODEC_TAGS = [
+        r'\bWEB-?DL\b', r'\bBluRay\b', r'\bBDRip\b', r'\bBRRip\b',
+        r'\bHDRip\b', r'\bDVDRip\b', r'\bHEVC\b', r'\bx265\b', r'\bx264\b',
+        r'\bH\.?264\b', r'\bH\.?265\b', r'\bAAC\b', r'\bDD5\.1\b',
+        r'\bAVC\b', r'\bAMZN\b', r'\bNF\b', r'\bHDTV\b', r'\bWEBRip\b',
+        r'\bDual\s*Audio\b', r'\bDual\b(?!\s+\w+\s+\w)',  # 'Dual' standalone
+    ]
+    for tag in CODEC_TAGS:
+        text = re.sub(tag, '', text, flags=re.IGNORECASE)
+
+    # 6. Multiple spaces / dots / dashes clean karo
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = re.sub(r'\s*[-–]\s*$', '', text)
+    text = text.strip(' .-_')
+
+    return text
+
+
 def smart_caption(original_caption, filepath, resolution=None, channel='@SBANIME'):
     """
-    Original caption mein quality info hai toh use karo,
-    warna auto generate karo.
+    Har case mein clean auto-caption banao.
+
+    Strategy:
+    1. Original caption/filename se garbage hata do (links, group tags, junk suffixes)
+    2. Cleaned text ko filename ki tarah treat karo
+    3. build_auto_caption() se proper format mein caption banao:
+       AnimeName S02E01 in Hindi 480p [@SBANIME].mp4
     """
-    if not original_caption:
-        return build_auto_caption(filepath, resolution, channel)
+    # Source: original caption hai toh use karo, warna actual filename
+    raw = (original_caption or '').strip()
+    if not raw:
+        raw = os.path.basename(filepath)
 
-    has_quality = bool(re.search(r'\d{3,4}p|4K|FHD', original_caption, re.IGNORECASE))
+    # Extension hata do pehle (agar hai)
+    raw_base = re.sub(r'\.(mp4|mkv|avi|mov|flv|wmv|ts|m4v|webm)$', '', raw, flags=re.IGNORECASE).strip()
 
-    if has_quality:
-        # Caption already accha hai — sirf ensure karo .mp4 se end ho (double nahi)
-        cap = original_caption.strip()
-        # Extension normalize karo
-        cap = re.sub(r'\.(mkv|avi|mov|flv|wmv|ts|m4v|webm)$', '.mp4', cap, flags=re.IGNORECASE)
-        if not cap.lower().endswith('.mp4'):
-            cap += '.mp4'
-        return cap
+    # Garbage clean karo
+    cleaned = clean_caption(raw_base)
+
+    # Agar cleaning ke baad kuch meaningful bacha toh
+    # ek temporary filename banao aur build_auto_caption() chalao
+    if cleaned:
+        # Temp filename: cleaned text + .mp4
+        # build_auto_caption() isko parse karega anime name, S/E, language ke liye
+        temp_filename = cleaned + '.mp4'
     else:
-        return build_auto_caption(filepath, resolution, channel)
+        # Kuch nahi bacha — seedha original filepath se banao
+        temp_filename = os.path.basename(filepath)
+
+    # Ab build_auto_caption() chalao — yeh metadata se language/quality detect karega
+    return build_auto_caption(
+        filepath=filepath,
+        resolution=resolution,
+        channel=channel,
+        override_filename=temp_filename,   # cleaned naam pass karo
+    )
