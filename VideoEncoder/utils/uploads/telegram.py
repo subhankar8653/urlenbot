@@ -139,7 +139,15 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
     c_time = time.time()
     filename = os.path.basename(new_file)
 
-    original_caption = message.caption or message.text or os.path.splitext(filename)[0]
+    # /url, /ddl, /dl jaisi commands caption mein nahi aani chahiye
+    # Agar message.text mein command hai toh sirf filename use karo
+    raw_text = message.caption or message.text or ''
+    if raw_text.strip().startswith('/'):
+        # Command message hai — filename se caption banao
+        original_caption = os.path.splitext(filename)[0]
+    else:
+        original_caption = raw_text or os.path.splitext(filename)[0]
+
     caption = smart_caption(original_caption, new_file, resolution)
     caption = await apply_swap(caption, message.from_user.id)
     bold_caption = f'<b>{caption}</b>'
