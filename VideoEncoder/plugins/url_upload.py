@@ -101,6 +101,9 @@ async def url_upload_cmd(bot: Client, message: Message):
     if not custom_name:
         custom_name = unquote_plus(os.path.basename(url.split("?")[0])) or "downloaded_file"
 
+    # Filename too long fix — Linux max = 255 bytes, safe limit = 200 chars
+    custom_name = _safe_filename(custom_name)
+
     msg = await message.reply("<b>💠 Downloading...</b>")
 
     try:
@@ -1091,8 +1094,34 @@ async def clear_swap_rules(bot: Client, message: Message):
 
 # ─── Helper functions ─────────────────────────────────────────────────────────
 
+def _safe_filename(name: str, max_len: int = 180) -> str:
+    """
+    Filename ko safe length tak truncate karo.
+    Extension preserve karta hai, naam ke beech se cut karta hai.
+    Linux max = 255 bytes. Hum 180 rakhtein hain — path overhead ke liye room.
+    """
+    # Agar already short hai to kuch mat karo
+    if len(name.encode("utf-8")) <= max_len:
+        return name
+
+    # Extension alag karo
+    base, ext = os.path.splitext(name)
+    ext_bytes = len(ext.encode("utf-8"))
+    allowed_base = max_len - ext_bytes - 1  # 1 extra safety byte
+
+    # Base ko truncate karo
+    base_encoded = base.encode("utf-8")[:allowed_base]
+    # Incomplete multi-byte char se bachne ke liye decode with errors='ignore'
+    base_truncated = base_encoded.decode("utf-8", errors="ignore")
+
+    safe = base_truncated + ext
+    LOGGER.warning(f"[URL] Filename too long, truncated: '{name[:60]}...' -> '{safe}'")
+    return safe
+
+
 async def _download_url(url: str, filename: str, msg: Message, orig_message: Message) -> str:
     """Download from URL with progress."""
+    filename = _safe_filename(filename)  # Double safety — koi bhi caller se aaye
     filepath = os.path.join(download_dir, filename)
 
     try:
