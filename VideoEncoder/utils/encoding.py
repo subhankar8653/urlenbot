@@ -154,36 +154,34 @@ async def encode(filepath, message, msg, audio_map=None):
     else:
         video_opts = f'{cabac} {reframe} -profile:v main -map 0:v? -map_chapters 0 -map_metadata 0'
 
-    # Metadata — Mirror Leech style
+    # Metadata — Mirror Leech style (list banao, string nahi — spaces safe rahein)
     full_meta = await db.get_full_metadata(message.from_user.id)
-    metadata = ''
+    metadata_args = []
     if full_meta.get('enabled'):
-        # Comment
+        if full_meta.get('clear_metadata'):
+            metadata_args += ['-map_metadata', '-1']
         if full_meta.get('comment'):
-            metadata += f' -metadata comment="{full_meta["comment"]}"'
-        # Video title
+            metadata_args += ['-metadata', f'comment={full_meta["comment"]}']
         vtitle = full_meta.get('video_title', '')
         if vtitle:
-            metadata += f' -metadata:s:v title="{vtitle}"'
-        # Audio title — {audiolang} placeholder support
+            metadata_args += ['-metadata:s:v', f'title={vtitle}']
         atitle = full_meta.get('audio_title', '')
         if atitle:
-            metadata += f' -metadata:s:a title="{atitle}"'
-        # Subtitle title — {sublang} placeholder support
+            metadata_args += ['-metadata:s:a', f'title={atitle}']
         stitle = full_meta.get('subtitle_title', '')
         if stitle:
-            metadata += f' -metadata:s:s title="{stitle}"'
-        # Strip attachments
+            metadata_args += ['-metadata:s:s', f'title={stitle}']
         if full_meta.get('strip_attachments'):
-            metadata += ' -map -0:t'
-        # Clear metadata
-        if full_meta.get('clear_metadata'):
-            metadata = ' -map_metadata -1' + metadata
+            metadata_args += ['-map', '-0:t']
     else:
         # Fallback: purani simple metadata setting
         m = await db.get_metadata_w(message.from_user.id)
-        metadata = '-metadata title=SuhaniBots -metadata:s:v title=SuhaniBots -metadata:s:a title=SuhaniBots' if m else ''
-
+        if m:
+            metadata_args = [
+                '-metadata', 'title=SuhaniBots',
+                '-metadata:s:v', 'title=SuhaniBots',
+                '-metadata:s:a', 'title=SuhaniBots',
+            ]
     # Subtitles
     h = await db.get_hardsub(message.from_user.id)
     s = await db.get_subtitles(message.from_user.id)
@@ -270,7 +268,7 @@ async def encode(filepath, message, msg, audio_map=None):
     command.extend(
         frame.split() + tunevideo.split() + aspect.split() +
         video_opts.split() + Crf.split() + watermark.split() +
-        metadata.split() + subtitles.split() +
+        metadata_args + subtitles.split() +
         audio_opts.split() + channels.split() +
         ['-threads', str(cpu_count)]
     )
