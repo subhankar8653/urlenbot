@@ -915,7 +915,7 @@ async def _show_addswap_panel(event, user_id: int, is_new: bool = False):
             pass
 
 
-@Client.on_callback_query(filters.regex(r"^asw_"), group=-1)
+@Client.on_callback_query(filters.regex(r"^asw_"))
 async def addswap_callbacks(bot: Client, cb: CallbackQuery):
     """Addswap panel ke saare callbacks."""
     data = cb.data  # e.g. asw_add_123 | asw_del_HindiZone_123 | asw_clearall_123
