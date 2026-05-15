@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from pyrogram import Client
 
 # ── Load config.env if present ───────────────────────────────────────────────
-load_dotenv("config.env", override=True)
+load_dotenv("config.env", override=False)  # Railway vars ko override mat karo
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
