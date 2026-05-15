@@ -248,3 +248,162 @@ async def url_settings_callbacks(bot: Client, cb: CallbackQuery):
     elif action == "preset":
         await cb.answer()
         await _show_preset_panel(cb.message, owner_id, is_new=False)
+
+
+# ─── /metadata — Mirror Leech style full metadata settings ───────────────────
+@Client.on_message(filters.command("metadata"))
+async def metadata_cmd(bot: Client, message: Message):
+    """Full metadata settings — Mirror Leech jaisi."""
+    c = await check_chat(message, chat="Both")
+    if not c:
+        return
+    await AddUserToDatabase(bot, message)
+    await _show_metadata_panel(message, message.from_user.id, is_new=True)
+
+
+async def _show_metadata_panel(event, user_id: int, is_new: bool = False):
+    meta = await db.get_full_metadata(user_id)
+
+    status = "✅ Enabled" if meta.get('enabled') else "❌ Disabled"
+    strip = "✅ ON" if meta.get('strip_attachments') else "❌ OFF"
+    clear = "✅ ON" if meta.get('clear_metadata') else "❌ OFF"
+
+    text = (
+        "<b>🏷️ Metadata Settings</b>\n\n"
+        f"• Status: <b>{status}</b>\n"
+        f"• Video Title: <code>{meta.get('video_title') or 'not set'}</code>\n"
+        f"• Audio Title: <code>{meta.get('audio_title') or 'not set'}</code>\n"
+        f"  ↳ <i>{{audiolang}} = auto detect (Hindi, Japanese...)</i>\n"
+        f"• Subtitle Title: <code>{meta.get('subtitle_title') or 'not set'}</code>\n"
+        f"  ↳ <i>{{sublang}} = auto detect</i>\n"
+        f"• Comment: <code>{meta.get('comment') or 'not set'}</code>\n"
+        f"• Strip Attachments: <b>{strip}</b>\n"
+        f"• Clear Metadata: <b>{clear}</b>\n\n"
+        "<b>Commands:</b>\n"
+        "• <code>/setmeta video &lt;title&gt;</code> — Video stream title\n"
+        "• <code>/setmeta audio &lt;title&gt;</code> — Audio stream title\n"
+        "• <code>/setmeta sub &lt;title&gt;</code> — Subtitle stream title\n"
+        "• <code>/setmeta comment &lt;text&gt;</code> — File comment\n"
+        "• <code>/setmeta reset</code> — Reset to defaults\n"
+    )
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"{'✅ Disable' if meta.get('enabled') else '❌ Enable'} Metadata",
+                callback_data=f"meta_toggle_enabled_{user_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"Strip Attachments: {'✅' if meta.get('strip_attachments') else '❌'}",
+                callback_data=f"meta_toggle_strip_{user_id}"
+            ),
+            InlineKeyboardButton(
+                f"Clear Metadata: {'✅' if meta.get('clear_metadata') else '❌'}",
+                callback_data=f"meta_toggle_clear_{user_id}"
+            ),
+        ],
+        [InlineKeyboardButton("❌ Close", callback_data="closeMeh")],
+    ])
+
+    if is_new:
+        await event.reply(text, reply_markup=kb)
+    else:
+        try:
+            await event.edit(text, reply_markup=kb)
+        except Exception:
+            pass
+
+
+@Client.on_message(filters.command("setmeta"))
+async def setmeta_cmd(bot: Client, message: Message):
+    """/setmeta video <title> | audio <title> | sub <title> | comment <text> | reset"""
+    c = await check_chat(message, chat="Both")
+    if not c:
+        return
+    await AddUserToDatabase(bot, message)
+
+    args = message.command[1:]
+    if len(args) < 1:
+        await message.reply(
+            "Usage:\n"
+            "• <code>/setmeta video Sbanime hindi</code>\n"
+            "• <code>/setmeta audio {audiolang}</code>\n"
+            "• <code>/setmeta sub {sublang}</code>\n"
+            "• <code>/setmeta comment Some comment</code>\n"
+            "• <code>/setmeta reset</code>"
+        )
+        return
+
+    user_id = message.from_user.id
+    field = args[0].lower()
+    value = " ".join(args[1:]).strip() if len(args) > 1 else ""
+
+    if field == "reset":
+        from ..utils.database.database import Database
+        await db.set_full_metadata(user_id, {
+            'enabled': False,
+            'video_title': 'Sbanime hindi',
+            'audio_title': '{audiolang}',
+            'subtitle_title': '{sublang}',
+            'comment': '',
+            'strip_attachments': False,
+            'clear_metadata': False,
+        })
+        await message.reply("✅ Metadata defaults restored!")
+        return
+
+    field_map = {
+        'video': 'video_title',
+        'audio': 'audio_title',
+        'sub': 'subtitle_title',
+        'subtitle': 'subtitle_title',
+        'comment': 'comment',
+    }
+
+    db_key = field_map.get(field)
+    if not db_key:
+        await message.reply(f"❌ Unknown field: <code>{field}</code>\nOptions: video, audio, sub, comment, reset")
+        return
+
+    meta = await db.get_full_metadata(user_id)
+    meta[db_key] = value
+    await db.set_full_metadata(user_id, meta)
+    await message.reply(f"✅ <b>{field.title()} title</b> set to: <code>{value or '(empty)'}</code>")
+
+
+@Client.on_callback_query(filters.regex(r"^meta_toggle_"))
+async def meta_toggle_cb(bot: Client, cb: CallbackQuery):
+    parts = cb.data.split("_")
+    # meta_toggle_<key>_<user_id>
+    if len(parts) < 4:
+        await cb.answer()
+        return
+
+    key = parts[2]
+    try:
+        owner_id = int(parts[3])
+    except ValueError:
+        await cb.answer()
+        return
+
+    if cb.from_user.id != owner_id:
+        await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+        return
+
+    key_map = {
+        'enabled': 'enabled',
+        'strip': 'strip_attachments',
+        'clear': 'clear_metadata',
+    }
+    db_key = key_map.get(key)
+    if not db_key:
+        await cb.answer("Unknown key")
+        return
+
+    meta = await db.get_full_metadata(owner_id)
+    meta[db_key] = not meta.get(db_key, False)
+    await db.set_full_metadata(owner_id, meta)
+    await cb.answer(f"{'✅ ON' if meta[db_key] else '❌ OFF'}")
+    await _show_metadata_panel(cb.message, owner_id, is_new=False)
