@@ -48,6 +48,16 @@ class Database:
                 'name_swap': False,
                 'apply_metadata': False,
             },
+            # Mirror Leech jaisi full metadata settings
+            full_metadata={
+                'enabled': False,
+                'video_title': 'Sbanime hindi',
+                'audio_title': '{audiolang}',
+                'subtitle_title': '{sublang}',
+                'comment': '',
+                'strip_attachments': False,
+                'clear_metadata': False,
+            },
         )
 
     async def add_user(self, id):
@@ -417,5 +427,35 @@ class Database:
         await self.col.update_one(
             {'id': int(user_id)},
             {'$set': {'url_auto_settings': settings}},
+            upsert=True,
+        )
+
+    # ─────────────────────────────────────────────
+    #  Full Metadata Settings (Mirror Leech style)
+    # ─────────────────────────────────────────────
+
+    _FULL_META_DEFAULT = {
+        'enabled': False,
+        'video_title': 'Sbanime hindi',
+        'audio_title': '{audiolang}',
+        'subtitle_title': '{sublang}',
+        'comment': '',
+        'strip_attachments': False,
+        'clear_metadata': False,
+    }
+
+    async def get_full_metadata(self, user_id: int) -> dict:
+        """Full metadata settings lo."""
+        user = await self._get_user(user_id)
+        saved = user.get('full_metadata', {})
+        result = dict(self._FULL_META_DEFAULT)
+        result.update(saved)
+        return result
+
+    async def set_full_metadata(self, user_id: int, meta: dict):
+        """Full metadata settings save karo."""
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'full_metadata': meta}},
             upsert=True,
         )
