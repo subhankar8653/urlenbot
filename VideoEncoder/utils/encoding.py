@@ -154,9 +154,35 @@ async def encode(filepath, message, msg, audio_map=None):
     else:
         video_opts = f'{cabac} {reframe} -profile:v main -map 0:v? -map_chapters 0 -map_metadata 0'
 
-    # Metadata
-    m = await db.get_metadata_w(message.from_user.id)
-    metadata = '-metadata title=SuhaniBots -metadata:s:v title=SuhaniBots -metadata:s:a title=SuhaniBots' if m else ''
+    # Metadata — Mirror Leech style
+    full_meta = await db.get_full_metadata(message.from_user.id)
+    metadata = ''
+    if full_meta.get('enabled'):
+        # Comment
+        if full_meta.get('comment'):
+            metadata += f' -metadata comment="{full_meta["comment"]}"'
+        # Video title
+        vtitle = full_meta.get('video_title', '')
+        if vtitle:
+            metadata += f' -metadata:s:v title="{vtitle}"'
+        # Audio title — {audiolang} placeholder support
+        atitle = full_meta.get('audio_title', '')
+        if atitle:
+            metadata += f' -metadata:s:a title="{atitle}"'
+        # Subtitle title — {sublang} placeholder support
+        stitle = full_meta.get('subtitle_title', '')
+        if stitle:
+            metadata += f' -metadata:s:s title="{stitle}"'
+        # Strip attachments
+        if full_meta.get('strip_attachments'):
+            metadata += ' -map -0:t'
+        # Clear metadata
+        if full_meta.get('clear_metadata'):
+            metadata = ' -map_metadata -1' + metadata
+    else:
+        # Fallback: purani simple metadata setting
+        m = await db.get_metadata_w(message.from_user.id)
+        metadata = '-metadata title=SuhaniBots -metadata:s:v title=SuhaniBots -metadata:s:a title=SuhaniBots' if m else ''
 
     # Subtitles
     h = await db.get_hardsub(message.from_user.id)
