@@ -211,7 +211,8 @@ def extract_anime_info(filename, metadata):
         episode = int(m.group(2))
         anime_name = name[:m.start()].strip(' .-_')
     else:
-        m = re.search(r'[\s\-_](\d{2,3})[\s\-_\.]', name)
+        # 2-4 digit episode numbers support (e.g. E06, E106, _06_, _106_)
+        m = re.search(r'[\s\-_](\d{2,4})[\s\-_\.]', name)
         if m:
             episode = int(m.group(1))
             anime_name = name[:m.start()].strip(' .-_')
@@ -242,6 +243,8 @@ def build_auto_caption(filepath, resolution=None, channel='@SBANIME'):
     """
     metadata = get_media_metadata(filepath)
     filename = os.path.basename(filepath)
+    # Extension strip karo pehle (double .mp4 problem fix)
+    base_filename = os.path.splitext(filename)[0]
 
     anime_name, season, episode = extract_anime_info(filename, metadata)
     quality = detect_quality(metadata, resolution)
@@ -249,15 +252,18 @@ def build_auto_caption(filepath, resolution=None, channel='@SBANIME'):
 
     parts = []
 
-    # 1. Anime Name
-    if anime_name:
-        parts.append(anime_name)
+    # 1. Anime Name — agar empty toh filename use karo (fallback)
+    name_part = anime_name.strip() if anime_name else base_filename
+    if name_part:
+        parts.append(name_part)
 
-    # 2. S02E06
+    # 2. S02E06 / E06 — 3+ digit episodes ke liye zero-pad mat karo
     if season and episode:
-        parts.append(f'S{season:02d}E{episode:02d}')
+        ep_str = f'{episode:02d}' if episode < 100 else str(episode)
+        parts.append(f'S{season:02d}E{ep_str}')
     elif episode:
-        parts.append(f'E{episode:02d}')
+        ep_str = f'{episode:02d}' if episode < 100 else str(episode)
+        parts.append(f'E{ep_str}')
 
     # 3. in Hindi
     if langs:
@@ -270,7 +276,11 @@ def build_auto_caption(filepath, resolution=None, channel='@SBANIME'):
     # 5. [@SBANIME]
     parts.append(f'[{channel}]')
 
-    return ' '.join(parts) + '.mp4'
+    caption = ' '.join(parts)
+    # Ensure ends with .mp4 (sirf ek baar)
+    if not caption.endswith('.mp4'):
+        caption += '.mp4'
+    return caption
 
 
 def smart_caption(original_caption, filepath, resolution=None, channel='@SBANIME'):
@@ -284,6 +294,12 @@ def smart_caption(original_caption, filepath, resolution=None, channel='@SBANIME
     has_quality = bool(re.search(r'\d{3,4}p|4K|FHD', original_caption, re.IGNORECASE))
 
     if has_quality:
-        return original_caption
+        # Caption already accha hai — sirf ensure karo .mp4 se end ho (double nahi)
+        cap = original_caption.strip()
+        # Extension normalize karo
+        cap = re.sub(r'\.(mkv|avi|mov|flv|wmv|ts|m4v|webm)$', '.mp4', cap, flags=re.IGNORECASE)
+        if not cap.lower().endswith('.mp4'):
+            cap += '.mp4'
+        return cap
     else:
         return build_auto_caption(filepath, resolution, channel)
