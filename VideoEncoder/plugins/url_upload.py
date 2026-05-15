@@ -99,7 +99,7 @@ async def url_upload_cmd(bot: Client, message: Message):
         url = direct
 
     if not custom_name:
-        custom_name = unquote_plus(os.path.basename(url.split("?")[0])) or "downloaded_file"
+        custom_name = await _get_filename_from_url(url)
 
     # Filename too long fix — Linux max = 255 bytes, safe limit = 200 chars
     custom_name = _safe_filename(custom_name)
@@ -1093,6 +1093,54 @@ async def clear_swap_rules(bot: Client, message: Message):
 
 
 # ─── Helper functions ─────────────────────────────────────────────────────────
+
+async def _get_filename_from_url(url: str) -> str:
+    """
+    URL se real filename nikalo.
+    Priority:
+    1. HTTP HEAD request ka Content-Disposition header (real filename hota hai)
+    2. URL ke basename mein valid extension ho toh use karo
+    3. Fallback: 'downloaded_file'
+
+    Yeh fix isliye zaruri hai kyunki Google jaisi URLs mein
+    basename ek lamba encoded string hota hai (e.g. ADGPM2n...) jo
+    caption mein URL jaisi dikh ti hai — real filename nahi hoti.
+    """
+    import aiohttp
+    import re as _re
+
+    VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".m4v", ".wmv", ".webm"}
+
+    # Step 1: HEAD request se Content-Disposition check karo
+    try:
+        async with aiohttp.ClientSession() as _sess:
+            async with _sess.head(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                cd = resp.headers.get("Content-Disposition", "")
+                if cd:
+                    m = _re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\r\n]+)', cd, _re.IGNORECASE)
+                    if m:
+                        fname = unquote_plus(m.group(1).strip().strip('"\''))
+                        if fname:
+                            LOGGER.info(f"[URL] Filename from Content-Disposition: {fname}")
+                            return fname
+    except Exception as e:
+        LOGGER.warning(f"[URL] HEAD request failed for filename detection: {e}")
+
+    # Step 2: URL ke path se basename lo — sirf tab use karo jab valid extension ho
+    try:
+        path_part = url.split("?")[0]
+        basename = unquote_plus(os.path.basename(path_part))
+        _, ext = os.path.splitext(basename)
+        if ext.lower() in VIDEO_EXTS and len(basename) < 200:
+            LOGGER.info(f"[URL] Filename from URL basename: {basename}")
+            return basename
+    except Exception:
+        pass
+
+    # Step 3: Fallback
+    LOGGER.info("[URL] Could not detect filename, using 'downloaded_file'")
+    return "downloaded_file"
+
 
 def _safe_filename(name: str, max_len: int = 180) -> str:
     """
