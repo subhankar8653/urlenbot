@@ -341,7 +341,6 @@ async def setmeta_cmd(bot: Client, message: Message):
     value = " ".join(args[1:]).strip() if len(args) > 1 else ""
 
     if field == "reset":
-        from ..utils.database.database import Database
         await db.set_full_metadata(user_id, {
             'enabled': False,
             'video_title': 'Sbanime hindi',
