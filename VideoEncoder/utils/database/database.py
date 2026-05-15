@@ -39,7 +39,8 @@ class Database:
             upload_as_doc=False,
             crf=22,
             resize=False,
-            thumbnail=None
+            thumbnail=None,
+            url_metadata={'video_title': '', 'audio_title': '', 'show_title': ''},
         )
 
     async def add_user(self, id):
@@ -351,4 +352,36 @@ class Database:
             {'id': int(user_id)},
             {'$set': {'custompics': {}}},
             upsert=True
+        )
+
+    # ─────────────────────────────────────────────
+    #  URL Uploader – Metadata Settings
+    # ─────────────────────────────────────────────
+
+    async def set_url_metadata(self, user_id: int, meta: dict):
+        """
+        URL uploader ke liye metadata settings save karo.
+        meta = { 'video_title': str, 'audio_title': str, 'show_title': str }
+        """
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'url_metadata': meta}},
+            upsert=True,
+        )
+
+    async def get_url_metadata(self, user_id: int) -> dict:
+        """URL uploader metadata settings lo."""
+        user = await self._get_user(user_id)
+        return user.get('url_metadata', {
+            'video_title': '',
+            'audio_title': '',
+            'show_title': '',
+        })
+
+    async def clear_url_metadata(self, user_id: int):
+        """URL uploader metadata clear karo."""
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'url_metadata': {'video_title': '', 'audio_title': '', 'show_title': ''}}},
+            upsert=True,
         )
