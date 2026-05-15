@@ -29,37 +29,7 @@ async def set_swap(client, message: Message):
     await message.reply(text)
 
 
-@Client.on_message(filters.command("swaplist"))
-async def swap_list(client, message: Message):
-    rules = await db.get_swap(message.from_user.id)
-    if not rules:
-        await message.reply("Koi swap rule nahi hai. Set karo: /swap old:new")
-        return
-    text = "Current Swap Rules:\n\n"
-    for o, n in rules.items():
-        text += f"- {o} -> {n}\n"
-    await message.reply(text)
-
-
 @Client.on_message(filters.command("swapclear"))
 async def swap_clear(client, message: Message):
     await db.clear_swap(message.from_user.id)
     await message.reply("Sab swap rules clear ho gaye!")
-
-
-@Client.on_message(filters.command("setpic"))
-async def set_pic(client, message: Message):
-    reply = message.reply_to_message
-    if not reply or not reply.photo:
-        await message.reply("Photo ko reply karo aur /setpic likho.\nHatane ke liye: /clearpic")
-        return
-    await db.set_thumbnail(message.from_user.id, reply.photo.file_id)
-    await db.set_coverpic(message.from_user.id, reply.photo.file_id)
-    await message.reply("Pic Set Ho Gayi!")
-
-
-@Client.on_message(filters.command("clearpic"))
-async def clear_pic(client, message: Message):
-    await db.set_thumbnail(message.from_user.id, None)
-    await db.clear_coverpic(message.from_user.id)
-    await message.reply("Thumbnail hata di gayi!")

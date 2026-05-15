@@ -752,7 +752,7 @@ async def _process_zip_queue(bot: Client, user_id: int, original_message: Messag
 
 
 # ─── Text handler for metadata input ─────────────────────────────────────────
-@Client.on_message(filters.text & filters.private)
+@Client.on_message(filters.text & filters.private, group=3)
 async def url_meta_text_input(bot: Client, message: Message):
     """Catches text replies for metadata field input."""
     user_id = message.from_user.id
