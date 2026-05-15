@@ -41,6 +41,13 @@ class Database:
             resize=False,
             thumbnail=None,
             url_metadata={'video_title': '', 'audio_title': '', 'show_title': ''},
+            url_auto_settings={
+                'rm_sub': False,
+                'rm_audio': False,
+                'hindi_only': False,
+                'name_swap': False,
+                'apply_metadata': False,
+            },
         )
 
     async def add_user(self, id):
@@ -383,5 +390,32 @@ class Database:
         await self.col.update_one(
             {'id': int(user_id)},
             {'$set': {'url_metadata': {'video_title': '', 'audio_title': '', 'show_title': ''}}},
+            upsert=True,
+        )
+
+    # ─────────────────────────────────────────────
+    #  URL Auto-Processing Settings
+    # ─────────────────────────────────────────────
+
+    async def get_url_auto_settings(self, user_id: int) -> dict:
+        """URL auto-processing settings lo — ye woh settings hain jo /url command
+        pe bina buttons ke automatically apply honge."""
+        user = await self._get_user(user_id)
+        default = {
+            'rm_sub': False,
+            'rm_audio': False,
+            'hindi_only': False,
+            'name_swap': False,
+            'apply_metadata': False,
+        }
+        saved = user.get('url_auto_settings', {})
+        default.update(saved)
+        return default
+
+    async def set_url_auto_settings(self, user_id: int, settings: dict):
+        """URL auto-processing settings save karo."""
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'url_auto_settings': settings}},
             upsert=True,
         )
