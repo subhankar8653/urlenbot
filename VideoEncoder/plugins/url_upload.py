@@ -220,37 +220,69 @@ async def _auto_process_and_upload(bot: Client, user_id: int, msg: Message, orig
 # ─── Archive Extract ───────────────────────────────────────────────────────────
 async def _extract_archive(filepath: str, msg: Message) -> str | None:
     """
-    ZIP/TAR archive ko extract karo aur pehli valid video file ka path return karo.
-    Agar multiple video files hain toh size ke hisaab se badi wali use hogi.
+    ZIP/TAR archive ko extract karo — nested ZIPs bhi handle hoti hain.
+    Sabse badi video file return hogi.
     """
+    VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".m4v", ".wmv", ".webm"}
+    ARCHIVE_EXTS = {".zip", ".tar", ".gz", ".bz2", ".xz"}
+
     extract_dir = filepath + "_extracted"
     os.makedirs(extract_dir, exist_ok=True)
 
-    try:
-        if zipfile.is_zipfile(filepath):
-            with zipfile.ZipFile(filepath, "r") as zf:
-                zf.extractall(extract_dir)
-        elif tarfile.is_tarfile(filepath):
-            with tarfile.open(filepath, "r:*") as tf:
-                tf.extractall(extract_dir)
-        else:
-            await msg.edit(
-                "❌ <b>Extract failed:</b> File ZIP ya TAR format mein nahi hai.\n"
-                "Supported: .zip, .tar, .tar.gz, .tar.bz2, .tar.xz"
-            )
-            return None
-    except Exception as e:
-        await msg.edit(f"❌ Extract failed: <code>{e}</code>")
-        return None
-    finally:
-        # Original archive delete karo
+    def _extract_one(src_path: str, dst_dir: str) -> bool:
+        """Ek archive extract karo. True = success."""
         try:
-            os.remove(filepath)
+            if zipfile.is_zipfile(src_path):
+                with zipfile.ZipFile(src_path, "r") as zf:
+                    zf.extractall(dst_dir)
+                return True
+            elif tarfile.is_tarfile(src_path):
+                with tarfile.open(src_path, "r:*") as tf:
+                    tf.extractall(dst_dir)
+                return True
         except Exception:
             pass
+        return False
 
-    # Extracted folder mein se video files dhundo
-    VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".m4v", ".wmv", ".webm"}
+    # Step 1: Main archive extract karo
+    ok = _extract_one(filepath, extract_dir)
+    try:
+        os.remove(filepath)
+    except Exception:
+        pass
+
+    if not ok:
+        await msg.edit(
+            "❌ <b>Extract failed:</b> File ZIP ya TAR format mein nahi hai.\n"
+            "Supported: .zip, .tar, .tar.gz, .tar.bz2, .tar.xz"
+        )
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        return None
+
+    # Step 2: Nested archives bhi extract karo (max 3 levels deep)
+    for _level in range(3):
+        nested_found = False
+        for root, dirs, files in os.walk(extract_dir):
+            for f in files:
+                ext = os.path.splitext(f)[1].lower()
+                if ext in ARCHIVE_EXTS:
+                    nested_path = os.path.join(root, f)
+                    nested_dir = nested_path + "_inner"
+                    os.makedirs(nested_dir, exist_ok=True)
+                    if _extract_one(nested_path, nested_dir):
+                        nested_found = True
+                        try:
+                            os.remove(nested_path)
+                        except Exception:
+                            pass
+                        # Move extracted files up
+                        for item in os.listdir(nested_dir):
+                            shutil.move(os.path.join(nested_dir, item), root)
+                        shutil.rmtree(nested_dir, ignore_errors=True)
+        if not nested_found:
+            break
+
+    # Step 3: Video files dhundo (recursively)
     video_files = []
     for root, dirs, files in os.walk(extract_dir):
         for f in files:
@@ -258,22 +290,22 @@ async def _extract_archive(filepath: str, msg: Message) -> str | None:
                 video_files.append(os.path.join(root, f))
 
     if not video_files:
+        all_files = []
+        for root, dirs, files in os.walk(extract_dir):
+            all_files.extend(files)
         await msg.edit(
             "❌ <b>Extract failed:</b> Archive mein koi video file nahi mili.\n"
-            f"Extracted content: {os.listdir(extract_dir)}"
+            f"Extracted files: {all_files[:10]}"
         )
         shutil.rmtree(extract_dir, ignore_errors=True)
         return None
 
-    # Sort by size (badi wali usually main file hoti hai)
+    # Sort by size — badi wali main file hoti hai
     video_files.sort(key=lambda x: os.path.getsize(x), reverse=True)
     chosen = video_files[0]
 
-    # Move to download_dir
     dest = os.path.join(download_dir, os.path.basename(chosen))
     shutil.move(chosen, dest)
-
-    # Cleanup extracted folder
     shutil.rmtree(extract_dir, ignore_errors=True)
 
     if len(video_files) > 1:
@@ -588,27 +620,64 @@ async def url_meta_text_input(bot: Client, message: Message):
 @Client.on_message(filters.command("addswap"))
 async def add_swap_rule(bot: Client, message: Message):
     """
-    /addswap <from_text> <to_text>
-    Example: /addswap toonweb sbanime
+    /addswap <from> <to>
+    Ya Mirror Leech style pipe format:
+    /addswap find1:change1|find2:change2|find3:change3
+    Example: /addswap HindiAnimeZone.com:@SBANIME|RareToonsIndia:@SBANIME
     """
     c = await check_chat(message, chat="Both")
     if not c:
         return
-    parts = message.text.split(None, 2)
-    if len(parts) < 3:
+
+    args = message.text.split(None, 1)
+    if len(args) < 2 or not args[1].strip():
         await message.reply(
-            "**Usage:** `/addswap <from> <to>`\n"
-            "Example: `/addswap toonweb sbanime`"
+            "<b>Usage:</b>\n"
+            "• Simple: <code>/addswap old_text new_text</code>\n"
+            "• Pipe format: <code>/addswap find1:change1|find2:change2</code>\n\n"
+            "<b>Examples:</b>\n"
+            "<code>/addswap HindiAnimeZone.com @SBANIME</code>\n"
+            "<code>/addswap HindiAnimeZone.com:@SBANIME|RareToonsIndia:@SBANIME</code>"
         )
         return
-    from_text = parts[1].strip()
-    to_text = parts[2].strip()
+
+    raw = args[1].strip()
     rules = await db.get_swap(message.from_user.id)
-    rules[from_text] = to_text
+    added = []
+
+    # Pipe format: find1:change1|find2:change2
+    if "|" in raw or (":" in raw and len(raw.split(None)) == 1):
+        pairs = raw.split("|")
+        for pair in pairs:
+            pair = pair.strip()
+            if ":" not in pair:
+                continue
+            from_text, to_text = pair.split(":", 1)
+            from_text = from_text.strip()
+            to_text = to_text.strip()
+            if from_text:
+                rules[from_text] = to_text
+                added.append((from_text, to_text))
+    else:
+        # Simple space format: /addswap old new
+        parts = raw.split(None, 1)
+        if len(parts) < 2:
+            await message.reply(
+                "❌ <b>2 arguments chahiye!</b>\n"
+                "<code>/addswap old_text new_text</code>"
+            )
+            return
+        from_text = parts[0].strip()
+        to_text = parts[1].strip()
+        rules[from_text] = to_text
+        added.append((from_text, to_text))
+
     await db.set_swap(message.from_user.id, rules)
+
+    lines = "\n".join(f"• <code>{f}</code> → <code>{t}</code>" for f, t in added)
     await message.reply(
-        f"✅ Swap rule added:\n<code>{from_text}</code> → <code>{to_text}</code>\n\n"
-        f"Total rules: {len(rules)}",
+        f"✅ <b>{len(added)} swap rule(s) added:</b>\n{lines}\n\n"
+        f"Total rules: <b>{len(rules)}</b>",
         reply_markup=output,
     )
 
