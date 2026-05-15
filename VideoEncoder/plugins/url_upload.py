@@ -1,11 +1,13 @@
 """
 URL Uploader Plugin for Encode Bot
 Features:
-  - URL se direct download + Telegram upload
-  - Subtitle remove (soft/hard dono)
-  - Audio remove / Hindi-only audio select
-  - Name swap (toonweb → sbanime etc.)
-  - Metadata editor (video title, audio title, video stream title)
+  - /url <link>           → Download + auto-apply saved settings → upload
+  - /url <link> -vt       → Download + show manual option buttons (old behavior)
+  - /url <link> -e        → Download zip/archive → unzip → auto-apply settings → upload
+  - /url <link> -e -vt    → Download zip/archive → unzip → show manual option buttons
+  - /url <link> | <name>  → Custom filename (all flags still work)
+
+  Auto-settings configure karne ke liye: /urlpreset command use karo
 """
 
 import asyncio
@@ -13,6 +15,9 @@ import os
 import re
 import subprocess
 import time
+import zipfile
+import tarfile
+import shutil
 from urllib.parse import unquote_plus
 
 from pyrogram import Client, filters
@@ -39,7 +44,7 @@ from ..utils.url_processor import (
 from ..utils.uploads import upload_worker
 
 # ─── Pending sessions store ──────────────────────────────────────────────────
-# { user_id: { 'filepath': str, 'msg_id': int, 'orig_name': str } }
+# { user_id: { 'filepath': str, 'msg': Message, 'orig_name': str, 'message': Message } }
 _url_sessions: dict = {}
 
 
@@ -48,8 +53,11 @@ _url_sessions: dict = {}
 async def url_upload_cmd(bot: Client, message: Message):
     """
     Usage:
-      /url <link>
-      /url <link> | <custom filename>
+      /url <link>              → auto-process (saved settings ke hisaab se)
+      /url <link> -vt          → manual options buttons dikhao
+      /url <link> -e           → zip/archive download → unzip → auto-process
+      /url <link> -e -vt       → zip/archive download → unzip → manual options
+      /url <link> | <filename> → custom filename (flags bhi kaam karte hain)
     """
     c = await check_chat(message, chat="Both")
     if not c:
@@ -58,18 +66,25 @@ async def url_upload_cmd(bot: Client, message: Message):
 
     if len(message.command) < 2:
         await message.reply(
-            "**Usage:** `/url <link>` or `/url <link> | <filename>`\n\n"
-            "After download you'll get options:\n"
-            "• Remove Subtitles\n"
-            "• Remove Audio tracks\n"
-            "• Select Hindi Audio only\n"
-            "• Name Swap (toonweb → sbanime)\n"
-            "• Edit Metadata\n"
-            "• Upload as-is"
+            "<b>Usage:</b>\n"
+            "• <code>/url &lt;link&gt;</code> – Auto-process with saved settings\n"
+            "• <code>/url &lt;link&gt; -vt</code> – Show manual option buttons\n"
+            "• <code>/url &lt;link&gt; -e</code> – Unzip then auto-process\n"
+            "• <code>/url &lt;link&gt; -e -vt</code> – Unzip then show buttons\n"
+            "• <code>/url &lt;link&gt; | &lt;filename&gt;</code> – Custom filename\n\n"
+            "Auto-settings configure karo: /urlpreset"
         )
         return
 
     raw = message.text.split(None, 1)[1].strip()
+
+    # ── Flags parse karo ──
+    show_buttons = "-vt" in raw
+    extract_zip  = "-e"  in raw
+
+    # Flags remove karo
+    raw = raw.replace("-vt", "").replace("-e", "").strip()
+
     url = raw
     custom_name = None
 
@@ -98,6 +113,15 @@ async def url_upload_cmd(bot: Client, message: Message):
         await msg.edit("❌ Download failed or file not found.")
         return
 
+    # ── ZIP/Archive extract ────────────────────────────────────────────────────
+    if extract_zip:
+        await msg.edit("<b>📦 Extracting archive...</b>")
+        extracted_path = await _extract_archive(filepath, msg)
+        if not extracted_path:
+            # Error already shown in _extract_archive
+            return
+        filepath = extracted_path
+
     user_id = message.from_user.id
     _url_sessions[user_id] = {
         "filepath": filepath,
@@ -106,7 +130,160 @@ async def url_upload_cmd(bot: Client, message: Message):
         "message": message,
     }
 
-    await _show_url_options(msg, user_id, filepath)
+    # ── Show buttons ya auto-process ──────────────────────────────────────────
+    if show_buttons:
+        await _show_url_options(msg, user_id, filepath)
+    else:
+        await _auto_process_and_upload(bot, user_id, msg, message)
+
+
+# ─── Auto-process (saved settings ke hisaab se) ───────────────────────────────
+async def _auto_process_and_upload(bot: Client, user_id: int, msg: Message, original_message: Message):
+    """
+    User ki saved URL auto-settings ke hisaab se file process karo aur upload karo.
+    Koi button nahi — seedha kaam ho jaayega.
+    """
+    session = _url_sessions.get(user_id)
+    if not session:
+        await msg.edit("⌛ Session expired.")
+        return
+
+    filepath = session["filepath"]
+    auto = await db.get_url_auto_settings(user_id)
+
+    # ── 1. Remove Subtitles ──
+    if auto.get("rm_sub"):
+        await msg.edit("<b>🔄 Removing subtitles (auto)...</b>")
+        new_path = await _remove_subtitles(filepath, msg)
+        if new_path:
+            filepath = new_path
+            session["filepath"] = filepath
+            _url_sessions[user_id] = session
+
+    # ── 2. Remove Audio ──
+    if auto.get("rm_audio"):
+        await msg.edit("<b>🔄 Removing audio (auto)...</b>")
+        new_path = await _remove_audio(filepath, msg)
+        if new_path:
+            filepath = new_path
+            session["filepath"] = filepath
+            _url_sessions[user_id] = session
+
+    # ── 3. Hindi Audio Only (rm_audio off ho toh hi) ──
+    elif auto.get("hindi_only"):
+        await msg.edit("<b>🔄 Keeping Hindi audio only (auto)...</b>")
+        audio_streams = get_audio_streams(filepath)
+        hindi_indices = [
+            s["index"] for s in audio_streams
+            if any(tag in (s.get("lang", "") + s.get("title", "")).lower()
+                   for tag in ["hin", "hindi", "hin2", "hi", "dub"])
+        ]
+        if hindi_indices:
+            new_path = await _keep_audio_streams(filepath, hindi_indices, msg)
+            if new_path:
+                filepath = new_path
+                session["filepath"] = filepath
+                _url_sessions[user_id] = session
+        else:
+            await msg.edit("<b>⚠️ Hindi audio nahi mila, sab streams rakh rahe hain...</b>")
+            await asyncio.sleep(2)
+
+    # ── 4. Name Swap ──
+    if auto.get("name_swap"):
+        swap_rules = await db.get_swap(user_id)
+        if swap_rules:
+            old_name = os.path.basename(filepath)
+            new_name = apply_name_swap(old_name, swap_rules)
+            if new_name != old_name:
+                new_path = os.path.join(os.path.dirname(filepath), new_name)
+                os.rename(filepath, new_path)
+                filepath = new_path
+                session["filepath"] = filepath
+                _url_sessions[user_id] = session
+
+    # ── 5. Apply Metadata ──
+    if auto.get("apply_metadata"):
+        meta = await db.get_url_metadata(user_id)
+        if any(meta.values()):
+            await msg.edit("<b>🔄 Applying metadata (auto)...</b>")
+            new_path = await _apply_metadata(filepath, meta, msg)
+            if new_path:
+                filepath = new_path
+                session["filepath"] = filepath
+                _url_sessions[user_id] = session
+
+    # ── Upload ──
+    await _do_upload(bot, filepath, original_message, msg)
+    _url_sessions.pop(user_id, None)
+
+
+# ─── Archive Extract ───────────────────────────────────────────────────────────
+async def _extract_archive(filepath: str, msg: Message) -> str | None:
+    """
+    ZIP/TAR archive ko extract karo aur pehli valid video file ka path return karo.
+    Agar multiple video files hain toh size ke hisaab se badi wali use hogi.
+    """
+    extract_dir = filepath + "_extracted"
+    os.makedirs(extract_dir, exist_ok=True)
+
+    try:
+        if zipfile.is_zipfile(filepath):
+            with zipfile.ZipFile(filepath, "r") as zf:
+                zf.extractall(extract_dir)
+        elif tarfile.is_tarfile(filepath):
+            with tarfile.open(filepath, "r:*") as tf:
+                tf.extractall(extract_dir)
+        else:
+            await msg.edit(
+                "❌ <b>Extract failed:</b> File ZIP ya TAR format mein nahi hai.\n"
+                "Supported: .zip, .tar, .tar.gz, .tar.bz2, .tar.xz"
+            )
+            return None
+    except Exception as e:
+        await msg.edit(f"❌ Extract failed: <code>{e}</code>")
+        return None
+    finally:
+        # Original archive delete karo
+        try:
+            os.remove(filepath)
+        except Exception:
+            pass
+
+    # Extracted folder mein se video files dhundo
+    VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".m4v", ".wmv", ".webm"}
+    video_files = []
+    for root, dirs, files in os.walk(extract_dir):
+        for f in files:
+            if os.path.splitext(f)[1].lower() in VIDEO_EXTS:
+                video_files.append(os.path.join(root, f))
+
+    if not video_files:
+        await msg.edit(
+            "❌ <b>Extract failed:</b> Archive mein koi video file nahi mili.\n"
+            f"Extracted content: {os.listdir(extract_dir)}"
+        )
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        return None
+
+    # Sort by size (badi wali usually main file hoti hai)
+    video_files.sort(key=lambda x: os.path.getsize(x), reverse=True)
+    chosen = video_files[0]
+
+    # Move to download_dir
+    dest = os.path.join(download_dir, os.path.basename(chosen))
+    shutil.move(chosen, dest)
+
+    # Cleanup extracted folder
+    shutil.rmtree(extract_dir, ignore_errors=True)
+
+    if len(video_files) > 1:
+        await msg.edit(
+            f"📦 <b>Extracted!</b> {len(video_files)} video files mili.\n"
+            f"Processing: <code>{os.path.basename(dest)}</code> (largest)"
+        )
+        await asyncio.sleep(2)
+
+    return dest
 
 
 # ─── Show options keyboard ────────────────────────────────────────────────────
@@ -140,7 +317,6 @@ async def _show_url_options(msg: Message, user_id: int, filepath: str):
 async def url_upload_callbacks(bot: Client, cb: CallbackQuery):
     data_str = cb.data  # e.g. "url_rmsub_12345"
     parts = data_str.split("_")
-    # parts[0] = "url", parts[1] = action, parts[2] = user_id
     if len(parts) < 3:
         await cb.answer("Invalid callback", show_alert=True)
         return
@@ -220,7 +396,6 @@ async def url_upload_callbacks(bot: Client, cb: CallbackQuery):
                 "⚠️ Hindi audio stream nahi mila! Manual stream number dena padega.",
                 show_alert=True,
             )
-            # Show stream list for manual selection
             streams_text = "\n".join(
                 f"  Stream #{s['index']}: lang={s.get('lang','?')} title={s.get('title','?')}"
                 for s in audio_streams
@@ -246,7 +421,6 @@ async def url_upload_callbacks(bot: Client, cb: CallbackQuery):
 
     # ── Manual audio stream selection ─────────────────────────────────────────
     elif action == "selaud":
-        # url_selaud_{user_id}_{stream_index}
         try:
             stream_idx = int(parts[3])
         except (IndexError, ValueError):
@@ -385,7 +559,6 @@ async def url_meta_text_input(bot: Client, message: Message):
 
     msg = session["msg"]
     await message.delete()
-    # Refresh metadata panel
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(
             f"🎬 Video Title: {meta.get('video_title') or '(not set)'}",
@@ -469,7 +642,6 @@ async def clear_swap_rules(bot: Client, message: Message):
 async def _download_url(url: str, filename: str, msg: Message, orig_message: Message) -> str:
     """Download from URL with progress."""
     filepath = os.path.join(download_dir, filename)
-    c_time = time.time()
 
     try:
         from pySmartDL import SmartDL
@@ -531,7 +703,6 @@ async def _ffmpeg_process(input_path: str, output_path: str, extra_args: list, m
         except Exception:
             pass
         return None
-    # Remove original, rename output
     try:
         os.remove(input_path)
     except Exception:
@@ -557,10 +728,8 @@ async def _remove_audio(filepath: str, msg: Message) -> str | None:
 
 
 async def _keep_audio_streams(filepath: str, stream_indices: list, msg: Message) -> str | None:
-    """Keep only specific audio stream indices (absolute stream indices from ffprobe)."""
+    """Keep only specific audio stream indices."""
     out = _make_output_path(filepath, "_hindiaudio")
-    # -map 0:v -map 0:s? -map 0:a:<relative_idx>
-    # We need to figure out relative audio index from absolute stream index
     audio_streams = get_audio_streams(filepath)
     audio_abs_indices = [s["index"] for s in audio_streams]
 
@@ -570,11 +739,9 @@ async def _keep_audio_streams(filepath: str, stream_indices: list, msg: Message)
             map_args += ["-map", f"0:a:{i}"]
 
     if len(map_args) == 2:
-        # None matched, fallback to all audio
         LOGGER.warning("No matching audio streams found, keeping all.")
         return None
 
-    # Set first selected audio as default
     map_args += ["-disposition:a:0", "default", "-c", "copy"]
     return await _ffmpeg_process(filepath, out, map_args, msg)
 
@@ -587,7 +754,6 @@ async def _apply_metadata(filepath: str, meta: dict, msg: Message) -> str | None
     if meta.get("video_title"):
         meta_args += ["-metadata:s:v:0", f"title={meta['video_title']}"]
     if meta.get("audio_title"):
-        # Apply to all audio streams
         meta_args += ["-metadata:s:a", f"title={meta['audio_title']}"]
     return await _ffmpeg_process(filepath, out, meta_args, msg)
 
