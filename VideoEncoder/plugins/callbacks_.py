@@ -13,7 +13,10 @@ from ..utils.database.access_db import db
 from ..utils.settings import (AudioSettings, ExtraSettings, OpenSettings,
                               VideoSettings)
 from .start import showw_status
-from ..video_utils.audio_selector import sessions
+try:
+    from ..video_utils.audio_selector import sessions
+except ImportError:
+    sessions = {}
 
 
 @app.on_callback_query()
