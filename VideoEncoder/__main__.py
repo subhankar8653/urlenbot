@@ -1,24 +1,18 @@
 
-import asyncio
 import dns.resolver
 from pyrogram import idle
 
-from . import app, log, LOGGER
+from . import app, log
 
 dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
-dns.resolver.default_resolver.nameservers = ['8.8.8.8']
+dns.resolver.default_resolver.nameservers = [
+    '8.8.8.8']  # this is a google public dns
 
 
 async def main():
     await app.start()
-    me = await app.get_me()
-    LOGGER.info(f"Bot started: @{me.username}")
-    if log:
-        try:
-            await app.send_message(chat_id=log, text=f'<b>Bot Started! @{me.username}</b>')
-        except Exception as e:
-            LOGGER.warning(f"LOG_CHANNEL pe message send nahi hua: {e}")
+    await app.send_message(chat_id=log, text=f'<b>Bot Started! @{(await app.get_me()).username}</b>')
     await idle()
     await app.stop()
 
-asyncio.run(main())
+app.loop.run_until_complete(main())

@@ -1,109 +1,117 @@
-"""
-VideoEncoder package __init__.py
----------------------------------
-Sab core variables yahan define hote hain:
-app (Pyrogram Client), LOGGER, env vars, etc.
-"""
 
+from os import getenv
 import logging
 import os
 import time
 from io import BytesIO, StringIO
+from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
 from pyrogram import Client
 
-# ── Load config.env if present ───────────────────────────────────────────────
-load_dotenv("config.env", override=False)  # Railway vars ko override mat karo
-
-# ── Logging setup ─────────────────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("VideoEncoder/utils/extras/logs.txt"),
-        logging.StreamHandler(),
-    ],
-    level=logging.INFO,
-)
-LOGGER = logging.getLogger(__name__)
-
-# ── Required env vars ─────────────────────────────────────────────────────────
-api_id    = int(os.environ.get("API_ID", 0))
-api_hash  = os.environ.get("API_HASH", "")
-bot_token = os.environ.get("BOT_TOKEN", "")
-mongo_uri = os.environ.get("MONGO_URI", "")
-
-if not api_id or not api_hash or not bot_token:
-    LOGGER.error("API_ID, API_HASH aur BOT_TOKEN set karo! config.env ya Railway Variables mein.")
-    raise ValueError("Missing required env vars: API_ID / API_HASH / BOT_TOKEN")
-
-# ── Auth users ────────────────────────────────────────────────────────────────
-owner_raw    = os.environ.get("OWNER_ID", "")
-sudo_raw     = os.environ.get("SUDO_USERS", "")
-everyone_raw = os.environ.get("EVERYONE_CHATS", "")
-
-try:
-    owner = int(owner_raw)
-except (ValueError, TypeError):
-    owner = 0
-
-sudo_users = []
-for uid in sudo_raw.split():
-    try:
-        sudo_users.append(int(uid))
-    except ValueError:
-        pass
-
-everyone = []
-for uid in everyone_raw.split():
-    try:
-        everyone.append(int(uid))
-    except ValueError:
-        pass
-
-all = sudo_users + [owner]  # noqa: A001
-
-# ── Log channel ───────────────────────────────────────────────────────────────
-try:
-    log = int(os.environ.get("LOG_CHANNEL", "0"))
-except (ValueError, TypeError):
-    log = 0
-
-# ── Directories ───────────────────────────────────────────────────────────────
-download_dir = os.environ.get("DOWNLOAD_DIR", "VideoEncoder/downloads/")
-encode_dir   = os.environ.get("ENCODE_DIR",   "VideoEncoder/encodes/")
-
-os.makedirs(download_dir, exist_ok=True)
-os.makedirs(encode_dir,   exist_ok=True)
-
-# ── Misc ──────────────────────────────────────────────────────────────────────
-PROGRESS     = "[{0}{1}] {2}%\n"
 botStartTime = time.time()
-data         = []          # Queue list
+
+if os.path.exists('config.env'):
+    load_dotenv('config.env')
+
+# Variables
+
+api_id = int(getenv("API_ID"))
+api_hash = getenv("API_HASH")
+bot_token = getenv("BOT_TOKEN")
+
+database = getenv("MONGO_URI")
+session = getenv("SESSION_NAME")
+
+drive_dir = getenv("DRIVE_DIR")
+index = getenv("INDEX_URL")
+
+download_dir = getenv("DOWNLOAD_DIR")
+encode_dir = getenv("ENCODE_DIR")
+
+owner = list(set(int(x) for x in getenv("OWNER_ID").split()))
+sudo_users = list(set(int(x) for x in getenv("SUDO_USERS").split()))
+everyone = list(set(int(x) for x in getenv("EVERYONE_CHATS").split()))
+all = everyone + sudo_users + owner
+
+try:
+    log = int(getenv("LOG_CHANNEL"))
+except:
+    log = owner
+    print('Fill log or give user/channel/group id atleast!')
+
+
+data = []
+
+PROGRESS = """
+• {0} of {1}
+• Speed: {2}
+• ETA: {3}
+"""
+
 video_mimetype = [
-    "video/mp4", "video/x-matroska", "video/webm",
-    "video/avi", "video/quicktime", "video/x-msvideo",
-    "video/mpeg", "video/3gpp",
+    "video/x-flv",
+    "video/mp4",
+    "application/x-mpegURL",
+    "video/MP2T",
+    "video/3gpp",
+    "video/quicktime",
+    "video/x-msvideo",
+    "video/x-ms-wmv",
+    "video/x-matroska",
+    "video/webm",
+    "video/x-m4v",
+    "video/quicktime",
+    "video/mpeg"
 ]
 
-# memory_file factory — used by pyexec plugin
-def memory_file(bytes=True):
-    return BytesIO() if bytes else StringIO()
+def memory_file(name=None, contents=None, *, bytes=True):
+    if isinstance(contents, str) and bytes:
+        contents = contents.encode()
+    file = BytesIO() if bytes else StringIO()
+    if name:
+        file.name = name
+    if contents:
+        file.write(contents)
+        file.seek(0)
+    return file
 
-# ── Google Drive (optional) ───────────────────────────────────────────────────
-drive_dir = os.environ.get("DRIVE_DIR",  "")
-index     = os.environ.get("INDEX_URL",  "")
+# Check Folder
+if not os.path.isdir(download_dir):
+    os.makedirs(download_dir)
+if not os.path.isdir(encode_dir):
+    os.makedirs(encode_dir)
 
-# ── Pyrogram Client ───────────────────────────────────────────────────────────
-session_name = os.environ.get("SESSION_NAME", "VideoEncoderBot")
+if not os.path.isdir('VideoEncoder/utils/extras'):
+    os.makedirs('VideoEncoder/utils/extras')
 
-app = Client(
-    name=session_name,
-    api_id=api_id,
-    api_hash=api_hash,
-    bot_token=bot_token,
-    plugins=dict(root="VideoEncoder/plugins"),
-    sleep_threshold=60,
+# the logging things
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%d-%b-%y %H:%M:%S",
+    handlers=[
+        RotatingFileHandler(
+            'VideoEncoder/utils/extras/logs.txt',
+            backupCount=20,
+            encoding='utf-8'
+        ),
+        logging.StreamHandler()
+    ]
 )
 
-LOGGER.info("VideoEncoder package initialised ✅")
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+LOGGER = logging.getLogger(__name__)
+
+# Client
+app = Client(
+    session,
+    bot_token=bot_token,
+    api_id=api_id,
+    api_hash=api_hash,
+    plugins={'root': os.path.join(__package__, 'plugins')},
+    sleep_threshold=60,
+    max_concurrent_transmissions=20,
+    workers=64,
+    ipv6=False)
