@@ -1,4 +1,5 @@
 
+import asyncio
 import dns.resolver
 from pyrogram import idle
 
@@ -15,4 +16,4 @@ async def main():
     await idle()
     await app.stop()
 
-app.loop.run_until_complete(main())
+asyncio.run(main())
