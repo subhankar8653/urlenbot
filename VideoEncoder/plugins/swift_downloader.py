@@ -601,11 +601,13 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
 # ─────────────────────────────────────────────
 #  Single file upload — returns sent Message object (for reorder)
 # ─────────────────────────────────────────────
-async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, encode: bool):
+async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, encode: bool,
+                           on_half: asyncio.Event = None):
     """
     Ek file upload karo.
     Returns: (success: bool, sent_message: Message | None, quality: str)
     sent_message = Telegram pe jo actual video message gaya (reorder ke liye chahiye)
+    on_half: asyncio.Event — jab upload 50% ho tab fire karo (next file ko signal karne ke liye)
     """
     fname_orig = os.path.basename(filepath)
     quality = _quality_from(fname_orig)
@@ -681,6 +683,22 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
 
         uc = await _make_uploader_client(message.from_user.id)
         sent_msg = None
+
+        # ── 50% staggered upload ke liye custom progress wrapper ──
+        # on_half event tab fire hoga jab yeh file 50% upload ho jaaye
+        # isse next file ka upload shuru hoga (thumbnail conflict fix)
+        _half_fired = False
+
+        async def _progress_with_half(current, total, ud_type, prog_msg, start):
+            nonlocal _half_fired
+            from ..utils.display_progress import progress_for_pyrogram
+            # Normal progress update
+            await progress_for_pyrogram(current, total, ud_type, prog_msg, start)
+            # 50% check — sirf ek baar fire karo
+            if not _half_fired and on_half and total > 0 and current >= total * 0.50:
+                _half_fired = True
+                on_half.set()
+
         try:
             sent_msg = await upload_video(
                 message, msg, filepath, caption,
@@ -688,8 +706,14 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
                 file_name=disk_fname,
                 cover=cover,
                 uploader_client=uc,
+                progress=_progress_with_half,
+                progress_args=("📤 Uploading...", msg, c_time),
             )
         finally:
+            # Upload complete hone pe bhi event fire karo
+            # (agar file bahut chhoti ho aur 50% progress callback nahi aaya)
+            if on_half and not _half_fired:
+                on_half.set()
             if uc:
                 try:
                     await uc.disconnect()
@@ -872,13 +896,11 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
         f"📤 Upload ho raha hai..."
     )
 
-    # ── Semaphore: max 2 concurrent uploads ──
-    # Pehle 360p + 720p ek saath, jab koi bhi finish ho tab 1080p start
-    sem = asyncio.Semaphore(2)
+    # ── Staggered Upload: File N+1 tab start ho jab File N 50% reach kare ──
+    # Isse thumbnail conflict solve hota hai (parallel uploads mein ek pe thumb nahi lagta)
+    # Chain: file[0] → 50% → file[1] start → 50% → file[2] start → ...
 
-    # Ek dummy status message — sirf ek, clean look
-    # _upload_one_file ko ek msg chahiye progress edit ke liye
-    # Hum ek shared status msg use karenge jo baad mein delete ho jaega
+    # Har file ke liye ek status message banao
     _dummy_msgs = {}
     for fp in files:
         q = _quality_from(os.path.basename(fp))
@@ -888,21 +910,35 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
         except Exception:
             _dummy_msgs[fp] = msg  # fallback
 
-    async def _upload_task(filepath):
-        async with sem:
-            um = _dummy_msgs.get(filepath, msg)
-            success, sent_msg, quality = await _upload_one_file(
-                client, message, um, filepath, dl_dir, encode
-            )
-            # Status message delete karo — clean chat
-            try:
-                await um.delete()
-            except Exception:
-                pass
-            return success, sent_msg, quality
+    # Events chain — file[i] ka event fire hoga jab uska upload 50% ho
+    # file[i+1] is event ka wait karega shuru hone se pehle
+    _half_events = [asyncio.Event() for _ in files]
+
+    async def _upload_task_staggered(filepath, idx):
+        """
+        idx = 0  → immediately start
+        idx = 1  → wait for files[0] to reach 50%
+        idx = 2  → wait for files[1] to reach 50%
+        etc.
+        """
+        # Apni turn ka wait karo (pichli file 50% tak pahunche)
+        if idx > 0:
+            await _half_events[idx - 1].wait()
+
+        um = _dummy_msgs.get(filepath, msg)
+        success, sent_msg, quality = await _upload_one_file(
+            client, message, um, filepath, dl_dir, encode,
+            on_half=_half_events[idx],   # 50% pe yeh event fire hoga
+        )
+        # Status message delete karo — clean chat
+        try:
+            await um.delete()
+        except Exception:
+            pass
+        return success, sent_msg, quality
 
     results = await asyncio.gather(
-        *[_upload_task(fp) for fp in files],
+        *[_upload_task_staggered(fp, i) for i, fp in enumerate(files)],
         return_exceptions=True
     )
 
