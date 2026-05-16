@@ -111,7 +111,24 @@ def _make_driver(dl_dir: str):
             options.binary_location = binary
             break
 
-    driver = webdriver.Chrome(options=options)
+    # System chromedriver use karo — selenium-manager ko bypass karo
+    # (Railway pe selenium-manager chromedriver download karta hai but Chrome nahi hota)
+    from selenium.webdriver.chrome.service import Service as ChromeService
+    chromedriver_paths = [
+        "/usr/bin/chromedriver",
+        "/usr/lib/chromium/chromedriver",
+        "/usr/lib/chromium-browser/chromedriver",
+    ]
+    service = None
+    for cd_path in chromedriver_paths:
+        if os.path.exists(cd_path):
+            service = ChromeService(executable_path=cd_path)
+            break
+
+    if service:
+        driver = webdriver.Chrome(service=service, options=options)
+    else:
+        driver = webdriver.Chrome(options=options)
     # Page load timeout badha diya — slow Railway server ke liye
     driver.set_page_load_timeout(90)
     driver.set_script_timeout(30)
