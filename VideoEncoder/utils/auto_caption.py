@@ -233,9 +233,10 @@ def extract_anime_info(filename, metadata):
     return anime_name, season, episode
 
 
-def build_auto_caption(filepath, resolution=None, channel='@SBANIME', override_filename=None):
+def build_auto_caption(filepath, resolution=None, channel='@SBANIME', override_filename=None, has_eng_sub=False):
     """
     Format: AnimeName S02E06 in Hindi 1080p [@SBANIME].mp4
+            AnimeName S02E06 in Hindi 1080p [@SBANIME] Esub.mp4  (has_eng_sub=True)
 
     resolution:
       - None / 'OG' : ffprobe se actual quality detect karo
@@ -244,6 +245,9 @@ def build_auto_caption(filepath, resolution=None, channel='@SBANIME', override_f
     override_filename:
       - Cleaned naam pass karo (garbage remove karne ke baad)
       - Language detect ke liye actual filepath bhi use hoga
+
+    has_eng_sub:
+      - True ho toh caption ke end mein 'Esub' add hoga (extension se pehle)
     """
     metadata = get_media_metadata(filepath)
     # override_filename diya toh usse parse karo, warna actual file ka naam
@@ -285,6 +289,10 @@ def build_auto_caption(filepath, resolution=None, channel='@SBANIME', override_f
     parts.append(f'[{channel}]')
 
     caption = ' '.join(parts)
+    # 6. Esub suffix (eng sub only ON tha aur eng sub mili thi)
+    # Format: AnimeName S01E04 in Hindi 480p [@SBANIME] Esub.mp4
+    if has_eng_sub:
+        caption += ' Esub'
     # Ensure ends with .mp4 (sirf ek baar)
     if not caption.endswith('.mp4'):
         caption += '.mp4'
@@ -348,7 +356,7 @@ def clean_caption(caption):
     return text
 
 
-def smart_caption(original_caption, filepath, resolution=None, channel='@SBANIME'):
+def smart_caption(original_caption, filepath, resolution=None, channel='@SBANIME', has_eng_sub=False):
     """
     Har case mein clean auto-caption banao.
 
@@ -357,6 +365,9 @@ def smart_caption(original_caption, filepath, resolution=None, channel='@SBANIME
     2. Cleaned text ko filename ki tarah treat karo
     3. build_auto_caption() se proper format mein caption banao:
        AnimeName S02E01 in Hindi 480p [@SBANIME].mp4
+       AnimeName S02E01 in Hindi 480p [@SBANIME] Esub.mp4  (has_eng_sub=True)
+
+    has_eng_sub: True ho toh caption ke end mein 'Esub' add hoga
     """
     # Source: original caption hai toh use karo, warna actual filename
     raw = (original_caption or '').strip()
@@ -385,4 +396,5 @@ def smart_caption(original_caption, filepath, resolution=None, channel='@SBANIME
         resolution=resolution,
         channel=channel,
         override_filename=temp_filename,   # cleaned naam pass karo
+        has_eng_sub=has_eng_sub,
     )
