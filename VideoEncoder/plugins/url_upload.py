@@ -1448,9 +1448,17 @@ async def _apply_full_metadata(filepath: str, meta: dict, msg: Message) -> str |
 
 
 async def _do_upload(bot: Client, filepath: str, message: Message, msg: Message, has_eng_sub: bool = False):
-    """Upload the processed file to Telegram."""
+    """Upload the processed file to Telegram.
+    
+    upload_worker filename se caption leta hai, isliye:
+    1. smart_caption() se proper caption/filename banao
+    2. File ko us naam se rename karo
+    3. upload_worker ko renamed filepath pass karo
+    """
+    import re as _re
     from ..utils.auto_caption import smart_caption
     await msg.edit("<b>📤 Uploading...</b>")
+    renamed_path = None
     try:
         resolution = await db.get_resolution(message.from_user.id)
         # Caption build karo — has_eng_sub=True ho toh 'Esub' caption mein add hoga
@@ -1460,7 +1468,15 @@ async def _do_upload(bot: Client, filepath: str, message: Message, msg: Message,
             resolution=resolution if resolution and resolution != "OG" else None,
             has_eng_sub=has_eng_sub,
         )
-        link = await upload_worker(filepath, message, msg, resolution=resolution, caption=caption)
+        # File ko caption ke naam se rename karo taaki upload_worker sahi naam use kare
+        # Filesystem-unsafe characters remove karo
+        safe_caption = _re.sub(r'[<>:"/\\|?*]', '', caption).strip()
+        renamed_path = os.path.join(os.path.dirname(filepath), safe_caption)
+        if renamed_path != filepath:
+            os.rename(filepath, renamed_path)
+            filepath = renamed_path
+        
+        link = await upload_worker(filepath, message, msg, resolution=resolution)
         if link:
             await msg.edit(f"✅ <b>Uploaded!</b>\nLink: {link}")
         else:
