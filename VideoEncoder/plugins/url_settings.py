@@ -64,9 +64,15 @@ async def _show_preset_panel(event, user_id: int, is_new: bool = False):
         ],
         [
             InlineKeyboardButton(
+                f"{tick('to_aac')} Convert to AAC",
+                callback_data=f"urlp_toggle_toaac_{user_id}"
+            ),
+            InlineKeyboardButton(
                 f"{tick('name_swap')} Name Swap",
                 callback_data=f"urlp_toggle_nameswap_{user_id}"
             ),
+        ],
+        [
             InlineKeyboardButton(
                 f"{tick('apply_metadata')} Apply Metadata",
                 callback_data=f"urlp_toggle_metadata_{user_id}"
@@ -86,6 +92,8 @@ async def _show_preset_panel(event, user_id: int, is_new: bool = False):
         f"• Remove Audio: <b>{'ON' if auto.get('rm_audio') else 'OFF'}</b>\n"
         f"• Hindi Audio Only: <b>{'ON' if auto.get('hindi_only') else 'OFF'}</b>\n"
         f"  ↳ (Remove Audio ON ho toh Hindi Only ignore hogi)\n"
+        f"• Convert to AAC: <b>{'ON' if auto.get('to_aac') else 'OFF'}</b>\n"
+        f"  ↳ (E-AC3/DTS/TrueHD → AAC 192k, Remove Audio ON ho toh ignore hogi)\n"
         f"• Name Swap: <b>{'ON' if auto.get('name_swap') else 'OFF'}</b>\n"
         f"  ↳ (Rules set karo: /addswap)\n"
         f"• Apply Metadata: <b>{'ON' if auto.get('apply_metadata') else 'OFF'}</b>\n"
@@ -125,6 +133,7 @@ async def url_preset_callbacks(bot: Client, cb: CallbackQuery):
         "engsubonly":  "eng_sub_only",
         "rmaudio":     "rm_audio",
         "hindionly":   "hindi_only",
+        "toaac":       "to_aac",
         "nameswap":    "name_swap",
         "metadata":    "apply_metadata",
     }
@@ -138,8 +147,11 @@ async def url_preset_callbacks(bot: Client, cb: CallbackQuery):
 
     if db_key == "rm_audio" and auto["rm_audio"]:
         auto["hindi_only"] = False
+        auto["to_aac"] = False   # rm_audio ON ho toh to_aac ka koi matlab nahi
     elif db_key == "hindi_only" and auto["hindi_only"]:
         auto["rm_audio"] = False
+    elif db_key == "to_aac" and auto["to_aac"]:
+        auto["rm_audio"] = False  # to_aac ON ho toh rm_audio OFF
     # rm_sub ON ho toh eng_sub_only ka koi matlab nahi
     if db_key == "rm_sub" and auto["rm_sub"]:
         auto["eng_sub_only"] = False
@@ -176,7 +188,8 @@ async def url_settings_cmd(bot: Client, message: Message):
         f"Eng Sub Only: {'✅' if auto.get('eng_sub_only') else '❌'}\n"
         f"  Remove Audio: {'✅' if auto.get('rm_audio') else '❌'} | "
         f"Hindi Only: {'✅' if auto.get('hindi_only') else '❌'}\n"
-        f"  Name Swap: {'✅' if auto.get('name_swap') else '❌'} | "
+        f"  Convert to AAC: {'✅' if auto.get('to_aac') else '❌'} | "
+        f"Name Swap: {'✅' if auto.get('name_swap') else '❌'} | "
         f"Metadata: {'✅' if auto.get('apply_metadata') else '❌'}"
     )
 

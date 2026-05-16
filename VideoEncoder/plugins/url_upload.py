@@ -257,7 +257,21 @@ async def _auto_process_and_upload(bot: Client, user_id: int, msg: Message, orig
             )
             await asyncio.sleep(3)
 
-    # ── 5. Name Swap ──
+    # ── 5. Convert Audio to AAC (rm_audio off ho toh hi) ──
+    # E-AC3, DTS, TrueHD jaisi formats ko AAC mein convert karo
+    if not auto.get("rm_audio") and auto.get("to_aac"):
+        already_aac = await _check_all_audio_aac(filepath)
+        if not already_aac:
+            await msg.edit("<b>🔊 Converting audio to AAC (auto)...</b>")
+            new_path = await _convert_audio_to_aac(filepath, msg)
+            if new_path:
+                filepath = new_path
+                session["filepath"] = filepath
+                _url_sessions[user_id] = session
+        else:
+            LOGGER.info("to_aac: audio already AAC — skipping conversion")
+
+    # ── 6. Name Swap ──
     if auto.get("name_swap"):
         swap_rules = await db.get_swap(user_id)
         if swap_rules:
@@ -585,11 +599,14 @@ async def _show_url_options(msg: Message, user_id: int, filepath: str):
             InlineKeyboardButton("🇬🇧 Eng Sub Only",     callback_data=f"url_engsub_{user_id}"),
         ],
         [
+            InlineKeyboardButton("🔊 Convert to AAC",    callback_data=f"url_toaac_{user_id}"),
             InlineKeyboardButton("🔤 Name Swap",         callback_data=f"url_nameswap_{user_id}"),
-            InlineKeyboardButton("🏷️ Edit Metadata",    callback_data=f"url_metadata_{user_id}"),
         ],
         [
+            InlineKeyboardButton("🏷️ Edit Metadata",    callback_data=f"url_metadata_{user_id}"),
             InlineKeyboardButton("📤 Upload As-is",     callback_data=f"url_upload_{user_id}"),
+        ],
+        [
             InlineKeyboardButton("❌ Cancel",           callback_data=f"url_cancel_{user_id}"),
         ],
     ])
@@ -754,6 +771,29 @@ async def url_upload_callbacks(bot: Client, cb: CallbackQuery):
             session["has_eng_sub"] = True
             session["filepath"] = new_path
             _url_sessions[owner_id] = session
+        await _show_url_options(msg, owner_id, session["filepath"])
+
+    # ── Convert Audio to AAC ──────────────────────────────────────────────────
+    elif action == "toaac":
+        await cb.answer()
+        await msg.edit("<b>🔄 Checking audio streams...</b>")
+        # Check karo kya already AAC hai
+        already_aac = await _check_all_audio_aac(filepath)
+        if already_aac:
+            await cb.answer("ℹ️ Audio already AAC format mein hai!", show_alert=True)
+            await _show_url_options(msg, owner_id, filepath)
+            return
+        await msg.edit(
+            "<b>🔊 Converting audio to AAC...</b>\n"
+            "<i>E-AC3/DTS/TrueHD → AAC 192k stereo (sabhi devices compatible)</i>"
+        )
+        new_path = await _convert_audio_to_aac(filepath, msg)
+        if new_path:
+            session["filepath"] = new_path
+            _url_sessions[owner_id] = session
+            await cb.answer("✅ Audio AAC mein convert ho gaya!", show_alert=False)
+        else:
+            await cb.answer("❌ Conversion failed!", show_alert=True)
         await _show_url_options(msg, owner_id, session["filepath"])
 
     # ── Back button ───────────────────────────────────────────────────────────
@@ -1404,7 +1444,92 @@ async def _keep_audio_streams(filepath: str, stream_indices: list, msg: Message)
     return await _ffmpeg_process(filepath, out, map_args, msg)
 
 
-async def _apply_metadata(filepath: str, meta: dict, msg: Message) -> str | None:
+async def _check_all_audio_aac(filepath: str) -> bool:
+    """
+    Check karo kya file ke saare audio streams already AAC hain.
+    True = sab AAC hain (conversion zaruri nahi)
+    False = koi non-AAC stream hai (conversion zaruri hai)
+    """
+    import json, subprocess as _sp
+    try:
+        cmd = [
+            "ffprobe", "-hide_banner", "-print_format", "json",
+            "-show_streams", "-select_streams", "a", filepath
+        ]
+        out = _sp.check_output(cmd, stderr=_sp.DEVNULL)
+        streams = json.loads(out.decode()).get("streams", [])
+    except Exception:
+        return False
+
+    if not streams:
+        return True  # Koi audio hi nahi
+
+    for s in streams:
+        codec = s.get("codec_name", "").lower()
+        if codec not in ("aac", "mp3", "opus"):
+            return False  # Koi non-compatible stream mila
+    return True
+
+
+async def _convert_audio_to_aac(filepath: str, msg: Message) -> str | None:
+    """
+    Saare audio streams ko AAC format mein convert karo.
+    - Video aur Subtitles: copy (re-encode nahi)
+    - Audio: libfdk_aac (agar available) ya aac codec, 192k, stereo
+    - Saare streams aur language metadata preserve hota hai
+
+    Kaun se formats handle hote hain:
+      E-AC3 (Dolby Digital Plus), AC-3, DTS, TrueHD, FLAC, Opus, PCM etc.
+    Kaun se already pass-through hote hain:
+      AAC, MP3 — inhe copy karo (re-encode mat karo)
+    """
+    import json, subprocess as _sp
+
+    # Audio streams info fetch karo
+    try:
+        cmd = [
+            "ffprobe", "-hide_banner", "-print_format", "json",
+            "-show_streams", "-select_streams", "a", filepath
+        ]
+        out = _sp.check_output(cmd, stderr=_sp.DEVNULL)
+        audio_streams = json.loads(out.decode()).get("streams", [])
+    except Exception:
+        audio_streams = []
+
+    if not audio_streams:
+        LOGGER.warning("_convert_audio_to_aac: no audio streams found")
+        return None
+
+    out_path = _make_output_path(filepath, "_aac")
+
+    # Build ffmpeg args:
+    # -map 0:v? -map 0:a? -map 0:s? -map 0:t?
+    # Video/Sub/Attachment: copy
+    # Per audio stream: already AAC/MP3 → copy, else → libfdk_aac/aac 192k stereo
+    map_args = ["-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?"]
+    codec_args = ["-c:v", "copy", "-c:s", "copy", "-c:t", "copy"]
+
+    PASS_THROUGH = {"aac", "mp3"}  # Inhe copy karo
+
+    for i, s in enumerate(audio_streams):
+        codec = s.get("codec_name", "").lower()
+        if codec in PASS_THROUGH:
+            codec_args += [f"-c:a:{i}", "copy"]
+            LOGGER.info(f"Audio stream {i} ({codec}): copy (already compatible)")
+        else:
+            # AAC mein convert karo — pehle libfdk_aac try karo (better quality)
+            # Fallback: built-in 'aac' codec
+            codec_args += [
+                f"-c:a:{i}", "aac",
+                f"-b:a:{i}", "192k",
+                f"-ac:{i}", "2",   # stereo (surround se stereo downmix)
+            ]
+            LOGGER.info(f"Audio stream {i} ({codec}): converting to AAC 192k stereo")
+
+    return await _ffmpeg_process(filepath, out_path, map_args + codec_args, msg)
+
+
+
     """Legacy wrapper for -vt mode manual metadata."""
     out = _make_output_path(filepath, "_meta")
     meta_args = ["-map", "0", "-c", "copy"]
