@@ -1460,12 +1460,15 @@ async def _do_upload(bot: Client, filepath: str, message: Message, msg: Message,
     await msg.edit("<b>📤 Uploading...</b>")
     renamed_path = None
     try:
-        resolution = await db.get_resolution(message.from_user.id)
-        # Caption build karo — has_eng_sub=True ho toh 'Esub' caption mein add hoga
+        # URL uploads mein encoding nahi hoti — actual quality hamesha
+        # ffprobe/metadata se detect karo (resolution=None).
+        # DB mein saved encode resolution URL uploads pe apply NAHI hona chahiye.
+        # Warna agar user ne /setres 480 set kiya hua hai toh 1080p video bhi
+        # "480p" caption ke saath upload hogi — jo GALAT hai.
         caption = smart_caption(
             original_caption=os.path.basename(filepath),
             filepath=filepath,
-            resolution=resolution if resolution and resolution != "OG" else None,
+            resolution=None,   # FIX: metadata se actual quality detect karo
             has_eng_sub=has_eng_sub,
         )
         # File ko caption ke naam se rename karo taaki upload_worker sahi naam use kare
@@ -1476,7 +1479,7 @@ async def _do_upload(bot: Client, filepath: str, message: Message, msg: Message,
             os.rename(filepath, renamed_path)
             filepath = renamed_path
         
-        link = await upload_worker(filepath, message, msg, resolution=resolution)
+        link = await upload_worker(filepath, message, msg, resolution=None)
         if link:
             await msg.edit(f"✅ <b>Uploaded!</b>\nLink: {link}")
         else:
