@@ -43,6 +43,7 @@ class Database:
             url_metadata={'video_title': '', 'audio_title': '', 'show_title': ''},
             url_auto_settings={
                 'rm_sub': False,
+                'eng_sub_only': False,
                 'rm_audio': False,
                 'hindi_only': False,
                 'name_swap': False,
@@ -413,6 +414,7 @@ class Database:
         user = await self._get_user(user_id)
         default = {
             'rm_sub': False,
+            'eng_sub_only': False,
             'rm_audio': False,
             'hindi_only': False,
             'name_swap': False,
