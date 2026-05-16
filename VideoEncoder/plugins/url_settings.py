@@ -308,6 +308,9 @@ async def _show_setmeta_panel(event, user_id: int, is_new: bool = False):
             InlineKeyboardButton(f"📝 Sub: {val('subtitle_title')}", callback_data=f"sm_edit_subtitle_title_{user_id}"),
         ],
         [
+            InlineKeyboardButton(f"🎞️ Movie Name: {val('movie_name')}", callback_data=f"sm_edit_movie_name_{user_id}"),
+        ],
+        [
             InlineKeyboardButton(f"💬 Comment: {val('comment')}", callback_data=f"sm_edit_comment_{user_id}"),
         ],
         [
@@ -324,6 +327,8 @@ async def _show_setmeta_panel(event, user_id: int, is_new: bool = False):
         f"   ↳ <i>{{audiolang}} likhne se actual language name auto fill hoga</i>\n"
         f"📝 <b>Sub Title:</b>   <code>{val('subtitle_title')}</code>\n"
         f"   ↳ <i>{{sublang}} likhne se subtitle language auto fill hoga</i>\n"
+        f"🎞️ <b>Movie Name:</b>  <code>{val('movie_name')}</code>\n"
+        f"   ↳ <i>MediaInfo mein 'Movie name' field dikhega (MKV global title)</i>\n"
         f"💬 <b>Comment:</b>     <code>{val('comment')}</code>\n\n"
         "<i>Kisi bhi button pe tap karo → naam type karke bhejo → ho gaya!</i>"
     )
@@ -380,6 +385,7 @@ async def setmeta_callbacks(bot: Client, cb: CallbackQuery):
             return
         await db.set_full_metadata(owner_id, {
             "enabled": True,
+            "movie_name": "",
             "video_title": "Sbanime",
             "audio_title": "{audiolang}",
             "subtitle_title": "{sublang}",
@@ -410,12 +416,14 @@ async def setmeta_callbacks(bot: Client, cb: CallbackQuery):
             "video_title":    "🎬 Video Stream Title",
             "audio_title":    "🔊 Audio Stream Title",
             "subtitle_title": "📝 Subtitle Stream Title",
+            "movie_name":     "🎞️ Movie Name (Global Title)",
             "comment":        "💬 Comment / Description",
         }
         field_hints = {
             "video_title":    "e.g. <code>Sbanime</code>",
             "audio_title":    "e.g. <code>{audiolang}</code> ya <code>Hindi</code>",
             "subtitle_title": "e.g. <code>{sublang}</code> ya <code>English</code>",
+            "movie_name":     "e.g. <code>FULLMETAL ALCHEMIST S01E01 in Hindi</code>",
             "comment":        "e.g. <code>@SBANIME</code>",
         }
 
@@ -471,6 +479,7 @@ async def setmeta_text_input(bot: Client, message: Message):
         "video_title":    "Video Title",
         "audio_title":    "Audio Title",
         "subtitle_title": "Subtitle Title",
+        "movie_name":     "Movie Name",
         "comment":        "Comment",
     }
 

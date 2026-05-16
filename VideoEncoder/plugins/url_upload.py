@@ -298,6 +298,7 @@ async def _auto_process_and_upload(bot: Client, user_id: int, msg: Message, orig
     if auto.get("apply_metadata"):
         full_meta = await db.get_full_metadata(user_id)
         if full_meta.get("enabled") and any([
+            full_meta.get("movie_name"),
             full_meta.get("video_title"),
             full_meta.get("audio_title"),
             full_meta.get("subtitle_title"),
@@ -1545,7 +1546,7 @@ async def _convert_audio_to_aac(filepath: str, msg: Message) -> str | None:
 async def _apply_full_metadata(filepath: str, meta: dict, msg: Message) -> str | None:
     """
     /setmeta wale full_metadata se apply karo.
-    video_title, audio_title, subtitle_title, comment, strip_attachments, clear_metadata.
+    movie_name, video_title, audio_title, subtitle_title, comment, strip_attachments, clear_metadata.
     {audiolang}/{sublang} pehle se resolve ho chuke hain.
     """
     out = _make_output_path(filepath, "_meta")
@@ -1560,6 +1561,9 @@ async def _apply_full_metadata(filepath: str, meta: dict, msg: Message) -> str |
     if meta.get("clear_metadata"):
         meta_args += ["-map_metadata", "-1"]
 
+    # Global container title (MediaInfo mein "Movie name" ke roop mein dikhta hai)
+    if meta.get("movie_name"):
+        meta_args += ["-metadata", f"title={meta['movie_name']}"]
     if meta.get("comment"):
         meta_args += ["-metadata", f"comment={meta['comment']}"]
     if meta.get("video_title"):
