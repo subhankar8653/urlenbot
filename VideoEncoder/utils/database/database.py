@@ -438,6 +438,7 @@ class Database:
 
     _FULL_META_DEFAULT = {
         'enabled': False,
+        'movie_name': '',
         'video_title': 'Sbanime hindi',
         'audio_title': '{audiolang}',
         'subtitle_title': '{sublang}',
