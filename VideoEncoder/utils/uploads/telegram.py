@@ -209,7 +209,11 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
 # ─────────────────────────────────────────────
 async def upload_video(message, msg, new_file, caption, c_time, thumb,
                        duration, width, height, file_name=None, cover=None,
-                       uploader_client=None):
+                       uploader_client=None, progress=None, progress_args=None):
+    # progress/progress_args override — caller custom progress callback de sakta hai
+    # (e.g. swift_downloader 50% staggered upload ke liye)
+    _progress_fn   = progress      if progress      is not None else progress_for_pyrogram
+    _progress_args = progress_args if progress_args is not None else ("📤 Uploading...", msg, c_time)
 
     send_kwargs = dict(
         supports_streaming=True,
@@ -220,8 +224,8 @@ async def upload_video(message, msg, new_file, caption, c_time, thumb,
         width=width,
         height=height,
         file_name=file_name,
-        progress=progress_for_pyrogram,
-        progress_args=("📤 Uploading...", msg, c_time),
+        progress=_progress_fn,
+        progress_args=_progress_args,
     )
     if cover:
         send_kwargs['cover'] = cover
