@@ -229,7 +229,35 @@ async def _auto_process_and_upload(bot: Client, user_id: int, msg: Message, orig
             )
             await asyncio.sleep(3)
 
-    # ── 4. Name Swap ──
+    # ── 4. Eng Sub Only (rm_sub off ho toh hi) ──
+    # rm_sub ON ho toh sab subs pehle hi hata diye — eng_sub_only skip karo
+    if not auto.get("rm_sub") and auto.get("eng_sub_only"):
+        await msg.edit("<b>🔄 Keeping English subtitles only (auto)...</b>")
+        sub_streams = get_subtitle_streams(filepath)
+        eng_indices = [
+            s["index"] for s in sub_streams
+            if _is_english_sub_stream(s)
+        ]
+        if eng_indices:
+            new_path = await _keep_subtitle_streams(filepath, eng_indices, msg)
+            if new_path:
+                filepath = new_path
+                # ✅ Flag: eng sub mili — caption mein Esub lagega
+                session["has_eng_sub"] = True
+                session["filepath"] = filepath
+                _url_sessions[user_id] = session
+        else:
+            stream_info = ", ".join(
+                f"#{s['index']}:{s.get('lang','?')}" for s in sub_streams
+            )
+            await msg.edit(
+                f"<b>⚠️ English subtitle nahi mila!</b>\n"
+                f"Streams found: <code>{stream_info or 'none'}</code>\n"
+                "Koi sub nahi rakha ja raha..."
+            )
+            await asyncio.sleep(3)
+
+    # ── 5. Name Swap ──
     if auto.get("name_swap"):
         swap_rules = await db.get_swap(user_id)
         if swap_rules:
@@ -250,7 +278,7 @@ async def _auto_process_and_upload(bot: Client, user_id: int, msg: Message, orig
         else:
             LOGGER.info("Name swap ON but no rules set — skipping")
 
-    # ── 5. Apply Metadata ──
+    # ── 6. Apply Metadata ──
     # FIX: get_full_metadata use karo (yahi /setmeta se set hota hai)
     # {audiolang} aur {sublang} ko actual language names se replace karo
     if auto.get("apply_metadata"):
@@ -271,7 +299,7 @@ async def _auto_process_and_upload(bot: Client, user_id: int, msg: Message, orig
                 _url_sessions[user_id] = session
 
     # ── Upload ──
-    await _do_upload(bot, filepath, original_message, msg)
+    await _do_upload(bot, filepath, original_message, msg, has_eng_sub=session.get("has_eng_sub", False))
     _url_sessions.pop(user_id, None)
 
 
@@ -284,6 +312,78 @@ def _is_hindi_stream(stream: dict) -> bool:
     lang = stream.get("lang", "").lower().strip()
     HINDI_CODES = {"hin", "hi", "hindi", "hin2", "hin-in"}
     return lang in HINDI_CODES
+
+
+# ─── Subtitle stream helpers ───────────────────────────────────────────────────
+def get_subtitle_streams(filepath: str) -> list:
+    """
+    File ke saare subtitle streams return karo.
+    List of dicts: [{ 'index': int, 'lang': str, 'title': str }, ...]
+    """
+    import json, subprocess as _sp
+    try:
+        cmd = [
+            "ffprobe", "-hide_banner", "-print_format", "json",
+            "-show_streams", filepath
+        ]
+        out = _sp.check_output(cmd, stderr=_sp.DEVNULL)
+        streams = json.loads(out.decode()).get("streams", [])
+    except Exception:
+        return []
+
+    result = []
+    sub_idx = 0
+    for s in streams:
+        if s.get("codec_type") == "subtitle":
+            tags = s.get("tags", {})
+            result.append({
+                "index":      s.get("index", 0),   # absolute stream index
+                "sub_index":  sub_idx,              # relative subtitle index (0,1,2...)
+                "lang":       tags.get("language", tags.get("LANGUAGE", "")).lower().strip(),
+                "title":      tags.get("title",    tags.get("TITLE",    "")),
+            })
+            sub_idx += 1
+    return result
+
+
+def _is_english_sub_stream(stream: dict) -> bool:
+    """
+    Stream English subtitle hai ya nahi.
+    'language' field se check karo (ISO 639: eng / en).
+    """
+    lang = stream.get("lang", "").lower().strip()
+    ENG_CODES = {"eng", "en", "english"}
+    return lang in ENG_CODES
+
+
+async def _keep_subtitle_streams(filepath: str, abs_indices: list, msg: Message) -> str | None:
+    """
+    Sirf given absolute stream indices wale subtitles rakh, baaki hata do.
+    Video + Audio sab waise rakhna, sirf sub filter karna.
+    """
+    out = _make_output_path(filepath, "_engsub")
+
+    # Saare subtitle streams lo — jinhe rakhna hai unka relative index chahiye ffmpeg ke liye
+    sub_streams = get_subtitle_streams(filepath)
+    if not sub_streams:
+        return None
+
+    map_args = ["-map", "0:v?", "-map", "0:a?"]
+    kept = 0
+    for s in sub_streams:
+        if s["index"] in abs_indices:
+            map_args += ["-map", f"0:s:{s['sub_index']}"]
+            if kept == 0:
+                # Pehli wali sub ko default mark karo
+                map_args += [f"-disposition:s:{kept}", "default"]
+            kept += 1
+
+    if kept == 0:
+        LOGGER.warning("_keep_subtitle_streams: no matching streams — skipping")
+        return None
+
+    map_args += ["-c", "copy"]
+    return await _ffmpeg_process(filepath, out, map_args, msg)
 
 
 # ─── Placeholder resolver ─────────────────────────────────────────────────────
@@ -477,18 +577,19 @@ async def _show_url_options(msg: Message, user_id: int, filepath: str):
 
     kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🚫 Remove Subs",      callback_data=f"url_rmsub_{user_id}"),
-            InlineKeyboardButton("🔇 Remove Audio",     callback_data=f"url_rmaudio_{user_id}"),
+            InlineKeyboardButton("🚫 Remove Subs",       callback_data=f"url_rmsub_{user_id}"),
+            InlineKeyboardButton("🔇 Remove Audio",      callback_data=f"url_rmaudio_{user_id}"),
         ],
         [
             InlineKeyboardButton("🇮🇳 Hindi Audio Only", callback_data=f"url_hindionly_{user_id}"),
+            InlineKeyboardButton("🇬🇧 Eng Sub Only",     callback_data=f"url_engsub_{user_id}"),
+        ],
+        [
             InlineKeyboardButton("🔤 Name Swap",         callback_data=f"url_nameswap_{user_id}"),
-        ],
-        [
             InlineKeyboardButton("🏷️ Edit Metadata",    callback_data=f"url_metadata_{user_id}"),
-            InlineKeyboardButton("📤 Upload As-is",     callback_data=f"url_upload_{user_id}"),
         ],
         [
+            InlineKeyboardButton("📤 Upload As-is",     callback_data=f"url_upload_{user_id}"),
             InlineKeyboardButton("❌ Cancel",           callback_data=f"url_cancel_{user_id}"),
         ],
     ])
@@ -532,7 +633,7 @@ async def url_upload_callbacks(bot: Client, cb: CallbackQuery):
     # ── Upload as-is ──────────────────────────────────────────────────────────
     if action == "upload":
         await cb.answer()
-        await _do_upload(bot, filepath, original_message, msg)
+        await _do_upload(bot, filepath, original_message, msg, has_eng_sub=session.get("has_eng_sub", False))
         # FIX: zip_queue process karo upload ke baad
         await _process_zip_queue(bot, owner_id, original_message)
 
@@ -623,6 +724,34 @@ async def url_upload_callbacks(bot: Client, cb: CallbackQuery):
         await msg.edit(f"<b>🔄 Keeping only stream #{stream_idx}...</b>")
         new_path = await _keep_audio_streams(filepath, [stream_idx], msg)
         if new_path:
+            session["filepath"] = new_path
+            _url_sessions[owner_id] = session
+        await _show_url_options(msg, owner_id, session["filepath"])
+
+    # ── Eng Sub Only ─────────────────────────────────────────────────────────
+    elif action == "engsub":
+        await cb.answer()
+        await msg.edit("<b>🔄 Detecting subtitle streams...</b>")
+        sub_streams = get_subtitle_streams(filepath)
+        eng_indices = [
+            s["index"] for s in sub_streams
+            if _is_english_sub_stream(s)
+        ]
+        if not eng_indices:
+            streams_text = ", ".join(
+                f"#{s['index']}:{s.get('lang','?')}" for s in sub_streams
+            ) or "none"
+            await cb.answer(
+                f"⚠️ English subtitle nahi mila! Streams: {streams_text}",
+                show_alert=True,
+            )
+            await _show_url_options(msg, owner_id, filepath)
+            return
+        await msg.edit(f"<b>🔄 Keeping only English subtitles (streams: {eng_indices})...</b>")
+        new_path = await _keep_subtitle_streams(filepath, eng_indices, msg)
+        if new_path:
+            # ✅ Flag: eng sub mili — caption mein Esub lagega
+            session["has_eng_sub"] = True
             session["filepath"] = new_path
             _url_sessions[owner_id] = session
         await _show_url_options(msg, owner_id, session["filepath"])
@@ -1318,12 +1447,20 @@ async def _apply_full_metadata(filepath: str, meta: dict, msg: Message) -> str |
     return await _ffmpeg_process(filepath, out, meta_args, msg)
 
 
-async def _do_upload(bot: Client, filepath: str, message: Message, msg: Message):
+async def _do_upload(bot: Client, filepath: str, message: Message, msg: Message, has_eng_sub: bool = False):
     """Upload the processed file to Telegram."""
+    from ..utils.auto_caption import smart_caption
     await msg.edit("<b>📤 Uploading...</b>")
     try:
         resolution = await db.get_resolution(message.from_user.id)
-        link = await upload_worker(filepath, message, msg, resolution=resolution)
+        # Caption build karo — has_eng_sub=True ho toh 'Esub' caption mein add hoga
+        caption = smart_caption(
+            original_caption=os.path.basename(filepath),
+            filepath=filepath,
+            resolution=resolution if resolution and resolution != "OG" else None,
+            has_eng_sub=has_eng_sub,
+        )
+        link = await upload_worker(filepath, message, msg, resolution=resolution, caption=caption)
         if link:
             await msg.edit(f"✅ <b>Uploaded!</b>\nLink: {link}")
         else:

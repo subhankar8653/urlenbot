@@ -47,6 +47,10 @@ async def _show_preset_panel(event, user_id: int, is_new: bool = False):
                 f"{tick('rm_sub')} Remove Subtitles",
                 callback_data=f"urlp_toggle_rmsub_{user_id}"
             ),
+            InlineKeyboardButton(
+                f"{tick('eng_sub_only')} Eng Sub Only",
+                callback_data=f"urlp_toggle_engsubonly_{user_id}"
+            ),
         ],
         [
             InlineKeyboardButton(
@@ -76,6 +80,9 @@ async def _show_preset_panel(event, user_id: int, is_new: bool = False):
         "Ye settings <code>/url &lt;link&gt;</code> mein auto apply hongi.\n"
         "Manual buttons ke liye <code>/url &lt;link&gt; -vt</code> use karo.\n\n"
         f"• Remove Subtitles: <b>{'ON' if auto.get('rm_sub') else 'OFF'}</b>\n"
+        f"• Eng Sub Only: <b>{'ON' if auto.get('eng_sub_only') else 'OFF'}</b>\n"
+        f"  ↳ (Remove Subs ON ho toh Eng Sub Only ignore hogi)\n"
+        f"  ↳ (Eng sub mile toh caption mein 'Esub' add hoga)\n"
         f"• Remove Audio: <b>{'ON' if auto.get('rm_audio') else 'OFF'}</b>\n"
         f"• Hindi Audio Only: <b>{'ON' if auto.get('hindi_only') else 'OFF'}</b>\n"
         f"  ↳ (Remove Audio ON ho toh Hindi Only ignore hogi)\n"
@@ -114,11 +121,12 @@ async def url_preset_callbacks(bot: Client, cb: CallbackQuery):
         return
 
     key_map = {
-        "rmsub":     "rm_sub",
-        "rmaudio":   "rm_audio",
-        "hindionly":  "hindi_only",
-        "nameswap":  "name_swap",
-        "metadata":  "apply_metadata",
+        "rmsub":       "rm_sub",
+        "engsubonly":  "eng_sub_only",
+        "rmaudio":     "rm_audio",
+        "hindionly":   "hindi_only",
+        "nameswap":    "name_swap",
+        "metadata":    "apply_metadata",
     }
     db_key = key_map.get(key_raw)
     if not db_key:
@@ -132,6 +140,11 @@ async def url_preset_callbacks(bot: Client, cb: CallbackQuery):
         auto["hindi_only"] = False
     elif db_key == "hindi_only" and auto["hindi_only"]:
         auto["rm_audio"] = False
+    # rm_sub ON ho toh eng_sub_only ka koi matlab nahi
+    if db_key == "rm_sub" and auto["rm_sub"]:
+        auto["eng_sub_only"] = False
+    elif db_key == "eng_sub_only" and auto["eng_sub_only"]:
+        auto["rm_sub"] = False
 
     await db.set_url_auto_settings(owner_id, auto)
     await cb.answer(f"{'✅ ON' if auto[db_key] else '❌ OFF'}")
@@ -160,9 +173,10 @@ async def url_settings_cmd(bot: Client, message: Message):
 
     auto_text = (
         f"  Remove Subs: {'✅' if auto.get('rm_sub') else '❌'} | "
-        f"Remove Audio: {'✅' if auto.get('rm_audio') else '❌'}\n"
-        f"  Hindi Only: {'✅' if auto.get('hindi_only') else '❌'} | "
-        f"Name Swap: {'✅' if auto.get('name_swap') else '❌'} | "
+        f"Eng Sub Only: {'✅' if auto.get('eng_sub_only') else '❌'}\n"
+        f"  Remove Audio: {'✅' if auto.get('rm_audio') else '❌'} | "
+        f"Hindi Only: {'✅' if auto.get('hindi_only') else '❌'}\n"
+        f"  Name Swap: {'✅' if auto.get('name_swap') else '❌'} | "
         f"Metadata: {'✅' if auto.get('apply_metadata') else '❌'}"
     )
 
