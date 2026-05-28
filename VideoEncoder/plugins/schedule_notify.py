@@ -247,8 +247,8 @@ async def _send_end_messages_to_channel(channel_id: int, anime_name: str):
 
 
 # ─────────────────────────────────────────────
-#  Cleanup — last 15 msgs mein se schedule/end msgs delete karo
-#  (videos/documents nahi — sirf text/sticker messages)
+#  Cleanup — last 50 msgs scan karke purane 3 non-media messages delete karo
+#  (videos/documents/photos nahi — sirf text/sticker/animation messages)
 # ─────────────────────────────────────────────
 async def cleanup_old_notifications(
     channel_id: int,
@@ -256,33 +256,25 @@ async def cleanup_old_notifications(
     user_session: str | None = None,
 ) -> int:
     """
-    Cleanup (IMPROVED):
+    Cleanup (FIXED):
       - Channel ke last 50 messages scan karo
-      - SKIP: video/document/photo/audio/sticker (media content)
-      - SKIP: text mein "end" ya "season" (important msgs)
-      - DELETE: sirf schedule/notification text messages
-        (jinmein "next episode", "upload on", ya koi bhi plain
-         non-media notification text hai)
-      - Zyada se zyada 10 messages delete (safety limit)
+      - SKIP: video/document/photo/audio (actual media content)
+      - SKIP: text mein "end", "season", "finale" (important msgs)
+      - DELETE: last 3 non-media, non-protected messages
+        (sticker, animation, plain text — koi bhi ho)
       - user_session diya → user account se delete (purane msgs bhi jaayenge)
       - user_session nahi → bot se delete (sirf bot ke messages)
       - Returns: deleted count
     """
-    # Yeh keywords wale messages ZAROOR delete honge (schedule msgs)
-    SCHEDULE_KEYWORDS = [
-        "next episode",
-        "upload on",
-        "coming soon",
-        "more coming",
-        "be updated",
-    ]
-
     # Yeh keywords wale messages KABHI delete NAHI honge
     PROTECTED_KEYWORDS = [
         "end",
         "season",
         "finale",
     ]
+
+    # Yeh media types kabhi delete nahi honge (actual content)
+    SKIP_MEDIA_TYPES = {"video", "document", "photo", "audio"}
 
     # ── User client banao agar session diya ──
     user_client = None
@@ -314,13 +306,17 @@ async def cleanup_old_notifications(
         LOGGER.info(f"[Cleanup-DEBUG] Channel {channel_id} ke messages scan shuru...")
 
         async for msg in scan_client.get_chat_history(channel_id, limit=50):
+            # Agar 3 messages mil gaye toh scan band karo
+            if len(to_delete) >= 3:
+                break
+
             # Message type detect karo
             msg_type = "text"
-            if msg.video:      msg_type = "video"
-            elif msg.document: msg_type = "document"
-            elif msg.photo:    msg_type = "photo"
-            elif msg.audio:    msg_type = "audio"
-            elif msg.sticker:  msg_type = "sticker"
+            if msg.video:       msg_type = "video"
+            elif msg.document:  msg_type = "document"
+            elif msg.photo:     msg_type = "photo"
+            elif msg.audio:     msg_type = "audio"
+            elif msg.sticker:   msg_type = "sticker"
             elif msg.animation: msg_type = "animation"
 
             msg_text = (msg.text or msg.caption or "").lower()
@@ -331,10 +327,10 @@ async def cleanup_old_notifications(
                 f"text='{msg_preview}'"
             )
 
-            # Media messages skip — yeh actual content hai
-            if msg_type != "text":
+            # Heavy media messages skip — yeh actual content hai
+            if msg_type in SKIP_MEDIA_TYPES:
                 skipped.append(f"msg {msg.id} [media={msg_type}]")
-                LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → SKIP (media)")
+                LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → SKIP (media={msg_type})")
                 continue
 
             # Protected keywords wale skip
@@ -344,36 +340,27 @@ async def cleanup_old_notifications(
                 LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → SKIP (protected: {matched_kw})")
                 continue
 
-            # Schedule keywords wale — delete list mein
-            if any(kw in msg_text for kw in SCHEDULE_KEYWORDS):
-                matched_kw = [kw for kw in SCHEDULE_KEYWORDS if kw in msg_text]
-                to_delete.append(msg.id)
-                LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → DELETE (schedule keyword: {matched_kw})")
-                continue
+            # Baaki sab (text, sticker, animation) — delete list mein
+            to_delete.append(msg.id)
+            LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → DELETE (type={msg_type})")
 
-            # Baaki plain text msgs
-            if len(to_delete) + len(skipped) < 5 and msg_text:
-                to_delete.append(msg.id)
-                LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → DELETE (plain text, early scan)")
-            else:
-                skipped.append(f"msg {msg.id} [non-schedule-text]")
-                LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → SKIP (non-schedule text)")
+        LOGGER.info(f"[Cleanup] to_delete={to_delete} | skipped={skipped}")
 
-        # Safety: zyada se zyada 10 delete
-        to_delete = to_delete[:10]
-
-        LOGGER.info(f"[Cleanup] to_delete={to_delete} skipped={skipped}")
+        if not to_delete:
+            LOGGER.info("[Cleanup] Koi deletable message nahi mila")
+            return 0
 
         deleted = 0
         for msg_id in to_delete:
             try:
                 await delete_client.delete_messages(channel_id, msg_id)
                 deleted += 1
+                LOGGER.info(f"[Cleanup] Deleted msg_id={msg_id}")
                 await asyncio.sleep(0.3)
             except Exception as e:
                 LOGGER.warning(f"[Cleanup] Could not delete {msg_id}: {e}")
 
-        LOGGER.info(f"[Cleanup] deleted={deleted} skipped={len(skipped)}")
+        LOGGER.info(f"[Cleanup] deleted={deleted} | skipped={len(skipped)}")
         return deleted
     except Exception as e:
         LOGGER.error(f"[Cleanup] Failed: {e}")
