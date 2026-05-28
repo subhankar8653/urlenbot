@@ -462,3 +462,43 @@ class Database:
             {'$set': {'full_metadata': meta}},
             upsert=True,
         )
+
+    # ─────────────────────────────────────────────
+    #  Auto Channel Upload Settings
+    #  Structure: list of dicts:
+    #    { channel_id, channel_title, anime, languages }
+    # ─────────────────────────────────────────────
+
+    async def get_channels(self, user_id: int) -> list:
+        """User ke linked channels lo."""
+        user = await self._get_user(user_id)
+        return user.get('auto_channels', [])
+
+    async def add_channel(self, user_id: int, channel_info: dict):
+        """Ek nayi channel entry add karo."""
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$push': {'auto_channels': channel_info}},
+            upsert=True,
+        )
+
+    async def remove_channel(self, user_id: int, index: int):
+        """Index ke hisaab se channel remove karo (0-based)."""
+        channels = await self.get_channels(user_id)
+        if 0 <= index < len(channels):
+            channels.pop(index)
+            await self.col.update_one(
+                {'id': int(user_id)},
+                {'$set': {'auto_channels': channels}},
+                upsert=True,
+            )
+            return True
+        return False
+
+    async def clear_channels(self, user_id: int):
+        """Saare channels clear karo."""
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'auto_channels': []}},
+            upsert=True,
+        )
