@@ -250,44 +250,36 @@ async def _send_end_messages_to_channel(channel_id: int, anime_name: str):
 # ─────────────────────────────────────────────
 async def cleanup_old_notifications(channel_id: int, anime_name: str):
     """
-    Cleanup strategy:
-      1. Last 30 msgs scan karo newest → oldest
-      2. Pehla video/document mila → woh last episode hai → STOP collecting
-      3. Us video ke BAAD wale saare non-video messages delete karo
-         (yeh schedule msg + end messages hote hain)
-      4. Videos/documents kabhi delete nahi hote
+    Cleanup strategy (v3 — Last 3 msgs):
+      1. Channel ke last 3 messages fetch karo (newest first)
+      2. Agar koi message video/document hai → use SKIP karo (kabhi delete nahi)
+      3. Baaki (text/sticker/photo etc.) messages delete kar do
+      4. Redeploy ke baad bhi kaam karta hai (Telegram history se fetch hota hai)
     """
     try:
-        msgs_after_last_video = []   # video milne se pehle wale (newest first)
-        found_video = False
+        to_delete = []
 
-        async for msg in app.get_chat_history(channel_id, limit=30):
+        async for msg in app.get_chat_history(channel_id, limit=3):
             if msg.video or msg.document:
-                # Pehla video mila — yahan rukk jaao
-                found_video = True
-                break
-            # Video nahi mila abhi tak — collect karo (delete candidates)
-            msgs_after_last_video.append(msg)
+                # Video/document hai — skip, kabhi delete nahi
+                LOGGER.info(f"[Cleanup] Skipping video/doc msg {msg.id} in {channel_id}")
+                continue
+            to_delete.append(msg.id)
 
-        if not found_video:
-            # Koi video nahi mila — kuch delete mat karo (safety)
-            LOGGER.info(f"[Cleanup] No episode video found in last 30 msgs, skipping cleanup.")
-            return
-
-        if not msgs_after_last_video:
-            LOGGER.info(f"[Cleanup] No notification messages found after last episode.")
+        if not to_delete:
+            LOGGER.info(f"[Cleanup] Last 3 msgs mein koi deletable message nahi mila for {anime_name}.")
             return
 
         deleted = 0
-        for msg in msgs_after_last_video:
+        for msg_id in to_delete:
             try:
-                await app.delete_messages(channel_id, msg.id)
+                await app.delete_messages(channel_id, msg_id)
                 deleted += 1
                 await asyncio.sleep(0.3)
             except Exception as e:
-                LOGGER.warning(f"[Cleanup] Could not delete msg {msg.id}: {e}")
+                LOGGER.warning(f"[Cleanup] Could not delete msg {msg_id}: {e}")
 
-        LOGGER.info(f"[Cleanup] Deleted {deleted} notification messages after last episode in {channel_id}")
+        LOGGER.info(f"[Cleanup] Deleted {deleted}/3 non-video messages from last 3 msgs in {channel_id}")
     except Exception as e:
         LOGGER.error(f"[Cleanup] Cleanup failed for channel {channel_id}: {e}")
 
