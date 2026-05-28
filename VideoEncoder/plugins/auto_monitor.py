@@ -172,6 +172,7 @@ async def _episode_quality_poller(
     remaining = set(TARGET_QUALITIES)   # jo qualities abhi tak nahi mili
     start_time = time.time()
     attempt = 0
+    _cleanup_done = False   # pehli upload se pehle ek baar cleanup
 
     status_msg = await log_message.reply(
         f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
@@ -240,7 +241,17 @@ async def _episode_quality_poller(
             await asyncio.sleep(POLL_INTERVAL)
             continue
 
-        # Naye files mile — Swift ki tarah staggered upload
+        # Naye files mile — Upload se PEHLE purane msgs delete karo (sirf pehli baar)
+        if not _cleanup_done:
+            _cleanup_done = True
+            try:
+                cleanup_fn = _get_cleanup_fn()
+                await cleanup_fn(channel_id, anime_name)
+                LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Pre-upload cleanup done for {anime_name}")
+            except Exception as _ce:
+                LOGGER.warning(f"[AutoMonitor] Ep {episode_num}: Cleanup error (continuing): {_ce}")
+
+        # Swift ki tarah staggered upload
         qualities_found = [_quality_from(os.path.basename(f)) for f in new_files]
         LOGGER.info(f"[AutoMonitor] Ep {episode_num}: New qualities: {qualities_found}")
 
@@ -486,15 +497,6 @@ async def auto_monitor_handler(client: Client, message: Message):
     total = end_ep - start_ep + 1
 
     for i, ep_num in enumerate(range(start_ep, end_ep + 1), 1):
-
-        # Pehle episode ke liye — purane notifications delete karo (upload se PEHLE)
-        if i == 1:
-            try:
-                cleanup_old_notifications = _get_cleanup_fn()
-                await cleanup_old_notifications(channel_id, anime_name)
-                LOGGER.info(f"[AutoMonitor] Pre-upload cleanup done for {anime_name}")
-            except Exception as e:
-                LOGGER.warning(f"[AutoMonitor] Pre-upload cleanup error: {e}")
 
         # Swift URL nikalo
         prep_msg = await message.reply(
