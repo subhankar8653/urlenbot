@@ -53,6 +53,10 @@ def _get_swift_fns():
     )
     return _scrape_and_download, _upload_one_file, _sort_by_size, _auto_rename, _quality_from, QUALITY_ORDER
 
+def _get_schedule_fn():
+    from .schedule_notify import send_schedule_notification
+    return send_schedule_notification
+
 # ─────────────────────────────────────────────
 #  Constants
 # ─────────────────────────────────────────────
@@ -352,6 +356,13 @@ async def _episode_quality_poller(
         except Exception:
             pass
         LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ALL qualities done in {elapsed_min}m")
+
+        # Schedule notification — channel pe "Next episode on Xth Month" ya "END" bhejo
+        try:
+            send_schedule_notification = _get_schedule_fn()
+            await send_schedule_notification(client, channel_id, anime_name, episode_num)
+        except Exception as e:
+            LOGGER.error(f"[AutoMonitor] Schedule notification error: {e}")
     else:
         # 30 min ke baad bhi nahi mila
         missing_str = ' | '.join(sorted(remaining))
