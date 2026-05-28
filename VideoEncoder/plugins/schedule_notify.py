@@ -132,30 +132,21 @@ async def _delete_end_messages_db(anime_name: str):
 
 # ─────────────────────────────────────────────
 #  Message serializer — save karte waqt
+#  Strategy: SABHI messages ko copy_message reference se save karo
+#  Isse links, buttons, formatting sab preserve hote hain
 # ─────────────────────────────────────────────
 def _serialize_message(msg: Message) -> dict | None:
-    """Message ko saveable dict mein convert karo."""
-    if msg.sticker:
-        return {'type': 'sticker', 'file_id': msg.sticker.file_id}
-    if msg.photo:
-        return {'type': 'photo', 'file_id': msg.photo.file_id,
-                'caption': msg.caption or ''}
-    if msg.video:
-        return {'type': 'video', 'file_id': msg.video.file_id,
-                'caption': msg.caption or ''}
-    if msg.animation:
-        return {'type': 'animation', 'file_id': msg.animation.file_id,
-                'caption': msg.caption or ''}
-    if msg.document:
-        return {'type': 'document', 'file_id': msg.document.file_id,
-                'caption': msg.caption or ''}
-    if msg.audio:
-        return {'type': 'audio', 'file_id': msg.audio.file_id,
-                'caption': msg.caption or ''}
-    if msg.text:
-        return {'type': 'text', 'text': msg.text}
-    # Forward (no media) — skip, handle as forward separately
-    return None
+    """
+    Sabhi messages ko copy_message reference ke roop mein save karo.
+    chat_id + message_id store karo — send karte waqt copy_message use hoga.
+    Isse inline buttons, hyperlinks, formatting sab perfectly preserve hoti hai.
+    """
+    # Har message type ke liye copy_message reference save karo
+    return {
+        'type': 'copy_ref',
+        'from_chat_id': msg.chat.id,
+        'message_id': msg.id,
+    }
 
 
 # ─────────────────────────────────────────────
@@ -173,31 +164,31 @@ async def _send_end_messages_to_channel(channel_id: int, anime_name: str):
     for item in messages:
         try:
             msg_type = item.get('type')
-            caption = item.get('caption', '')
 
-            if msg_type == 'text':
-                await app.send_message(channel_id, item['text'])
-            elif msg_type == 'sticker':
-                await app.send_sticker(channel_id, item['file_id'])
-            elif msg_type == 'photo':
-                await app.send_photo(channel_id, item['file_id'], caption=caption)
-            elif msg_type == 'video':
-                await app.send_video(channel_id, item['file_id'], caption=caption)
-            elif msg_type == 'animation':
-                await app.send_animation(channel_id, item['file_id'], caption=caption)
-            elif msg_type == 'document':
-                await app.send_document(channel_id, item['file_id'], caption=caption)
-            elif msg_type == 'audio':
-                await app.send_audio(channel_id, item['file_id'], caption=caption)
-            elif msg_type == 'forward':
-                # copy_message use karo — inline buttons bhi preserve hote hain
+            if msg_type in ('copy_ref', 'forward'):
+                # copy_message — links, buttons, formatting sab preserve hota hai
                 await app.copy_message(
                     chat_id=channel_id,
                     from_chat_id=item['from_chat_id'],
                     message_id=item['message_id']
                 )
+            elif msg_type == 'sticker':
+                # Sticker copy_message se nahi hota — file_id se bhejo
+                await app.send_sticker(channel_id, item['file_id'])
+            elif msg_type == 'text':
+                await app.send_message(channel_id, item['text'])
+            elif msg_type == 'photo':
+                await app.send_photo(channel_id, item['file_id'], caption=item.get('caption', ''))
+            elif msg_type == 'video':
+                await app.send_video(channel_id, item['file_id'], caption=item.get('caption', ''))
+            elif msg_type == 'animation':
+                await app.send_animation(channel_id, item['file_id'], caption=item.get('caption', ''))
+            elif msg_type == 'document':
+                await app.send_document(channel_id, item['file_id'], caption=item.get('caption', ''))
+            elif msg_type == 'audio':
+                await app.send_audio(channel_id, item['file_id'], caption=item.get('caption', ''))
 
-            await asyncio.sleep(0.5)  # Telegram rate limit se bachne ke liye
+            await asyncio.sleep(0.5)
 
         except Exception as e:
             LOGGER.error(f"[EndMsg] Failed to send end message item {item}: {e}")
@@ -363,35 +354,23 @@ async def capture_end_message(client: Client, message: Message):
 
     state = _recording_state[user_id]
 
-    # Forward message — special handling
-    if message.forward_from_chat or message.forward_from:
-        from_chat_id = None
-        msg_id = None
-        if message.forward_from_chat:
-            from_chat_id = message.forward_from_chat.id
-            msg_id = message.forward_from_message_id
-        item = {
-            'type': 'forward',
-            'from_chat_id': from_chat_id,
-            'message_id': msg_id,
-        }
-        # Fallback: agar forward info nahi mili toh serialize karo
-        if not from_chat_id or not msg_id:
-            item = _serialize_message(message)
-        if item:
-            state['messages'].append(item)
-            count = len(state['messages'])
-            await message.reply(f"✅ Saved! ({count} messages total) — `/done` se khatam karo")
-            return
+    # Sticker ko alag se handle karo (copy_message sticker pe kaam nahi karta)
+    if message.sticker:
+        item = {'type': 'sticker', 'file_id': message.sticker.file_id}
+        state['messages'].append(item)
+        count = len(state['messages'])
+        await message.reply(f"✅ Saved! ({count} messages total) — `/done` se khatam karo")
+        return
 
-    # Normal message
+    # Baaki sabhi messages (text, forward, photo, buttons wale) — copy_message reference save karo
+    # copy_message se inline buttons, hyperlinks, formatting sab perfectly preserve hoti hai
     item = _serialize_message(message)
     if item:
         state['messages'].append(item)
         count = len(state['messages'])
         await message.reply(f"✅ Saved! ({count} messages total) — `/done` se khatam karo")
     else:
-        await message.reply("⚠️ Yeh message type support nahi hota. Text, sticker, photo, video, forward bhejo.")
+        await message.reply("⚠️ Kuch save nahi ho saka. Dobara try karo.")
 
 
 # ─────────────────────────────────────────────
@@ -479,7 +458,7 @@ async def cmd_end_message_preview(client: Client, message: Message):
                 await app.send_animation(message.chat.id, item['file_id'], caption=item.get('caption', ''))
             elif msg_type == 'document':
                 await app.send_document(message.chat.id, item['file_id'], caption=item.get('caption', ''))
-            elif msg_type == 'forward':
+            elif msg_type in ('copy_ref', 'forward'):
                 await app.copy_message(
                     chat_id=message.chat.id,
                     from_chat_id=item['from_chat_id'],
