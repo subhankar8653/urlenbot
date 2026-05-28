@@ -250,25 +250,64 @@ async def _send_end_messages_to_channel(channel_id: int, anime_name: str):
 # ─────────────────────────────────────────────
 async def cleanup_old_notifications(channel_id: int, anime_name: str) -> int:
     """
-    Cleanup (FINAL):
-      - Channel ke last 3 messages scan karo
-      - SKIP: video/document | text mein "end" ya "season"
-      - Baaki sab DELETE
+    Cleanup (IMPROVED):
+      - Channel ke last 50 messages scan karo
+      - SKIP: video/document/photo/audio/sticker (media content)
+      - SKIP: text mein "end" ya "season" (important msgs)
+      - DELETE: sirf schedule/notification text messages
+        (jinmein "next episode", "upload on", ya koi bhi plain
+         non-media notification text hai)
+      - Zyada se zyada 10 messages delete (safety limit)
       - Returns: deleted count
     """
+    # Yeh keywords wale messages ZAROOR delete honge (schedule msgs)
+    SCHEDULE_KEYWORDS = [
+        "next episode",
+        "upload on",
+        "coming soon",
+        "more coming",
+        "be updated",
+    ]
+
+    # Yeh keywords wale messages KABHI delete NAHI honge
+    PROTECTED_KEYWORDS = [
+        "end",
+        "season",
+        "finale",
+    ]
+
     try:
         to_delete = []
         skipped   = []
 
-        async for msg in app.get_chat_history(channel_id, limit=3):
-            if msg.video or msg.document:
-                skipped.append(f"msg {msg.id} [video/doc]")
+        async for msg in app.get_chat_history(channel_id, limit=50):
+            # Media messages skip — yeh actual content hai
+            if (msg.video or msg.document or msg.photo or
+                    msg.audio or msg.sticker or msg.animation):
+                skipped.append(f"msg {msg.id} [media]")
                 continue
+
             msg_text = (msg.text or msg.caption or "").lower()
-            if "end" in msg_text or "season" in msg_text:
-                skipped.append(f"msg {msg.id} [end/season]")
+
+            # Protected keywords wale skip
+            if any(kw in msg_text for kw in PROTECTED_KEYWORDS):
+                skipped.append(f"msg {msg.id} [protected]")
                 continue
-            to_delete.append(msg.id)
+
+            # Schedule keywords wale — delete list mein
+            if any(kw in msg_text for kw in SCHEDULE_KEYWORDS):
+                to_delete.append(msg.id)
+                continue
+
+            # Baaki plain text msgs (jo na media hai, na protected) — bhi delete
+            # Lekin sirf last 5 mein se (zyada aggressive cleanup avoid karne ke liye)
+            if len(to_delete) + len(skipped) < 5 and msg_text:
+                to_delete.append(msg.id)
+            else:
+                skipped.append(f"msg {msg.id} [non-schedule-text]")
+
+        # Safety: zyada se zyada 10 delete
+        to_delete = to_delete[:10]
 
         LOGGER.info(f"[Cleanup] to_delete={to_delete} skipped={skipped}")
 
