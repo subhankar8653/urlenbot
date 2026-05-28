@@ -190,11 +190,11 @@ async def _send_end_messages_to_channel(channel_id: int, anime_name: str):
             elif msg_type == 'audio':
                 await app.send_audio(channel_id, item['file_id'], caption=caption)
             elif msg_type == 'forward':
-                # Forward message — from_chat + message_id
-                await app.forward_messages(
-                    channel_id,
+                # copy_message use karo — inline buttons bhi preserve hote hain
+                await app.copy_message(
+                    chat_id=channel_id,
                     from_chat_id=item['from_chat_id'],
-                    message_ids=item['message_id']
+                    message_id=item['message_id']
                 )
 
             await asyncio.sleep(0.5)  # Telegram rate limit se bachne ke liye
@@ -209,18 +209,36 @@ async def _send_end_messages_to_channel(channel_id: int, anime_name: str):
 # ─────────────────────────────────────────────
 async def _cleanup_old_notifications(channel_id: int, anime_name: str):
     """
-    Channel ke last 15 messages scan karo.
-    Jo messages videos/documents nahi hain unhe delete karo
-    (yeh schedule + end messages hote hain).
-    Episode files safe rehti hain.
+    Cleanup strategy:
+      1. Last 30 msgs scan karo newest → oldest
+      2. Pehla video/document mila → woh last episode hai → STOP collecting
+      3. Us video ke BAAD wale saare non-video messages delete karo
+         (yeh schedule msg + end messages hote hain)
+      4. Videos/documents kabhi delete nahi hote
     """
     try:
-        deleted = 0
-        async for msg in app.get_chat_history(channel_id, limit=15):
-            # Video ya document hai → episode file → SKIP
+        msgs_after_last_video = []   # video milne se pehle wale (newest first)
+        found_video = False
+
+        async for msg in app.get_chat_history(channel_id, limit=30):
             if msg.video or msg.document:
-                continue
-            # Baaki sab (text, sticker, photo, animation, audio) → delete
+                # Pehla video mila — yahan rukk jaao
+                found_video = True
+                break
+            # Video nahi mila abhi tak — collect karo (delete candidates)
+            msgs_after_last_video.append(msg)
+
+        if not found_video:
+            # Koi video nahi mila — kuch delete mat karo (safety)
+            LOGGER.info(f"[Cleanup] No episode video found in last 30 msgs, skipping cleanup.")
+            return
+
+        if not msgs_after_last_video:
+            LOGGER.info(f"[Cleanup] No notification messages found after last episode.")
+            return
+
+        deleted = 0
+        for msg in msgs_after_last_video:
             try:
                 await app.delete_messages(channel_id, msg.id)
                 deleted += 1
@@ -228,7 +246,7 @@ async def _cleanup_old_notifications(channel_id: int, anime_name: str):
             except Exception as e:
                 LOGGER.warning(f"[Cleanup] Could not delete msg {msg.id}: {e}")
 
-        LOGGER.info(f"[Cleanup] Deleted {deleted} notification messages from channel {channel_id}")
+        LOGGER.info(f"[Cleanup] Deleted {deleted} notification messages after last episode in {channel_id}")
     except Exception as e:
         LOGGER.error(f"[Cleanup] Cleanup failed for channel {channel_id}: {e}")
 
@@ -462,10 +480,10 @@ async def cmd_end_message_preview(client: Client, message: Message):
             elif msg_type == 'document':
                 await app.send_document(message.chat.id, item['file_id'], caption=item.get('caption', ''))
             elif msg_type == 'forward':
-                await app.forward_messages(
-                    message.chat.id,
+                await app.copy_message(
+                    chat_id=message.chat.id,
                     from_chat_id=item['from_chat_id'],
-                    message_ids=item['message_id']
+                    message_id=item['message_id']
                 )
             await asyncio.sleep(0.5)
         except Exception as e:
