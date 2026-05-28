@@ -96,54 +96,6 @@ async def _get_schedule_for_anime(anime_name: str) -> dict | None:
     return best
 
 
-# ─────────────────────────────────────────────
-#  Sent Notification IDs DB
-#  (cleanup ke liye bot apne bheje hue msg IDs track karta hai)
-# ─────────────────────────────────────────────
-async def _get_sent_notification_ids(channel_id: int) -> list:
-    """Channel ke liye bot ke bheje hue schedule/notification msg IDs return karo."""
-    oid = await _owner_id()
-    if not oid:
-        return []
-    user = await db._get_user(oid)
-    notif_map = user.get('sent_notification_ids', {})
-    key = str(channel_id)
-    return notif_map.get(key, [])
-
-
-async def _save_sent_notification_id(channel_id: int, msg_id: int):
-    """Ek naya sent notification msg ID save karo (channel ke liye)."""
-    oid = await _owner_id()
-    if not oid:
-        return
-    user = await db._get_user(oid)
-    notif_map = user.get('sent_notification_ids', {})
-    key = str(channel_id)
-    id_list = notif_map.get(key, [])
-    id_list.append(msg_id)
-    # Sirf last 50 IDs rakhna kaafi hai — purane automatically hatenge
-    notif_map[key] = id_list[-50:]
-    await db.col.update_one({'id': oid}, {'$set': {'sent_notification_ids': notif_map}}, upsert=True)
-    LOGGER.info(f"[NotifTrack] Saved msg_id={msg_id} for channel={channel_id}")
-
-
-async def _remove_sent_notification_ids(channel_id: int, msg_ids: list):
-    """Delete ho gaye IDs ko list se hata do (cleanup ke baad)."""
-    if not msg_ids:
-        return
-    oid = await _owner_id()
-    if not oid:
-        return
-    user = await db._get_user(oid)
-    notif_map = user.get('sent_notification_ids', {})
-    key = str(channel_id)
-    id_list = notif_map.get(key, [])
-    removed_set = set(msg_ids)
-    notif_map[key] = [i for i in id_list if i not in removed_set]
-    await db.col.update_one({'id': oid}, {'$set': {'sent_notification_ids': notif_map}}, upsert=True)
-    LOGGER.info(f"[NotifTrack] Removed {len(msg_ids)} IDs from channel={channel_id} tracker")
-
-
 # End messages DB
 async def _get_end_messages(anime_name: str) -> list:
     """Return saved end message list for anime. Each item: dict with type + content."""
@@ -298,41 +250,100 @@ async def _send_end_messages_to_channel(channel_id: int, anime_name: str):
 # ─────────────────────────────────────────────
 async def cleanup_old_notifications(channel_id: int, anime_name: str) -> int:
     """
-    Cleanup (FIXED — bot tracked IDs use karta hai):
-      - get_chat_history() bots ke liye kaam nahi karta [400 BOT_METHOD_INVALID]
-      - Isliye bot apne bheje hue schedule/notification msgs ke IDs
-        database mein track karta hai
-      - Cleanup mein directly woh IDs delete hote hain — 100% reliable
+    Cleanup (IMPROVED):
+      - Channel ke last 50 messages scan karo
+      - SKIP: video/document/photo/audio/sticker (media content)
+      - SKIP: text mein "end" ya "season" (important msgs)
+      - DELETE: sirf schedule/notification text messages
+        (jinmein "next episode", "upload on", ya koi bhi plain
+         non-media notification text hai)
+      - Zyada se zyada 10 messages delete (safety limit)
       - Returns: deleted count
     """
+    # Yeh keywords wale messages ZAROOR delete honge (schedule msgs)
+    SCHEDULE_KEYWORDS = [
+        "next episode",
+        "upload on",
+        "coming soon",
+        "more coming",
+        "be updated",
+    ]
+
+    # Yeh keywords wale messages KABHI delete NAHI honge
+    PROTECTED_KEYWORDS = [
+        "end",
+        "season",
+        "finale",
+    ]
+
     try:
-        saved_ids = await _get_sent_notification_ids(channel_id)
+        to_delete = []
+        skipped   = []
 
-        if not saved_ids:
-            LOGGER.info(f"[Cleanup] No tracked notification IDs for channel={channel_id} — nothing to delete")
-            return 0
+        LOGGER.info(f"[Cleanup-DEBUG] Channel {channel_id} ke messages scan shuru...")
 
-        LOGGER.info(f"[Cleanup] Found {len(saved_ids)} tracked IDs to delete: {saved_ids}")
+        async for msg in app.get_chat_history(channel_id, limit=50):
+            # Message type detect karo
+            msg_type = "text"
+            if msg.video:      msg_type = "video"
+            elif msg.document: msg_type = "document"
+            elif msg.photo:    msg_type = "photo"
+            elif msg.audio:    msg_type = "audio"
+            elif msg.sticker:  msg_type = "sticker"
+            elif msg.animation: msg_type = "animation"
+
+            msg_text = (msg.text or msg.caption or "").lower()
+            msg_preview = msg_text[:60].replace('\n', ' ') if msg_text else "[no text]"
+
+            LOGGER.info(
+                f"[Cleanup-DEBUG] msg_id={msg.id} | type={msg_type} | "
+                f"text='{msg_preview}'"
+            )
+
+            # Media messages skip — yeh actual content hai
+            if msg_type != "text":
+                skipped.append(f"msg {msg.id} [media={msg_type}]")
+                LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → SKIP (media)")
+                continue
+
+            # Protected keywords wale skip
+            if any(kw in msg_text for kw in PROTECTED_KEYWORDS):
+                matched_kw = [kw for kw in PROTECTED_KEYWORDS if kw in msg_text]
+                skipped.append(f"msg {msg.id} [protected={matched_kw}]")
+                LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → SKIP (protected: {matched_kw})")
+                continue
+
+            # Schedule keywords wale — delete list mein
+            if any(kw in msg_text for kw in SCHEDULE_KEYWORDS):
+                matched_kw = [kw for kw in SCHEDULE_KEYWORDS if kw in msg_text]
+                to_delete.append(msg.id)
+                LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → DELETE (schedule keyword: {matched_kw})")
+                continue
+
+            # Baaki plain text msgs
+            if len(to_delete) + len(skipped) < 5 and msg_text:
+                to_delete.append(msg.id)
+                LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → DELETE (plain text, early scan)")
+            else:
+                skipped.append(f"msg {msg.id} [non-schedule-text]")
+                LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → SKIP (non-schedule text)")
+
+        # Safety: zyada se zyada 10 delete
+        to_delete = to_delete[:10]
+
+        LOGGER.info(f"[Cleanup] to_delete={to_delete} skipped={skipped}")
 
         deleted = 0
-        successfully_deleted = []
-
-        for msg_id in saved_ids:
+        for msg_id in to_delete:
             try:
                 await app.delete_messages(channel_id, msg_id)
-                successfully_deleted.append(msg_id)
                 deleted += 1
-                LOGGER.info(f"[Cleanup] Deleted msg_id={msg_id} from channel={channel_id}")
                 await asyncio.sleep(0.3)
             except Exception as e:
-                LOGGER.warning(f"[Cleanup] Could not delete msg_id={msg_id}: {e}")
+                LOGGER.warning(f"[Cleanup] Could not delete {msg_id}: {e}")
 
-        # Successfully delete hue IDs ko tracker se hata do
-        await _remove_sent_notification_ids(channel_id, successfully_deleted)
-
-        LOGGER.info(f"[Cleanup] Done — deleted={deleted} out of {len(saved_ids)}")
+        LOGGER.info(f"[Cleanup] deleted={deleted} skipped={len(skipped)}")
         return deleted
-
     except Exception as e:
         LOGGER.error(f"[Cleanup] Failed: {e}")
         return 0
@@ -363,25 +374,17 @@ async def send_schedule_notification(
     total_eps     = schedule.get('total_eps', 0)
     is_last_ep    = total_eps > 0 and episode_num >= total_eps
 
-    # Step 1: Cleanup (pehle purane tracked msgs delete karo)
-    deleted = await cleanup_old_notifications(channel_id, anime_name)
-    LOGGER.info(f"[Schedule] Cleanup done — deleted={deleted} old notifications")
-
-    await asyncio.sleep(0.5)
-
-    # Step 2: Schedule message (bhejne ke baad ID track karo)
+    # Step 2: Schedule message
     try:
         if is_last_ep:
-            sent = await app.send_message(channel_id, "**END**")
-            await _save_sent_notification_id(channel_id, sent.id)
-            LOGGER.info(f"[Schedule] Last ep {episode_num} → posted END (id={sent.id}) for '{anime_name}'")
+            await app.send_message(channel_id, "**END**")
+            LOGGER.info(f"[Schedule] Last ep {episode_num} → posted END for '{anime_name}'")
             # Last episode pe end messages nahi bhejte
             return
         else:
             next_date = _next_episode_date(interval_days)
-            sent = await app.send_message(channel_id, f"**Next episode upload on {next_date}**")
-            await _save_sent_notification_id(channel_id, sent.id)
-            LOGGER.info(f"[Schedule] Ep {episode_num} → Next on {next_date} (id={sent.id}) for '{anime_name}'")
+            await app.send_message(channel_id, f"**Next episode upload on {next_date}**")
+            LOGGER.info(f"[Schedule] Ep {episode_num} → Next on {next_date} for '{anime_name}'")
     except Exception as e:
         LOGGER.error(f"[Schedule] Schedule msg failed: {e}")
         return
@@ -501,4 +504,240 @@ async def cmd_done(client: Client, message: Message):
         f"📺 Anime: **{anime_name}**\n"
         f"💾 Total: **{len(messages)}** messages saved\n\n"
         f"Har episode upload ke baad yeh messages automatically post honge."
+    )
+
+
+# ─────────────────────────────────────────────
+#  /cancel_end — recording mode cancel
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("cancel_end") & filters.private)
+async def cmd_cancel_end(client: Client, message: Message):
+    user_id = message.from_user.id
+    if not _is_authorized(user_id):
+        return
+
+    if user_id not in _recording_state:
+        await message.reply("⚠️ Koi recording chal nahi rahi.")
+        return
+
+    state = _recording_state.pop(user_id)
+    await message.reply(
+        f"❌ **Recording Cancelled!**\n\n"
+        f"📺 Anime: **{state['anime_name']}**\n"
+        f"💾 {len(state['messages'])} messages discard ho gaye."
+    )
+
+
+# ─────────────────────────────────────────────
+#  /schedule — anime ka episode schedule set karo
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("schedule") & filters.private)
+async def cmd_schedule(client: Client, message: Message):
+    """
+    /schedule [days] [total_eps] [Anime Name]
+    Example: /schedule 7 12 Witch Hat Atelier
+    """
+    if not _is_authorized(message.from_user.id):
+        return
+
+    parts = message.text.split(None, 3)
+    if len(parts) < 4:
+        await message.reply(
+            "**Usage:**\n"
+            "`/schedule [days] [total_eps] [Anime Name]`\n\n"
+            "**Example:**\n"
+            "`/schedule 7 12 Witch Hat Atelier`\n\n"
+            "📅 `days` = kitne din baad next episode aata hai\n"
+            "🔢 `total_eps` = total episodes (0 = unlimited)\n"
+            "📺 `Anime Name` = anime ka naam"
+        )
+        return
+
+    try:
+        interval_days = int(parts[1])
+        total_eps = int(parts[2])
+    except ValueError:
+        await message.reply("❌ `days` aur `total_eps` numbers hone chahiye!\nExample: `/schedule 7 12 Anime Name`")
+        return
+
+    anime_name = parts[3].strip()
+
+    slist = await _get_schedule_list()
+
+    # Already exists? Update karo
+    for entry in slist:
+        if _normalize(entry.get('anime_name', '')) == _normalize(anime_name):
+            entry['interval_days'] = interval_days
+            entry['total_eps'] = total_eps
+            await _save_schedule_list(slist)
+            await message.reply(
+                f"✅ **Schedule Updated!**\n\n"
+                f"📺 **Anime:** {anime_name}\n"
+                f"📅 **Interval:** {interval_days} days\n"
+                f"🔢 **Total Episodes:** {total_eps if total_eps > 0 else 'Unlimited'}"
+            )
+            return
+
+    slist.append({
+        'anime_name': anime_name,
+        'interval_days': interval_days,
+        'total_eps': total_eps,
+    })
+    await _save_schedule_list(slist)
+
+    await message.reply(
+        f"✅ **Schedule Set!**\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📺 **Anime:** {anime_name}\n"
+        f"📅 **Next Episode In:** {interval_days} days\n"
+        f"🔢 **Total Episodes:** {total_eps if total_eps > 0 else 'Unlimited'}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Har episode ke baad automatically schedule message post hoga! 🚀"
+    )
+
+
+# ─────────────────────────────────────────────
+#  /schedule_list — saare schedules dekho
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("schedule_list") & filters.private)
+async def cmd_schedule_list(client: Client, message: Message):
+    if not _is_authorized(message.from_user.id):
+        return
+
+    slist = await _get_schedule_list()
+
+    if not slist:
+        await message.reply(
+            "📋 **Schedule List Empty!**\n\n"
+            "Koi schedule set nahi hai.\n"
+            "Set karne ke liye: `/schedule [days] [total_eps] [Anime Name]`"
+        )
+        return
+
+    text = "📋 **Schedule List:**\n\n"
+    for i, entry in enumerate(slist, 1):
+        name = entry.get('anime_name', 'Unknown')
+        days = entry.get('interval_days', 7)
+        total = entry.get('total_eps', 0)
+        total_str = str(total) if total > 0 else '∞'
+        text += (
+            f"**{i}.** 📺 {name}\n"
+            f"    📅 Every {days} days | 🔢 {total_str} eps\n\n"
+        )
+
+    text += f"Total: **{len(slist)}** schedules"
+    await message.reply(text)
+
+
+# ─────────────────────────────────────────────
+#  /schedule_del — schedule delete karo
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("schedule_del") & filters.private)
+async def cmd_schedule_del(client: Client, message: Message):
+    """
+    /schedule_del [Anime Name]
+    Example: /schedule_del Witch Hat Atelier
+    """
+    if not _is_authorized(message.from_user.id):
+        return
+
+    parts = message.text.split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply(
+            "**Usage:** `/schedule_del [Anime Name]`\n"
+            "Example: `/schedule_del Witch Hat Atelier`"
+        )
+        return
+
+    anime_name = parts[1].strip()
+    slist = await _get_schedule_list()
+    name_norm = _normalize(anime_name)
+
+    new_list = [e for e in slist if _normalize(e.get('anime_name', '')) != name_norm]
+
+    if len(new_list) == len(slist):
+        await message.reply(
+            f"❌ **'{anime_name}'** ka koi schedule nahi mila!\n\n"
+            f"List dekhne ke liye: `/schedule_list`"
+        )
+        return
+
+    await _save_schedule_list(new_list)
+    await message.reply(
+        f"✅ **Schedule Deleted!**\n\n"
+        f"📺 **{anime_name}** ka schedule remove ho gaya."
+    )
+
+
+# ─────────────────────────────────────────────
+#  /end_message_preview — saved end messages dekho
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("end_message_preview") & filters.private)
+async def cmd_end_message_preview(client: Client, message: Message):
+    """
+    /end_message_preview [Anime Name]
+    """
+    if not _is_authorized(message.from_user.id):
+        return
+
+    parts = message.text.split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply(
+            "**Usage:** `/end_message_preview [Anime Name]`\n"
+            "Example: `/end_message_preview Witch Hat Atelier`"
+        )
+        return
+
+    anime_name = parts[1].strip()
+    messages = await _get_end_messages(anime_name)
+
+    if not messages:
+        await message.reply(
+            f"📭 **'{anime_name}'** ke liye koi end messages saved nahi hain.\n\n"
+            f"Add karne ke liye: `/end_message {anime_name}`"
+        )
+        return
+
+    await message.reply(
+        f"📋 **End Messages Preview**\n\n"
+        f"📺 Anime: **{anime_name}**\n"
+        f"💾 Total: **{len(messages)}** messages saved\n\n"
+        f"Ye messages har episode ke baad post honge.\n"
+        f"Delete karne ke liye: `/end_message_del {anime_name}`"
+    )
+
+
+# ─────────────────────────────────────────────
+#  /end_message_del — saved end messages delete karo
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("end_message_del") & filters.private)
+async def cmd_end_message_del(client: Client, message: Message):
+    """
+    /end_message_del [Anime Name]
+    """
+    if not _is_authorized(message.from_user.id):
+        return
+
+    parts = message.text.split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply(
+            "**Usage:** `/end_message_del [Anime Name]`\n"
+            "Example: `/end_message_del Witch Hat Atelier`"
+        )
+        return
+
+    anime_name = parts[1].strip()
+    existing = await _get_end_messages(anime_name)
+
+    if not existing:
+        await message.reply(
+            f"❌ **'{anime_name}'** ke liye koi end messages saved nahi hain!"
+        )
+        return
+
+    await _delete_end_messages_db(anime_name)
+    await message.reply(
+        f"✅ **End Messages Deleted!**\n\n"
+        f"📺 Anime: **{anime_name}**\n"
+        f"🗑️ {len(existing)} messages delete ho gaye."
     )
