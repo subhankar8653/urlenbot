@@ -32,6 +32,7 @@ from ..utils.uploads.telegram import upload_video, _make_uploader_client
 from ..utils.encoding import get_duration, get_thumbnail, get_width_height
 from ..utils.auto_caption import build_auto_caption
 from ..utils.database.access_db import db
+from ..plugins.custompic import get_custompic_for_file
 
 try:
     from selenium import webdriver
@@ -640,7 +641,14 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
         duration = get_duration(filepath)
 
         user_id = message.from_user.id
-        custom_thumb_id = await db.get_thumbnail(user_id)
+
+        # Pehle keyword-based custompic dhundo, phir default thumbnail fallback
+        fname_for_thumb = os.path.basename(filepath)
+        custompic_id = await get_custompic_for_file(user_id, fname_for_thumb)
+        custom_thumb_id = custompic_id if custompic_id else await db.get_thumbnail(user_id)
+        if custompic_id:
+            LOGGER.info(f"[Swift] Using custompic for '{fname_for_thumb}'")
+
         thumb = None
         custom_thumb_used = False
 

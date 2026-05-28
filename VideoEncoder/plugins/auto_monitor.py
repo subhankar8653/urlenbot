@@ -265,10 +265,11 @@ async def _episode_quality_poller(
         # Channel message mein from_user nahi hota, aur reply_video/reply_document
         # bhi nahi hota. Isliye sab kuch app.send_* se delegate karte hain.
         class _ProxyMsg:
-            def __init__(self, original_msg, uid):
+            def __init__(self, original_msg, uid, upload_chat_id):
                 self._msg = original_msg
                 self.from_user = type('U', (), {'id': uid})()
-                self.chat = original_msg.chat
+                # Upload seedha anime channel pe hoga
+                self.chat = type('C', (), {'id': upload_chat_id})()
                 self.id = original_msg.id
 
             async def reply(self, *args, **kwargs):
@@ -276,26 +277,27 @@ async def _episode_quality_poller(
 
             async def reply_video(self, video, **kwargs):
                 return await app.send_video(
-                    chat_id=self._msg.chat.id,
+                    chat_id=self.chat.id,
                     video=video,
                     **kwargs
                 )
 
             async def reply_document(self, document, **kwargs):
                 return await app.send_document(
-                    chat_id=self._msg.chat.id,
+                    chat_id=self.chat.id,
                     document=document,
                     **kwargs
                 )
 
             async def reply_audio(self, audio, **kwargs):
                 return await app.send_audio(
-                    chat_id=self._msg.chat.id,
+                    chat_id=self.chat.id,
                     audio=audio,
                     **kwargs
                 )
 
-        proxy_msg = _ProxyMsg(log_message, owner_id)
+        # channel_id pass karo taaki seedha anime channel pe upload ho
+        proxy_msg = _ProxyMsg(log_message, owner_id, channel_id)
 
         async def _upload_task(filepath, idx):
             if idx > 0:
@@ -310,9 +312,8 @@ async def _episode_quality_poller(
             except Exception:
                 pass
 
-            # Agar upload hua → anime ke channel pe bhi bhejo
-            if success and sent_msg:
-                await _forward_to_anime_channel(client, sent_msg, channel_id, anime_name)
+            # Upload seedha channel pe ho gaya (proxy_msg.chat.id = channel_id)
+            # Forward ki zaroorat nahi
 
             return success, sent_msg, quality
 
