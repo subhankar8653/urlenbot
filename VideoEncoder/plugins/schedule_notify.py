@@ -280,31 +280,53 @@ async def cleanup_old_notifications(channel_id: int, anime_name: str) -> int:
         to_delete = []
         skipped   = []
 
+        LOGGER.info(f"[Cleanup-DEBUG] Channel {channel_id} ke messages scan shuru...")
+
         async for msg in app.get_chat_history(channel_id, limit=50):
-            # Media messages skip — yeh actual content hai
-            if (msg.video or msg.document or msg.photo or
-                    msg.audio or msg.sticker or msg.animation):
-                skipped.append(f"msg {msg.id} [media]")
-                continue
+            # Message type detect karo
+            msg_type = "text"
+            if msg.video:      msg_type = "video"
+            elif msg.document: msg_type = "document"
+            elif msg.photo:    msg_type = "photo"
+            elif msg.audio:    msg_type = "audio"
+            elif msg.sticker:  msg_type = "sticker"
+            elif msg.animation: msg_type = "animation"
 
             msg_text = (msg.text or msg.caption or "").lower()
+            msg_preview = msg_text[:60].replace('\n', ' ') if msg_text else "[no text]"
+
+            LOGGER.info(
+                f"[Cleanup-DEBUG] msg_id={msg.id} | type={msg_type} | "
+                f"text='{msg_preview}'"
+            )
+
+            # Media messages skip — yeh actual content hai
+            if msg_type != "text":
+                skipped.append(f"msg {msg.id} [media={msg_type}]")
+                LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → SKIP (media)")
+                continue
 
             # Protected keywords wale skip
             if any(kw in msg_text for kw in PROTECTED_KEYWORDS):
-                skipped.append(f"msg {msg.id} [protected]")
+                matched_kw = [kw for kw in PROTECTED_KEYWORDS if kw in msg_text]
+                skipped.append(f"msg {msg.id} [protected={matched_kw}]")
+                LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → SKIP (protected: {matched_kw})")
                 continue
 
             # Schedule keywords wale — delete list mein
             if any(kw in msg_text for kw in SCHEDULE_KEYWORDS):
+                matched_kw = [kw for kw in SCHEDULE_KEYWORDS if kw in msg_text]
                 to_delete.append(msg.id)
+                LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → DELETE (schedule keyword: {matched_kw})")
                 continue
 
-            # Baaki plain text msgs (jo na media hai, na protected) — bhi delete
-            # Lekin sirf last 5 mein se (zyada aggressive cleanup avoid karne ke liye)
+            # Baaki plain text msgs
             if len(to_delete) + len(skipped) < 5 and msg_text:
                 to_delete.append(msg.id)
+                LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → DELETE (plain text, early scan)")
             else:
                 skipped.append(f"msg {msg.id} [non-schedule-text]")
+                LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → SKIP (non-schedule text)")
 
         # Safety: zyada se zyada 10 delete
         to_delete = to_delete[:10]
