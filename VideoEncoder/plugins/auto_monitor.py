@@ -517,7 +517,14 @@ async def auto_monitor_handler(client: Client, message: Message):
                 f"`{swift_url}`\n\n"
                 f"🧹 Purane messages delete ho rahe hain..."
             )
-            deleted_count = await _cfn(channel_id, anime_name)
+            # Owner ka user_session fetch karo — user account se delete hoga
+            _owner_user_session = None
+            try:
+                _owner_doc = await db._get_user(oid)
+                _owner_user_session = _owner_doc.get("user_session", None)
+            except Exception:
+                pass
+            deleted_count = await _cfn(channel_id, anime_name, _owner_user_session)
             if deleted_count > 0:
                 await prep_msg.edit(
                     f"✅ **AutoMonitor** | `{anime_name}` | Ep `{ep_num}`\n\n"

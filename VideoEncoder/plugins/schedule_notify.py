@@ -33,7 +33,9 @@ from datetime import datetime, timedelta, timezone
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-from .. import LOGGER, app, owner, sudo_users
+from pyrogram.errors import UserNotParticipant
+
+from .. import LOGGER, app, owner, sudo_users, api_id, api_hash
 from ..utils.database.access_db import db
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -248,7 +250,11 @@ async def _send_end_messages_to_channel(channel_id: int, anime_name: str):
 #  Cleanup — last 15 msgs mein se schedule/end msgs delete karo
 #  (videos/documents nahi — sirf text/sticker messages)
 # ─────────────────────────────────────────────
-async def cleanup_old_notifications(channel_id: int, anime_name: str) -> int:
+async def cleanup_old_notifications(
+    channel_id: int,
+    anime_name: str,
+    user_session: str | None = None,
+) -> int:
     """
     Cleanup (IMPROVED):
       - Channel ke last 50 messages scan karo
@@ -258,6 +264,8 @@ async def cleanup_old_notifications(channel_id: int, anime_name: str) -> int:
         (jinmein "next episode", "upload on", ya koi bhi plain
          non-media notification text hai)
       - Zyada se zyada 10 messages delete (safety limit)
+      - user_session diya → user account se delete (purane msgs bhi jaayenge)
+      - user_session nahi → bot se delete (sirf bot ke messages)
       - Returns: deleted count
     """
     # Yeh keywords wale messages ZAROOR delete honge (schedule msgs)
@@ -276,13 +284,36 @@ async def cleanup_old_notifications(channel_id: int, anime_name: str) -> int:
         "finale",
     ]
 
+    # ── User client banao agar session diya ──
+    user_client = None
+    if user_session:
+        try:
+            from pyrogram import Client as _Client
+            user_client = _Client(
+                "cleanup_user",
+                session_string=user_session,
+                api_id=api_id,
+                api_hash=api_hash,
+                in_memory=True,
+            )
+            await user_client.connect()
+            LOGGER.info("[Cleanup] User client connected — user account se delete hoga")
+        except Exception as ue:
+            LOGGER.warning(f"[Cleanup] User client connect failed: {ue} — bot se try karega")
+            user_client = None
+
+    # scan_client: messages fetch karne ke liye (app ya user_client)
+    scan_client = user_client if user_client else app
+    # delete_client: messages delete karne ke liye
+    delete_client = user_client if user_client else app
+
     try:
         to_delete = []
         skipped   = []
 
         LOGGER.info(f"[Cleanup-DEBUG] Channel {channel_id} ke messages scan shuru...")
 
-        async for msg in app.get_chat_history(channel_id, limit=50):
+        async for msg in scan_client.get_chat_history(channel_id, limit=50):
             # Message type detect karo
             msg_type = "text"
             if msg.video:      msg_type = "video"
@@ -336,7 +367,7 @@ async def cleanup_old_notifications(channel_id: int, anime_name: str) -> int:
         deleted = 0
         for msg_id in to_delete:
             try:
-                await app.delete_messages(channel_id, msg_id)
+                await delete_client.delete_messages(channel_id, msg_id)
                 deleted += 1
                 await asyncio.sleep(0.3)
             except Exception as e:
@@ -347,6 +378,13 @@ async def cleanup_old_notifications(channel_id: int, anime_name: str) -> int:
     except Exception as e:
         LOGGER.error(f"[Cleanup] Failed: {e}")
         return 0
+    finally:
+        # User client disconnect karo
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────
