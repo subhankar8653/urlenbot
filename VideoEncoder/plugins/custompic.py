@@ -23,7 +23,7 @@ import logging
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-from .. import app
+from .. import app, owner, sudo_users
 from ..utils.helper import check_chat
 from ..utils.database.access_db import db
 
@@ -38,29 +38,41 @@ async def get_custompic_for_file(user_id: int, filename: str) -> str | None:
     Filename mein koi saved keyword match karta hai to us keyword ki pic return karo.
     Case-insensitive match. Sabse lamba matching keyword jeetega.
 
+    Owner + saare sudo_users ke custompics scan karta hai —
+    taaki auto_monitor jaise cases mein bhi sahi pic mile chahe
+    /setpic kisi bhi authorized user ne kiya ho.
+
     Usage (swift_downloader.py mein):
         from ..plugins.custompic import get_custompic_for_file
         thumb = await get_custompic_for_file(user_id, filename) or default_thumb
     """
     try:
-        pics = await db.get_all_custompics(user_id)   # {keyword: file_id}
-        if not pics:
-            return None
-
         fname_lower = filename.lower()
 
-        # Sabse lamba matching keyword prefer karo (e.g. "naruto shippuden" > "naruto")
+        # Saare authorized users ke IDs — owner + sudo_users + caller khud
+        all_user_ids = list(set(owner + sudo_users + ([user_id] if user_id else [])))
+
         best_key = None
         best_len = 0
-        for keyword, file_id in pics.items():
-            if keyword.lower() in fname_lower:
-                if len(keyword) > best_len:
-                    best_key = keyword
-                    best_len = len(keyword)
+        best_file_id = None
+
+        for uid in all_user_ids:
+            try:
+                pics = await db.get_all_custompics(uid)   # {keyword: file_id}
+                if not pics:
+                    continue
+                for keyword, file_id in pics.items():
+                    if keyword.lower() in fname_lower:
+                        if len(keyword) > best_len:
+                            best_key = keyword
+                            best_len = len(keyword)
+                            best_file_id = file_id
+            except Exception:
+                continue
 
         if best_key:
             LOGGER.info(f"[CustomPic] Match: '{best_key}' in '{filename}'")
-            return pics[best_key]
+            return best_file_id
 
     except Exception as e:
         LOGGER.error(f"[CustomPic] get_custompic_for_file error: {e}")
