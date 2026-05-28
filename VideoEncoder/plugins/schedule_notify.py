@@ -1,22 +1,33 @@
 """
-schedule_notify.py
-===================
-Episode Schedule Notification System
+schedule_notify.py  v2
+=======================
+Episode Schedule + End Message Notification System
 
-Jab saare qualities upload ho jaaye, bot channel pe post karta hai:
-  → "**Next episode upload on 4th June**"
-  → Last episode ke baad: "**END**"
+Flow (episode complete hone ke baad):
+  1. Purane schedule/end messages delete karo (last 15 msgs mein se, videos nahi)
+  2. Schedule message post karo → "Next episode upload on 4th June"
+     (Last episode pe → "END" post hoga, end messages nahi)
+  3. End messages post karo (ek ek karke, saare saved messages)
 
 Commands:
   /schedule [days] [total_eps] [Anime Name]
-    Example: /schedule 7 12 Witch Hat Atelier
-    → Har 7 din baad episode aata hai, total 12 episodes, Witch Hat Atelier ke liye
+      Example: /schedule 7 12 Witch Hat Atelier
 
-  /schedule_list    → Dekho kya set hai
-  /schedule_del [Anime Name]  → Remove karo
+  /end_message [Anime Name]
+      → Bot bolta hai "Ab bhejo jo messages end mein add karne hain"
+      → Tum bhejte ho (text, sticker, forward, kuch bhi)
+      → /done  → save ho jaata hai
+
+  /end_message_preview [Anime Name]  → Dekho kya saved hai
+  /end_message_del [Anime Name]      → Delete karo
+
+  /schedule_list   → Saare schedules dekho
+  /schedule_del [Anime Name]
 """
 
+import asyncio
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 from pyrogram import Client, filters
@@ -25,37 +36,35 @@ from pyrogram.types import Message
 from .. import LOGGER, app, owner, sudo_users
 from ..utils.database.access_db import db
 
-# IST = UTC+5:30
 IST = timezone(timedelta(hours=5, minutes=30))
+
+# In-memory state: kaun abhi end_message recording mode mein hai
+# { user_id: { 'anime_name': str, 'messages': [ {type, content} ] } }
+_recording_state: dict = {}
 
 
 def _is_authorized(user_id: int) -> bool:
     return user_id in owner or user_id in sudo_users
 
 
-# ─────────────────────────────────────────────
-#  Ordinal suffix helper  →  1st, 2nd, 3rd, 4th ...
-# ─────────────────────────────────────────────
+def _normalize(text: str) -> str:
+    return re.sub(r'[^a-z0-9]', '', text.lower())
+
+
 def _ordinal(n: int) -> str:
     if 11 <= (n % 100) <= 13:
         return f"{n}th"
     return f"{n}{['th','st','nd','rd','th','th','th','th','th','th'][n % 10]}"
 
 
-# ─────────────────────────────────────────────
-#  Next episode date calculate karo (IST)
-# ─────────────────────────────────────────────
 def _next_episode_date(interval_days: int) -> str:
-    """Aaj ki IST date + interval_days = next episode date → '4th June' format"""
     today_ist = datetime.now(IST)
     next_date = today_ist + timedelta(days=interval_days)
-    day_str = _ordinal(next_date.day)
-    month_str = next_date.strftime("%B")   # e.g. "June"
-    return f"{day_str} {month_str}"
+    return f"{_ordinal(next_date.day)} {next_date.strftime('%B')}"
 
 
 # ─────────────────────────────────────────────
-#  DB Helpers — schedule list owner ke doc mein
+#  DB Helpers
 # ─────────────────────────────────────────────
 async def _owner_id() -> int | None:
     return owner[0] if owner else None
@@ -69,32 +78,159 @@ async def _get_schedule_list() -> list:
     return user.get('episode_schedule_list', [])
 
 
-async def _save_schedule_list(schedule_list: list):
+async def _save_schedule_list(slist: list):
     oid = await _owner_id()
     if not oid:
         return
-    await db.col.update_one(
-        {'id': oid},
-        {'$set': {'episode_schedule_list': schedule_list}},
-        upsert=True
-    )
-
-
-def _normalize(text: str) -> str:
-    import re
-    return re.sub(r'[^a-z0-9]', '', text.lower())
+    await db.col.update_one({'id': oid}, {'$set': {'episode_schedule_list': slist}}, upsert=True)
 
 
 async def _get_schedule_for_anime(anime_name: str) -> dict | None:
-    """Anime name se matching schedule entry dhundo."""
-    schedule_list = await _get_schedule_list()
+    slist = await _get_schedule_list()
     name_norm = _normalize(anime_name)
     best, best_len = None, 0
-    for entry in schedule_list:
-        entry_norm = _normalize(entry.get('anime_name', ''))
-        if entry_norm and entry_norm in name_norm and len(entry_norm) > best_len:
-            best, best_len = entry, len(entry_norm)
+    for entry in slist:
+        en = _normalize(entry.get('anime_name', ''))
+        if en and en in name_norm and len(en) > best_len:
+            best, best_len = entry, len(en)
     return best
+
+
+# End messages DB
+async def _get_end_messages(anime_name: str) -> list:
+    """Return saved end message list for anime. Each item: dict with type + content."""
+    oid = await _owner_id()
+    if not oid:
+        return []
+    user = await db._get_user(oid)
+    end_map = user.get('end_messages_map', {})
+    key = _normalize(anime_name)
+    return end_map.get(key, [])
+
+
+async def _save_end_messages(anime_name: str, messages: list):
+    oid = await _owner_id()
+    if not oid:
+        return
+    user = await db._get_user(oid)
+    end_map = user.get('end_messages_map', {})
+    key = _normalize(anime_name)
+    end_map[key] = messages
+    await db.col.update_one({'id': oid}, {'$set': {'end_messages_map': end_map}}, upsert=True)
+
+
+async def _delete_end_messages_db(anime_name: str):
+    oid = await _owner_id()
+    if not oid:
+        return
+    user = await db._get_user(oid)
+    end_map = user.get('end_messages_map', {})
+    key = _normalize(anime_name)
+    end_map.pop(key, None)
+    await db.col.update_one({'id': oid}, {'$set': {'end_messages_map': end_map}}, upsert=True)
+
+
+# ─────────────────────────────────────────────
+#  Message serializer — save karte waqt
+# ─────────────────────────────────────────────
+def _serialize_message(msg: Message) -> dict | None:
+    """Message ko saveable dict mein convert karo."""
+    if msg.sticker:
+        return {'type': 'sticker', 'file_id': msg.sticker.file_id}
+    if msg.photo:
+        return {'type': 'photo', 'file_id': msg.photo.file_id,
+                'caption': msg.caption or ''}
+    if msg.video:
+        return {'type': 'video', 'file_id': msg.video.file_id,
+                'caption': msg.caption or ''}
+    if msg.animation:
+        return {'type': 'animation', 'file_id': msg.animation.file_id,
+                'caption': msg.caption or ''}
+    if msg.document:
+        return {'type': 'document', 'file_id': msg.document.file_id,
+                'caption': msg.caption or ''}
+    if msg.audio:
+        return {'type': 'audio', 'file_id': msg.audio.file_id,
+                'caption': msg.caption or ''}
+    if msg.text:
+        return {'type': 'text', 'text': msg.text}
+    # Forward (no media) — skip, handle as forward separately
+    return None
+
+
+# ─────────────────────────────────────────────
+#  Send saved end messages to channel
+# ─────────────────────────────────────────────
+async def _send_end_messages_to_channel(channel_id: int, anime_name: str):
+    """DB se saved end messages ek ek karke channel pe bhejo."""
+    messages = await _get_end_messages(anime_name)
+    if not messages:
+        LOGGER.info(f"[EndMsg] No end messages saved for '{anime_name}'")
+        return
+
+    LOGGER.info(f"[EndMsg] Sending {len(messages)} end messages for '{anime_name}' to {channel_id}")
+
+    for item in messages:
+        try:
+            msg_type = item.get('type')
+            caption = item.get('caption', '')
+
+            if msg_type == 'text':
+                await app.send_message(channel_id, item['text'])
+            elif msg_type == 'sticker':
+                await app.send_sticker(channel_id, item['file_id'])
+            elif msg_type == 'photo':
+                await app.send_photo(channel_id, item['file_id'], caption=caption)
+            elif msg_type == 'video':
+                await app.send_video(channel_id, item['file_id'], caption=caption)
+            elif msg_type == 'animation':
+                await app.send_animation(channel_id, item['file_id'], caption=caption)
+            elif msg_type == 'document':
+                await app.send_document(channel_id, item['file_id'], caption=caption)
+            elif msg_type == 'audio':
+                await app.send_audio(channel_id, item['file_id'], caption=caption)
+            elif msg_type == 'forward':
+                # Forward message — from_chat + message_id
+                await app.forward_messages(
+                    channel_id,
+                    from_chat_id=item['from_chat_id'],
+                    message_ids=item['message_id']
+                )
+
+            await asyncio.sleep(0.5)  # Telegram rate limit se bachne ke liye
+
+        except Exception as e:
+            LOGGER.error(f"[EndMsg] Failed to send end message item {item}: {e}")
+
+
+# ─────────────────────────────────────────────
+#  Cleanup — last 15 msgs mein se schedule/end msgs delete karo
+#  (videos/documents nahi — sirf text/sticker messages)
+# ─────────────────────────────────────────────
+async def _cleanup_old_notifications(channel_id: int, anime_name: str):
+    """
+    Channel ke last 15 messages scan karo.
+    Jo messages videos/documents nahi hain unhe delete karo
+    (yeh schedule + end messages hote hain).
+    Episode files safe rehti hain.
+    """
+    try:
+        deleted = 0
+        async for msg in app.get_chat_history(channel_id, limit=15):
+            # Video ya document hai → episode file → SKIP
+            if msg.video or msg.document:
+                continue
+            # Baaki sab (text, sticker, photo, animation, audio) → delete
+            try:
+                await app.delete_messages(channel_id, msg.id)
+                deleted += 1
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                LOGGER.warning(f"[Cleanup] Could not delete msg {msg.id}: {e}")
+
+        LOGGER.info(f"[Cleanup] Deleted {deleted} notification messages from channel {channel_id}")
+    except Exception as e:
+        LOGGER.error(f"[Cleanup] Cleanup failed for channel {channel_id}: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -108,36 +244,256 @@ async def send_schedule_notification(
 ):
     """
     Episode complete hone ke baad call karo.
-    Schedule set hai toh:
-      - Agar last episode nahi → "Next episode upload on Xth Month"
-      - Agar last episode hai  → "END"
+    Flow:
+      1. Purane schedule/end msgs delete karo
+      2. Schedule msg post karo
+      3. End messages post karo (last episode pe nahi — END ke baad kuch nahi)
     """
     schedule = await _get_schedule_for_anime(anime_name)
     if not schedule:
-        LOGGER.info(f"[Schedule] No schedule set for '{anime_name}', skipping notification.")
+        LOGGER.info(f"[Schedule] No schedule for '{anime_name}', skipping.")
         return
 
     interval_days = schedule.get('interval_days', 7)
     total_eps     = schedule.get('total_eps', 0)
+    is_last_ep    = total_eps > 0 and episode_num >= total_eps
 
+    # Step 1: Purane notifications clean karo
+    await _cleanup_old_notifications(channel_id, anime_name)
+    await asyncio.sleep(1)
+
+    # Step 2: Schedule message
     try:
-        if total_eps > 0 and episode_num >= total_eps:
-            # Last episode — END post karo
-            msg_text = f"**END**"
-            LOGGER.info(f"[Schedule] Last episode ({episode_num}/{total_eps}) for '{anime_name}' → posting END")
+        if is_last_ep:
+            await app.send_message(channel_id, "**END**")
+            LOGGER.info(f"[Schedule] Last ep {episode_num} → posted END for '{anime_name}'")
+            # Last episode pe end messages nahi bhejte
+            return
         else:
-            # Next episode date calculate karo
             next_date = _next_episode_date(interval_days)
-            msg_text = f"**Next episode upload on {next_date}**"
-            LOGGER.info(f"[Schedule] Ep {episode_num} done for '{anime_name}' → posting: {msg_text}")
-
-        await app.send_message(
-            chat_id=channel_id,
-            text=msg_text,
-        )
-
+            await app.send_message(channel_id, f"**Next episode upload on {next_date}**")
+            LOGGER.info(f"[Schedule] Ep {episode_num} → Next on {next_date} for '{anime_name}'")
     except Exception as e:
-        LOGGER.error(f"[Schedule] Notification send failed for '{anime_name}': {e}")
+        LOGGER.error(f"[Schedule] Schedule msg failed: {e}")
+        return
+
+    await asyncio.sleep(0.5)
+
+    # Step 3: End messages bhejo
+    await _send_end_messages_to_channel(channel_id, anime_name)
+
+
+# ─────────────────────────────────────────────
+#  /end_message command — recording mode start
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("end_message") & filters.private)
+async def cmd_end_message(client: Client, message: Message):
+    """
+    /end_message Witch Hat Atelier
+    → Recording mode shuru — ab jo bhejoge woh save hoga
+    → /done se band karo
+    """
+    if not _is_authorized(message.from_user.id):
+        return
+
+    parts = message.text.split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply(
+            "**Usage:** `/end_message Anime Name`\n"
+            "Example: `/end_message Witch Hat Atelier`\n\n"
+            "Phir jo messages bhejoge woh save honge.\n"
+            "Khatam karne ke liye: `/done`"
+        )
+        return
+
+    anime_name = parts[1].strip()
+    user_id = message.from_user.id
+
+    _recording_state[user_id] = {
+        'anime_name': anime_name,
+        'messages': []
+    }
+
+    existing = await _get_end_messages(anime_name)
+    note = f"\n\n⚠️ Pehle se **{len(existing)}** messages saved hain — naye se replace ho jayenge." if existing else ""
+
+    await message.reply(
+        f"🎬 **End Message Recording Started!**\n\n"
+        f"📺 Anime: **{anime_name}**\n\n"
+        f"Ab jo bhi bhejoge — text, sticker, forward, photo — sab save hoga.{note}\n\n"
+        f"✅ Khatam karne ke liye: `/done`\n"
+        f"❌ Cancel karne ke liye: `/cancel_end`"
+    )
+
+
+# ─────────────────────────────────────────────
+#  Recording mode — messages capture karo
+# ─────────────────────────────────────────────
+@Client.on_message(
+    filters.private &
+    ~filters.command(["done", "cancel_end", "end_message", "schedule",
+                      "schedule_list", "schedule_del", "end_message_preview",
+                      "end_message_del"])
+)
+async def capture_end_message(client: Client, message: Message):
+    """Agar user recording mode mein hai toh messages capture karo."""
+    user_id = message.from_user.id
+    if user_id not in _recording_state:
+        return
+    if not _is_authorized(user_id):
+        return
+
+    state = _recording_state[user_id]
+
+    # Forward message — special handling
+    if message.forward_from_chat or message.forward_from:
+        from_chat_id = None
+        msg_id = None
+        if message.forward_from_chat:
+            from_chat_id = message.forward_from_chat.id
+            msg_id = message.forward_from_message_id
+        item = {
+            'type': 'forward',
+            'from_chat_id': from_chat_id,
+            'message_id': msg_id,
+        }
+        # Fallback: agar forward info nahi mili toh serialize karo
+        if not from_chat_id or not msg_id:
+            item = _serialize_message(message)
+        if item:
+            state['messages'].append(item)
+            count = len(state['messages'])
+            await message.reply(f"✅ Saved! ({count} messages total) — `/done` se khatam karo")
+            return
+
+    # Normal message
+    item = _serialize_message(message)
+    if item:
+        state['messages'].append(item)
+        count = len(state['messages'])
+        await message.reply(f"✅ Saved! ({count} messages total) — `/done` se khatam karo")
+    else:
+        await message.reply("⚠️ Yeh message type support nahi hota. Text, sticker, photo, video, forward bhejo.")
+
+
+# ─────────────────────────────────────────────
+#  /done — save karo
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("done") & filters.private)
+async def cmd_done(client: Client, message: Message):
+    user_id = message.from_user.id
+    if not _is_authorized(user_id):
+        return
+
+    if user_id not in _recording_state:
+        await message.reply("⚠️ Koi recording chal nahi rahi. Pehle `/end_message Anime Name` karo.")
+        return
+
+    state = _recording_state.pop(user_id)
+    anime_name = state['anime_name']
+    messages   = state['messages']
+
+    if not messages:
+        await message.reply("⚠️ Koi message save nahi hua! Recording cancel ho gaya.")
+        return
+
+    await _save_end_messages(anime_name, messages)
+
+    await message.reply(
+        f"✅ **End Messages Saved!**\n\n"
+        f"📺 Anime: **{anime_name}**\n"
+        f"💾 Total: **{len(messages)}** messages saved\n\n"
+        f"Har episode upload ke baad yeh messages automatically post honge."
+    )
+
+
+# ─────────────────────────────────────────────
+#  /cancel_end — recording cancel karo
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("cancel_end") & filters.private)
+async def cmd_cancel_end(client: Client, message: Message):
+    user_id = message.from_user.id
+    if not _is_authorized(user_id):
+        return
+
+    if user_id not in _recording_state:
+        await message.reply("⚠️ Koi recording chal nahi rahi.")
+        return
+
+    state = _recording_state.pop(user_id)
+    await message.reply(f"❌ Recording cancel! `{state['anime_name']}` ke liye kuch save nahi hua.")
+
+
+# ─────────────────────────────────────────────
+#  /end_message_preview — dekho kya saved hai
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("end_message_preview") & filters.private)
+async def cmd_end_message_preview(client: Client, message: Message):
+    if not _is_authorized(message.from_user.id):
+        return
+
+    parts = message.text.split(None, 1)
+    if len(parts) < 2:
+        await message.reply("**Usage:** `/end_message_preview Witch Hat Atelier`")
+        return
+
+    anime_name = parts[1].strip()
+    messages = await _get_end_messages(anime_name)
+
+    if not messages:
+        await message.reply(f"📭 `{anime_name}` ke liye koi end messages saved nahi hain.")
+        return
+
+    await message.reply(f"🔍 **Preview: {anime_name}** ({len(messages)} messages)\n\nSend ho raha hai...")
+
+    for item in messages:
+        try:
+            msg_type = item.get('type')
+            if msg_type == 'text':
+                await message.reply(item['text'])
+            elif msg_type == 'sticker':
+                await app.send_sticker(message.chat.id, item['file_id'])
+            elif msg_type == 'photo':
+                await app.send_photo(message.chat.id, item['file_id'], caption=item.get('caption', ''))
+            elif msg_type == 'video':
+                await app.send_video(message.chat.id, item['file_id'], caption=item.get('caption', ''))
+            elif msg_type == 'animation':
+                await app.send_animation(message.chat.id, item['file_id'], caption=item.get('caption', ''))
+            elif msg_type == 'document':
+                await app.send_document(message.chat.id, item['file_id'], caption=item.get('caption', ''))
+            elif msg_type == 'forward':
+                await app.forward_messages(
+                    message.chat.id,
+                    from_chat_id=item['from_chat_id'],
+                    message_ids=item['message_id']
+                )
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            await message.reply(f"⚠️ Ek message preview nahi ho saka: {e}")
+
+
+# ─────────────────────────────────────────────
+#  /end_message_del — delete saved end messages
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("end_message_del") & filters.private)
+async def cmd_end_message_del(client: Client, message: Message):
+    if not _is_authorized(message.from_user.id):
+        return
+
+    parts = message.text.split(None, 1)
+    if len(parts) < 2:
+        await message.reply("**Usage:** `/end_message_del Witch Hat Atelier`")
+        return
+
+    anime_name = parts[1].strip()
+    messages = await _get_end_messages(anime_name)
+
+    if not messages:
+        await message.reply(f"❌ `{anime_name}` ke liye koi end messages nahi hain.")
+        return
+
+    await _delete_end_messages_db(anime_name)
+    await message.reply(f"🗑️ **Deleted!** `{anime_name}` ke saare end messages remove ho gaye.")
 
 
 # ─────────────────────────────────────────────
@@ -145,24 +501,16 @@ async def send_schedule_notification(
 # ─────────────────────────────────────────────
 @Client.on_message(filters.command("schedule") & filters.private)
 async def cmd_schedule(client: Client, message: Message):
-    """
-    /schedule [days] [total_eps] [Anime Name]
-    Example: /schedule 7 12 Witch Hat Atelier
-    """
     if not _is_authorized(message.from_user.id):
         return
 
     parts = message.text.split(None, 3)
-
     if len(parts) < 4:
         await message.reply(
-            "**Usage:**\n"
-            "`/schedule [days] [total_eps] [Anime Name]`\n\n"
-            "**Example:**\n"
-            "`/schedule 7 12 Witch Hat Atelier`\n\n"
+            "**Usage:**\n`/schedule [days] [total_eps] [Anime Name]`\n\n"
+            "**Example:**\n`/schedule 7 12 Witch Hat Atelier`\n\n"
             "💡 days = kitne din baad episode aata hai\n"
-            "💡 total_eps = total kitne episodes hain\n"
-            "💡 Anime Name = wahi likhna jo /add_anime mein hai"
+            "💡 total_eps = total kitne episodes hain"
         )
         return
 
@@ -170,86 +518,61 @@ async def cmd_schedule(client: Client, message: Message):
         interval_days = int(parts[1])
         total_eps     = int(parts[2])
     except ValueError:
-        await message.reply("❌ Days aur total_eps numbers hone chahiye!\nExample: `/schedule 7 12 Witch Hat Atelier`")
+        await message.reply("❌ Days aur total_eps numbers hone chahiye!")
         return
 
     anime_name = parts[3].strip()
+    slist = await _get_schedule_list()
 
-    schedule_list = await _get_schedule_list()
-
-    # Agar pehle se exist karta hai toh update karo
-    for i, entry in enumerate(schedule_list):
+    for i, entry in enumerate(slist):
         if _normalize(entry.get('anime_name', '')) == _normalize(anime_name):
-            schedule_list[i] = {
-                'anime_name': anime_name,
-                'interval_days': interval_days,
-                'total_eps': total_eps,
-            }
-            await _save_schedule_list(schedule_list)
-            next_date = _next_episode_date(interval_days)
+            slist[i] = {'anime_name': anime_name, 'interval_days': interval_days, 'total_eps': total_eps}
+            await _save_schedule_list(slist)
             await message.reply(
                 f"✅ **Schedule Updated!**\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"📺 **Anime:** {anime_name}\n"
                 f"📅 **Interval:** {interval_days} days\n"
-                f"🎬 **Total Episodes:** {total_eps}\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"Next notification preview:\n"
-                f"**Next episode upload on {next_date}**"
+                f"🎬 **Total Episodes:** {total_eps}\n\n"
+                f"Preview: **Next episode upload on {_next_episode_date(interval_days)}**"
             )
             return
 
-    # Naya add karo
-    schedule_list.append({
-        'anime_name': anime_name,
-        'interval_days': interval_days,
-        'total_eps': total_eps,
-    })
-    await _save_schedule_list(schedule_list)
-
-    next_date = _next_episode_date(interval_days)
+    slist.append({'anime_name': anime_name, 'interval_days': interval_days, 'total_eps': total_eps})
+    await _save_schedule_list(slist)
     await message.reply(
         f"✅ **Schedule Set!**\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📺 **Anime:** {anime_name}\n"
         f"📅 **Interval:** {interval_days} days\n"
-        f"🎬 **Total Episodes:** {total_eps}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Next notification preview:\n"
-        f"**Next episode upload on {next_date}**"
+        f"🎬 **Total Episodes:** {total_eps}\n\n"
+        f"Preview: **Next episode upload on {_next_episode_date(interval_days)}**"
     )
 
 
 # ─────────────────────────────────────────────
-#  /schedule_list command
+#  /schedule_list
 # ─────────────────────────────────────────────
 @Client.on_message(filters.command("schedule_list") & filters.private)
 async def cmd_schedule_list(client: Client, message: Message):
     if not _is_authorized(message.from_user.id):
         return
 
-    schedule_list = await _get_schedule_list()
-
-    if not schedule_list:
-        await message.reply(
-            "📋 Koi schedule set nahi hai!\n\n"
-            "Set karo: `/schedule 7 12 Witch Hat Atelier`"
-        )
+    slist = await _get_schedule_list()
+    if not slist:
+        await message.reply("📋 Koi schedule set nahi hai!\n\nSet karo: `/schedule 7 12 Witch Hat Atelier`")
         return
 
     text = "📅 **Episode Schedules**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-    for i, entry in enumerate(schedule_list, 1):
+    for i, entry in enumerate(slist, 1):
         text += (
             f"**{i}.** 📺 {entry.get('anime_name')}\n"
-            f"   📅 Every {entry.get('interval_days')} days\n"
-            f"   🎬 Total: {entry.get('total_eps')} eps\n\n"
+            f"   📅 Every {entry.get('interval_days')} days | 🎬 Total: {entry.get('total_eps')} eps\n\n"
         )
-    text += f"━━━━━━━━━━━━━━━━━━━━\nTotal: **{len(schedule_list)}**\n\n🗑️ Remove: `/schedule_del Anime Name`"
+    text += f"━━━━━━━━━━━━━━━━━━━━\nTotal: **{len(slist)}**\n\n🗑️ Remove: `/schedule_del Anime Name`"
     await message.reply(text)
 
 
 # ─────────────────────────────────────────────
-#  /schedule_del command
+#  /schedule_del
 # ─────────────────────────────────────────────
 @Client.on_message(filters.command("schedule_del") & filters.private)
 async def cmd_schedule_del(client: Client, message: Message):
@@ -257,16 +580,15 @@ async def cmd_schedule_del(client: Client, message: Message):
         return
 
     parts = message.text.split(None, 1)
-    if len(parts) < 2 or not parts[1].strip():
-        await message.reply("**Usage:** `/schedule_del Anime Name`\nExample: `/schedule_del Witch Hat Atelier`")
+    if len(parts) < 2:
+        await message.reply("**Usage:** `/schedule_del Anime Name`")
         return
 
     anime_name = parts[1].strip()
-    schedule_list = await _get_schedule_list()
+    slist = await _get_schedule_list()
+    new_list = [e for e in slist if _normalize(e.get('anime_name', '')) != _normalize(anime_name)]
 
-    new_list = [e for e in schedule_list if _normalize(e.get('anime_name', '')) != _normalize(anime_name)]
-
-    if len(new_list) == len(schedule_list):
+    if len(new_list) == len(slist):
         await message.reply(f"❌ `{anime_name}` ka koi schedule nahi mila.")
         return
 
