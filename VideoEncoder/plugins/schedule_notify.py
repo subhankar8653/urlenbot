@@ -250,11 +250,10 @@ async def _send_end_messages_to_channel(channel_id: int, anime_name: str):
 # ─────────────────────────────────────────────
 async def cleanup_old_notifications(channel_id: int, anime_name: str):
     """
-    Cleanup (v5 - FINAL):
-      - Channel ke last 3 messages scan karo (newest first)
+    Cleanup (FINAL):
+      - Channel ke last 3 messages scan karo
       - SKIP: video/document | text mein "end" ya "season"
       - Baaki sab DELETE
-      - NOTE: Yeh auto_monitor se pehli quality upload se PEHLE call hoti hai
     """
     try:
         to_delete = []
@@ -270,7 +269,7 @@ async def cleanup_old_notifications(channel_id: int, anime_name: str):
                 continue
             to_delete.append(msg.id)
 
-        LOGGER.info(f"[Cleanup] to_delete={to_delete} | skipped={skipped}")
+        LOGGER.info(f"[Cleanup] to_delete={to_delete} skipped={skipped}")
 
         deleted = 0
         for msg_id in to_delete:
@@ -281,7 +280,7 @@ async def cleanup_old_notifications(channel_id: int, anime_name: str):
             except Exception as e:
                 LOGGER.warning(f"[Cleanup] Could not delete {msg_id}: {e}")
 
-        LOGGER.info(f"[Cleanup] Done: deleted={deleted} skipped={len(skipped)}")
+        LOGGER.info(f"[Cleanup] deleted={deleted} skipped={len(skipped)}")
     except Exception as e:
         LOGGER.error(f"[Cleanup] Failed: {e}")
 

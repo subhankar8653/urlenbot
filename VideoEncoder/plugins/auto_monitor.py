@@ -172,7 +172,7 @@ async def _episode_quality_poller(
     remaining = set(TARGET_QUALITIES)   # jo qualities abhi tak nahi mili
     start_time = time.time()
     attempt = 0
-    _cleanup_done = False   # pehli upload se PEHLE ek baar cleanup
+    _cleanup_done = False   # har attempt mein cleanup — jab bhi new files milein
 
     status_msg = await log_message.reply(
         f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
@@ -241,16 +241,16 @@ async def _episode_quality_poller(
             await asyncio.sleep(POLL_INTERVAL)
             continue
 
-        # Naye files mile — pehli baar upload se PEHLE purane msgs delete karo
+        # Naye files mile — upload se PEHLE channel ke purane msgs delete karo
         if not _cleanup_done:
             _cleanup_done = True
             try:
                 _cfn = _get_cleanup_fn()
                 await _cfn(channel_id, anime_name)
                 LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ Pre-upload cleanup done")
+                await asyncio.sleep(1)
             except Exception as _ce:
                 LOGGER.warning(f"[AutoMonitor] Ep {episode_num}: Cleanup error: {_ce}")
-            await asyncio.sleep(1)
 
         # Swift ki tarah staggered upload
         qualities_found = [_quality_from(os.path.basename(f)) for f in new_files]
