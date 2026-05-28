@@ -250,24 +250,37 @@ async def _send_end_messages_to_channel(channel_id: int, anime_name: str):
 # ─────────────────────────────────────────────
 async def cleanup_old_notifications(channel_id: int, anime_name: str):
     """
-    Cleanup strategy (v3 — Last 3 msgs):
-      1. Channel ke last 3 messages fetch karo (newest first)
-      2. Agar koi message video/document hai → use SKIP karo (kabhi delete nahi)
-      3. Baaki (text/sticker/photo etc.) messages delete kar do
-      4. Redeploy ke baad bhi kaam karta hai (Telegram history se fetch hota hai)
+    Cleanup strategy (v4):
+      - Channel ke last 3 messages fetch karo (newest first)
+      - SKIP conditions (delete nahi karna):
+          1. Video ya document hai
+          2. Text mein "end" ya "season" word hai (case-insensitive)
+      - Baaki sab (text, photo, sticker, etc.) → DELETE
+      - Redeploy ke baad bhi kaam karta hai (Telegram history se live fetch)
     """
     try:
         to_delete = []
+        skipped   = []
 
         async for msg in app.get_chat_history(channel_id, limit=3):
+            # Rule 1: Video / document — kabhi delete nahi
             if msg.video or msg.document:
-                # Video/document hai — skip, kabhi delete nahi
-                LOGGER.info(f"[Cleanup] Skipping video/doc msg {msg.id} in {channel_id}")
+                skipped.append(f"msg {msg.id} [video/doc]")
                 continue
+
+            # Rule 2: Text mein "end" ya "season" hai — skip
+            msg_text = (msg.text or msg.caption or "").lower()
+            if "end" in msg_text or "season" in msg_text:
+                skipped.append(f"msg {msg.id} [end/season text]")
+                continue
+
             to_delete.append(msg.id)
 
+        if skipped:
+            LOGGER.info(f"[Cleanup] Skipped: {', '.join(skipped)}")
+
         if not to_delete:
-            LOGGER.info(f"[Cleanup] Last 3 msgs mein koi deletable message nahi mila for {anime_name}.")
+            LOGGER.info(f"[Cleanup] Last 3 msgs mein koi deletable msg nahi for {anime_name}.")
             return
 
         deleted = 0
@@ -279,7 +292,7 @@ async def cleanup_old_notifications(channel_id: int, anime_name: str):
             except Exception as e:
                 LOGGER.warning(f"[Cleanup] Could not delete msg {msg_id}: {e}")
 
-        LOGGER.info(f"[Cleanup] Deleted {deleted}/3 non-video messages from last 3 msgs in {channel_id}")
+        LOGGER.info(f"[Cleanup] Deleted {deleted} msgs (skipped {len(skipped)}) from last 3 in {channel_id}")
     except Exception as e:
         LOGGER.error(f"[Cleanup] Cleanup failed for channel {channel_id}: {e}")
 
