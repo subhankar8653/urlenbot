@@ -1,5 +1,7 @@
+import asyncio
 import os
 import re
+import subprocess
 import time
 
 from pyrogram import Client
@@ -201,6 +203,24 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
         except Exception:
             pass
 
+    # ── Auto Channel Upload ──
+    # User ke linked channels check karo aur file wahan bhi bhejo
+    if link:
+        try:
+            await _upload_to_user_channels(
+                user_id=message.from_user.id,
+                new_file=new_file,
+                caption=bold_caption,
+                user_message=link,
+                duration=duration,
+                width=width,
+                height=height,
+                filename=new_filename,
+            )
+        except Exception as e:
+            # Channel upload fail ho toh main upload ko affect na kare
+            print(f"[Channel Upload Error] {e}")
+
     return link
 
 
@@ -301,3 +321,212 @@ async def upload_doc(message, msg, c_time, caption, new_file, file_name=None,
                 pass
 
     return resp.link
+
+
+# ─────────────────────────────────────────────
+#  Audio Filter using FFmpeg
+#  Input: file path + "Hindi" ya "Hindi+Tamil" ya "All"
+#  Output: filtered file path (naya file)
+# ─────────────────────────────────────────────
+async def _filter_audio_tracks(input_path: str, languages: str, output_dir: str) -> str:
+    """
+    Specified language tracks hi rakhta hai, baaki remove karta hai.
+    languages = "Hindi" / "Hindi+Tamil" / "All"
+    Returns: output file path (agar filter hua) ya original path (agar All/fail)
+    """
+    if not languages or languages.strip().lower() == "all":
+        return input_path
+
+    # Language name → ISO 639-2 code mapping
+    lang_to_iso = {
+        'hindi': 'hin', 'english': 'eng', 'tamil': 'tam',
+        'telugu': 'tel', 'japanese': 'jpn', 'korean': 'kor',
+        'chinese': 'chi', 'bengali': 'ben', 'marathi': 'mar',
+        # Direct ISO codes bhi accept karo
+        'hin': 'hin', 'eng': 'eng', 'tam': 'tam', 'tel': 'tel',
+        'jpn': 'jpn', 'kor': 'kor', 'chi': 'chi', 'ben': 'ben',
+    }
+
+    iso_to_name = {v: k.capitalize() for k, v in lang_to_iso.items()}
+
+    # Requested languages parse karo
+    req_langs = [l.strip().lower() for l in languages.replace('+', ',').split(',')]
+    req_iso = set()
+    for r in req_langs:
+        if r in lang_to_iso:
+            req_iso.add(lang_to_iso[r])
+
+    if not req_iso:
+        return input_path
+
+    try:
+        # FFprobe se audio streams lo
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', input_path],
+            capture_output=True, text=True, timeout=30
+        )
+        import json
+        data_j = json.loads(result.stdout)
+
+        audio_tracks = []
+        for stream in data_j.get('streams', []):
+            if stream.get('codec_type') == 'audio':
+                tags = stream.get('tags', {})
+                lang_code = tags.get('language', tags.get('LANGUAGE', 'und')).lower().strip()
+                audio_tracks.append({
+                    'index': stream['index'],
+                    'lang': lang_code,
+                })
+
+        if not audio_tracks:
+            return input_path
+
+        # Match karo
+        keep_indices = [t['index'] for t in audio_tracks if t['lang'] in req_iso]
+
+        if not keep_indices:
+            # Koi match nahi mila — pehla track rakho
+            keep_indices = [audio_tracks[0]['index']]
+
+        if len(keep_indices) >= len(audio_tracks):
+            # Sab tracks match kiye — filter karne ki zaroorat nahi
+            return input_path
+
+        # FFmpeg command banao
+        base = os.path.splitext(os.path.basename(input_path))[0]
+        output_path = os.path.join(output_dir, f"ch_filtered_{int(time.time())}_{base}.mkv")
+
+        cmd = ['ffmpeg', '-y', '-i', input_path, '-map', '0:v:0']
+        for idx in keep_indices:
+            cmd.extend(['-map', f'0:{idx}'])
+        cmd.extend(['-map', '0:s?', '-c', 'copy', output_path])
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await proc.communicate()
+
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 1024 * 1024:
+            return output_path
+
+        return input_path
+
+    except Exception as e:
+        print(f"[Audio Filter Error] {e}")
+        return input_path
+
+
+# ─────────────────────────────────────────────
+#  Auto Channel Upload
+#  User ke saare linked channels mein file bhejo
+# ─────────────────────────────────────────────
+async def _upload_to_user_channels(
+    user_id: int,
+    new_file: str,
+    caption: str,
+    user_message,          # upload_to_tg ka return value (message link string)
+    duration: int,
+    width: int,
+    height: int,
+    filename: str,
+):
+    """
+    User ke linked channels mein file upload karo.
+    - No audio filter → Direct forward (fast)
+    - Audio filter hai → FFmpeg filter → Re-upload
+    """
+    channels = await db.get_channels(user_id)
+    if not channels:
+        return
+
+    # File abhi disk pe honi chahiye
+    if not os.path.isfile(new_file):
+        print("[Channel Upload] File not found on disk, skipping.")
+        return
+
+    for ch in channels:
+        channel_id = ch.get('channel_id')
+        languages = ch.get('languages', 'All')
+        channel_title = ch.get('channel_title', str(channel_id))
+
+        if not channel_id:
+            continue
+
+        try:
+            # Custom thumbnail check karo
+            custom_thumb = await db.get_thumbnail(user_id)
+            thumb = None
+            if custom_thumb:
+                thumb = await app.download_media(
+                    custom_thumb,
+                    file_name=os.path.join(download_dir, f"ch_thumb_{int(time.time())}.jpg")
+                )
+            else:
+                thumb = get_thumbnail(new_file, download_dir, duration / 4)
+
+            needs_filter = languages.strip().lower() != 'all'
+
+            if needs_filter:
+                # ── Audio filter lagao aur direct upload karo ──
+                print(f"[Channel Upload] Filtering audio ({languages}) for {channel_title}")
+                filtered_file = await _filter_audio_tracks(
+                    new_file, languages, os.path.dirname(new_file)
+                )
+
+                await app.send_video(
+                    chat_id=channel_id,
+                    video=filtered_file,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    duration=duration,
+                    width=width,
+                    height=height,
+                    file_name=filename,
+                    thumb=thumb,
+                    supports_streaming=True,
+                )
+
+                # Filtered file cleanup karo (original nahi)
+                if filtered_file != new_file and os.path.isfile(filtered_file):
+                    try:
+                        os.remove(filtered_file)
+                    except Exception:
+                        pass
+
+            else:
+                # ── No filter → Log channel se forward karo (fast) ──
+                print(f"[Channel Upload] Forwarding to {channel_title}")
+                try:
+                    # Log channel mein message dhundho aur forward karo
+                    # Pehle direct upload try karo (safe method)
+                    await app.send_video(
+                        chat_id=channel_id,
+                        video=new_file,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
+                        duration=duration,
+                        width=width,
+                        height=height,
+                        file_name=filename,
+                        thumb=thumb,
+                        supports_streaming=True,
+                    )
+                except Exception as e:
+                    print(f"[Channel Upload] Direct upload failed for {channel_title}: {e}")
+
+            # Thumb cleanup
+            if thumb and os.path.isfile(thumb) and 'ch_thumb_' in thumb:
+                try:
+                    os.remove(thumb)
+                except Exception:
+                    pass
+
+            print(f"[Channel Upload] ✅ Done: {channel_title}")
+            await asyncio.sleep(2)  # Flood wait se bachne ke liye
+
+        except (ChannelInvalid, ChannelPrivate, ChatIdInvalid, PeerIdInvalid) as e:
+            print(f"[Channel Upload] ❌ Invalid channel {channel_title}: {e}")
+        except Exception as e:
+            print(f"[Channel Upload] ❌ Error for {channel_title}: {e}")
