@@ -172,7 +172,6 @@ async def _episode_quality_poller(
     remaining = set(TARGET_QUALITIES)   # jo qualities abhi tak nahi mili
     start_time = time.time()
     attempt = 0
-    _cleanup_done = False   # har attempt mein cleanup — jab bhi new files milein
 
     status_msg = await log_message.reply(
         f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
@@ -240,17 +239,6 @@ async def _episode_quality_poller(
             shutil.rmtree(dl_dir, ignore_errors=True)
             await asyncio.sleep(POLL_INTERVAL)
             continue
-
-        # Naye files mile — upload se PEHLE channel ke purane msgs delete karo
-        if not _cleanup_done:
-            _cleanup_done = True
-            try:
-                _cfn = _get_cleanup_fn()
-                await _cfn(channel_id, anime_name)
-                LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ Pre-upload cleanup done")
-                await asyncio.sleep(1)
-            except Exception as _ce:
-                LOGGER.warning(f"[AutoMonitor] Ep {episode_num}: Cleanup error: {_ce}")
 
         # Swift ki tarah staggered upload
         qualities_found = [_quality_from(os.path.basename(f)) for f in new_files]
@@ -519,6 +507,35 @@ async def auto_monitor_handler(client: Client, message: Message):
             f"Swift URL mila! Quality poller shuru...\n"
             f"`{swift_url}`"
         )
+
+        # Swift URL milte hi — purane schedule/end messages channel se delete karo
+        try:
+            _cfn = _get_cleanup_fn()
+            await prep_msg.edit(
+                f"✅ **AutoMonitor** | `{anime_name}` | Ep `{ep_num}`\n\n"
+                f"Swift URL mila! Quality poller shuru...\n"
+                f"`{swift_url}`\n\n"
+                f"🧹 Purane messages delete ho rahe hain..."
+            )
+            deleted_count = await _cfn(channel_id, anime_name)
+            if deleted_count > 0:
+                await prep_msg.edit(
+                    f"✅ **AutoMonitor** | `{anime_name}` | Ep `{ep_num}`\n\n"
+                    f"Swift URL mila! Quality poller shuru...\n"
+                    f"`{swift_url}`\n\n"
+                    f"🧹 Purane messages delete ho rahe hain...\n"
+                    f"✅ {deleted_count} message(s) delete ho gaye!"
+                )
+            else:
+                await prep_msg.edit(
+                    f"✅ **AutoMonitor** | `{anime_name}` | Ep `{ep_num}`\n\n"
+                    f"Swift URL mila! Quality poller shuru...\n"
+                    f"`{swift_url}`\n\n"
+                    f"🧹 Cleanup done — koi purana message nahi tha."
+                )
+            await asyncio.sleep(1)
+        except Exception as _ce:
+            LOGGER.warning(f"[AutoMonitor] Ep {ep_num}: Swift-time cleanup error: {_ce}")
 
         # Quality poller ko background task mein run karo
         # (taki agli episode ke liye wait na karo)

@@ -248,12 +248,13 @@ async def _send_end_messages_to_channel(channel_id: int, anime_name: str):
 #  Cleanup — last 15 msgs mein se schedule/end msgs delete karo
 #  (videos/documents nahi — sirf text/sticker messages)
 # ─────────────────────────────────────────────
-async def cleanup_old_notifications(channel_id: int, anime_name: str):
+async def cleanup_old_notifications(channel_id: int, anime_name: str) -> int:
     """
     Cleanup (FINAL):
       - Channel ke last 3 messages scan karo
       - SKIP: video/document | text mein "end" ya "season"
       - Baaki sab DELETE
+      - Returns: deleted count
     """
     try:
         to_delete = []
@@ -281,8 +282,10 @@ async def cleanup_old_notifications(channel_id: int, anime_name: str):
                 LOGGER.warning(f"[Cleanup] Could not delete {msg_id}: {e}")
 
         LOGGER.info(f"[Cleanup] deleted={deleted} skipped={len(skipped)}")
+        return deleted
     except Exception as e:
         LOGGER.error(f"[Cleanup] Failed: {e}")
+        return 0
 
 
 # ─────────────────────────────────────────────
