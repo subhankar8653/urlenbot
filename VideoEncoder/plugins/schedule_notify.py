@@ -131,22 +131,68 @@ async def _delete_end_messages_db(anime_name: str):
 
 
 # ─────────────────────────────────────────────
+#  Button serializer helper
+# ─────────────────────────────────────────────
+def _serialize_buttons(msg: Message) -> list | None:
+    """
+    Message ke inline keyboard buttons serialize karo.
+    List of rows → har row list of {text, url/callback_data}
+    """
+    if not msg.reply_markup:
+        return None
+    try:
+        rows = []
+        for row in msg.reply_markup.inline_keyboard:
+            btn_row = []
+            for btn in row:
+                b = {'text': btn.text}
+                if btn.url:
+                    b['url'] = btn.url
+                elif btn.callback_data:
+                    b['callback_data'] = btn.callback_data
+                btn_row.append(b)
+            rows.append(btn_row)
+        return rows if rows else None
+    except Exception:
+        return None
+
+
+def _deserialize_buttons(rows: list):
+    """Saved button rows se InlineKeyboardMarkup banao."""
+    from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    kb_rows = []
+    for row in rows:
+        kb_row = []
+        for b in row:
+            if 'url' in b:
+                kb_row.append(InlineKeyboardButton(b['text'], url=b['url']))
+            elif 'callback_data' in b:
+                kb_row.append(InlineKeyboardButton(b['text'], callback_data=b['callback_data']))
+            else:
+                kb_row.append(InlineKeyboardButton(b['text'], callback_data='noop'))
+        kb_rows.append(kb_row)
+    return InlineKeyboardMarkup(kb_rows)
+
+
+# ─────────────────────────────────────────────
 #  Message serializer — save karte waqt
-#  Strategy: SABHI messages ko copy_message reference se save karo
-#  Isse links, buttons, formatting sab preserve hote hain
 # ─────────────────────────────────────────────
 def _serialize_message(msg: Message) -> dict | None:
     """
-    Sabhi messages ko copy_message reference ke roop mein save karo.
-    chat_id + message_id store karo — send karte waqt copy_message use hoga.
-    Isse inline buttons, hyperlinks, formatting sab perfectly preserve hoti hai.
+    Message ko saveable dict mein convert karo.
+    chat_id + message_id + buttons (agar hain) save karo.
+    Send karte waqt copy_message + reply_markup use hoga.
     """
-    # Har message type ke liye copy_message reference save karo
-    return {
+    item = {
         'type': 'copy_ref',
         'from_chat_id': msg.chat.id,
         'message_id': msg.id,
     }
+    # Buttons separately serialize karo — copy_message buttons preserve nahi karta
+    buttons = _serialize_buttons(msg)
+    if buttons:
+        item['buttons'] = buttons
+    return item
 
 
 # ─────────────────────────────────────────────
@@ -166,11 +212,15 @@ async def _send_end_messages_to_channel(channel_id: int, anime_name: str):
             msg_type = item.get('type')
 
             if msg_type in ('copy_ref', 'forward'):
-                # copy_message — links, buttons, formatting sab preserve hota hai
+                # Saved buttons agar hain toh manually attach karo
+                reply_markup = None
+                if item.get('buttons'):
+                    reply_markup = _deserialize_buttons(item['buttons'])
                 await app.copy_message(
                     chat_id=channel_id,
                     from_chat_id=item['from_chat_id'],
-                    message_id=item['message_id']
+                    message_id=item['message_id'],
+                    reply_markup=reply_markup,
                 )
             elif msg_type == 'sticker':
                 # Sticker copy_message se nahi hota — file_id se bhejo
@@ -459,10 +509,14 @@ async def cmd_end_message_preview(client: Client, message: Message):
             elif msg_type == 'document':
                 await app.send_document(message.chat.id, item['file_id'], caption=item.get('caption', ''))
             elif msg_type in ('copy_ref', 'forward'):
+                reply_markup = None
+                if item.get('buttons'):
+                    reply_markup = _deserialize_buttons(item['buttons'])
                 await app.copy_message(
                     chat_id=message.chat.id,
                     from_chat_id=item['from_chat_id'],
-                    message_id=item['message_id']
+                    message_id=item['message_id'],
+                    reply_markup=reply_markup,
                 )
             await asyncio.sleep(0.5)
         except Exception as e:
