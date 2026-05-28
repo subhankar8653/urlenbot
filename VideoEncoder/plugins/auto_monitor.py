@@ -57,6 +57,10 @@ def _get_schedule_fn():
     from .schedule_notify import send_schedule_notification
     return send_schedule_notification
 
+def _get_cleanup_fn():
+    from .schedule_notify import cleanup_old_notifications
+    return cleanup_old_notifications
+
 # ─────────────────────────────────────────────
 #  Constants
 # ─────────────────────────────────────────────
@@ -482,6 +486,15 @@ async def auto_monitor_handler(client: Client, message: Message):
     total = end_ep - start_ep + 1
 
     for i, ep_num in enumerate(range(start_ep, end_ep + 1), 1):
+
+        # Pehle episode ke liye — purane notifications delete karo (upload se PEHLE)
+        if i == 1:
+            try:
+                cleanup_old_notifications = _get_cleanup_fn()
+                await cleanup_old_notifications(channel_id, anime_name)
+                LOGGER.info(f"[AutoMonitor] Pre-upload cleanup done for {anime_name}")
+            except Exception as e:
+                LOGGER.warning(f"[AutoMonitor] Pre-upload cleanup error: {e}")
 
         # Swift URL nikalo
         prep_msg = await message.reply(
