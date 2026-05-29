@@ -954,7 +954,7 @@ async def cmd_end_message_del(client: Client, message: Message):
 # ─────────────────────────────────────────────
 #  /update_channel — broadcast channel add karo
 # ─────────────────────────────────────────────
-@Client.on_message(filters.command("update_channel") & filters.private)
+@Client.on_message(filters.command("update_channel") & (filters.private | filters.group))
 async def cmd_update_channel(client: Client, message: Message):
     """
     /update_channel [channel_id]
@@ -1021,7 +1021,7 @@ async def cmd_update_channel(client: Client, message: Message):
     )
 
 
-@Client.on_message(filters.command("update_channel_list") & filters.private)
+@Client.on_message(filters.command("update_channel_list") & (filters.private | filters.group))
 async def cmd_update_channel_list(client: Client, message: Message):
     if not _is_authorized(message.from_user.id):
         return
@@ -1047,7 +1047,7 @@ async def cmd_update_channel_list(client: Client, message: Message):
     await message.reply(text)
 
 
-@Client.on_message(filters.command("update_channel_del") & filters.private)
+@Client.on_message(filters.command("update_channel_del") & (filters.private | filters.group))
 async def cmd_update_channel_del(client: Client, message: Message):
     if not _is_authorized(message.from_user.id):
         return
@@ -1145,12 +1145,15 @@ async def send_broadcast_to_update_channels(
         season = _detect_season(caption)
 
     # ── Message build karo ──
+    SEP = "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     lines = []
-    lines.append(f"**🔰 {anime_name}**")
+    lines.append(SEP)
     if hashtag:
-        lines.append(f"**{hashtag}**")
+        lines.append(f"**🔰{anime_name} {hashtag}**")
+    else:
+        lines.append(f"**🔰{anime_name}**")
     lines.append("")
-    lines.append(f"**📍Season {season:02d} Episode {episode_num:02d} Added...!**")
+    lines.append(f"**⚡Season {season:02d} Episode {episode_num:02d} Added...!**")
 
     if channel_link:
         watch_line = f"**[📌𝙒𝘼𝙏𝘾𝙃 & 𝘿𝙊𝙒𝙉𝙇𝙊𝘼𝘿📌]({channel_link})**"
