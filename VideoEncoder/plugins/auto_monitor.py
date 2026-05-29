@@ -36,7 +36,7 @@ import time
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-from .. import LOGGER, app, owner, sudo_users, download_dir
+from .. import LOGGER, app, owner, sudo_users, download_dir, api_id, api_hash
 from ..utils.database.access_db import db
 
 # ─────────────────────────────────────────────
@@ -163,6 +163,76 @@ def _extract_url(text: str) -> str | None:
 #  Sab mil gaye → done.
 #  30 min baad bhi jo nahi mila → failure notice.
 # ─────────────────────────────────────────────
+async def _delete_3_before_upload(
+    channel_id: int,
+    uploaded_msg_id: int,
+    user_session: str | None = None,
+):
+    """
+    Uploaded file ke message_id se pehle ke messages scan karo.
+    - Jo messages uploaded_msg_id se pehle hain unhe check karo
+    - Video wale messages SKIP karo
+    - Baaki (text, sticker, animation, photo, document, audio) mein se
+      pehle 3 delete karo
+    - user_session diya → user account se delete (purane msgs bhi)
+    - user_session nahi → bot se delete
+    """
+    user_client = None
+    if user_session:
+        try:
+            from pyrogram import Client as _Client
+            user_client = _Client(
+                "del3_user",
+                session_string=user_session,
+                api_id=api_id,
+                api_hash=api_hash,
+                in_memory=True,
+            )
+            await user_client.connect()
+        except Exception as ue:
+            LOGGER.warning(f"[Del3] User client failed: {ue}")
+            user_client = None
+
+    scan_client   = user_client if user_client else app
+    delete_client = user_client if user_client else app
+
+    try:
+        to_delete = []
+
+        async for msg in scan_client.get_chat_history(channel_id, limit=100):
+            # Sirf uploaded_msg_id se pehle ke messages
+            if msg.id >= uploaded_msg_id:
+                continue
+            # 3 mil gaye — band karo
+            if len(to_delete) >= 3:
+                break
+
+            # Video wala message? SKIP — delete nahi karna
+            if msg.video:
+                LOGGER.info(f"[Del3] msg {msg.id} → SKIP (video)")
+                continue
+
+            to_delete.append(msg.id)
+            LOGGER.info(f"[Del3] msg {msg.id} → DELETE")
+
+        for msg_id in to_delete:
+            try:
+                await delete_client.delete_messages(channel_id, msg_id)
+                LOGGER.info(f"[Del3] Deleted msg_id={msg_id}")
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                LOGGER.warning(f"[Del3] Could not delete {msg_id}: {e}")
+
+    except Exception as e:
+        LOGGER.error(f"[Del3] Failed: {e}")
+    finally:
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
+
+
 async def _episode_quality_poller(
     client: Client,
     log_message: Message,   # log channel ya trigger message — status updates ke liye
@@ -330,21 +400,28 @@ async def _episode_quality_poller(
             except Exception:
                 pass
 
-            # ── Pehli quality upload hote hi turant broadcast bhejo ──
-            if success:
+            if success and sent_msg:
+                uploaded_msg_id = sent_msg.id
+
+                # ── Upload ke turant baad: pehle ke 3 non-video msgs delete karo ──
+                try:
+                    _owner_doc = await db._get_user(owner_id)
+                    _user_session = _owner_doc.get("user_session", None)
+                    await _delete_3_before_upload(
+                        channel_id=channel_id,
+                        uploaded_msg_id=uploaded_msg_id,
+                        user_session=_user_session,
+                    )
+                except Exception as _de:
+                    LOGGER.warning(f"[AutoMonitor] Pre-upload delete error: {_de}")
+
+                # ── Pehli quality upload hote hi turant broadcast bhejo ──
                 async with _broadcast_lock:
                     if not broadcast_sent:
                         broadcast_sent = True
                         try:
                             from .schedule_notify import send_broadcast_to_update_channels
-                            _caption = ""
-                            try:
-                                async for _msg in client.get_chat_history(channel_id, limit=3):
-                                    if _msg.caption:
-                                        _caption = _msg.caption
-                                        break
-                            except Exception:
-                                pass
+                            _caption = sent_msg.caption or ""
                             await send_broadcast_to_update_channels(
                                 anime_name=anime_name,
                                 episode_num=episode_num,
