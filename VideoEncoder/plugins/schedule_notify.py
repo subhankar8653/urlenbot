@@ -532,26 +532,102 @@ async def cmd_end_message(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────
-#  Recording mode — messages capture karo
+#  Unified capture handler
+#  Broadcast state + Recording state dono yahan handle hote hain.
+#  Do alag handlers same filter pe register karne se Pyrogram conflict
+#  karta hai — isliye ek hi handler mein merge kiya.
 # ─────────────────────────────────────────────
 @Client.on_message(
     filters.private &
     ~filters.command(["done", "cancel_end", "end_message", "schedule",
                       "schedule_list", "schedule_del", "end_message_preview",
                       "end_message_del", "update_channel", "update_channel_list",
-                      "update_channel_del", "broadcast_message"])
+                      "update_channel_del", "broadcast_message", "cancel_broadcast",
+                      "confirm_broadcast"])
 )
-async def capture_end_message(client: Client, message: Message):
-    """Agar user recording mode mein hai toh messages capture karo."""
+async def capture_any_state(client: Client, message: Message):
+    """Pehle broadcast state check karo, phir recording state."""
     user_id = message.from_user.id
-    if user_id not in _recording_state:
-        return
     if not _is_authorized(user_id):
+        return
+
+    # ── Priority 1: Broadcast state ──
+    if user_id in _broadcast_state:
+        state = _broadcast_state[user_id]
+        text = (message.text or "").strip()
+
+        if state['step'] == 'name':
+            if not text:
+                await message.reply("⚠️ Anime ka naam bhejo!")
+                return
+            state['anime_name'] = text
+            state['step'] = 'hashtag'
+            await message.reply(
+                f"✅ Anime: **{text}**\n\n"
+                f"**Step 2/3** — Hashtag bhejo (ya `skip` likho):\n\n"
+                f"_Example: #official\\_hindi\\_dub_"
+            )
+
+        elif state['step'] == 'hashtag':
+            if text.lower() == 'skip':
+                state['hashtag'] = ''
+            else:
+                state['hashtag'] = text if text.startswith('#') else f"#{text}"
+            state['step'] = 'link'
+            hashtag_info = f"Hashtag: **{state['hashtag']}**\n\n" if state['hashtag'] else "Hashtag: _skipped_\n\n"
+            await message.reply(
+                f"✅ {hashtag_info}"
+                f"**Step 3/3** — Channel ka link bhejo:\n\n"
+                f"_Example: https://t.me/yourchannel_"
+            )
+
+        elif state['step'] == 'link':
+            if not text.startswith('http'):
+                await message.reply("⚠️ Valid channel link bhejo! (https://t.me/...)")
+                return
+            channel_link = text
+            anime_name   = state['anime_name']
+            hashtag      = state['hashtag']
+            _broadcast_state.pop(user_id)
+
+            preview_lines = [f"**🔰 {anime_name}**"]
+            if hashtag:
+                preview_lines.append(f"**{hashtag}**")
+            preview_lines.append("")
+            preview_lines.append("**📍Season XX Episode XX Added...!**")
+            watch_line = f"**[📌𝙒𝘼𝙏𝘾𝙃 & 𝘿𝙊𝙒𝙉𝙇𝙊𝘼𝘿📌]({channel_link})**"
+            preview_lines.append(watch_line)
+            preview_lines.append(watch_line)
+
+            channels = await _get_update_channels()
+            _broadcast_state[user_id] = {
+                'step': 'confirm',
+                'anime_name': anime_name,
+                'hashtag': hashtag,
+                'channel_link': channel_link,
+            }
+            await message.reply(
+                f"📋 **Broadcast Preview:**\n\n"
+                f"{'━' * 20}\n"
+                f"{chr(10).join(preview_lines)}\n"
+                f"{'━' * 20}\n\n"
+                f"📢 **{len(channels)}** update channels pe broadcast hoga.\n\n"
+                f"✅ Bhejne ke liye: `/confirm_broadcast`\n"
+                f"❌ Cancel: `/cancel_broadcast`",
+                disable_web_page_preview=True,
+            )
+
+        elif state['step'] == 'confirm':
+            await message.reply("✅ `/confirm_broadcast` bhejo ya ❌ `/cancel_broadcast`")
+
+        return  # broadcast handle ho gaya
+
+    # ── Priority 2: End message recording state ──
+    if user_id not in _recording_state:
         return
 
     state = _recording_state[user_id]
 
-    # Sticker ko alag se handle karo
     if message.sticker:
         item = {'type': 'sticker', 'file_id': message.sticker.file_id}
         state['messages'].append(item)
@@ -1072,100 +1148,6 @@ async def cmd_cancel_broadcast(client: Client, message: Message):
     await message.reply("❌ Broadcast cancelled.")
 
 
-@Client.on_message(
-    filters.private &
-    ~filters.command(["done", "cancel_end", "end_message", "schedule",
-                      "schedule_list", "schedule_del", "end_message_preview",
-                      "end_message_del", "update_channel", "update_channel_list",
-                      "update_channel_del", "broadcast_message", "cancel_broadcast"])
-)
-async def capture_broadcast(client: Client, message: Message):
-    """Broadcast conversation state machine."""
-    user_id = message.from_user.id
-    if user_id not in _broadcast_state:
-        return
-    if not _is_authorized(user_id):
-        return
-
-    state = _broadcast_state[user_id]
-    text = (message.text or "").strip()
-
-    # ── Step 1: Anime name ──
-    if state['step'] == 'name':
-        if not text:
-            await message.reply("⚠️ Anime ka naam bhejo!")
-            return
-        state['anime_name'] = text
-        state['step'] = 'hashtag'
-        await message.reply(
-            f"✅ Anime: **{text}**\n\n"
-            f"**Step 2/3** — Hashtag bhejo (ya `skip` likho):\n\n"
-            f"_Example: #official\\_hindi\\_dub_"
-        )
-
-    # ── Step 2: Hashtag ──
-    elif state['step'] == 'hashtag':
-        if text.lower() == 'skip':
-            state['hashtag'] = ''
-        else:
-            state['hashtag'] = text if text.startswith('#') else f"#{text}"
-        state['step'] = 'link'
-        hashtag_info = f"Hashtag: **{state['hashtag']}**\n\n" if state['hashtag'] else "Hashtag: _skipped_\n\n"
-        await message.reply(
-            f"✅ {hashtag_info}"
-            f"**Step 3/3** — Channel ka link bhejo:\n\n"
-            f"_Example: https://t.me/yourchannel_"
-        )
-
-    # ── Step 3: Channel link ──
-    elif state['step'] == 'link':
-        if not text.startswith('http'):
-            await message.reply("⚠️ Valid channel link bhejo! (https://t.me/...)")
-            return
-
-        channel_link = text
-        anime_name   = state['anime_name']
-        hashtag      = state['hashtag']
-        _broadcast_state.pop(user_id)
-
-        # Episode info ke liye update channels se info nahi milegi (manual broadcast hai)
-        # Season/Episode default 01/01 — user manually season/ep set kar sakta hai
-        # Ya auto_monitor se call hoga tab woh pass karega
-        # For manual: preview dikhao aur confirm lo
-        preview_lines = [f"**🔰 {anime_name}**"]
-        if hashtag:
-            preview_lines.append(f"**{hashtag}**")
-        preview_lines.append("")
-        preview_lines.append(f"**📍Season XX Episode XX Added...!**")
-        watch_line = f"**[📌𝙒𝘼𝙏𝘾𝙃 & 𝘿𝙊𝙒𝙉𝙇𝙊𝘼𝘿📌]({channel_link})**"
-        preview_lines.append(watch_line)
-        preview_lines.append(watch_line)
-
-        channels = await _get_update_channels()
-        ch_count = len(channels)
-
-        # State mein save karo confirm ke liye
-        _broadcast_state[user_id] = {
-            'step': 'confirm',
-            'anime_name': anime_name,
-            'hashtag': hashtag,
-            'channel_link': channel_link,
-        }
-
-        await message.reply(
-            f"📋 **Broadcast Preview:**\n\n"
-            f"{'━' * 20}\n"
-            f"{chr(10).join(preview_lines)}\n"
-            f"{'━' * 20}\n\n"
-            f"📢 **{ch_count}** update channels pe broadcast hoga.\n\n"
-            f"✅ Bhejne ke liye: `/confirm_broadcast`\n"
-            f"❌ Cancel: `/cancel_broadcast`",
-            disable_web_page_preview=True,
-        )
-
-    # ── Step confirm ──
-    elif state['step'] == 'confirm':
-        await message.reply("✅ `/confirm_broadcast` bhejo ya ❌ `/cancel_broadcast`")
 
 
 @Client.on_message(filters.command("confirm_broadcast") & filters.private)
@@ -1186,15 +1168,10 @@ async def cmd_confirm_broadcast(client: Client, message: Message):
 
     prog = await message.reply(f"📣 Broadcasting to {len(channels)} channels...")
 
-    # Manual broadcast mein season/ep nahi pata — Season 00 Episode 00 placeholder
-    # Best approach: user se nahi puchte, generic format mein bhejte hain
-    # Actual episode info auto_monitor se aayegi jab automatic broadcast hogi
     anime_name   = state['anime_name']
     hashtag      = state['hashtag']
     channel_link = state['channel_link']
 
-    # Manual broadcast — season/ep user ne specify nahi kiya
-    # Toh directly custom message bhejo (bina season/ep ke)
     lines = [f"**🔰 {anime_name}**"]
     if hashtag:
         lines.append(f"**{hashtag}**")
