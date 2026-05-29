@@ -566,10 +566,13 @@ async def auto_monitor_handler(client: Client, message: Message):
         except Exception as _ce:
             LOGGER.warning(f"[AutoMonitor] Ep {ep_num}: Swift-time cleanup error: {_ce}")
 
-        # Episode fully complete hone ke baad hi agli episode shuru karo (sequential)
-        await _episode_quality_poller(
-            client, message, swift_url,
-            ep_num, anime_name, channel_id, oid
+        # Quality poller ko background task mein run karo
+        # (taki agli episode ke liye wait na karo)
+        asyncio.create_task(
+            _episode_quality_poller(
+                client, message, swift_url,
+                ep_num, anime_name, channel_id, oid
+            )
         )
 
         # Episodes ke beech thoda gap
