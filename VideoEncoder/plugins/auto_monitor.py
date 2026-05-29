@@ -36,7 +36,7 @@ import time
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-from .. import LOGGER, app, owner, sudo_users, download_dir, api_id, api_hash
+from .. import LOGGER, app, owner, sudo_users, download_dir
 from ..utils.database.access_db import db
 
 # ─────────────────────────────────────────────
@@ -128,22 +128,21 @@ def _find_matching_anime(text: str, anime_list: list) -> dict | None:
 
 
 def _extract_episodes(text: str) -> tuple[int, int] | None:
-    # "Episode 34-36" / "Ep 34 - 36" / "EPISODE 4-13 + ZIP PACK ADDED!"
-    # Priority 1: explicit Episode/Ep keyword with range
-    m = re.search(r'(?i)episodes?\s*(\d+)\s*[-–]\s*(\d+)', text)
+    # "EPISODE 4-13 + ZIP PACK ADDED!" / "Episode 34-36" / "Ep 34 - 36"
+    m = re.search(r'(?i)episodes?\s*(\d+)\s*[-\u2013]\s*(\d+)', text)
     if m:
         return int(m.group(1)), int(m.group(2))
-    # Priority 2: Ep/Episode + to range
-    m = re.search(r'[Ee]p(?:isode)?[Ss]?\s*(\d+)\s*(?:[-–to]+)\s*(\d+)', text)
+    # Ep/Episode + to range
+    m = re.search(r'[Ee]p(?:isode)?\s*(\d+)\s*[-\u2013to]+\s*(\d+)', text)
     if m:
         return int(m.group(1)), int(m.group(2))
-    # Priority 3: Single "Episode 5"
-    m = re.search(r'[Ee]p(?:isode)?[Ss]?\s*(\d+)', text)
+    # Single "Episode 5"
+    m = re.search(r'[Ee]p(?:isode)?\s*(\d+)', text)
     if m:
         ep = int(m.group(1))
         return ep, ep
-    # Priority 4: "34-36 Added" or "34-36 + ZIP PACK ADDED"
-    m = re.search(r'(\d+)\s*[-–]\s*(\d+)\s*(?:[+]|\s)[^\n]*[Aa]dded', text)
+    # "34-36 Added" / "34-36 + ZIP PACK ADDED"
+    m = re.search(r'(\d+)\s*[-\u2013]\s*(\d+)[^\n]*[Aa]dded', text)
     if m:
         return int(m.group(1)), int(m.group(2))
     return None
@@ -163,76 +162,6 @@ def _extract_url(text: str) -> str | None:
 #  Sab mil gaye → done.
 #  30 min baad bhi jo nahi mila → failure notice.
 # ─────────────────────────────────────────────
-async def _delete_3_before_upload(
-    channel_id: int,
-    uploaded_msg_id: int,
-    user_session: str | None = None,
-):
-    """
-    Uploaded file ke message_id se pehle ke messages scan karo.
-    - Jo messages uploaded_msg_id se pehle hain unhe check karo
-    - Video wale messages SKIP karo
-    - Baaki (text, sticker, animation, photo, document, audio) mein se
-      pehle 3 delete karo
-    - user_session diya → user account se delete (purane msgs bhi)
-    - user_session nahi → bot se delete
-    """
-    user_client = None
-    if user_session:
-        try:
-            from pyrogram import Client as _Client
-            user_client = _Client(
-                "del3_user",
-                session_string=user_session,
-                api_id=api_id,
-                api_hash=api_hash,
-                in_memory=True,
-            )
-            await user_client.connect()
-        except Exception as ue:
-            LOGGER.warning(f"[Del3] User client failed: {ue}")
-            user_client = None
-
-    scan_client   = user_client if user_client else app
-    delete_client = user_client if user_client else app
-
-    try:
-        to_delete = []
-
-        async for msg in scan_client.get_chat_history(channel_id, limit=100):
-            # Sirf uploaded_msg_id se pehle ke messages
-            if msg.id >= uploaded_msg_id:
-                continue
-            # 3 mil gaye — band karo
-            if len(to_delete) >= 3:
-                break
-
-            # Video wala message? SKIP — delete nahi karna
-            if msg.video:
-                LOGGER.info(f"[Del3] msg {msg.id} → SKIP (video)")
-                continue
-
-            to_delete.append(msg.id)
-            LOGGER.info(f"[Del3] msg {msg.id} → DELETE")
-
-        for msg_id in to_delete:
-            try:
-                await delete_client.delete_messages(channel_id, msg_id)
-                LOGGER.info(f"[Del3] Deleted msg_id={msg_id}")
-                await asyncio.sleep(0.3)
-            except Exception as e:
-                LOGGER.warning(f"[Del3] Could not delete {msg_id}: {e}")
-
-    except Exception as e:
-        LOGGER.error(f"[Del3] Failed: {e}")
-    finally:
-        if user_client:
-            try:
-                await user_client.disconnect()
-            except Exception:
-                pass
-
-
 async def _episode_quality_poller(
     client: Client,
     log_message: Message,   # log channel ya trigger message — status updates ke liye
@@ -383,7 +312,6 @@ async def _episode_quality_poller(
         # channel_id pass karo taaki seedha anime channel pe upload ho
         proxy_msg = _ProxyMsg(log_message, owner_id, channel_id)
 
-        # Broadcast sirf ek baar bheja jayega — pehli quality upload hote hi
         _broadcast_lock = asyncio.Lock()
 
         async def _upload_task(filepath, idx):
@@ -403,17 +331,28 @@ async def _episode_quality_poller(
             if success and sent_msg:
                 uploaded_msg_id = sent_msg.id
 
-                # ── Upload ke turant baad: pehle ke 3 non-video msgs delete karo ──
+                # ── Quality upload hote hi: pehle ke 3 non-video msgs delete karo ──
                 try:
-                    _owner_doc = await db._get_user(owner_id)
-                    _user_session = _owner_doc.get("user_session", None)
-                    await _delete_3_before_upload(
-                        channel_id=channel_id,
-                        uploaded_msg_id=uploaded_msg_id,
-                        user_session=_user_session,
-                    )
-                except Exception as _de:
-                    LOGGER.warning(f"[AutoMonitor] Pre-upload delete error: {_de}")
+                    to_delete = []
+                    async for msg in app.get_chat_history(channel_id, limit=100):
+                        if msg.id >= uploaded_msg_id:
+                            continue
+                        if len(to_delete) >= 3:
+                            break
+                        if msg.video:
+                            LOGGER.info(f"[Del3] msg {msg.id} → SKIP (video)")
+                            continue
+                        to_delete.append(msg.id)
+
+                    for mid in to_delete:
+                        try:
+                            await app.delete_messages(channel_id, mid)
+                            LOGGER.info(f"[Del3] Deleted msg_id={mid}")
+                            await asyncio.sleep(0.3)
+                        except Exception as de:
+                            LOGGER.warning(f"[Del3] Could not delete {mid}: {de}")
+                except Exception as de:
+                    LOGGER.warning(f"[Del3] Delete-3 error: {de}")
 
                 # ── Pehli quality upload hote hi turant broadcast bhejo ──
                 async with _broadcast_lock:
@@ -427,7 +366,7 @@ async def _episode_quality_poller(
                                 episode_num=episode_num,
                                 caption=_caption,
                             )
-                            LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ Broadcast sent immediately after first upload ({quality})")
+                            LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ Broadcast sent after {quality} upload")
                         except Exception as _be:
                             LOGGER.error(f"[AutoMonitor] Broadcast error: {_be}")
 
@@ -652,7 +591,7 @@ async def auto_monitor_handler(client: Client, message: Message):
         except Exception as _ce:
             LOGGER.warning(f"[AutoMonitor] Ep {ep_num}: Swift-time cleanup error: {_ce}")
 
-        # Pehle episode fully complete karo, tab hi agli episode shuru karo (sequential)
+        # Episode fully complete hone ke baad hi agli episode shuru karo (sequential)
         await _episode_quality_poller(
             client, message, swift_url,
             ep_num, anime_name, channel_id, oid

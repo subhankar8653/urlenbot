@@ -515,7 +515,7 @@ async def send_schedule_notification(
 
     await asyncio.sleep(0.5)
 
-    # Step 3: End messages bhejo — last episode pe bhi bhejo (END ke baad aata hai)
+    # Step 3: End messages bhejo
     await _send_end_messages_to_channel(channel_id, channel_key)
 
 
