@@ -332,7 +332,6 @@ async def _episode_quality_poller(
         )
 
         # Successfully uploaded qualities ko remaining se hata do
-        low_quality_uploaded = False
         for r in results:
             if isinstance(r, Exception):
                 LOGGER.error(f"[AutoMonitor] Upload task error: {r}")
@@ -341,12 +340,9 @@ async def _episode_quality_poller(
             if success:
                 remaining.discard(quality)
                 LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ {quality} uploaded!")
-                # Broadcast sirf tab — jab 360p ya 480p upload ho
-                if quality in ("360p", "480p"):
-                    low_quality_uploaded = True
 
-        # ── Broadcast sirf 360p/480p upload hone ke baad (sirf ek baar) ──
-        if not broadcast_sent and low_quality_uploaded:
+        # ── Pehle successful upload ke baad broadcast bhejo (sirf ek baar) ──
+        if not broadcast_sent and len(remaining) < len(TARGET_QUALITIES):
             broadcast_sent = True
             try:
                 from .schedule_notify import send_broadcast_to_update_channels
