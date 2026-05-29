@@ -66,7 +66,7 @@ def _get_cleanup_fn():
 # ─────────────────────────────────────────────
 POLL_INTERVAL    = 60          # seconds — har retry ke beech gap
 MAX_POLL_TIME    = 30 * 60     # 30 minutes max
-TARGET_QUALITIES = ["360p", "480p", "720p", "1080p"]   # inhe dhundna hai
+TARGET_QUALITIES = ["360p", "720p", "1080p"]   # inhe dhundna hai
 
 # ─────────────────────────────────────────────
 #  DB Helpers — owner ke user doc mein store hota hai
@@ -341,39 +341,28 @@ async def _episode_quality_poller(
                 remaining.discard(quality)
                 LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ {quality} uploaded!")
 
-        # ── 360p/480p upload ke baad broadcast bhejo (sirf ek baar) ──
-        if not broadcast_sent:
-            # Check karo koi low quality (360p ya 480p) abhi successfully upload hua kya
-            low_quality_uploaded = False
-            for r in results:
-                if isinstance(r, Exception):
-                    continue
-                success, sent_msg, quality = r
-                if success and quality in ("360p", "480p"):
-                    low_quality_uploaded = True
-                    break
-
-            if low_quality_uploaded:
-                broadcast_sent = True
+        # ── Pehle successful upload ke baad broadcast bhejo (sirf ek baar) ──
+        if not broadcast_sent and len(remaining) < len(TARGET_QUALITIES):
+            broadcast_sent = True
+            try:
+                from .schedule_notify import send_broadcast_to_update_channels
+                # Caption fetch karo abhi uploaded message se (season detect ke liye)
+                _caption = ""
                 try:
-                    from .schedule_notify import send_broadcast_to_update_channels
-                    # Caption fetch karo abhi uploaded message se (season detect ke liye)
-                    _caption = ""
-                    try:
-                        async for _msg in client.get_chat_history(channel_id, limit=3):
-                            if _msg.caption:
-                                _caption = _msg.caption
-                                break
-                    except Exception:
-                        pass
-                    await send_broadcast_to_update_channels(
-                        anime_name=anime_name,
-                        episode_num=episode_num,
-                        caption=_caption,
-                    )
-                    LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Broadcast sent after 360p/480p upload")
-                except Exception as _be:
-                    LOGGER.error(f"[AutoMonitor] Broadcast error: {_be}")
+                    async for _msg in client.get_chat_history(channel_id, limit=3):
+                        if _msg.caption:
+                            _caption = _msg.caption
+                            break
+                except Exception:
+                    pass
+                await send_broadcast_to_update_channels(
+                    anime_name=anime_name,
+                    episode_num=episode_num,
+                    caption=_caption,
+                )
+                LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Broadcast sent after first upload")
+            except Exception as _be:
+                LOGGER.error(f"[AutoMonitor] Broadcast error: {_be}")
 
         # Cleanup
         shutil.rmtree(dl_dir, ignore_errors=True)
