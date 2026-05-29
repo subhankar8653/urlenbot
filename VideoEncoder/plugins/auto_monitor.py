@@ -329,31 +329,6 @@ async def _episode_quality_poller(
                 pass
 
             if success and sent_msg:
-                uploaded_msg_id = sent_msg.id
-
-                # ── Quality upload hote hi: pehle ke 3 non-video msgs delete karo ──
-                try:
-                    to_delete = []
-                    async for msg in app.get_chat_history(channel_id, limit=100):
-                        if msg.id >= uploaded_msg_id:
-                            continue
-                        if len(to_delete) >= 3:
-                            break
-                        if msg.video:
-                            LOGGER.info(f"[Del3] msg {msg.id} → SKIP (video)")
-                            continue
-                        to_delete.append(msg.id)
-
-                    for mid in to_delete:
-                        try:
-                            await app.delete_messages(channel_id, mid)
-                            LOGGER.info(f"[Del3] Deleted msg_id={mid}")
-                            await asyncio.sleep(0.3)
-                        except Exception as de:
-                            LOGGER.warning(f"[Del3] Could not delete {mid}: {de}")
-                except Exception as de:
-                    LOGGER.warning(f"[Del3] Delete-3 error: {de}")
-
                 # ── Pehli quality upload hote hi turant broadcast bhejo ──
                 async with _broadcast_lock:
                     if not broadcast_sent:
