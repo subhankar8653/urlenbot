@@ -404,12 +404,6 @@ async def cleanup_old_notifications(
 
         LOGGER.info(f"[Cleanup-DEBUG] Channel {channel_id} ke messages scan shuru...")
 
-        # get_chat_history bots ke liye kaam nahi karta (GetHistory restricted)
-        # Agar user_client nahi hai aur bot se try kiya toh silently skip karo
-        if not user_client:
-            LOGGER.warning("[Cleanup] No user_session — bot se get_chat_history nahi chalega, cleanup skip")
-            return 0
-
         async for msg in scan_client.get_chat_history(channel_id, limit=50):
             # Agar 3 messages mil gaye toh scan band karo
             if len(to_delete) >= 3:
@@ -511,6 +505,8 @@ async def send_schedule_notification(
         if is_last_ep:
             await app.send_message(channel_id, "**END**")
             LOGGER.info(f"[Schedule] Last ep {episode_num} → posted END for '{anime_name}'")
+            # Last episode pe end messages nahi bhejte
+            return
         else:
             next_date = _next_episode_date(interval_days)
             await app.send_message(channel_id, f"**Next episode upload on {next_date}**")
