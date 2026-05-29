@@ -371,7 +371,6 @@ async def _episode_quality_poller(
         # Update channels pe broadcast bhejo
         try:
             from .schedule_notify import send_broadcast_to_update_channels
-            _season = 1  # Default season 1
             # Channel link try karo — private channel ho toh empty string
             _ch_link = ""
             try:
@@ -380,12 +379,19 @@ async def _episode_quality_poller(
                     _ch_link = f"https://t.me/{_ch_info.username}"
             except Exception:
                 pass
+            # Caption fetch karo last uploaded message se (season detect ke liye)
+            _caption = ""
+            try:
+                async for _msg in client.get_chat_history(channel_id, limit=3):
+                    if _msg.caption:
+                        _caption = _msg.caption
+                        break
+            except Exception:
+                pass
             await send_broadcast_to_update_channels(
                 anime_name=anime_name,
-                season=_season,
                 episode_num=episode_num,
-                hashtag="",
-                channel_link=_ch_link,
+                caption=_caption,   # season auto-detect hoga
             )
         except Exception as e:
             LOGGER.error(f"[AutoMonitor] Broadcast to update channels error: {e}")

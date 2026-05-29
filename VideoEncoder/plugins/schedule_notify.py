@@ -197,6 +197,34 @@ async def _save_update_channels(channels: list):
 
 
 # ─────────────────────────────────────────────
+#  Anime Broadcast Info DB
+#  Per-anime hashtag + channel_link save karo
+#  { 'animenamekey': {'hashtag': '...', 'channel_link': '...'}, ... }
+# ─────────────────────────────────────────────
+async def _get_anime_broadcast_info(anime_name: str) -> dict | None:
+    oid = await _owner_id()
+    if not oid:
+        return None
+    user = await db._get_user(oid)
+    bmap = user.get('anime_broadcast_map', {})
+    return bmap.get(_normalize(anime_name))
+
+
+async def _save_anime_broadcast_info(anime_name: str, hashtag: str, channel_link: str):
+    oid = await _owner_id()
+    if not oid:
+        return
+    user = await db._get_user(oid)
+    bmap = user.get('anime_broadcast_map', {})
+    bmap[_normalize(anime_name)] = {
+        'anime_name': anime_name,
+        'hashtag': hashtag,
+        'channel_link': channel_link,
+    }
+    await db.col.update_one({'id': oid}, {'$set': {'anime_broadcast_map': bmap}}, upsert=True)
+
+
+# ─────────────────────────────────────────────
 #  Button serializer helper
 # ─────────────────────────────────────────────
 def _serialize_buttons(msg: Message) -> list | None:
@@ -1060,29 +1088,63 @@ async def cmd_update_channel_del(client: Client, message: Message):
 #  Auto Broadcast — episode upload hone pe
 #  update channels pe broadcast bhejo
 # ─────────────────────────────────────────────
+#  Season detect karo caption se
+# ─────────────────────────────────────────────
+def _detect_season(caption: str) -> int:
+    """
+    Caption mein se season number nikalo.
+    'Season 2' / 'S02' / 'S2E05' → 2
+    Kuch nahi mila → 1 (default)
+    """
+    if not caption:
+        return 1
+    # Season 02 / Season 2
+    m = re.search(r'[Ss]eason\s*(\d+)', caption)
+    if m:
+        return int(m.group(1))
+    # S02E05 / S2E5
+    m = re.search(r'[Ss](\d+)[Ee]\d+', caption)
+    if m:
+        return int(m.group(1))
+    return 1
+
+
 async def send_broadcast_to_update_channels(
     anime_name: str,
-    season: int,
     episode_num: int,
+    caption: str = "",
+    season: int = 0,
     hashtag: str = "",
     channel_link: str = "",
 ):
     """
     Saare update channels pe broadcast message bhejo.
-    Format:
-      🔰 Anime Name
-      #hashtag  (optional)
 
-      📍Season XX Episode XX Added...!
-      📌𝙒𝘼𝙏𝘾𝙃 & 𝘿𝙊𝙒𝙉𝙇𝙊𝘼𝘿📌  (link hoga agar channel_link set hai)
-      📌𝙒𝘼𝙏𝘾𝙃 & 𝘿𝙊𝙒𝙉𝙇𝙊𝘼𝘿📌  (link hoga agar channel_link set hai)
+    - hashtag/channel_link: agar pass nahi kiya → DB se saved info fetch hogi
+    - season: agar 0 → caption se detect karenge (default 1)
     """
     channels = await _get_update_channels()
     if not channels:
         LOGGER.info("[Broadcast] No update channels set, skipping.")
         return
 
-    # Message build karo
+    # ── Saved broadcast info fetch karo agar args empty hain ──
+    if not hashtag or not channel_link:
+        saved = await _get_anime_broadcast_info(anime_name)
+        if saved:
+            if not hashtag:
+                hashtag = saved.get('hashtag', '')
+            if not channel_link:
+                channel_link = saved.get('channel_link', '')
+            LOGGER.info(f"[Broadcast] Using saved info for '{anime_name}': hashtag='{hashtag}'")
+        else:
+            LOGGER.info(f"[Broadcast] No saved broadcast info for '{anime_name}', sending without hashtag/link")
+
+    # ── Season detect karo ──
+    if season == 0:
+        season = _detect_season(caption)
+
+    # ── Message build karo ──
     lines = []
     lines.append(f"**🔰 {anime_name}**")
     if hashtag:
@@ -1100,7 +1162,7 @@ async def send_broadcast_to_update_channels(
 
     broadcast_text = "\n".join(lines)
 
-    LOGGER.info(f"[Broadcast] Sending to {len(channels)} update channels for '{anime_name}' S{season:02d}E{episode_num:02d}")
+    LOGGER.info(f"[Broadcast] Sending to {len(channels)} update channels — '{anime_name}' S{season:02d}E{episode_num:02d}")
 
     for ch in channels:
         try:
@@ -1172,6 +1234,10 @@ async def cmd_confirm_broadcast(client: Client, message: Message):
     hashtag      = state['hashtag']
     channel_link = state['channel_link']
 
+    # ── Broadcast info save karo — agli baar auto broadcast ke liye ──
+    await _save_anime_broadcast_info(anime_name, hashtag, channel_link)
+    LOGGER.info(f"[Broadcast] Saved broadcast info for '{anime_name}'")
+
     lines = [f"**🔰 {anime_name}**"]
     if hashtag:
         lines.append(f"**{hashtag}**")
@@ -1196,5 +1262,6 @@ async def cmd_confirm_broadcast(client: Client, message: Message):
 
     await prog.edit(
         f"✅ **Broadcast Done!**\n\n"
-        f"📢 Sent to **{sent}/{len(channels)}** channels!"
+        f"📢 Sent to **{sent}/{len(channels)}** channels!\n"
+        f"💾 **Auto broadcast saved** — agle episodes pe automatically broadcast hoga!"
     )
