@@ -505,8 +505,6 @@ async def send_schedule_notification(
         if is_last_ep:
             await app.send_message(channel_id, "**END**")
             LOGGER.info(f"[Schedule] Last ep {episode_num} → posted END for '{anime_name}'")
-            # Last episode pe end messages nahi bhejte
-            return
         else:
             next_date = _next_episode_date(interval_days)
             await app.send_message(channel_id, f"**Next episode upload on {next_date}**")
@@ -517,7 +515,7 @@ async def send_schedule_notification(
 
     await asyncio.sleep(0.5)
 
-    # Step 3: End messages bhejo
+    # Step 3: End messages bhejo — last episode pe bhi bhejo (END ke baad aata hai)
     await _send_end_messages_to_channel(channel_id, channel_key)
 
 
