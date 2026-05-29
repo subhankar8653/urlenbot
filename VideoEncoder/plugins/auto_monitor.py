@@ -367,6 +367,28 @@ async def _episode_quality_poller(
             await send_schedule_notification(client, channel_id, anime_name, episode_num)
         except Exception as e:
             LOGGER.error(f"[AutoMonitor] Schedule notification error: {e}")
+
+        # Update channels pe broadcast bhejo
+        try:
+            from .schedule_notify import send_broadcast_to_update_channels
+            _season = 1  # Default season 1
+            # Channel link try karo — private channel ho toh empty string
+            _ch_link = ""
+            try:
+                _ch_info = await client.get_chat(channel_id)
+                if getattr(_ch_info, 'username', None):
+                    _ch_link = f"https://t.me/{_ch_info.username}"
+            except Exception:
+                pass
+            await send_broadcast_to_update_channels(
+                anime_name=anime_name,
+                season=_season,
+                episode_num=episode_num,
+                hashtag="",
+                channel_link=_ch_link,
+            )
+        except Exception as e:
+            LOGGER.error(f"[AutoMonitor] Broadcast to update channels error: {e}")
     else:
         # 30 min ke baad bhi nahi mila
         missing_str = ' | '.join(sorted(remaining))

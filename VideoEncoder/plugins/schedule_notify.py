@@ -1,25 +1,35 @@
 """
-schedule_notify.py  v2
+schedule_notify.py  v3
 =======================
-Episode Schedule + End Message Notification System
+Episode Schedule + End Message + Update Channel + Broadcast System
 
 Flow (episode complete hone ke baad):
   1. Purane schedule/end messages delete karo (last 15 msgs mein se, videos nahi)
   2. Schedule message post karo → "Next episode upload on 4th June"
      (Last episode pe → "END" post hoga, end messages nahi)
   3. End messages post karo (ek ek karke, saare saved messages)
+  4. Saare registered update channels pe broadcast bhejo
 
 Commands:
   /schedule [days] [total_eps] [Anime Name]
       Example: /schedule 7 12 Witch Hat Atelier
 
-  /end_message [Anime Name]
-      → Bot bolta hai "Ab bhejo jo messages end mein add karne hain"
-      → Tum bhejte ho (text, sticker, forward, kuch bhi)
-      → /done  → save ho jaata hai
+  /end_message
+      → Default end message set karo (sab channels pe apply)
+  /end_message [Channel Name]
+      → Sirf us channel ke liye custom end message set karo
+      → /done se save karo
 
-  /end_message_preview [Anime Name]  → Dekho kya saved hai
-  /end_message_del [Anime Name]      → Delete karo
+  /end_message_preview           → Default end messages preview
+  /end_message_preview [Name]    → Channel-specific preview
+  /end_message_del [Name]        → Delete karo
+
+  /update_channel [channel_id]   → Broadcast update channel add karo
+  /update_channel_list           → Saare update channels dekho
+  /update_channel_del [number]   → Remove karo
+
+  /broadcast_message             → Manual broadcast bhejo
+      → Bot poochega: anime name, hashtag (optional), channel link
 
   /schedule_list   → Saare schedules dekho
   /schedule_del [Anime Name]
@@ -41,8 +51,13 @@ from ..utils.database.access_db import db
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # In-memory state: kaun abhi end_message recording mode mein hai
-# { user_id: { 'anime_name': str, 'messages': [ {type, content} ] } }
+# { user_id: { 'channel_key': str, 'messages': [ {type, content} ] } }
+# channel_key = '' means default, else channel name/key
 _recording_state: dict = {}
+
+# Broadcast conversation state
+# { user_id: { 'step': 'name'|'hashtag'|'link', 'anime_name': str, 'hashtag': str } }
+_broadcast_state: dict = {}
 
 
 def _is_authorized(user_id: int) -> bool:
@@ -98,38 +113,87 @@ async def _get_schedule_for_anime(anime_name: str) -> dict | None:
     return best
 
 
-# End messages DB
-async def _get_end_messages(anime_name: str) -> list:
-    """Return saved end message list for anime. Each item: dict with type + content."""
+# ─────────────────────────────────────────────
+#  End Messages DB
+#  DB structure:
+#    end_messages_map = {
+#      '__default__': [...],   ← default (sab channels ke liye)
+#      'channelkey':  [...],   ← specific channel ke liye
+#    }
+# ─────────────────────────────────────────────
+DEFAULT_END_KEY = '__default__'
+
+
+async def _get_end_messages(channel_key: str = DEFAULT_END_KEY) -> list:
+    """
+    Return saved end messages.
+    channel_key = DEFAULT_END_KEY  → default messages
+    channel_key = 'somename'       → channel-specific messages
+    Priority: channel-specific → default → []
+    """
     oid = await _owner_id()
     if not oid:
         return []
     user = await db._get_user(oid)
     end_map = user.get('end_messages_map', {})
-    key = _normalize(anime_name)
+    key = _normalize(channel_key) if channel_key != DEFAULT_END_KEY else DEFAULT_END_KEY
+    # Channel-specific check
+    if key != DEFAULT_END_KEY and key in end_map:
+        return end_map[key]
+    # Default fallback
+    return end_map.get(DEFAULT_END_KEY, [])
+
+
+async def _get_end_messages_raw(channel_key: str) -> list:
+    """Sirf us specific key ke messages lo — fallback nahi."""
+    oid = await _owner_id()
+    if not oid:
+        return []
+    user = await db._get_user(oid)
+    end_map = user.get('end_messages_map', {})
+    key = _normalize(channel_key) if channel_key != DEFAULT_END_KEY else DEFAULT_END_KEY
     return end_map.get(key, [])
 
 
-async def _save_end_messages(anime_name: str, messages: list):
+async def _save_end_messages(channel_key: str, messages: list):
     oid = await _owner_id()
     if not oid:
         return
     user = await db._get_user(oid)
     end_map = user.get('end_messages_map', {})
-    key = _normalize(anime_name)
+    key = _normalize(channel_key) if channel_key != DEFAULT_END_KEY else DEFAULT_END_KEY
     end_map[key] = messages
     await db.col.update_one({'id': oid}, {'$set': {'end_messages_map': end_map}}, upsert=True)
 
 
-async def _delete_end_messages_db(anime_name: str):
+async def _delete_end_messages_db(channel_key: str):
     oid = await _owner_id()
     if not oid:
         return
     user = await db._get_user(oid)
     end_map = user.get('end_messages_map', {})
-    key = _normalize(anime_name)
+    key = _normalize(channel_key) if channel_key != DEFAULT_END_KEY else DEFAULT_END_KEY
     end_map.pop(key, None)
     await db.col.update_one({'id': oid}, {'$set': {'end_messages_map': end_map}}, upsert=True)
+
+
+# ─────────────────────────────────────────────
+#  Update Channels DB
+#  List of channels jahan episode upload hone pe broadcast jayega
+# ─────────────────────────────────────────────
+async def _get_update_channels() -> list:
+    oid = await _owner_id()
+    if not oid:
+        return []
+    user = await db._get_user(oid)
+    return user.get('update_channels', [])
+
+
+async def _save_update_channels(channels: list):
+    oid = await _owner_id()
+    if not oid:
+        return
+    await db.col.update_one({'id': oid}, {'$set': {'update_channels': channels}}, upsert=True)
 
 
 # ─────────────────────────────────────────────
@@ -200,14 +264,21 @@ def _serialize_message(msg: Message) -> dict | None:
 # ─────────────────────────────────────────────
 #  Send saved end messages to channel
 # ─────────────────────────────────────────────
-async def _send_end_messages_to_channel(channel_id: int, anime_name: str):
-    """DB se saved end messages ek ek karke channel pe bhejo."""
-    messages = await _get_end_messages(anime_name)
+async def _send_end_messages_to_channel(channel_id: int, channel_key: str = DEFAULT_END_KEY):
+    """
+    DB se saved end messages ek ek karke channel pe bhejo.
+    channel_key ke liye specific messages check karo,
+    nahi toh default use karo.
+    """
+    messages = await _get_end_messages(channel_key)
     if not messages:
-        LOGGER.info(f"[EndMsg] No end messages saved for '{anime_name}'")
+        LOGGER.info(f"[EndMsg] No end messages for key='{channel_key}', trying default...")
+        messages = await _get_end_messages(DEFAULT_END_KEY)
+    if not messages:
+        LOGGER.info(f"[EndMsg] No end messages at all for channel {channel_id}")
         return
 
-    LOGGER.info(f"[EndMsg] Sending {len(messages)} end messages for '{anime_name}' to {channel_id}")
+    LOGGER.info(f"[EndMsg] Sending {len(messages)} end messages to {channel_id}")
 
     for item in messages:
         try:
@@ -382,6 +453,7 @@ async def send_schedule_notification(
     channel_id: int,
     anime_name: str,
     episode_num: int,
+    channel_key: str = DEFAULT_END_KEY,
 ):
     """
     Episode complete hone ke baad call karo.
@@ -389,6 +461,7 @@ async def send_schedule_notification(
       1. Purane schedule/end msgs delete karo
       2. Schedule msg post karo
       3. End messages post karo (last episode pe nahi — END ke baad kuch nahi)
+    channel_key: channel-specific end messages ke liye (default = DEFAULT_END_KEY)
     """
     schedule = await _get_schedule_for_anime(anime_name)
     if not schedule:
@@ -417,47 +490,42 @@ async def send_schedule_notification(
     await asyncio.sleep(0.5)
 
     # Step 3: End messages bhejo
-    await _send_end_messages_to_channel(channel_id, anime_name)
+    await _send_end_messages_to_channel(channel_id, channel_key)
 
 
 # ─────────────────────────────────────────────
 #  /end_message command — recording mode start
+#  /end_message          → default set karo
+#  /end_message SonyYay  → SonyYay channel ke liye custom set karo
 # ─────────────────────────────────────────────
 @Client.on_message(filters.command("end_message") & filters.private)
 async def cmd_end_message(client: Client, message: Message):
-    """
-    /end_message Witch Hat Atelier
-    → Recording mode shuru — ab jo bhejoge woh save hoga
-    → /done se band karo
-    """
     if not _is_authorized(message.from_user.id):
         return
 
     parts = message.text.split(None, 1)
+    # Agar koi name nahi diya → default set karo
     if len(parts) < 2 or not parts[1].strip():
-        await message.reply(
-            "**Usage:** `/end_message Anime Name`\n"
-            "Example: `/end_message Witch Hat Atelier`\n\n"
-            "Phir jo messages bhejoge woh save honge.\n"
-            "Khatam karne ke liye: `/done`"
-        )
-        return
+        channel_key = DEFAULT_END_KEY
+        display_name = "🌐 Default (sab channels pe apply hoga)"
+    else:
+        channel_key = parts[1].strip()
+        display_name = f"📢 Channel: **{channel_key}**"
 
-    anime_name = parts[1].strip()
     user_id = message.from_user.id
 
     _recording_state[user_id] = {
-        'anime_name': anime_name,
+        'channel_key': channel_key,
         'messages': []
     }
 
-    existing = await _get_end_messages(anime_name)
+    existing = await _get_end_messages_raw(channel_key)
     note = f"\n\n⚠️ Pehle se **{len(existing)}** messages saved hain — naye se replace ho jayenge." if existing else ""
 
     await message.reply(
         f"🎬 **End Message Recording Started!**\n\n"
-        f"📺 Anime: **{anime_name}**\n\n"
-        f"Ab jo bhi bhejoge — text, sticker, forward, photo — sab save hoga.{note}\n\n"
+        f"{display_name}{note}\n\n"
+        f"Ab jo bhi bhejoge — text, sticker, forward, photo — sab save hoga.\n\n"
         f"✅ Khatam karne ke liye: `/done`\n"
         f"❌ Cancel karne ke liye: `/cancel_end`"
     )
@@ -470,7 +538,8 @@ async def cmd_end_message(client: Client, message: Message):
     filters.private &
     ~filters.command(["done", "cancel_end", "end_message", "schedule",
                       "schedule_list", "schedule_del", "end_message_preview",
-                      "end_message_del"])
+                      "end_message_del", "update_channel", "update_channel_list",
+                      "update_channel_del", "broadcast_message"])
 )
 async def capture_end_message(client: Client, message: Message):
     """Agar user recording mode mein hai toh messages capture karo."""
@@ -482,7 +551,7 @@ async def capture_end_message(client: Client, message: Message):
 
     state = _recording_state[user_id]
 
-    # Sticker ko alag se handle karo (copy_message sticker pe kaam nahi karta)
+    # Sticker ko alag se handle karo
     if message.sticker:
         item = {'type': 'sticker', 'file_id': message.sticker.file_id}
         state['messages'].append(item)
@@ -490,8 +559,6 @@ async def capture_end_message(client: Client, message: Message):
         await message.reply(f"✅ Saved! ({count} messages total) — `/done` se khatam karo")
         return
 
-    # Baaki sabhi messages (text, forward, photo, buttons wale) — copy_message reference save karo
-    # copy_message se inline buttons, hyperlinks, formatting sab perfectly preserve hoti hai
     item = _serialize_message(message)
     if item:
         state['messages'].append(item)
@@ -511,22 +578,27 @@ async def cmd_done(client: Client, message: Message):
         return
 
     if user_id not in _recording_state:
-        await message.reply("⚠️ Koi recording chal nahi rahi. Pehle `/end_message Anime Name` karo.")
+        await message.reply("⚠️ Koi recording chal nahi rahi. Pehle `/end_message` ya `/end_message ChannelName` karo.")
         return
 
     state = _recording_state.pop(user_id)
-    anime_name = state['anime_name']
-    messages   = state['messages']
+    channel_key = state['channel_key']
+    messages    = state['messages']
 
     if not messages:
         await message.reply("⚠️ Koi message save nahi hua! Recording cancel ho gaya.")
         return
 
-    await _save_end_messages(anime_name, messages)
+    await _save_end_messages(channel_key, messages)
+
+    if channel_key == DEFAULT_END_KEY:
+        target_info = "🌐 **Default** — sab channels pe apply hoga"
+    else:
+        target_info = f"📢 Channel: **{channel_key}**"
 
     await message.reply(
         f"✅ **End Messages Saved!**\n\n"
-        f"📺 Anime: **{anime_name}**\n"
+        f"{target_info}\n"
         f"💾 Total: **{len(messages)}** messages saved\n\n"
         f"Har episode upload ke baad yeh messages automatically post honge."
     )
@@ -546,9 +618,11 @@ async def cmd_cancel_end(client: Client, message: Message):
         return
 
     state = _recording_state.pop(user_id)
+    channel_key = state['channel_key']
+    target = "🌐 Default" if channel_key == DEFAULT_END_KEY else f"📢 {channel_key}"
     await message.reply(
         f"❌ **Recording Cancelled!**\n\n"
-        f"📺 Anime: **{state['anime_name']}**\n"
+        f"{target}\n"
         f"💾 {len(state['messages'])} messages discard ho gaye."
     )
 
@@ -700,35 +774,39 @@ async def cmd_schedule_del(client: Client, message: Message):
 @Client.on_message(filters.command("end_message_preview") & filters.private)
 async def cmd_end_message_preview(client: Client, message: Message):
     """
-    /end_message_preview [Anime Name]
+    /end_message_preview          → default messages preview
+    /end_message_preview SonyYay  → channel-specific preview
     """
     if not _is_authorized(message.from_user.id):
         return
 
     parts = message.text.split(None, 1)
     if len(parts) < 2 or not parts[1].strip():
-        await message.reply(
-            "**Usage:** `/end_message_preview [Anime Name]`\n"
-            "Example: `/end_message_preview Witch Hat Atelier`"
-        )
-        return
+        channel_key = DEFAULT_END_KEY
+        display = "🌐 Default End Messages"
+    else:
+        channel_key = parts[1].strip()
+        display = f"📢 Channel: **{channel_key}**"
 
-    anime_name = parts[1].strip()
-    messages = await _get_end_messages(anime_name)
+    messages = await _get_end_messages_raw(channel_key)
 
     if not messages:
+        no_key_text = (
+            "default" if channel_key == DEFAULT_END_KEY else channel_key
+        )
         await message.reply(
-            f"📭 **'{anime_name}'** ke liye koi end messages saved nahi hain.\n\n"
-            f"Add karne ke liye: `/end_message {anime_name}`"
+            f"📭 **'{no_key_text}'** ke liye koi end messages saved nahi hain.\n\n"
+            f"Add karne ke liye:\n"
+            f"• Default: `/end_message`\n"
+            f"• Channel: `/end_message ChannelName`"
         )
         return
 
     await message.reply(
         f"📋 **End Messages Preview**\n\n"
-        f"📺 Anime: **{anime_name}**\n"
+        f"{display}\n"
         f"💾 Total: **{len(messages)}** messages saved\n\n"
-        f"Ye messages har episode ke baad post honge.\n"
-        f"Delete karne ke liye: `/end_message_del {anime_name}`"
+        f"Delete karne ke liye: `/end_message_del {channel_key if channel_key != DEFAULT_END_KEY else 'default'}`"
     )
 
 
@@ -738,31 +816,408 @@ async def cmd_end_message_preview(client: Client, message: Message):
 @Client.on_message(filters.command("end_message_del") & filters.private)
 async def cmd_end_message_del(client: Client, message: Message):
     """
-    /end_message_del [Anime Name]
+    /end_message_del          → default messages delete karo
+    /end_message_del SonyYay  → channel-specific delete karo
     """
     if not _is_authorized(message.from_user.id):
         return
 
     parts = message.text.split(None, 1)
-    if len(parts) < 2 or not parts[1].strip():
-        await message.reply(
-            "**Usage:** `/end_message_del [Anime Name]`\n"
-            "Example: `/end_message_del Witch Hat Atelier`"
-        )
-        return
+    # "default" keyword ya koi argument nahi → default delete
+    if len(parts) < 2 or not parts[1].strip() or parts[1].strip().lower() == 'default':
+        channel_key = DEFAULT_END_KEY
+        display = "🌐 Default End Messages"
+    else:
+        channel_key = parts[1].strip()
+        display = f"📢 Channel: **{channel_key}**"
 
-    anime_name = parts[1].strip()
-    existing = await _get_end_messages(anime_name)
+    existing = await _get_end_messages_raw(channel_key)
 
     if not existing:
         await message.reply(
-            f"❌ **'{anime_name}'** ke liye koi end messages saved nahi hain!"
+            f"❌ **'{channel_key if channel_key != DEFAULT_END_KEY else 'default'}'** ke liye koi end messages saved nahi hain!"
         )
         return
 
-    await _delete_end_messages_db(anime_name)
+    await _delete_end_messages_db(channel_key)
     await message.reply(
         f"✅ **End Messages Deleted!**\n\n"
-        f"📺 Anime: **{anime_name}**\n"
+        f"{display}\n"
         f"🗑️ {len(existing)} messages delete ho gaye."
+    )
+
+
+# ─────────────────────────────────────────────
+#  /update_channel — broadcast channel add karo
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("update_channel") & filters.private)
+async def cmd_update_channel(client: Client, message: Message):
+    """
+    /update_channel [channel_id]
+    Ek baar set karo — episode upload hone pe wahan broadcast jayega.
+    """
+    if not _is_authorized(message.from_user.id):
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        channels = await _get_update_channels()
+        if not channels:
+            await message.reply(
+                "📢 **Update Channels**\n\n"
+                "❌ Abhi koi update channel set nahi hai.\n\n"
+                "**Usage:** `/update_channel -100xxxxxxxxx`\n"
+                "Jab bhi episode upload hoga, wahan broadcast jayega!"
+            )
+        else:
+            text = "📢 **Update Channels:**\n\n"
+            for i, ch in enumerate(channels, 1):
+                try:
+                    chat = await client.get_chat(ch['channel_id'])
+                    title = chat.title
+                except Exception:
+                    title = ch.get('title', 'Unknown')
+                text += f"**{i}.** {title}\n    `{ch['channel_id']}`\n\n"
+            text += f"Total: **{len(channels)}**\n\nRemove: `/update_channel_del <number>`"
+            await message.reply(text)
+        return
+
+    try:
+        channel_id = int(parts[1])
+    except ValueError:
+        await message.reply("❌ Valid channel ID dalo! Format: `-100xxxxxxxxx`")
+        return
+
+    # Channel check
+    try:
+        chat = await client.get_chat(channel_id)
+        title = chat.title
+    except Exception as e:
+        await message.reply(f"❌ Channel nahi mila: `{e}`\n\nBot ko channel mein admin banao pehle.")
+        return
+
+    channels = await _get_update_channels()
+
+    # Already exists check
+    for ch in channels:
+        if ch['channel_id'] == channel_id:
+            await message.reply(f"⚠️ **{title}** already update channels mein hai!")
+            return
+
+    channels.append({'channel_id': channel_id, 'title': title})
+    await _save_update_channels(channels)
+
+    await message.reply(
+        f"✅ **Update Channel Added!**\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📢 **{title}**\n"
+        f"🆔 `{channel_id}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Ab jab bhi koi episode upload hoga, yahan broadcast jayega! 🚀"
+    )
+
+
+@Client.on_message(filters.command("update_channel_list") & filters.private)
+async def cmd_update_channel_list(client: Client, message: Message):
+    if not _is_authorized(message.from_user.id):
+        return
+
+    channels = await _get_update_channels()
+    if not channels:
+        await message.reply(
+            "📢 **Update Channels**\n\n"
+            "❌ Koi update channel set nahi hai.\n\n"
+            "Add karo: `/update_channel -100xxxxxxxxx`"
+        )
+        return
+
+    text = "📢 **Update Channels:**\n\n"
+    for i, ch in enumerate(channels, 1):
+        try:
+            chat = await client.get_chat(ch['channel_id'])
+            title = chat.title
+        except Exception:
+            title = ch.get('title', 'Unknown')
+        text += f"**{i}.** {title}\n    `{ch['channel_id']}`\n\n"
+    text += f"Total: **{len(channels)}**\n\n🗑️ Remove: `/update_channel_del <number>`"
+    await message.reply(text)
+
+
+@Client.on_message(filters.command("update_channel_del") & filters.private)
+async def cmd_update_channel_del(client: Client, message: Message):
+    if not _is_authorized(message.from_user.id):
+        return
+
+    channels = await _get_update_channels()
+    if not channels:
+        await message.reply("❌ Koi update channel set nahi hai!")
+        return
+
+    if len(message.command) < 2:
+        text = "🗑️ **Konsa remove karna hai?**\n\n"
+        for i, ch in enumerate(channels, 1):
+            text += f"**{i}.** {ch.get('title', 'Unknown')} (`{ch['channel_id']}`)\n"
+        text += "\nUse: `/update_channel_del <number>`"
+        await message.reply(text)
+        return
+
+    try:
+        num = int(message.command[1])
+    except ValueError:
+        await message.reply("❌ Sahi number dalo!")
+        return
+
+    if num < 1 or num > len(channels):
+        await message.reply(f"❌ 1 se {len(channels)} tak dalo.")
+        return
+
+    removed = channels.pop(num - 1)
+    await _save_update_channels(channels)
+    await message.reply(
+        f"✅ **Removed!**\n\n"
+        f"📢 {removed.get('title', 'Unknown')}\n"
+        f"🆔 `{removed['channel_id']}`"
+    )
+
+
+# ─────────────────────────────────────────────
+#  Auto Broadcast — episode upload hone pe
+#  update channels pe broadcast bhejo
+# ─────────────────────────────────────────────
+async def send_broadcast_to_update_channels(
+    anime_name: str,
+    season: int,
+    episode_num: int,
+    hashtag: str = "",
+    channel_link: str = "",
+):
+    """
+    Saare update channels pe broadcast message bhejo.
+    Format:
+      🔰 Anime Name
+      #hashtag  (optional)
+
+      📍Season XX Episode XX Added...!
+      📌𝙒𝘼𝙏𝘾𝙃 & 𝘿𝙊𝙒𝙉𝙇𝙊𝘼𝘿📌  (link hoga agar channel_link set hai)
+      📌𝙒𝘼𝙏𝘾𝙃 & 𝘿𝙊𝙒𝙉𝙇𝙊𝘼𝘿📌  (link hoga agar channel_link set hai)
+    """
+    channels = await _get_update_channels()
+    if not channels:
+        LOGGER.info("[Broadcast] No update channels set, skipping.")
+        return
+
+    # Message build karo
+    lines = []
+    lines.append(f"**🔰 {anime_name}**")
+    if hashtag:
+        lines.append(f"**{hashtag}**")
+    lines.append("")
+    lines.append(f"**📍Season {season:02d} Episode {episode_num:02d} Added...!**")
+
+    if channel_link:
+        watch_line = f"**[📌𝙒𝘼𝙏𝘾𝙃 & 𝘿𝙊𝙒𝙉𝙇𝙊𝘼𝘿📌]({channel_link})**"
+        lines.append(watch_line)
+        lines.append(watch_line)
+    else:
+        lines.append("**📌𝙒𝘼𝙏𝘾𝙃 & 𝘿𝙊𝙒𝙉𝙇𝙊𝘼𝘿📌**")
+        lines.append("**📌𝙒𝘼𝙏𝘾𝙃 & 𝘿𝙊𝙒𝙉𝙇𝙊𝘼𝘿📌**")
+
+    broadcast_text = "\n".join(lines)
+
+    LOGGER.info(f"[Broadcast] Sending to {len(channels)} update channels for '{anime_name}' S{season:02d}E{episode_num:02d}")
+
+    for ch in channels:
+        try:
+            await app.send_message(
+                chat_id=ch['channel_id'],
+                text=broadcast_text,
+                disable_web_page_preview=True,
+            )
+            LOGGER.info(f"[Broadcast] ✅ Sent to {ch['channel_id']} ({ch.get('title', '?')})")
+        except Exception as e:
+            LOGGER.error(f"[Broadcast] ❌ Failed for {ch['channel_id']}: {e}")
+        await asyncio.sleep(0.5)
+
+
+# ─────────────────────────────────────────────
+#  /broadcast_message — manual broadcast
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("broadcast_message") & filters.private)
+async def cmd_broadcast_message(client: Client, message: Message):
+    """
+    /broadcast_message → conversation shuru
+    Step 1: anime name
+    Step 2: hashtag (ya skip)
+    Step 3: channel link
+    """
+    if not _is_authorized(message.from_user.id):
+        return
+
+    user_id = message.from_user.id
+    _broadcast_state[user_id] = {'step': 'name', 'anime_name': '', 'hashtag': ''}
+
+    await message.reply(
+        "📣 **Broadcast Message**\n\n"
+        "**Step 1/3** — Anime ka naam bhejo:\n\n"
+        "_Example: Karna the Guardian_\n\n"
+        "❌ Cancel: `/cancel_broadcast`"
+    )
+
+
+@Client.on_message(filters.command("cancel_broadcast") & filters.private)
+async def cmd_cancel_broadcast(client: Client, message: Message):
+    if not _is_authorized(message.from_user.id):
+        return
+    _broadcast_state.pop(message.from_user.id, None)
+    await message.reply("❌ Broadcast cancelled.")
+
+
+@Client.on_message(
+    filters.private &
+    ~filters.command(["done", "cancel_end", "end_message", "schedule",
+                      "schedule_list", "schedule_del", "end_message_preview",
+                      "end_message_del", "update_channel", "update_channel_list",
+                      "update_channel_del", "broadcast_message", "cancel_broadcast"])
+)
+async def capture_broadcast(client: Client, message: Message):
+    """Broadcast conversation state machine."""
+    user_id = message.from_user.id
+    if user_id not in _broadcast_state:
+        return
+    if not _is_authorized(user_id):
+        return
+
+    state = _broadcast_state[user_id]
+    text = (message.text or "").strip()
+
+    # ── Step 1: Anime name ──
+    if state['step'] == 'name':
+        if not text:
+            await message.reply("⚠️ Anime ka naam bhejo!")
+            return
+        state['anime_name'] = text
+        state['step'] = 'hashtag'
+        await message.reply(
+            f"✅ Anime: **{text}**\n\n"
+            f"**Step 2/3** — Hashtag bhejo (ya `skip` likho):\n\n"
+            f"_Example: #official\\_hindi\\_dub_"
+        )
+
+    # ── Step 2: Hashtag ──
+    elif state['step'] == 'hashtag':
+        if text.lower() == 'skip':
+            state['hashtag'] = ''
+        else:
+            state['hashtag'] = text if text.startswith('#') else f"#{text}"
+        state['step'] = 'link'
+        hashtag_info = f"Hashtag: **{state['hashtag']}**\n\n" if state['hashtag'] else "Hashtag: _skipped_\n\n"
+        await message.reply(
+            f"✅ {hashtag_info}"
+            f"**Step 3/3** — Channel ka link bhejo:\n\n"
+            f"_Example: https://t.me/yourchannel_"
+        )
+
+    # ── Step 3: Channel link ──
+    elif state['step'] == 'link':
+        if not text.startswith('http'):
+            await message.reply("⚠️ Valid channel link bhejo! (https://t.me/...)")
+            return
+
+        channel_link = text
+        anime_name   = state['anime_name']
+        hashtag      = state['hashtag']
+        _broadcast_state.pop(user_id)
+
+        # Episode info ke liye update channels se info nahi milegi (manual broadcast hai)
+        # Season/Episode default 01/01 — user manually season/ep set kar sakta hai
+        # Ya auto_monitor se call hoga tab woh pass karega
+        # For manual: preview dikhao aur confirm lo
+        preview_lines = [f"**🔰 {anime_name}**"]
+        if hashtag:
+            preview_lines.append(f"**{hashtag}**")
+        preview_lines.append("")
+        preview_lines.append(f"**📍Season XX Episode XX Added...!**")
+        watch_line = f"**[📌𝙒𝘼𝙏𝘾𝙃 & 𝘿𝙊𝙒𝙉𝙇𝙊𝘼𝘿📌]({channel_link})**"
+        preview_lines.append(watch_line)
+        preview_lines.append(watch_line)
+
+        channels = await _get_update_channels()
+        ch_count = len(channels)
+
+        # State mein save karo confirm ke liye
+        _broadcast_state[user_id] = {
+            'step': 'confirm',
+            'anime_name': anime_name,
+            'hashtag': hashtag,
+            'channel_link': channel_link,
+        }
+
+        await message.reply(
+            f"📋 **Broadcast Preview:**\n\n"
+            f"{'━' * 20}\n"
+            f"{chr(10).join(preview_lines)}\n"
+            f"{'━' * 20}\n\n"
+            f"📢 **{ch_count}** update channels pe broadcast hoga.\n\n"
+            f"✅ Bhejne ke liye: `/confirm_broadcast`\n"
+            f"❌ Cancel: `/cancel_broadcast`",
+            disable_web_page_preview=True,
+        )
+
+    # ── Step confirm ──
+    elif state['step'] == 'confirm':
+        await message.reply("✅ `/confirm_broadcast` bhejo ya ❌ `/cancel_broadcast`")
+
+
+@Client.on_message(filters.command("confirm_broadcast") & filters.private)
+async def cmd_confirm_broadcast(client: Client, message: Message):
+    if not _is_authorized(message.from_user.id):
+        return
+
+    user_id = message.from_user.id
+    state = _broadcast_state.pop(user_id, None)
+    if not state or state.get('step') != 'confirm':
+        await message.reply("⚠️ Pehle `/broadcast_message` karo.")
+        return
+
+    channels = await _get_update_channels()
+    if not channels:
+        await message.reply("❌ Koi update channel set nahi! Pehle `/update_channel` se add karo.")
+        return
+
+    prog = await message.reply(f"📣 Broadcasting to {len(channels)} channels...")
+
+    # Manual broadcast mein season/ep nahi pata — Season 00 Episode 00 placeholder
+    # Best approach: user se nahi puchte, generic format mein bhejte hain
+    # Actual episode info auto_monitor se aayegi jab automatic broadcast hogi
+    anime_name   = state['anime_name']
+    hashtag      = state['hashtag']
+    channel_link = state['channel_link']
+
+    # Manual broadcast — season/ep user ne specify nahi kiya
+    # Toh directly custom message bhejo (bina season/ep ke)
+    lines = [f"**🔰 {anime_name}**"]
+    if hashtag:
+        lines.append(f"**{hashtag}**")
+    lines.append("")
+    watch_line = f"**[📌𝙒𝘼𝙏𝘾𝙃 & 𝘿𝙊𝙒𝙉𝙇𝙊𝘼𝘿📌]({channel_link})**"
+    lines.append(watch_line)
+    lines.append(watch_line)
+    broadcast_text = "\n".join(lines)
+
+    sent = 0
+    for ch in channels:
+        try:
+            await app.send_message(
+                chat_id=ch['channel_id'],
+                text=broadcast_text,
+                disable_web_page_preview=True,
+            )
+            sent += 1
+        except Exception as e:
+            LOGGER.error(f"[ManualBroadcast] Failed for {ch['channel_id']}: {e}")
+        await asyncio.sleep(0.5)
+
+    await prog.edit(
+        f"✅ **Broadcast Done!**\n\n"
+        f"📢 Sent to **{sent}/{len(channels)}** channels!"
     )
