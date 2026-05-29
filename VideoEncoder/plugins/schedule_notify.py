@@ -1223,45 +1223,18 @@ async def cmd_confirm_broadcast(client: Client, message: Message):
         await message.reply("⚠️ Pehle `/broadcast_message` karo.")
         return
 
-    channels = await _get_update_channels()
-    if not channels:
-        await message.reply("❌ Koi update channel set nahi! Pehle `/update_channel` se add karo.")
-        return
-
-    prog = await message.reply(f"📣 Broadcasting to {len(channels)} channels...")
-
     anime_name   = state['anime_name']
     hashtag      = state['hashtag']
     channel_link = state['channel_link']
 
-    # ── Broadcast info save karo — agli baar auto broadcast ke liye ──
+    # Sirf DB mein save karo — channel pe broadcast nahi
     await _save_anime_broadcast_info(anime_name, hashtag, channel_link)
-    LOGGER.info(f"[Broadcast] Saved broadcast info for '{anime_name}'")
 
-    lines = [f"**🔰 {anime_name}**"]
-    if hashtag:
-        lines.append(f"**{hashtag}**")
-    lines.append("")
-    watch_line = f"**[📌𝙒𝘼𝙏𝘾𝙃 & 𝘿𝙊𝙒𝙉𝙇𝙊𝘼𝘿📌]({channel_link})**"
-    lines.append(watch_line)
-    lines.append(watch_line)
-    broadcast_text = "\n".join(lines)
-
-    sent = 0
-    for ch in channels:
-        try:
-            await app.send_message(
-                chat_id=ch['channel_id'],
-                text=broadcast_text,
-                disable_web_page_preview=True,
-            )
-            sent += 1
-        except Exception as e:
-            LOGGER.error(f"[ManualBroadcast] Failed for {ch['channel_id']}: {e}")
-        await asyncio.sleep(0.5)
-
-    await prog.edit(
-        f"✅ **Broadcast Done!**\n\n"
-        f"📢 Sent to **{sent}/{len(channels)}** channels!\n"
-        f"💾 **Auto broadcast saved** — agle episodes pe automatically broadcast hoga!"
+    await message.reply(
+        f"✅ **Broadcast Info Saved!**\n\n"
+        f"📺 Anime: **{anime_name}**\n"
+        f"🏷️ Hashtag: **{hashtag if hashtag else 'None'}**\n"
+        f"🔗 Link: `{channel_link}`\n\n"
+        f"Ab jab bhi **{anime_name}** ka episode upload hoga,\n"
+        f"automatically broadcast ho jaayega! 🚀"
     )

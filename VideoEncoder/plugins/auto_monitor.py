@@ -172,6 +172,7 @@ async def _episode_quality_poller(
     remaining = set(TARGET_QUALITIES)   # jo qualities abhi tak nahi mili
     start_time = time.time()
     attempt = 0
+    broadcast_sent = False   # pehle upload pe ek baar hi broadcast hoga
 
     status_msg = await log_message.reply(
         f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
@@ -340,6 +341,29 @@ async def _episode_quality_poller(
                 remaining.discard(quality)
                 LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ {quality} uploaded!")
 
+        # ── Pehle successful upload ke baad broadcast bhejo (sirf ek baar) ──
+        if not broadcast_sent and len(remaining) < len(TARGET_QUALITIES):
+            broadcast_sent = True
+            try:
+                from .schedule_notify import send_broadcast_to_update_channels
+                # Caption fetch karo abhi uploaded message se (season detect ke liye)
+                _caption = ""
+                try:
+                    async for _msg in client.get_chat_history(channel_id, limit=3):
+                        if _msg.caption:
+                            _caption = _msg.caption
+                            break
+                except Exception:
+                    pass
+                await send_broadcast_to_update_channels(
+                    anime_name=anime_name,
+                    episode_num=episode_num,
+                    caption=_caption,
+                )
+                LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Broadcast sent after first upload")
+            except Exception as _be:
+                LOGGER.error(f"[AutoMonitor] Broadcast error: {_be}")
+
         # Cleanup
         shutil.rmtree(dl_dir, ignore_errors=True)
 
@@ -367,34 +391,6 @@ async def _episode_quality_poller(
             await send_schedule_notification(client, channel_id, anime_name, episode_num)
         except Exception as e:
             LOGGER.error(f"[AutoMonitor] Schedule notification error: {e}")
-
-        # Update channels pe broadcast bhejo
-        try:
-            from .schedule_notify import send_broadcast_to_update_channels
-            # Channel link try karo — private channel ho toh empty string
-            _ch_link = ""
-            try:
-                _ch_info = await client.get_chat(channel_id)
-                if getattr(_ch_info, 'username', None):
-                    _ch_link = f"https://t.me/{_ch_info.username}"
-            except Exception:
-                pass
-            # Caption fetch karo last uploaded message se (season detect ke liye)
-            _caption = ""
-            try:
-                async for _msg in client.get_chat_history(channel_id, limit=3):
-                    if _msg.caption:
-                        _caption = _msg.caption
-                        break
-            except Exception:
-                pass
-            await send_broadcast_to_update_channels(
-                anime_name=anime_name,
-                episode_num=episode_num,
-                caption=_caption,   # season auto-detect hoga
-            )
-        except Exception as e:
-            LOGGER.error(f"[AutoMonitor] Broadcast to update channels error: {e}")
     else:
         # 30 min ke baad bhi nahi mila
         missing_str = ' | '.join(sorted(remaining))
