@@ -128,8 +128,12 @@ def _find_matching_anime(text: str, anime_list: list) -> dict | None:
 
 
 def _extract_episodes(text: str) -> tuple[int, int] | None:
-    # "Episode 34-36" / "Ep 34 - 36"
-    m = re.search(r'[Ee]p(?:isode)?\s*(\d+)\s*[-–to]+\s*(\d+)', text)
+    # "EPISODE 4-13 + ZIP PACK ADDED!" / "Episode 34-36" / "Ep 34 - 36"
+    m = re.search(r'(?i)episodes?\s*(\d+)\s*[-\u2013]\s*(\d+)', text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    # Ep/Episode + to range
+    m = re.search(r'[Ee]p(?:isode)?\s*(\d+)\s*[-\u2013to]+\s*(\d+)', text)
     if m:
         return int(m.group(1)), int(m.group(2))
     # Single "Episode 5"
@@ -137,8 +141,8 @@ def _extract_episodes(text: str) -> tuple[int, int] | None:
     if m:
         ep = int(m.group(1))
         return ep, ep
-    # "34-36 Added"
-    m = re.search(r'(\d+)\s*[-–]\s*(\d+)\s*[Aa]dded', text)
+    # "34-36 Added" / "34-36 + ZIP PACK ADDED"
+    m = re.search(r'(\d+)\s*[-\u2013]\s*(\d+)[^\n]*[Aa]dded', text)
     if m:
         return int(m.group(1)), int(m.group(2))
     return None
@@ -308,7 +312,10 @@ async def _episode_quality_poller(
         # channel_id pass karo taaki seedha anime channel pe upload ho
         proxy_msg = _ProxyMsg(log_message, owner_id, channel_id)
 
+        _broadcast_lock = asyncio.Lock()
+
         async def _upload_task(filepath, idx):
+            nonlocal broadcast_sent
             if idx > 0:
                 await _half_events[idx - 1].wait()
             um = _dummy_msgs.get(filepath, status_msg)
@@ -321,8 +328,22 @@ async def _episode_quality_poller(
             except Exception:
                 pass
 
-            # Upload seedha channel pe ho gaya (proxy_msg.chat.id = channel_id)
-            # Forward ki zaroorat nahi
+            if success and sent_msg:
+                # ── Pehli quality upload hote hi turant broadcast bhejo ──
+                async with _broadcast_lock:
+                    if not broadcast_sent:
+                        broadcast_sent = True
+                        try:
+                            from .schedule_notify import send_broadcast_to_update_channels
+                            _caption = sent_msg.caption or ""
+                            await send_broadcast_to_update_channels(
+                                anime_name=anime_name,
+                                episode_num=episode_num,
+                                caption=_caption,
+                            )
+                            LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ Broadcast sent after {quality} upload")
+                        except Exception as _be:
+                            LOGGER.error(f"[AutoMonitor] Broadcast error: {_be}")
 
             return success, sent_msg, quality
 
@@ -340,29 +361,6 @@ async def _episode_quality_poller(
             if success:
                 remaining.discard(quality)
                 LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ {quality} uploaded!")
-
-        # ── Pehle successful upload ke baad broadcast bhejo (sirf ek baar) ──
-        if not broadcast_sent and len(remaining) < len(TARGET_QUALITIES):
-            broadcast_sent = True
-            try:
-                from .schedule_notify import send_broadcast_to_update_channels
-                # Caption fetch karo abhi uploaded message se (season detect ke liye)
-                _caption = ""
-                try:
-                    async for _msg in client.get_chat_history(channel_id, limit=3):
-                        if _msg.caption:
-                            _caption = _msg.caption
-                            break
-                except Exception:
-                    pass
-                await send_broadcast_to_update_channels(
-                    anime_name=anime_name,
-                    episode_num=episode_num,
-                    caption=_caption,
-                )
-                LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Broadcast sent after first upload")
-            except Exception as _be:
-                LOGGER.error(f"[AutoMonitor] Broadcast error: {_be}")
 
         # Cleanup
         shutil.rmtree(dl_dir, ignore_errors=True)
@@ -568,13 +566,10 @@ async def auto_monitor_handler(client: Client, message: Message):
         except Exception as _ce:
             LOGGER.warning(f"[AutoMonitor] Ep {ep_num}: Swift-time cleanup error: {_ce}")
 
-        # Quality poller ko background task mein run karo
-        # (taki agli episode ke liye wait na karo)
-        asyncio.create_task(
-            _episode_quality_poller(
-                client, message, swift_url,
-                ep_num, anime_name, channel_id, oid
-            )
+        # Episode fully complete hone ke baad hi agli episode shuru karo (sequential)
+        await _episode_quality_poller(
+            client, message, swift_url,
+            ep_num, anime_name, channel_id, oid
         )
 
         # Episodes ke beech thoda gap
