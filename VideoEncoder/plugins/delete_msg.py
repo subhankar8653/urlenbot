@@ -248,21 +248,29 @@ async def auto_delete_old_messages(client: Client, message: Message):
 
     current_id = message.id
 
-    # Video se pehle ke ACTUAL 3 messages fetch karo (ID gaps handle karta hai)
+    # Bot ke paas get_chat_history nahi hota channel pe
+    # Isliye: current_id se peeche 50 IDs ka range scan karo
+    # Jo IDs exist karti hain unme se latest 3 lo
     to_delete = []
+    search_start = max(1, current_id - 50)
+    candidate_ids = list(range(search_start, current_id))  # pehle wale IDs
+
     try:
-        async for old_msg in client.get_chat_history(
+        # get_messages batch mein kaam karta hai — 200 tak ek baar mein
+        msgs = await client.get_messages(
             chat_id=message.chat.id,
-            limit=4,                  # 4 fetch karo: current video + 3 pehle wale
-            offset_id=current_id,     # current video se PEHLE se shuru karo
-        ):
-            if old_msg.id < current_id:
-                to_delete.append(old_msg.id)
-            if len(to_delete) >= 3:
-                break
+            message_ids=candidate_ids,
+        )
+        # Filter: sirf jo exist karte hain (None nahi hain)
+        # Descending order mein sort karo (latest pehle)
+        valid = [m for m in msgs if m and m.id and m.id < current_id]
+        valid.sort(key=lambda m: m.id, reverse=True)
+        to_delete = [m.id for m in valid[:3]]
     except Exception as e:
-        LOGGER.warning(f"[AutoDelete] History fetch failed for {message.chat.id}: {e}")
-        return
+        LOGGER.warning(f"[AutoDelete] Message fetch failed for {message.chat.id}: {e}")
+        # Fallback: simple -1,-2,-3 try karo
+        to_delete = [current_id - 1, current_id - 2, current_id - 3]
+        to_delete = [i for i in to_delete if i > 0]
 
     deleted_count = 0
     for msg_id in to_delete:
