@@ -248,9 +248,24 @@ async def auto_delete_old_messages(client: Client, message: Message):
 
     current_id = message.id
 
-    # Naye message ka ID se pehle ke 3 messages delete karo
-    to_delete = [current_id - 1, current_id - 2, current_id - 3]
-    to_delete = [i for i in to_delete if i > 0]
+    # Actual previous 3 messages fetch karo — ID guess nahi, history se lo
+    to_delete = []
+    try:
+        async for old_msg in client.get_chat_history(message.chat.id, limit=10):
+            if old_msg.id >= current_id:
+                continue  # naya video message aur koi uske baad aaya skip
+            to_delete.append(old_msg.id)
+            if len(to_delete) == 3:
+                break
+    except Exception as e:
+        LOGGER.warning(
+            f"[AutoDelete] Could not fetch chat history "
+            f"in {message.chat.id}: {e}"
+        )
+        return
+
+    if not to_delete:
+        return
 
     deleted_count = 0
     for msg_id in to_delete:
@@ -271,39 +286,3 @@ async def auto_delete_old_messages(client: Client, message: Message):
             f"[AutoDelete] Deleted {deleted_count} old messages "
             f"in channel {message.chat.id} (new video msg_id={current_id})"
         )
-
-
-# ─────────────────────────────────────────────
-#  Export function — auto_monitor.py se call hoga
-#  Jab pehli quality upload ho, channel pe pehle ke 3 msgs delete karo
-# ─────────────────────────────────────────────
-async def delete_prev_messages(client, channel_id: int, uploaded_msg_id: int):
-    """
-    auto_monitor.py se call karo jab video upload ho.
-    uploaded_msg_id ke pehle ke 3 messages delete karo.
-    Sirf un channels pe kaam karta hai jo /delete_message se set hain.
-    """
-    channels = await _get_delete_channels()
-    if not channels:
-        return
-
-    monitored_ids = {ch['channel_id'] for ch in channels}
-    if channel_id not in monitored_ids:
-        return
-
-    to_delete = [uploaded_msg_id - 1, uploaded_msg_id - 2, uploaded_msg_id - 3]
-    to_delete = [i for i in to_delete if i > 0]
-
-    deleted_count = 0
-    for msg_id in to_delete:
-        try:
-            await client.delete_messages(
-                chat_id=channel_id,
-                message_ids=msg_id
-            )
-            deleted_count += 1
-        except Exception as e:
-            LOGGER.warning(f"[AutoDelete] Could not delete msg {msg_id} in {channel_id}: {e}")
-
-    if deleted_count > 0:
-        LOGGER.info(f"[AutoDelete] Deleted {deleted_count} msgs before upload {uploaded_msg_id} in {channel_id}")
