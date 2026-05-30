@@ -224,6 +224,29 @@ async def _save_anime_broadcast_info(anime_name: str, hashtag: str, channel_link
     await db.col.update_one({'id': oid}, {'$set': {'anime_broadcast_map': bmap}}, upsert=True)
 
 
+async def _get_all_broadcast_info() -> dict:
+    """Saara anime_broadcast_map return karo."""
+    oid = await _owner_id()
+    if not oid:
+        return {}
+    user = await db._get_user(oid)
+    return user.get('anime_broadcast_map', {})
+
+
+async def _delete_broadcast_info(key: str) -> bool:
+    """Ek anime entry delete karo by normalized key. True if deleted, False if not found."""
+    oid = await _owner_id()
+    if not oid:
+        return False
+    user = await db._get_user(oid)
+    bmap = user.get('anime_broadcast_map', {})
+    if key not in bmap:
+        return False
+    del bmap[key]
+    await db.col.update_one({'id': oid}, {'$set': {'anime_broadcast_map': bmap}}, upsert=True)
+    return True
+
+
 # ─────────────────────────────────────────────
 #  Button serializer helper
 # ─────────────────────────────────────────────
@@ -439,7 +462,7 @@ async def cmd_end_message(client: Client, message: Message):
                       "schedule_list", "schedule_del", "end_message_preview",
                       "end_message_del", "update_channel", "update_channel_list",
                       "update_channel_del", "broadcast_message", "cancel_broadcast",
-                      "confirm_broadcast"])
+                      "confirm_broadcast", "broadcast_message_list", "broadcast_message_delete"])
 )
 async def capture_any_state(client: Client, message: Message):
     """Pehle broadcast state check karo, phir recording state."""
@@ -1059,6 +1082,7 @@ async def cmd_broadcast_message(client: Client, message: Message):
     Step 3: channel link
     """
     if not _is_authorized(message.from_user.id):
+        await message.reply("❌ Tumhare paas ye command use karne ki permission nahi hai!")
         return
 
     user_id = message.from_user.id
@@ -1075,6 +1099,7 @@ async def cmd_broadcast_message(client: Client, message: Message):
 @Client.on_message(filters.command("cancel_broadcast") & filters.private)
 async def cmd_cancel_broadcast(client: Client, message: Message):
     if not _is_authorized(message.from_user.id):
+        await message.reply("❌ Tumhare paas ye command use karne ki permission nahi hai!")
         return
     _broadcast_state.pop(message.from_user.id, None)
     await message.reply("❌ Broadcast cancelled.")
@@ -1085,6 +1110,7 @@ async def cmd_cancel_broadcast(client: Client, message: Message):
 @Client.on_message(filters.command("confirm_broadcast") & filters.private)
 async def cmd_confirm_broadcast(client: Client, message: Message):
     if not _is_authorized(message.from_user.id):
+        await message.reply("❌ Tumhare paas ye command use karne ki permission nahi hai!")
         return
 
     user_id = message.from_user.id
@@ -1155,3 +1181,85 @@ async def cmd_confirm_broadcast(client: Client, message: Message):
         f"📊 Sent: **{sent}** | Failed: **{failed}**\n\n"
         f"💾 Info saved — future episodes mein automatically use hogi."
     )
+
+
+# ─────────────────────────────────────────────
+#  /broadcast_message_list — saved anime broadcast info dekho
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("broadcast_message_list") & filters.private)
+async def cmd_broadcast_message_list(client: Client, message: Message):
+    if not _is_authorized(message.from_user.id):
+        await message.reply("❌ Tumhare paas ye command use karne ki permission nahi hai!")
+        return
+
+    bmap = await _get_all_broadcast_info()
+    if not bmap:
+        await message.reply(
+            "📣 **Broadcast Info List**\n\n"
+            "❌ Koi saved broadcast info nahi hai.\n\n"
+            "Add karo: `/broadcast_message`"
+        )
+        return
+
+    entries = list(bmap.values())
+    text = "📣 **Saved Broadcast Info:**\n\n"
+    for i, entry in enumerate(entries, 1):
+        name = entry.get('anime_name', 'Unknown')
+        tag  = entry.get('hashtag', '—')
+        link = entry.get('channel_link', '—')
+        text += (
+            f"**{i}.** 🎬 {name}\n"
+            f"    🏷️ `{tag}`\n"
+            f"    🔗 `{link}`\n\n"
+        )
+    text += f"Total: **{len(entries)}**\n\n🗑️ Delete: `/broadcast_message_delete <number>`"
+    await message.reply(text)
+
+
+# ─────────────────────────────────────────────
+#  /broadcast_message_delete — ek entry remove karo
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("broadcast_message_delete") & filters.private)
+async def cmd_broadcast_message_delete(client: Client, message: Message):
+    if not _is_authorized(message.from_user.id):
+        await message.reply("❌ Tumhare paas ye command use karne ki permission nahi hai!")
+        return
+
+    bmap = await _get_all_broadcast_info()
+    if not bmap:
+        await message.reply("❌ Koi saved broadcast info nahi hai!")
+        return
+
+    entries = list(bmap.items())  # [(key, entry), ...]
+
+    if len(message.command) < 2:
+        text = "🗑️ **Konsa delete karna hai?**\n\n"
+        for i, (key, entry) in enumerate(entries, 1):
+            name = entry.get('anime_name', 'Unknown')
+            tag  = entry.get('hashtag', '—')
+            text += f"**{i}.** 🎬 {name}  🏷️ `{tag}`\n"
+        text += "\nUse: `/broadcast_message_delete <number>`"
+        await message.reply(text)
+        return
+
+    try:
+        num = int(message.command[1])
+    except ValueError:
+        await message.reply("❌ Sahi number dalo!")
+        return
+
+    if num < 1 or num > len(entries):
+        await message.reply(f"❌ 1 se {len(entries)} tak dalo.")
+        return
+
+    key, entry = entries[num - 1]
+    deleted = await _delete_broadcast_info(key)
+    if deleted:
+        await message.reply(
+            f"✅ **Deleted!**\n\n"
+            f"🎬 {entry.get('anime_name', 'Unknown')}\n"
+            f"🏷️ `{entry.get('hashtag', '—')}`\n"
+            f"🔗 `{entry.get('channel_link', '—')}`"
+        )
+    else:
+        await message.reply("❌ Delete nahi hua, dobara try karo.")
