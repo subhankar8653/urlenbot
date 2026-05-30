@@ -246,15 +246,26 @@ async def auto_delete_old_messages(client: Client, message: Message):
         if not mime.startswith("video/"):
             return  # Sirf video documents — images/zip etc skip
 
-    # Naye message ka ID = current_msg_id
-    # Pehle ke 3 messages = (current_msg_id - 1), (current_msg_id - 2), (current_msg_id - 3)
     current_id = message.id
-    to_delete = [current_id - 1, current_id - 2, current_id - 3]
+
+    # Video se pehle ke ACTUAL 3 messages fetch karo (ID gaps handle karta hai)
+    to_delete = []
+    try:
+        async for old_msg in client.get_chat_history(
+            chat_id=message.chat.id,
+            limit=4,                  # 4 fetch karo: current video + 3 pehle wale
+            offset_id=current_id,     # current video se PEHLE se shuru karo
+        ):
+            if old_msg.id < current_id:
+                to_delete.append(old_msg.id)
+            if len(to_delete) >= 3:
+                break
+    except Exception as e:
+        LOGGER.warning(f"[AutoDelete] History fetch failed for {message.chat.id}: {e}")
+        return
 
     deleted_count = 0
     for msg_id in to_delete:
-        if msg_id <= 0:
-            continue
         try:
             await client.delete_messages(
                 chat_id=message.chat.id,
