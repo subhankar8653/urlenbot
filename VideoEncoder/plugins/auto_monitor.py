@@ -346,6 +346,13 @@ async def _episode_quality_poller(
                         except Exception as _be:
                             LOGGER.error(f"[AutoMonitor] Broadcast error: {_be}")
 
+                        # ── Pehli quality ke baad pehle ke 3 msgs delete karo ──
+                        try:
+                            from .delete_msg import delete_prev_messages
+                            await delete_prev_messages(client, channel_id, sent_msg.id)
+                        except Exception as _de:
+                            LOGGER.error(f"[AutoMonitor] Auto-delete error: {_de}")
+
             return success, sent_msg, quality
 
         results = await asyncio.gather(
