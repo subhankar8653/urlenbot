@@ -306,6 +306,20 @@ async def send_schedule_notification(
     """
     schedule = await _get_schedule_for_anime(anime_name)
 
+    # Step 0: Purane schedule + end messages delete karo (videos/documents ke upar wale)
+    try:
+        to_delete = []
+        async for old_msg in app.get_chat_history(channel_id, limit=15):
+            if old_msg.video or old_msg.document:
+                break  # Video milte hi rok do
+            to_delete.append(old_msg.id)
+        if to_delete:
+            await app.delete_messages(channel_id, to_delete)
+            LOGGER.info(f"[Schedule] Deleted {len(to_delete)} old msgs before new schedule")
+    except Exception as e:
+        LOGGER.warning(f"[Schedule] Could not delete old messages: {e}")
+
+
     # Step 1: Schedule message — sirf tab jab schedule set ho
     if schedule:
         interval_days = schedule.get('interval_days', 7)
