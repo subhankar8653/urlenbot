@@ -620,7 +620,9 @@ _add_anime_sessions: dict = {}
 async def cmd_add_anime(client: Client, message: Message):
     """
     /add_anime [channel_id] [Anime Name]
-    Seedha ek command mein save — koi steps nahi.
+
+    Example:
+      /add_anime -1001234567890 Fullmetal Alchemist: Brotherhood
     """
     if not _is_authorized(message.from_user.id):
         return
@@ -632,7 +634,7 @@ async def cmd_add_anime(client: Client, message: Message):
             "**Usage:**\n"
             "`/add_anime [channel_id] [Anime Name]`\n\n"
             "**Example:**\n"
-            "`/add_anime -1001234567890 Fullmetal Alchemist Brotherhood`\n\n"
+            "`/add_anime -1001234567890 Fullmetal Alchemist: Brotherhood`\n\n"
             "💡 Anime Name wahi likhna jo RTI post ya URL mein aata hai"
         )
         return
@@ -670,24 +672,92 @@ async def cmd_add_anime(client: Client, message: Message):
             await message.reply(f"⚠️ Already exists!\n\n📺 **{anime_name}** → `{channel_title}`")
             return
 
-    anime_list.append({
-        'channel_id':    channel_id,
+    # Step 1 done — ab hashtag maango
+    _add_anime_sessions[message.from_user.id] = {
+        'step': 'hashtag',
+        'channel_id': channel_id,
         'channel_title': channel_title,
-        'anime_name':    anime_name,
-        'hashtag':       '',
-        'channel_link':  '',
-    })
-    await _save_anime_list(anime_list)
+        'anime_name': anime_name,
+        'hashtag': '',
+    }
 
     await message.reply(
-        f"✅ **Anime Added!**\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📺 **Anime:** {anime_name}\n"
-        f"📢 **Channel:** {channel_title}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Ab jab bhi RTI pe `{anime_name}` ka post aayega,\n"
-        f"bot automatically download + upload karega! 🚀"
+        f"✅ **Step 1/3 Done!**\n\n"
+        f"📺 Anime: **{anime_name}**\n"
+        f"📢 Channel: **{channel_title}**\n\n"
+        f"**Step 2/3** — Broadcast ke liye **hashtag** bhejo:\n"
+        f"_Example: `#official_hindi_dub`_\n\n"
+        f"Nahi chahiye toh `skip` likho."
     )
+
+
+@Client.on_message(filters.text & filters.private, group=5)
+async def add_anime_text_input(bot: Client, message: Message):
+    """Add anime ke liye 2-step text input — hashtag phir channel link."""
+    user_id = message.from_user.id
+    if not _is_authorized(user_id):
+        return
+    session = _add_anime_sessions.get(user_id)
+    if not session:
+        return
+
+    text = message.text.strip()
+
+    # ── Step 2: Hashtag ──
+    if session['step'] == 'hashtag':
+        if text.lower() == 'skip':
+            session['hashtag'] = ''
+        else:
+            session['hashtag'] = text if text.startswith('#') else f"#{text}"
+        session['step'] = 'link'
+        _add_anime_sessions[user_id] = session
+
+        hashtag_info = f"Hashtag: **{session['hashtag']}**" if session['hashtag'] else "Hashtag: _skipped_"
+        await message.reply(
+            f"✅ {hashtag_info}\n\n"
+            f"**Step 3/3** — Broadcast ke liye **channel link** bhejo:\n"
+            f"_Example: `https://t.me/yourchannel`_\n\n"
+            f"Nahi chahiye toh `skip` likho."
+        )
+        return
+
+    # ── Step 3: Channel Link ──
+    if session['step'] == 'link':
+        if text.lower() == 'skip':
+            channel_link = ''
+        elif not text.startswith('http'):
+            await message.reply("⚠️ Valid channel link bhejo (https://t.me/...) ya `skip` likho.")
+            return
+        else:
+            channel_link = text
+
+        # Session khatam — save karo
+        _add_anime_sessions.pop(user_id, None)
+
+        anime_list = await _get_anime_list()
+        anime_list.append({
+            'channel_id':    session['channel_id'],
+            'channel_title': session['channel_title'],
+            'anime_name':    session['anime_name'],
+            'hashtag':       session['hashtag'],
+            'channel_link':  channel_link,
+        })
+        await _save_anime_list(anime_list)
+
+        hashtag_str = session['hashtag'] if session['hashtag'] else "None"
+        link_str = channel_link if channel_link else "None"
+
+        await message.reply(
+            f"✅ **Anime Added!**\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📺 **Anime:** {session['anime_name']}\n"
+            f"📢 **Channel:** {session['channel_title']}\n"
+            f"🏷️ **Hashtag:** {hashtag_str}\n"
+            f"🔗 **Link:** {link_str}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Ab jab bhi RTI pe `{session['anime_name']}` ka post aayega,\n"
+            f"bot automatically download + upload + broadcast karega! 🚀"
+        )
 
 
 # ─────────────────────────────────────────────
