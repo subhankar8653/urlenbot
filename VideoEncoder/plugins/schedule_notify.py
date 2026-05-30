@@ -346,134 +346,6 @@ async def _send_end_messages_to_channel(channel_id: int, channel_key: str = DEFA
 
 
 # ─────────────────────────────────────────────
-#  Cleanup — last 50 msgs scan karke purane 3 non-media messages delete karo
-#  (videos/documents/photos nahi — sirf text/sticker/animation messages)
-# ─────────────────────────────────────────────
-async def cleanup_old_notifications(
-    channel_id: int,
-    anime_name: str,
-    user_session: str | None = None,
-) -> int:
-    """
-    Cleanup (FIXED):
-      - Channel ke last 50 messages scan karo
-      - SKIP: video/document/photo/audio (actual media content)
-      - SKIP: text mein "end", "season", "finale" (important msgs)
-      - DELETE: last 3 non-media, non-protected messages
-        (sticker, animation, plain text — koi bhi ho)
-      - user_session diya → user account se delete (purane msgs bhi jaayenge)
-      - user_session nahi → bot se delete (sirf bot ke messages)
-      - Returns: deleted count
-    """
-    # Yeh keywords wale messages KABHI delete NAHI honge
-    PROTECTED_KEYWORDS = [
-        "end",
-        "season",
-        "finale",
-    ]
-
-    # Yeh media types kabhi delete nahi honge (actual content)
-    SKIP_MEDIA_TYPES = {"video", "document", "photo", "audio"}
-
-    # ── User client banao agar session diya ──
-    user_client = None
-    if user_session:
-        try:
-            from pyrogram import Client as _Client
-            user_client = _Client(
-                "cleanup_user",
-                session_string=user_session,
-                api_id=api_id,
-                api_hash=api_hash,
-                in_memory=True,
-            )
-            await user_client.connect()
-            LOGGER.info("[Cleanup] User client connected — user account se delete hoga")
-        except Exception as ue:
-            LOGGER.warning(f"[Cleanup] User client connect failed: {ue} — bot se try karega")
-            user_client = None
-
-    # scan_client: messages fetch karne ke liye (app ya user_client)
-    scan_client = user_client if user_client else app
-    # delete_client: messages delete karne ke liye
-    delete_client = user_client if user_client else app
-
-    try:
-        to_delete = []
-        skipped   = []
-
-        LOGGER.info(f"[Cleanup-DEBUG] Channel {channel_id} ke messages scan shuru...")
-
-        async for msg in scan_client.get_chat_history(channel_id, limit=50):
-            # Agar 3 messages mil gaye toh scan band karo
-            if len(to_delete) >= 3:
-                break
-
-            # Message type detect karo
-            msg_type = "text"
-            if msg.video:       msg_type = "video"
-            elif msg.document:  msg_type = "document"
-            elif msg.photo:     msg_type = "photo"
-            elif msg.audio:     msg_type = "audio"
-            elif msg.sticker:   msg_type = "sticker"
-            elif msg.animation: msg_type = "animation"
-
-            msg_text = (msg.text or msg.caption or "").lower()
-            msg_preview = msg_text[:60].replace('\n', ' ') if msg_text else "[no text]"
-
-            LOGGER.info(
-                f"[Cleanup-DEBUG] msg_id={msg.id} | type={msg_type} | "
-                f"text='{msg_preview}'"
-            )
-
-            # Heavy media messages skip — yeh actual content hai
-            if msg_type in SKIP_MEDIA_TYPES:
-                skipped.append(f"msg {msg.id} [media={msg_type}]")
-                LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → SKIP (media={msg_type})")
-                continue
-
-            # Protected keywords wale skip
-            if any(kw in msg_text for kw in PROTECTED_KEYWORDS):
-                matched_kw = [kw for kw in PROTECTED_KEYWORDS if kw in msg_text]
-                skipped.append(f"msg {msg.id} [protected={matched_kw}]")
-                LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → SKIP (protected: {matched_kw})")
-                continue
-
-            # Baaki sab (text, sticker, animation) — delete list mein
-            to_delete.append(msg.id)
-            LOGGER.info(f"[Cleanup-DEBUG] msg {msg.id} → DELETE (type={msg_type})")
-
-        LOGGER.info(f"[Cleanup] to_delete={to_delete} | skipped={skipped}")
-
-        if not to_delete:
-            LOGGER.info("[Cleanup] Koi deletable message nahi mila")
-            return 0
-
-        deleted = 0
-        for msg_id in to_delete:
-            try:
-                await delete_client.delete_messages(channel_id, msg_id)
-                deleted += 1
-                LOGGER.info(f"[Cleanup] Deleted msg_id={msg_id}")
-                await asyncio.sleep(0.3)
-            except Exception as e:
-                LOGGER.warning(f"[Cleanup] Could not delete {msg_id}: {e}")
-
-        LOGGER.info(f"[Cleanup] deleted={deleted} | skipped={len(skipped)}")
-        return deleted
-    except Exception as e:
-        LOGGER.error(f"[Cleanup] Failed: {e}")
-        return 0
-    finally:
-        # User client disconnect karo
-        if user_client:
-            try:
-                await user_client.disconnect()
-            except Exception:
-                pass
-
-
-# ─────────────────────────────────────────────
 #  Main function — auto_monitor.py se call hoga
 # ─────────────────────────────────────────────
 async def send_schedule_notification(
@@ -486,36 +358,34 @@ async def send_schedule_notification(
     """
     Episode complete hone ke baad call karo.
     Flow:
-      1. Purane schedule/end msgs delete karo
-      2. Schedule msg post karo
-      3. End messages post karo (last episode pe nahi — END ke baad kuch nahi)
+      1. Schedule set hai → Schedule msg post karo (next date ya END)
+      2. End messages HAMESHA post karo (schedule ho ya na ho)
     channel_key: channel-specific end messages ke liye (default = DEFAULT_END_KEY)
     """
     schedule = await _get_schedule_for_anime(anime_name)
-    if not schedule:
-        LOGGER.info(f"[Schedule] No schedule for '{anime_name}', skipping.")
-        return
 
-    interval_days = schedule.get('interval_days', 7)
-    total_eps     = schedule.get('total_eps', 0)
-    is_last_ep    = total_eps > 0 and episode_num >= total_eps
+    # Step 1: Schedule message — sirf tab jab schedule set ho
+    if schedule:
+        interval_days = schedule.get('interval_days', 7)
+        total_eps     = schedule.get('total_eps', 0)
+        is_last_ep    = total_eps > 0 and episode_num >= total_eps
 
-    # Step 2: Schedule message
-    try:
-        if is_last_ep:
-            await app.send_message(channel_id, "**END**")
-            LOGGER.info(f"[Schedule] Last ep {episode_num} → posted END for '{anime_name}'")
-        else:
-            next_date = _next_episode_date(interval_days)
-            await app.send_message(channel_id, f"**Next episode upload on {next_date}**")
-            LOGGER.info(f"[Schedule] Ep {episode_num} → Next on {next_date} for '{anime_name}'")
-    except Exception as e:
-        LOGGER.error(f"[Schedule] Schedule msg failed: {e}")
-        return
+        try:
+            if is_last_ep:
+                await app.send_message(channel_id, "**END**")
+                LOGGER.info(f"[Schedule] Last ep {episode_num} → posted END for '{anime_name}'")
+            else:
+                next_date = _next_episode_date(interval_days)
+                await app.send_message(channel_id, f"**Next episode upload on {next_date}**")
+                LOGGER.info(f"[Schedule] Ep {episode_num} → Next on {next_date} for '{anime_name}'")
+        except Exception as e:
+            LOGGER.error(f"[Schedule] Schedule msg failed: {e}")
 
-    await asyncio.sleep(0.5)
+        await asyncio.sleep(0.5)
+    else:
+        LOGGER.info(f"[Schedule] No schedule for '{anime_name}' — skipping schedule msg.")
 
-    # Step 3: End messages bhejo
+    # Step 2: End messages — schedule ho ya na ho, HAMESHA bhejo
     await _send_end_messages_to_channel(channel_id, channel_key)
 
 
@@ -1225,14 +1095,61 @@ async def cmd_confirm_broadcast(client: Client, message: Message):
     hashtag      = state['hashtag']
     channel_link = state['channel_link']
 
-    # Sirf DB mein save karo — channel pe broadcast nahi
+    # DB mein save karo future auto-broadcasts ke liye
     await _save_anime_broadcast_info(anime_name, hashtag, channel_link)
 
-    await message.reply(
-        f"✅ **Broadcast Info Saved!**\n\n"
+    # Abhi turant bhi broadcast bhejo
+    channels = await _get_update_channels()
+    status_msg = await message.reply(
+        f"📣 **Broadcasting...**\n\n"
+        f"📺 {anime_name}\n"
+        f"📢 {len(channels)} channels pe bhej raha hoon..."
+    )
+
+    if not channels:
+        await status_msg.edit(
+            f"✅ **Broadcast Info Saved!**\n\n"
+            f"📺 Anime: **{anime_name}**\n"
+            f"🏷️ Hashtag: **{hashtag if hashtag else 'None'}**\n"
+            f"🔗 Link: `{channel_link}`\n\n"
+            f"⚠️ Koi update channel set nahi hai — broadcast nahi bheja.\n"
+            f"Update channel add karo: `/update_channel [channel_id]`"
+        )
+        return
+
+    lines = [f"**🔰 {anime_name}**"]
+    if hashtag:
+        lines.append(f"**{hashtag}**")
+    lines.append("")
+    lines.append("**📍New Episode Added...!**")
+    if channel_link:
+        watch_line = f"**[📌𝙒𝘼𝙏𝘾𝙃 & 𝘿𝙊𝙒𝙉𝙇𝙊𝘼𝘿📌]({channel_link})**"
+        lines.append(watch_line)
+        lines.append(watch_line)
+    else:
+        lines.append("**📌𝙒𝘼𝙏𝘾𝙃 & 𝘿𝙊𝙒𝙉𝙇𝙊𝘼𝘿📌**")
+
+    broadcast_text = "\n".join(lines)
+    sent = 0
+    failed = 0
+    for ch in channels:
+        try:
+            await app.send_message(
+                chat_id=ch['channel_id'],
+                text=broadcast_text,
+                disable_web_page_preview=True,
+            )
+            sent += 1
+        except Exception as e:
+            LOGGER.error(f"[Broadcast] Failed for {ch['channel_id']}: {e}")
+            failed += 1
+        await asyncio.sleep(0.5)
+
+    await status_msg.edit(
+        f"✅ **Broadcast Done!**\n\n"
         f"📺 Anime: **{anime_name}**\n"
         f"🏷️ Hashtag: **{hashtag if hashtag else 'None'}**\n"
         f"🔗 Link: `{channel_link}`\n\n"
-        f"Ab jab bhi **{anime_name}** ka episode upload hoga,\n"
-        f"automatically broadcast ho jaayega! 🚀"
+        f"📊 Sent: **{sent}** | Failed: **{failed}**\n\n"
+        f"💾 Info saved — future episodes mein automatically use hogi."
     )

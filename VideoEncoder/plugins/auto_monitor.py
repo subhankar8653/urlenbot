@@ -57,10 +57,6 @@ def _get_schedule_fn():
     from .schedule_notify import send_schedule_notification
     return send_schedule_notification
 
-def _get_cleanup_fn():
-    from .schedule_notify import cleanup_old_notifications
-    return cleanup_old_notifications
-
 # ─────────────────────────────────────────────
 #  Constants
 # ─────────────────────────────────────────────
@@ -164,14 +160,17 @@ def _extract_url(text: str) -> str | None:
 # ─────────────────────────────────────────────
 async def _episode_quality_poller(
     client: Client,
-    log_message: Message,   # log channel ya trigger message — status updates ke liye
+    log_message: Message,
     swift_url: str,
     episode_num: int,
     anime_name: str,
-    channel_id: int,        # anime ka upload channel
+    channel_id: int,
     owner_id: int,
+    matched_entry: dict = None,
 ):
     _scrape_and_download, _upload_one_file, _sort_by_size, _auto_rename, _quality_from, QUALITY_ORDER = _get_swift_fns()
+    if matched_entry is None:
+        matched_entry = {}
 
     remaining = set(TARGET_QUALITIES)   # jo qualities abhi tak nahi mili
     start_time = time.time()
@@ -340,6 +339,8 @@ async def _episode_quality_poller(
                                 anime_name=anime_name,
                                 episode_num=episode_num,
                                 caption=_caption,
+                                hashtag=matched_entry.get("hashtag", ""),
+                                channel_link=matched_entry.get("channel_link", ""),
                             )
                             LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ Broadcast sent after {quality} upload")
                         except Exception as _be:
@@ -530,46 +531,11 @@ async def auto_monitor_handler(client: Client, message: Message):
             f"`{swift_url}`"
         )
 
-        # Swift URL milte hi — purane schedule/end messages channel se delete karo
-        try:
-            _cfn = _get_cleanup_fn()
-            await prep_msg.edit(
-                f"✅ **AutoMonitor** | `{anime_name}` | Ep `{ep_num}`\n\n"
-                f"Swift URL mila! Quality poller shuru...\n"
-                f"`{swift_url}`\n\n"
-                f"🧹 Purane messages delete ho rahe hain..."
-            )
-            # Owner ka user_session fetch karo — user account se delete hoga
-            _owner_user_session = None
-            try:
-                _owner_doc = await db._get_user(oid)
-                _owner_user_session = _owner_doc.get("user_session", None)
-            except Exception:
-                pass
-            deleted_count = await _cfn(channel_id, anime_name, _owner_user_session)
-            if deleted_count > 0:
-                await prep_msg.edit(
-                    f"✅ **AutoMonitor** | `{anime_name}` | Ep `{ep_num}`\n\n"
-                    f"Swift URL mila! Quality poller shuru...\n"
-                    f"`{swift_url}`\n\n"
-                    f"🧹 Purane messages delete ho rahe hain...\n"
-                    f"✅ {deleted_count} message(s) delete ho gaye!"
-                )
-            else:
-                await prep_msg.edit(
-                    f"✅ **AutoMonitor** | `{anime_name}` | Ep `{ep_num}`\n\n"
-                    f"Swift URL mila! Quality poller shuru...\n"
-                    f"`{swift_url}`\n\n"
-                    f"🧹 Cleanup done — koi purana message nahi tha."
-                )
-            await asyncio.sleep(1)
-        except Exception as _ce:
-            LOGGER.warning(f"[AutoMonitor] Ep {ep_num}: Swift-time cleanup error: {_ce}")
-
         # Episode fully complete hone ke baad hi agli episode shuru karo (sequential)
         await _episode_quality_poller(
             client, message, swift_url,
-            ep_num, anime_name, channel_id, oid
+            ep_num, anime_name, channel_id, oid,
+            matched_entry=matched,
         )
 
         # Episodes ke beech thoda gap
@@ -640,8 +606,16 @@ async def cmd_set_monitor(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────
-#  /add_anime
+#  /add_anime — Interactive 3-step flow
+#  Step 1: /add_anime [channel_id] [Anime Name]
+#  Step 2: Bot poochega hashtag (ya skip)
+#  Step 3: Bot poochega channel link (ya skip)
 # ─────────────────────────────────────────────
+
+# { user_id: { 'step': 'hashtag'|'link', 'channel_id': int, 'channel_title': str, 'anime_name': str, 'hashtag': str } }
+_add_anime_sessions: dict = {}
+
+
 @Client.on_message(filters.command("add_anime") & filters.private)
 async def cmd_add_anime(client: Client, message: Message):
     """
@@ -698,23 +672,92 @@ async def cmd_add_anime(client: Client, message: Message):
             await message.reply(f"⚠️ Already exists!\n\n📺 **{anime_name}** → `{channel_title}`")
             return
 
-    anime_list.append({
+    # Step 1 done — ab hashtag maango
+    _add_anime_sessions[message.from_user.id] = {
+        'step': 'hashtag',
         'channel_id': channel_id,
         'channel_title': channel_title,
         'anime_name': anime_name,
-    })
-    await _save_anime_list(anime_list)
+        'hashtag': '',
+    }
 
     await message.reply(
-        f"✅ **Anime Added!**\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📺 **Anime:** {anime_name}\n"
-        f"📢 **Channel:** {channel_title}\n"
-        f"🆔 `{channel_id}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Ab jab bhi RTI pe `{anime_name}` ka post aayega,\n"
-        f"bot automatically download + upload karega! 🚀"
+        f"✅ **Step 1/3 Done!**\n\n"
+        f"📺 Anime: **{anime_name}**\n"
+        f"📢 Channel: **{channel_title}**\n\n"
+        f"**Step 2/3** — Broadcast ke liye **hashtag** bhejo:\n"
+        f"_Example: `#official_hindi_dub`_\n\n"
+        f"Nahi chahiye toh `skip` likho."
     )
+
+
+@Client.on_message(filters.text & filters.private, group=5)
+async def add_anime_text_input(bot: Client, message: Message):
+    """Add anime ke liye 2-step text input — hashtag phir channel link."""
+    user_id = message.from_user.id
+    if not _is_authorized(user_id):
+        return
+    session = _add_anime_sessions.get(user_id)
+    if not session:
+        return
+
+    text = message.text.strip()
+
+    # ── Step 2: Hashtag ──
+    if session['step'] == 'hashtag':
+        if text.lower() == 'skip':
+            session['hashtag'] = ''
+        else:
+            session['hashtag'] = text if text.startswith('#') else f"#{text}"
+        session['step'] = 'link'
+        _add_anime_sessions[user_id] = session
+
+        hashtag_info = f"Hashtag: **{session['hashtag']}**" if session['hashtag'] else "Hashtag: _skipped_"
+        await message.reply(
+            f"✅ {hashtag_info}\n\n"
+            f"**Step 3/3** — Broadcast ke liye **channel link** bhejo:\n"
+            f"_Example: `https://t.me/yourchannel`_\n\n"
+            f"Nahi chahiye toh `skip` likho."
+        )
+        return
+
+    # ── Step 3: Channel Link ──
+    if session['step'] == 'link':
+        if text.lower() == 'skip':
+            channel_link = ''
+        elif not text.startswith('http'):
+            await message.reply("⚠️ Valid channel link bhejo (https://t.me/...) ya `skip` likho.")
+            return
+        else:
+            channel_link = text
+
+        # Session khatam — save karo
+        _add_anime_sessions.pop(user_id, None)
+
+        anime_list = await _get_anime_list()
+        anime_list.append({
+            'channel_id':    session['channel_id'],
+            'channel_title': session['channel_title'],
+            'anime_name':    session['anime_name'],
+            'hashtag':       session['hashtag'],
+            'channel_link':  channel_link,
+        })
+        await _save_anime_list(anime_list)
+
+        hashtag_str = session['hashtag'] if session['hashtag'] else "None"
+        link_str = channel_link if channel_link else "None"
+
+        await message.reply(
+            f"✅ **Anime Added!**\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📺 **Anime:** {session['anime_name']}\n"
+            f"📢 **Channel:** {session['channel_title']}\n"
+            f"🏷️ **Hashtag:** {hashtag_str}\n"
+            f"🔗 **Link:** {link_str}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Ab jab bhi RTI pe `{session['anime_name']}` ka post aayega,\n"
+            f"bot automatically download + upload + broadcast karega! 🚀"
+        )
 
 
 # ─────────────────────────────────────────────
@@ -751,7 +794,13 @@ async def cmd_list_anime(client: Client, message: Message):
         name = entry.get('anime_name', 'Unknown')
         ch_title = entry.get('channel_title', 'Unknown')
         ch_id = entry.get('channel_id', 'N/A')
-        text += f"**{i}.** 📺 {name}\n   📢 {ch_title} (`{ch_id}`)\n\n"
+        hashtag = entry.get('hashtag', '') or '—'
+        link = entry.get('channel_link', '') or '—'
+        text += (
+            f"**{i}.** 📺 {name}\n"
+            f"   📢 {ch_title} (`{ch_id}`)\n"
+            f"   🏷️ {hashtag} | 🔗 {link}\n\n"
+        )
 
     text += (
         f"━━━━━━━━━━━━━━━━━━━━\n"
