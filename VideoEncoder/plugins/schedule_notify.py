@@ -472,6 +472,10 @@ async def capture_any_state(client: Client, message: Message):
 
     # ── Priority 1: Broadcast state ──
     if user_id in _broadcast_state:
+        # Agar koi bhi command aaye toh state clear karo — command handlers khud handle karenge
+        if message.text and message.text.startswith('/'):
+            _broadcast_state.pop(user_id, None)
+            return
         state = _broadcast_state[user_id]
         text = (message.text or "").strip()
 
