@@ -829,10 +829,10 @@ async def cmd_update_channel(client: Client, message: Message):
     Ek baar set karo — episode upload hone pe wahan broadcast jayega.
     """
     if not _is_authorized(message.from_user.id):
+        await message.reply("❌ Tumhare paas ye command use karne ki permission nahi hai!")
         return
 
-    parts = message.text.split()
-    if len(parts) < 2:
+    if len(message.command) < 2:
         channels = await _get_update_channels()
         if not channels:
             await message.reply(
@@ -855,7 +855,7 @@ async def cmd_update_channel(client: Client, message: Message):
         return
 
     try:
-        channel_id = int(parts[1])
+        channel_id = int(message.command[1])
     except ValueError:
         await message.reply("❌ Valid channel ID dalo! Format: `-100xxxxxxxxx`")
         return
@@ -892,6 +892,7 @@ async def cmd_update_channel(client: Client, message: Message):
 @Client.on_message(filters.command("update_channel_list") & filters.private)
 async def cmd_update_channel_list(client: Client, message: Message):
     if not _is_authorized(message.from_user.id):
+        await message.reply("❌ Tumhare paas ye command use karne ki permission nahi hai!")
         return
 
     channels = await _get_update_channels()
@@ -918,6 +919,7 @@ async def cmd_update_channel_list(client: Client, message: Message):
 @Client.on_message(filters.command("update_channel_del") & filters.private)
 async def cmd_update_channel_del(client: Client, message: Message):
     if not _is_authorized(message.from_user.id):
+        await message.reply("❌ Tumhare paas ye command use karne ki permission nahi hai!")
         return
 
     channels = await _get_update_channels()
