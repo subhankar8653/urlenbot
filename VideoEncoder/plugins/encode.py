@@ -92,6 +92,8 @@ async def auto_encode(app, message):
     if message.document:
         if not message.document.mime_type in video_mimetype:
             return
+    if not message.from_user:
+        return  # Channel post / anonymous admin — skip
     c = await check_chat(message, chat='Both')
     if not c:
         return

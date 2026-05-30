@@ -230,6 +230,8 @@ async def auto_delete_old_messages(client: Client, message: Message):
     """
     Jab set kiye hue channel pe nayi video/document file aaye,
     toh usse pehle ke 3 messages delete karo.
+    User session available ho toh userbot se delete karo (better permissions),
+    warna bot se try karo.
     """
     # Sirf set channels pe kaam karo
     channels = await _get_delete_channels()
@@ -253,7 +255,7 @@ async def auto_delete_old_messages(client: Client, message: Message):
     try:
         async for old_msg in client.get_chat_history(message.chat.id, limit=10):
             if old_msg.id >= current_id:
-                continue  # naya video message aur koi uske baad aaya skip
+                continue
             to_delete.append(old_msg.id)
             if len(to_delete) == 3:
                 break
@@ -267,19 +269,50 @@ async def auto_delete_old_messages(client: Client, message: Message):
     if not to_delete:
         return
 
+    # User session try karo pehle (owner ka) — better channel permissions
+    delete_client = client
+    user_client = None
+
+    try:
+        oid = await _owner_id()
+        if oid:
+            user = await db._get_user(oid)
+            session_str = user.get("user_session") if user else None
+            if session_str:
+                from pyrogram import Client as PyroClient
+                user_client = PyroClient(
+                    "auto_delete_user",
+                    session_string=session_str,
+                    in_memory=True,
+                )
+                await user_client.connect()
+                delete_client = user_client
+                LOGGER.info("[AutoDelete] Using userbot session for delete")
+    except Exception as e:
+        LOGGER.warning(f"[AutoDelete] Could not init userbot, using bot: {e}")
+        user_client = None
+        delete_client = client
+
     deleted_count = 0
-    for msg_id in to_delete:
-        try:
-            await client.delete_messages(
-                chat_id=message.chat.id,
-                message_ids=msg_id
-            )
-            deleted_count += 1
-        except Exception as e:
-            LOGGER.warning(
-                f"[AutoDelete] Could not delete msg {msg_id} "
-                f"in {message.chat.id}: {e}"
-            )
+    try:
+        for msg_id in to_delete:
+            try:
+                await delete_client.delete_messages(
+                    chat_id=message.chat.id,
+                    message_ids=msg_id
+                )
+                deleted_count += 1
+            except Exception as e:
+                LOGGER.warning(
+                    f"[AutoDelete] Could not delete msg {msg_id} "
+                    f"in {message.chat.id}: {e}"
+                )
+    finally:
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
 
     if deleted_count > 0:
         LOGGER.info(
