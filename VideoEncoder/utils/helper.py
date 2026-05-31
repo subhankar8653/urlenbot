@@ -26,6 +26,9 @@ start_but = InlineKeyboardMarkup([
 async def check_chat(message, chat):
     ''' Authorize User! '''
     chat_id = message.chat.id
+    # Channel messages / anonymous posts have no from_user — deny by default
+    if not message.from_user:
+        return None
     user_id = message.from_user.id
     get_sudo = await db.get_sudo()
     get_auth = await db.get_chat()
