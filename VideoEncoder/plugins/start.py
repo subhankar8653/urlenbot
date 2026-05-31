@@ -6,7 +6,6 @@ import time
 from os import execl as osexecl
 from subprocess import run as srun
 from sys import executable
-from time import time
 
 from psutil import (boot_time, cpu_count, cpu_percent, disk_usage,
                     net_io_counters, swap_memory, virtual_memory)
@@ -87,8 +86,8 @@ async def show_status_count(_, event: Message):
 
 
 async def show_status(_):
-    currentTime = TimeFormatter(time() - botStartTime)
-    osUptime = TimeFormatter(time() - boot_time())
+    currentTime = TimeFormatter(time.time() - botStartTime)
+    osUptime = TimeFormatter(time.time() - boot_time())
     total, used, free, disk = disk_usage('/')
     total = humanbytes(total)
     used = humanbytes(used)
@@ -132,7 +131,7 @@ Users: {total_users}"""
 
 
 async def showw_status(_):
-    currentTime = TimeFormatter(time() - botStartTime)
+    currentTime = TimeFormatter(time.time() - botStartTime)
     total, used, free, disk = disk_usage('/')
     total = humanbytes(total)
     used = humanbytes(used)
