@@ -185,11 +185,12 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
                 uploader_client=uc
             )
         else:
-            link = await upload_video(
+            _resp = await upload_video(
                 message, msg, new_file, bold_caption,
                 c_time, thumb, duration, width, height, new_filename, custom_thumb,
                 uploader_client=uc
             )
+            link = _resp.link if _resp else None
     finally:
         if uc:
             try:
@@ -279,7 +280,7 @@ async def upload_video(message, msg, new_file, caption, c_time, thumb,
             except Exception:
                 pass
 
-    return resp.link
+    return resp  # Message object return karo (swift ke liye .id chahiye)
 
 
 # ─────────────────────────────────────────────
