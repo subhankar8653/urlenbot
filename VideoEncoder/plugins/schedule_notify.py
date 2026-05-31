@@ -377,10 +377,39 @@ async def cmd_end_message(client: Client, message: Message):
 # ─────────────────────────────────────────────
 @Client.on_message(
     filters.private &
-    ~filters.command(["done", "cancel_end", "end_message", "schedule",
-                      "schedule_list", "schedule_del", "end_message_preview",
-                      "end_message_del", "swift", "swiftdl", "swiftencode",
-                      "url", "mega", "meganow", "rti", "dl", "ddl", "batch"])
+    ~filters.command([
+        # schedule_notify commands
+        "done", "cancel_end", "end_message", "schedule", "schedule_list",
+        "schedule_del", "end_message_preview", "end_message_del",
+        # encode / download commands
+        "swift", "swiftdl", "swiftencode", "url", "mega", "meganow",
+        "rti", "dl", "ddl", "batch", "af",
+        # start / help / system
+        "start", "help", "stats", "status", "clean", "restart", "update",
+        "queue", "clear", "exec", "sh", "logs",
+        # upload commands
+        "dupload", "vupload", "gupload",
+        # settings
+        "settings", "vset", "reset", "urlsettings", "urlpreset",
+        "setmeta", "clearmeta", "metadata",
+        # thumbnail / pic
+        "thumb", "setpic", "deletepic", "delpic", "listpic", "previewpic",
+        # auth
+        "addchat", "addsudo", "rmchat", "rmsudo",
+        # channel
+        "addchannel", "seechannel", "delchannel",
+        # delete_msg
+        "delete_message", "delete_message_list", "delete_message_del",
+        # save_restrict
+        "savelogin", "savelogout", "saveget",
+        # swap / addswap
+        "swap", "swapclear", "addswap", "swaplist", "clearswap",
+        # auto_monitor
+        "set_monitor", "add_anime", "list_anime", "del_anime", "monitor_status",
+        # speedtest / extras
+        "speedtest", "cancel",
+    ]),
+    group=20,
 )
 async def capture_any_state(client: Client, message: Message):
     """End message recording state handle karo."""

@@ -88,6 +88,9 @@ async def batch_encode(app, message):
 
 @Client.on_message(filters.video | filters.document)
 async def auto_encode(app, message):
+    # Channel messages have no from_user — skip silently
+    if not message.from_user:
+        return
     # Check mimetype for documents
     if message.document:
         if not message.document.mime_type in video_mimetype:
