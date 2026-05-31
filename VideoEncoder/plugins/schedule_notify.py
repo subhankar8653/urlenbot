@@ -379,7 +379,8 @@ async def cmd_end_message(client: Client, message: Message):
     filters.private &
     ~filters.command(["done", "cancel_end", "end_message", "schedule",
                       "schedule_list", "schedule_del", "end_message_preview",
-                      "end_message_del"])
+                      "end_message_del", "swift", "swiftdl", "swiftencode",
+                      "url", "mega", "meganow", "rti", "dl", "ddl", "batch"])
 )
 async def capture_any_state(client: Client, message: Message):
     """End message recording state handle karo."""
