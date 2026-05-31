@@ -175,7 +175,6 @@ async def _episode_quality_poller(
     remaining = set(TARGET_QUALITIES)   # jo qualities abhi tak nahi mili
     start_time = time.time()
     attempt = 0
-    broadcast_sent = False   # pehle upload pe ek baar hi broadcast hoga
 
     status_msg = await log_message.reply(
         f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
@@ -311,10 +310,8 @@ async def _episode_quality_poller(
         # channel_id pass karo taaki seedha anime channel pe upload ho
         proxy_msg = _ProxyMsg(log_message, owner_id, channel_id)
 
-        _broadcast_lock = asyncio.Lock()
 
         async def _upload_task(filepath, idx):
-            nonlocal broadcast_sent
             if idx > 0:
                 await _half_events[idx - 1].wait()
             um = _dummy_msgs.get(filepath, status_msg)
@@ -328,23 +325,29 @@ async def _episode_quality_poller(
                 pass
 
             if success and sent_msg:
-                # ── Pehli quality upload hote hi turant broadcast bhejo ──
-                async with _broadcast_lock:
-                    if not broadcast_sent:
-                        broadcast_sent = True
-                        try:
-                            from .schedule_notify import send_broadcast_to_update_channels
-                            _caption = sent_msg.caption or ""
-                            await send_broadcast_to_update_channels(
-                                anime_name=anime_name,
-                                episode_num=episode_num,
-                                caption=_caption,
-                                hashtag=matched_entry.get("hashtag", ""),
-                                channel_link=matched_entry.get("channel_link", ""),
-                            )
-                            LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ Broadcast sent after {quality} upload")
-                        except Exception as _be:
-                            LOGGER.error(f"[AutoMonitor] Broadcast error: {_be}")
+                # ── 360p upload hote hi update channels pe post bhejo ──
+                if quality == "360p":
+                    try:
+                        from .update_channel import send_update_post
+                        from ..utils.auto_caption import extract_anime_info
+                        _fname = ""
+                        if sent_msg.document and sent_msg.document.file_name:
+                            _fname = sent_msg.document.file_name
+                        elif sent_msg.caption:
+                            _fname = sent_msg.caption.replace("<b>", "").replace("</b>", "").strip()
+                        _parsed_name, _season, _episode = extract_anime_info(_fname, {})
+                        _final_name = _parsed_name or anime_name
+                        _final_season = _season
+                        _final_episode = _episode if _episode else episode_num
+                        await send_update_post(
+                            client,
+                            anime_name=_final_name,
+                            season=_final_season,
+                            episode=_final_episode,
+                        )
+                        LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ Update post sent after 360p upload")
+                    except Exception as _ue:
+                        LOGGER.error(f"[AutoMonitor] Update post error: {_ue}")
 
             return success, sent_msg, quality
 
@@ -613,7 +616,7 @@ async def cmd_set_monitor(client: Client, message: Message):
 # ─────────────────────────────────────────────
 
 # { user_id: { 'step': 'hashtag'|'link', 'channel_id': int, 'channel_title': str, 'anime_name': str, 'hashtag': str } }
-_add_anime_sessions: dict = {}
+# _add_anime_sessions removed — /add_anime is now a single-step command
 
 
 @Client.on_message(filters.command("add_anime") & filters.private)
@@ -672,92 +675,27 @@ async def cmd_add_anime(client: Client, message: Message):
             await message.reply(f"⚠️ Already exists!\n\n📺 **{anime_name}** → `{channel_title}`")
             return
 
-    # Step 1 done — ab hashtag maango
-    _add_anime_sessions[message.from_user.id] = {
-        'step': 'hashtag',
-        'channel_id': channel_id,
+    # Seedha save karo — no extra steps needed
+    anime_list = await _get_anime_list()
+    anime_list.append({
+        'channel_id':    channel_id,
         'channel_title': channel_title,
-        'anime_name': anime_name,
-        'hashtag': '',
-    }
+        'anime_name':    anime_name,
+        'hashtag':       '',
+        'channel_link':  '',
+    })
+    await _save_anime_list(anime_list)
 
     await message.reply(
-        f"✅ **Step 1/3 Done!**\n\n"
-        f"📺 Anime: **{anime_name}**\n"
-        f"📢 Channel: **{channel_title}**\n\n"
-        f"**Step 2/3** — Broadcast ke liye **hashtag** bhejo:\n"
-        f"_Example: `#official_hindi_dub`_\n\n"
-        f"Nahi chahiye toh `skip` likho."
+        f"✅ **Anime Added!**\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📺 **Anime:** {anime_name}\n"
+        f"📢 **Channel:** {channel_title}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Ab jab bhi RTI pe `{anime_name}` ka post aayega,\n"
+        f"bot automatically download + upload karega! \U0001f680"
     )
 
-
-@Client.on_message(filters.text & filters.private, group=5)
-async def add_anime_text_input(bot: Client, message: Message):
-    """Add anime ke liye 2-step text input — hashtag phir channel link."""
-    user_id = message.from_user.id
-    if not _is_authorized(user_id):
-        return
-    session = _add_anime_sessions.get(user_id)
-    if not session:
-        return
-
-    text = message.text.strip()
-
-    # ── Step 2: Hashtag ──
-    if session['step'] == 'hashtag':
-        if text.lower() == 'skip':
-            session['hashtag'] = ''
-        else:
-            session['hashtag'] = text if text.startswith('#') else f"#{text}"
-        session['step'] = 'link'
-        _add_anime_sessions[user_id] = session
-
-        hashtag_info = f"Hashtag: **{session['hashtag']}**" if session['hashtag'] else "Hashtag: _skipped_"
-        await message.reply(
-            f"✅ {hashtag_info}\n\n"
-            f"**Step 3/3** — Broadcast ke liye **channel link** bhejo:\n"
-            f"_Example: `https://t.me/yourchannel`_\n\n"
-            f"Nahi chahiye toh `skip` likho."
-        )
-        return
-
-    # ── Step 3: Channel Link ──
-    if session['step'] == 'link':
-        if text.lower() == 'skip':
-            channel_link = ''
-        elif not text.startswith('http'):
-            await message.reply("⚠️ Valid channel link bhejo (https://t.me/...) ya `skip` likho.")
-            return
-        else:
-            channel_link = text
-
-        # Session khatam — save karo
-        _add_anime_sessions.pop(user_id, None)
-
-        anime_list = await _get_anime_list()
-        anime_list.append({
-            'channel_id':    session['channel_id'],
-            'channel_title': session['channel_title'],
-            'anime_name':    session['anime_name'],
-            'hashtag':       session['hashtag'],
-            'channel_link':  channel_link,
-        })
-        await _save_anime_list(anime_list)
-
-        hashtag_str = session['hashtag'] if session['hashtag'] else "None"
-        link_str = channel_link if channel_link else "None"
-
-        await message.reply(
-            f"✅ **Anime Added!**\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📺 **Anime:** {session['anime_name']}\n"
-            f"📢 **Channel:** {session['channel_title']}\n"
-            f"🏷️ **Hashtag:** {hashtag_str}\n"
-            f"🔗 **Link:** {link_str}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Ab jab bhi RTI pe `{session['anime_name']}` ka post aayega,\n"
-            f"bot automatically download + upload + broadcast karega! 🚀"
-        )
 
 
 # ─────────────────────────────────────────────

@@ -70,6 +70,10 @@ For Sudo:
 For Owner:
 - /addchat and /addsudo
 - /rmsudo and /rmchat
+- /update_channel - Update channel add karo
+- /update_channel_list - Update channels dekho
+- /delete_update_channel - Update channel remove karo
+- /update_post - Anime invite link save karo
 
 Supports: <a href='https://t.me/sbanime'>click here</a>"""
     await message.reply(text=msg, disable_web_page_preview=True, reply_markup=start_but)
