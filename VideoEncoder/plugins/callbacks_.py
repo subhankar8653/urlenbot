@@ -16,7 +16,7 @@ from .start import showw_status
 from ..video_utils.audio_selector import sessions
 
 
-@app.on_callback_query()
+@app.on_callback_query(group=1)
 async def callback_handlers(bot: Client, cb: CallbackQuery):
     try:
         # Close Button
