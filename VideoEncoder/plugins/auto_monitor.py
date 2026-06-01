@@ -331,21 +331,34 @@ async def _episode_quality_poller(
                         from .update_channel import send_update_post
                         from ..utils.auto_caption import extract_anime_info
                         import re as _re
-                        _fname = ""
-                        if sent_msg.document and sent_msg.document.file_name:
-                            # Best source: actual file name
-                            _fname = sent_msg.document.file_name
-                        elif sent_msg.video and sent_msg.video.file_name:
-                            _fname = sent_msg.video.file_name
-                        elif sent_msg.caption:
-                            # Strip ALL html tags, not just <b></b>
-                            _fname = _re.sub(r'<[^>]+>', '', sent_msg.caption).strip()
-                        # anime_name (from DB entry) is most reliable — use as primary
-                        # _parsed_name from filename as secondary only if anime_name missing
-                        _parsed_name, _season, _episode = extract_anime_info(_fname, {}) if _fname else (None, None, None)
-                        _final_name = anime_name or _parsed_name or ""
-                        _final_season = _season
-                        _final_episode = _episode if _episode else episode_num
+
+                        # anime_name DB se directly use karo — most reliable
+                        # sent_msg.file_name unreliable hai (forwarded messages mein None hota hai)
+                        _final_name = anime_name or ""
+                        _final_season = None
+                        _final_episode = episode_num
+
+                        # Episode/Season: filename se try karo sirf agar DB se nahi mila
+                        if not _final_name or _final_episode is None:
+                            _fname = ""
+                            try:
+                                if sent_msg.document and sent_msg.document.file_name:
+                                    _fname = sent_msg.document.file_name
+                                elif sent_msg.video and sent_msg.video.file_name:
+                                    _fname = sent_msg.video.file_name
+                                elif sent_msg.caption:
+                                    _fname = _re.sub(r'<[^>]+>', '', sent_msg.caption).strip()
+                            except Exception:
+                                pass
+                            if _fname:
+                                _parsed_name, _parsed_season, _parsed_ep = extract_anime_info(_fname, {})
+                                if not _final_name:
+                                    _final_name = _parsed_name or ""
+                                if _final_season is None:
+                                    _final_season = _parsed_season
+                                if _final_episode is None:
+                                    _final_episode = _parsed_ep
+
                         if _final_name:
                             await send_update_post(
                                 client,
@@ -353,7 +366,7 @@ async def _episode_quality_poller(
                                 season=_final_season,
                                 episode=_final_episode,
                             )
-                            LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ Update post sent after 360p upload")
+                            LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ Update post sent after 360p upload for '{_final_name}'")
                         else:
                             LOGGER.warning(f"[AutoMonitor] Ep {episode_num}: anime_name empty, update post skip kiya")
                     except Exception as _ue:
