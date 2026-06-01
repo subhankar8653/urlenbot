@@ -4,11 +4,13 @@ update_channel.py
 Update Channel System
 
 Flow:
-  - /update_channel [channel_id]      → Update channel add karo
-  - /update_channel_list              → Saare update channels dekho (with IDs)
-  - /delete_update_channel [channel_id] → Update channel remove karo
-  - /update_post                      → Anime + invite link ka pair save karo
-                                        (2-step: anime name → invite link)
+  - /update_channel [channel_id]          → Update channel add karo
+  - /update_channel_list                  → Saare update channels dekho (with IDs)
+  - /delete_update_channel [channel_id]   → Update channel remove karo
+  - /update_post                          → Anime + invite link ka pair save karo
+                                            (2-step: anime name → invite link)
+  - /update_post_list                     → Saare saved anime → invite link pairs dekho
+  - /delete_update_post [anime_name]      → Kisi anime ka saved post entry remove karo
 
 Auto-trigger:
   Jab bhi 360p file upload hoti hai kisi anime channel pe (auto_monitor se),
@@ -26,6 +28,19 @@ DB storage:
   - update_channels  → col2, id='update_channels', data: list of {channel_id, channel_title}
   - update_post_map  → col2, id='update_post_map', data: dict {anime_name_lower: invite_link}
   Both stored in bot-level col2 (status collection) — user-specific nahi.
+
+Commands registered here (conflict check):
+  /update_channel          — unique
+  /update_channel_list     — unique
+  /delete_update_channel   — unique
+  /update_post             — unique (2-step session, group=15 text handler)
+  /cancel_update_post      — unique (session cancel)
+  /update_post_list        — unique (NEW)
+  /delete_update_post      — unique (NEW)
+
+  NOTE: text handler (group=15) sirf tab fire karta hai jab
+  _update_post_sessions mein us user ka session ho.
+  Isliye dusre plugins ke saath koi conflict nahi.
 """
 
 import logging
@@ -44,7 +59,7 @@ LOGGER = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 #  In-memory session for /update_post 2-step flow
 # ─────────────────────────────────────────────
-_update_post_sessions: dict = {}   # { user_id: 'awaiting_link' | {'anime': str} }
+_update_post_sessions: dict = {}   # { user_id: {'step': 'anime'|'link', 'anime': str} }
 
 
 # ─────────────────────────────────────────────
@@ -111,13 +126,18 @@ async def send_update_post(
     """
     channels = await _get_update_channels()
     if not channels:
+        LOGGER.warning("[UpdateChannel] send_update_post called but no update channels saved.")
         return
 
     post_map = await _get_post_map()
 
     # Season/Episode string
     season_str = f"(S-{season:02d})" if season else ""
-    title_line = f"**{anime_name} {season_str}**".strip() if season_str else f"**{anime_name}**"
+    title_line = (
+        f"**{anime_name} {season_str}**".strip()
+        if season_str
+        else f"**{anime_name}**"
+    )
 
     ep_str = ""
     if episode:
@@ -127,10 +147,8 @@ async def send_update_post(
     divider = "────────────────────"
 
     # Invite link dhundo — normalized fuzzy match
-    # Normalize: lowercase, extra spaces hata, punctuation ignore
     def _norm(s: str) -> str:
-        import re as _re
-        return _re.sub(r'[\s\-_]+', ' ', s.lower()).strip()
+        return re.sub(r'[\s\-_]+', ' ', s.lower()).strip()
 
     invite_link = None
     query_norm = _norm(anime_name)
@@ -145,9 +163,9 @@ async def send_update_post(
         lines.append(ep_str)
     text = "\n".join(lines)
 
-    # Blank post guard — agar sirf divider hi bacha toh send mat karo
+    # Blank post guard
     if not title_line.strip("*").strip():
-        LOGGER.warning(f"[UpdateChannel] anime_name empty, post skip kiya.")
+        LOGGER.warning("[UpdateChannel] anime_name empty, post skip kiya.")
         return
 
     # Button
@@ -168,7 +186,9 @@ async def send_update_post(
                 reply_markup=markup,
                 parse_mode="markdown",
             )
-            LOGGER.info(f"[UpdateChannel] Post sent to {ch_id} for '{anime_name}' Ep {episode}")
+            LOGGER.info(
+                f"[UpdateChannel] Post sent to {ch_id} for '{anime_name}' Ep {episode}"
+            )
         except Exception as e:
             LOGGER.error(f"[UpdateChannel] Failed to send to {ch_id}: {e}")
 
@@ -196,22 +216,23 @@ async def cmd_update_channel(client: Client, message: Message):
         await message.reply("❌ Valid channel ID chahiye. Format: `-100xxxxxxxxx`")
         return
 
-    # Check if already exists
     channels = await _get_update_channels()
     for ch in channels:
         if ch.get("channel_id") == channel_id:
-            await message.reply(f"⚠️ Yeh channel already update list mein hai!\n\n`{channel_id}`")
+            await message.reply(
+                f"⚠️ Yeh channel already update list mein hai!\n\n`{channel_id}`"
+            )
             return
 
-    # Bot ko channel mein add karna hoga
     try:
         chat = await client.get_chat(channel_id)
         channel_title = chat.title
     except Exception as e:
-        await message.reply(f"❌ Channel nahi mila: `{e}`\n\nBot ko channel mein admin banao pehle.")
+        await message.reply(
+            f"❌ Channel nahi mila: `{e}`\n\nBot ko channel mein admin banao pehle."
+        )
         return
 
-    # Admin check
     try:
         bot_me = await client.get_me()
         member = await client.get_chat_member(channel_id, bot_me.id)
@@ -290,7 +311,9 @@ async def cmd_delete_update_channel(client: Client, message: Message):
         return
 
     await _save_update_channels(new_channels)
-    await message.reply(f"🗑️ **Removed!** Channel `{channel_id}` update list se hata diya.")
+    await message.reply(
+        f"🗑️ **Removed!** Channel `{channel_id}` update list se hata diya."
+    )
 
 
 # ─────────────────────────────────────────────
@@ -320,8 +343,96 @@ async def cmd_cancel_update_post(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────
+#  /update_post_list  (NEW)
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("update_post_list") & filters.private)
+async def cmd_update_post_list(client: Client, message: Message):
+    """Saare saved anime → invite link pairs dikho."""
+    if not _is_auth(message.from_user.id):
+        return
+
+    post_map = await _get_post_map()
+    if not post_map:
+        await message.reply(
+            "📭 Koi anime post entry save nahi hai.\n\n"
+            "Add karne ke liye: `/update_post`"
+        )
+        return
+
+    text = f"📋 **Saved Anime Posts ({len(post_map)})**\n\n"
+    for i, (anime, link) in enumerate(post_map.items(), 1):
+        link_display = f"[link]({link})" if link else "_(no link)_"
+        text += f"`{i}.` **{anime}**\n    🔗 {link_display}\n\n"
+
+    text += "🗑️ Remove: `/delete_update_post [anime name]`"
+    await message.reply(text, disable_web_page_preview=True)
+
+
+# ─────────────────────────────────────────────
+#  /delete_update_post [anime_name]  (NEW)
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("delete_update_post") & filters.private)
+async def cmd_delete_update_post(client: Client, message: Message):
+    """Kisi anime ka saved post entry remove karo."""
+    if not _is_auth(message.from_user.id):
+        return
+
+    parts = message.text.split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        # List dikha do taaki user naam dekh sake
+        post_map = await _get_post_map()
+        if not post_map:
+            await message.reply(
+                "📭 Koi anime post entry save nahi hai.\n\n"
+                "Add karne ke liye: `/update_post`"
+            )
+            return
+        text = "🗑️ **Konsa delete karna hai?**\n\n"
+        for i, anime in enumerate(post_map.keys(), 1):
+            text += f"`{i}.` {anime}\n"
+        text += "\n**Usage:** `/delete_update_post [anime name]`\n"
+        text += "**Example:** `/delete_update_post agent of four seasons`"
+        await message.reply(text)
+        return
+
+    query = parts[1].strip().lower()
+
+    post_map = await _get_post_map()
+    if not post_map:
+        await message.reply("📭 Koi anime post entry save nahi hai.")
+        return
+
+    # Exact match (lowercase) — fuzzy nahi, taaki galti se delete na ho
+    def _norm(s: str) -> str:
+        return re.sub(r'[\s\-_]+', ' ', s.lower()).strip()
+
+    matched_key = None
+    for key in post_map:
+        if _norm(key) == _norm(query):
+            matched_key = key
+            break
+
+    if not matched_key:
+        await message.reply(
+            f"❌ `{query}` naam se koi entry nahi mili.\n\n"
+            f"Sahi naam dekhne ke liye: `/update_post_list`"
+        )
+        return
+
+    del post_map[matched_key]
+    await _save_post_map(post_map)
+
+    await message.reply(
+        f"✅ **Deleted!**\n\n"
+        f"📺 `{matched_key}` remove ho gaya update post list se."
+    )
+
+
+# ─────────────────────────────────────────────
 #  Text input handler for /update_post 2-step flow
-#  group=15 — state machine, specific session check se hi fire karta hai
+#
+#  group=15 — high group number taaki command handlers pehle chalein
+#  Session check se hi fire karta hai — dusre plugins ko affect nahi karta
 # ─────────────────────────────────────────────
 @Client.on_message(filters.text & filters.private, group=15)
 async def update_post_text_input(client: Client, message: Message):
@@ -330,9 +441,10 @@ async def update_post_text_input(client: Client, message: Message):
     if not _is_auth(user_id):
         return
 
+    # Agar koi active session nahi hai toh seedha return — dusre handlers affect nahi
     session = _update_post_sessions.get(user_id)
     if not session:
-        return   # Hamara kaam nahi
+        return
 
     text = message.text.strip()
 
@@ -342,12 +454,13 @@ async def update_post_text_input(client: Client, message: Message):
         await message.reply("❌ Cancelled.")
         return
 
+    # Agar koi aur command aaya toh session clear karo — conflict se bacho
+    if text.startswith("/"):
+        _update_post_sessions.pop(user_id, None)
+        return
+
     # ── Step 1: Anime name ──
     if session.get("step") == "anime":
-        if not text or text.startswith("/"):
-            await message.reply("❌ Valid anime naam do (command nahi).")
-            return
-
         _update_post_sessions[user_id] = {"step": "link", "anime": text}
         await message.reply(
             f"✅ Anime: **{text}**\n\n"
@@ -365,13 +478,14 @@ async def update_post_text_input(client: Client, message: Message):
         if text.lower() == "skip":
             invite_link = ""
         elif not text.startswith("http"):
-            await message.reply("⚠️ Valid invite link do (`https://t.me/...`) ya `skip` likho.")
-            _update_post_sessions[user_id] = session   # session restore karo
+            await message.reply(
+                "⚠️ Valid invite link do (`https://t.me/...`) ya `skip` likho."
+            )
+            _update_post_sessions[user_id] = session   # session restore
             return
         else:
             invite_link = text
 
-        # Save
         post_map = await _get_post_map()
         post_map[anime_name.lower().strip()] = invite_link
         await _save_post_map(post_map)
