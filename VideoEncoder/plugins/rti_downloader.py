@@ -303,33 +303,99 @@ async def _run_rti_swift(client, message: Message, swift_url: str, status_msg, e
     return True
 
 async def _process_episode(client, message, page_url, episode_num, total_episodes, status_msg):
+    """
+    Ek episode ke liye Swift URL nikalo aur download+upload karo.
+
+    Return values:
+      "ok"       → success, agle episode pe jao
+      "retry"    → sabhi retries ke baad bhi Swift URL nahi mila → BAND karo
+      "error"    → download/upload mein exception → BAND karo
+    """
     loop = asyncio.get_event_loop()
 
-    await status_msg.edit(f"🔍 **Ep {episode_num}/{total_episodes}** — Link dhundh raha hoon...")
-    wmq_link, _ = await loop.run_in_executor(None, get_watchmult_link, page_url, episode_num)
-    if not wmq_link:
-        await status_msg.edit(f"❌ **Ep {episode_num}** — WatchMultQuality link nahi mila.")
-        return False
+    # ── Swift URL nikalne ke liye retry constants ──
+    SWIFT_MAX_ATTEMPTS   = 5    # 5 baar try karo
+    SWIFT_RETRY_INTERVAL = 60   # har attempt ke beech 60s wait
 
-    await status_msg.edit(f"🔍 **Ep {episode_num}/{total_episodes}** — Argon link extract ho raha hai...")
-    argon_link = await loop.run_in_executor(None, get_argon_link, wmq_link)
-    if not argon_link:
-        await status_msg.edit(f"❌ **Ep {episode_num}** — Argon iframe nahi mila.")
-        return False
+    swift_url = None
 
-    swift_url = argon_to_swift(argon_link)
-    if not swift_url:
-        await status_msg.edit(f"❌ **Ep {episode_num}** — Swift URL fail.")
-        return False
+    for attempt in range(1, SWIFT_MAX_ATTEMPTS + 1):
+        # Step 1: WatchMultQuality link
+        try:
+            await status_msg.edit(
+                f"🔍 **Ep {episode_num}/{total_episodes}**\n"
+                f"Attempt `{attempt}/{SWIFT_MAX_ATTEMPTS}` — WatchMultQuality link dhundh raha hoon..."
+            )
+        except Exception:
+            pass
 
-    # Swift URL milne ke baad message mein show karo
-    await message.reply(
-        f"🔗 **Ep {episode_num} — Swift Link**\n\n"
-        f"`{swift_url}`\n\n"
-        f"⬇️ Ab download shuru ho raha hai..."
-    )
+        wmq_link, _ = await loop.run_in_executor(None, get_watchmult_link, page_url, episode_num)
 
-    return await _run_rti_swift(client, message, swift_url, status_msg, ep_num=episode_num, total_eps=total_episodes)
+        if wmq_link:
+            # Step 2: Argon link
+            try:
+                await status_msg.edit(
+                    f"🔍 **Ep {episode_num}/{total_episodes}**\n"
+                    f"Attempt `{attempt}/{SWIFT_MAX_ATTEMPTS}` — Argon link extract ho raha hai..."
+                )
+            except Exception:
+                pass
+
+            argon_link = await loop.run_in_executor(None, get_argon_link, wmq_link)
+
+            if argon_link:
+                # Step 3: Swift URL
+                swift_url = argon_to_swift(argon_link)
+                if swift_url:
+                    break  # ✅ Swift URL mil gaya — loop se bahar
+
+        # Yahan tak matlab kuch na kuch fail hua
+        if attempt == SWIFT_MAX_ATTEMPTS:
+            # Sabhi attempts khatam — HARD STOP signal bhejo
+            try:
+                await status_msg.edit(
+                    f"🛑 **Ep {episode_num} — Complete Fail**\n\n"
+                    f"❌ `{SWIFT_MAX_ATTEMPTS}` attempts ke baad bhi Swift URL nahi mila.\n"
+                    f"⛔ Agle episodes **band** kar diye gaye.\n"
+                    f"RTI pe manually check karo."
+                )
+            except Exception:
+                pass
+            return "retry"
+
+        # Retry message
+        remaining = SWIFT_MAX_ATTEMPTS - attempt
+        try:
+            await status_msg.edit(
+                f"⏳ **Ep {episode_num}/{total_episodes}**\n\n"
+                f"🔄 Attempt `{attempt}/{SWIFT_MAX_ATTEMPTS}` fail — link nahi mila\n"
+                f"⏰ `{SWIFT_RETRY_INTERVAL}s` baad retry... (`{remaining}` attempts baki)"
+            )
+        except Exception:
+            pass
+
+        await asyncio.sleep(SWIFT_RETRY_INTERVAL)
+
+    # ── Swift URL mil gaya — download + upload ──
+    try:
+        await message.reply(
+            f"🔗 **Ep {episode_num} — Swift Link**\n\n"
+            f"`{swift_url}`\n\n"
+            f"⬇️ Ab download shuru ho raha hai..."
+        )
+        await _run_rti_swift(client, message, swift_url, status_msg, ep_num=episode_num, total_eps=total_episodes)
+        return "ok"
+    except Exception as e:
+        LOGGER.error(f"[RTI] Ep {episode_num} download/upload error: {e}")
+        try:
+            await status_msg.edit(
+                f"🛑 **Ep {episode_num} — Upload Error**\n\n"
+                f"❌ `{str(e)[:120]}`\n"
+                f"⛔ Agle episodes **band** kar diye gaye."
+            )
+        except Exception:
+            pass
+        return "error"
 
 
 # ─────────────────────────────────────────────
@@ -439,18 +505,19 @@ async def rti_command(client: Client, message: Message):
 
     success_count = 0
     for i, ep_num in enumerate(episode_list, 1):
-        try:
-            success = await _process_episode(
-                client, message, page_url,
-                episode_num=ep_num,
-                total_episodes=total_eps,
-                status_msg=status_msg,
-            )
-            if success:
-                success_count += 1
-        except Exception as e:
-            LOGGER.error(f"[RTI] Ep {ep_num} error: {e}")
-            await status_msg.edit(f"❌ Ep {ep_num} error: `{str(e)[:100]}`")
+        result = await _process_episode(
+            client, message, page_url,
+            episode_num=ep_num,
+            total_episodes=total_eps,
+            status_msg=status_msg,
+        )
+
+        if result == "ok":
+            success_count += 1
+        else:
+            # "retry" ya "error" — dono cases mein HARD STOP
+            LOGGER.warning(f"[RTI] Ep {ep_num} failed ({result}). Stopping range.")
+            break
 
         if i < total_eps:
             await asyncio.sleep(3)

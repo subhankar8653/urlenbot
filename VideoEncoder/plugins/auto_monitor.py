@@ -60,9 +60,12 @@ def _get_schedule_fn():
 # ─────────────────────────────────────────────
 #  Constants
 # ─────────────────────────────────────────────
-POLL_INTERVAL    = 60          # seconds — har retry ke beech gap
-MAX_POLL_TIME    = 30 * 60     # 30 minutes max
-TARGET_QUALITIES = ["360p", "720p", "1080p"]   # inhe dhundna hai
+POLL_INTERVAL_FAST = 30         # seconds — pehle 10 attempts (5 min)
+POLL_INTERVAL_SLOW = 60         # seconds — baad ke 20 attempts (20 min)
+POLL_FAST_ATTEMPTS = 10         # kitne attempts fast interval pe
+POLL_SLOW_ATTEMPTS = 20         # kitne attempts slow interval pe
+# Total max time = (10×30s) + (20×60s) = 5min + 20min = 25min
+TARGET_QUALITIES   = ["360p", "720p", "1080p"]   # inhe dhundna hai
 
 # ─────────────────────────────────────────────
 #  DB Helpers — owner ke user doc mein store hota hai
@@ -180,21 +183,27 @@ async def _episode_quality_poller(
     remaining = set(TARGET_QUALITIES)   # jo qualities abhi tak nahi mili
     start_time = time.time()
     attempt = 0
+    max_attempts = POLL_FAST_ATTEMPTS + POLL_SLOW_ATTEMPTS  # 10 + 20 = 30
 
     status_msg = await log_message.reply(
         f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
-        f"⏳ Quality poller shuru — Max 30 min\n"
+        f"⏳ Quality poller shuru — Fast: 10×30s → Slow: 20×60s\n"
         f"🎯 Dhundh raha hoon: `{' | '.join(sorted(remaining))}`"
     )
 
-    while remaining and (time.time() - start_time) < MAX_POLL_TIME:
+    while remaining and attempt < max_attempts:
         attempt += 1
         elapsed_min = int((time.time() - start_time) / 60)
+
+        # Pehle 10 attempts = fast (30s), baad ke 20 = slow (60s)
+        is_fast = attempt <= POLL_FAST_ATTEMPTS
+        interval = POLL_INTERVAL_FAST if is_fast else POLL_INTERVAL_SLOW
+        phase_label = f"⚡ Fast" if is_fast else f"🐢 Slow"
 
         try:
             await status_msg.edit(
                 f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
-                f"🔄 Attempt `{attempt}` | Elapsed: `{elapsed_min}m`\n"
+                f"🔄 Attempt `{attempt}/{max_attempts}` {phase_label} | Elapsed: `{elapsed_min}m`\n"
                 f"🎯 Baki: `{' | '.join(sorted(remaining))}`\n"
                 f"⏳ Swift page scan ho raha hai..."
             )
@@ -216,19 +225,19 @@ async def _episode_quality_poller(
         except Exception as e:
             LOGGER.error(f"[AutoMonitor] Ep {episode_num} scrape error: {e}")
             shutil.rmtree(dl_dir, ignore_errors=True)
-            await asyncio.sleep(POLL_INTERVAL)
+            await asyncio.sleep(interval)
             continue
 
         if result["error"] and not result["files"]:
             LOGGER.warning(f"[AutoMonitor] Ep {episode_num} attempt {attempt}: {result['error'][:80]}")
             shutil.rmtree(dl_dir, ignore_errors=True)
-            await asyncio.sleep(POLL_INTERVAL)
+            await asyncio.sleep(interval)
             continue
 
         files = result.get("files", [])
         if not files:
             shutil.rmtree(dl_dir, ignore_errors=True)
-            await asyncio.sleep(POLL_INTERVAL)
+            await asyncio.sleep(interval)
             continue
 
         # Files ko size ke hisab se sort — chhoti (360p) pehle
@@ -245,7 +254,7 @@ async def _episode_quality_poller(
             # Is attempt mein koi naya quality nahi aaya
             LOGGER.info(f"[AutoMonitor] Ep {episode_num}: No new qualities this attempt. Waiting...")
             shutil.rmtree(dl_dir, ignore_errors=True)
-            await asyncio.sleep(POLL_INTERVAL)
+            await asyncio.sleep(interval)
             continue
 
         # Swift ki tarah staggered upload
@@ -428,7 +437,7 @@ async def _episode_quality_poller(
         shutil.rmtree(dl_dir, ignore_errors=True)
 
         if remaining:
-            await asyncio.sleep(POLL_INTERVAL)
+            await asyncio.sleep(interval)
 
     # ── Poller khatam ──
     elapsed_min = int((time.time() - start_time) / 60)
@@ -445,22 +454,22 @@ async def _episode_quality_poller(
             pass
         LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ALL qualities done in {elapsed_min}m")
     else:
-        # 30 min ke baad bhi nahi mila
+        # Sabhi attempts khatam
         missing_str = ' | '.join(sorted(remaining))
         try:
             await status_msg.edit(
                 f"⚠️ **Incomplete!** | `{anime_name}` | Ep `{episode_num}`\n\n"
-                f"❌ 30 min baad bhi nahi mili: `{missing_str}`\n"
+                f"❌ {max_attempts} attempts ({elapsed_min}m) baad bhi nahi mili: `{missing_str}`\n"
                 f"✅ Jo mili: `{' | '.join(q for q in TARGET_QUALITIES if q not in remaining)}`\n\n"
                 f"Process complete nahi hua. RTI pe manually check karo."
             )
         except Exception:
             await log_message.reply(
                 f"⚠️ **AutoMonitor Warning** | `{anime_name}` | Ep `{episode_num}`\n\n"
-                f"❌ 30 min baad bhi nahi mili: `{missing_str}`\n"
-                f"Process complete nahi hua. RTI pe manually check karo."
+                f"❌ {max_attempts} attempts ke baad bhi nahi mili: `{missing_str}`\n"
+                f"RTI pe manually check karo."
             )
-        LOGGER.warning(f"[AutoMonitor] Ep {episode_num}: TIMEOUT. Missing: {missing_str}")
+        LOGGER.warning(f"[AutoMonitor] Ep {episode_num}: TIMEOUT after {attempt} attempts. Missing: {missing_str}")
 
 
 async def _forward_to_anime_channel(client: Client, sent_msg, channel_id: int, anime_name: str):
@@ -574,13 +583,45 @@ async def auto_monitor_handler(client: Client, message: Message):
             f"🔍 Swift URL nikaal raha hoon..."
         )
 
-        swift_url = await _get_swift_url_for_episode(url, ep_num, prep_msg)
+        # ── Swift URL Retry Logic — 2-phase ──
+        # Phase 1: pehle 10 attempts × 30s = 5 min
+        # Phase 2: baad ke 20 attempts × 60s = 20 min
+        SWIFT_FAST_ATTEMPTS = 10
+        SWIFT_SLOW_ATTEMPTS = 20
+        SWIFT_MAX_ATTEMPTS  = SWIFT_FAST_ATTEMPTS + SWIFT_SLOW_ATTEMPTS  # 30
+
+        swift_url = None
+        for swift_attempt in range(1, SWIFT_MAX_ATTEMPTS + 1):
+            swift_url = await _get_swift_url_for_episode(url, ep_num, prep_msg)
+            if swift_url:
+                break
+
+            # Last attempt ke baad fail → bahar niklo
+            if swift_attempt == SWIFT_MAX_ATTEMPTS:
+                await prep_msg.edit(
+                    f"❌ **AutoMonitor** | `{anime_name}` | Ep `{ep_num}`\n\n"
+                    f"⏱️ {SWIFT_MAX_ATTEMPTS} attempts (~25 min) ke baad bhi\n"
+                    f"Swift URL nahi mila. RTI pe manually check karo."
+                )
+                break
+
+            # Phase decide karo
+            is_fast   = swift_attempt <= SWIFT_FAST_ATTEMPTS
+            interval  = 30 if is_fast else 60
+            phase_lbl = "⚡ Fast" if is_fast else "🐢 Slow"
+            remaining_attempts = SWIFT_MAX_ATTEMPTS - swift_attempt
+            try:
+                await prep_msg.edit(
+                    f"⏳ **AutoMonitor** | `{anime_name}` | Ep `{ep_num}`\n\n"
+                    f"🔄 Attempt `{swift_attempt}/{SWIFT_MAX_ATTEMPTS}` {phase_lbl} — Swift URL nahi mila\n"
+                    f"⏰ `{interval}s` baad retry... ({remaining_attempts} attempts left)"
+                )
+            except Exception:
+                pass
+
+            await asyncio.sleep(interval)
 
         if not swift_url:
-            await prep_msg.edit(
-                f"❌ **AutoMonitor** | `{anime_name}` | Ep `{ep_num}`\n\n"
-                f"Swift URL nahi mila. RTI pe manually check karo."
-            )
             continue
 
         await prep_msg.edit(
@@ -881,8 +922,9 @@ async def cmd_monitor_status(client: Client, message: Message):
         f"📡 Monitor Channel: {mc_text}\n"
         f"📺 Anime Count: **{len(anime_list)}**\n"
         f"🎯 Target Qualities: `{' | '.join(TARGET_QUALITIES)}`\n"
-        f"⏱️ Poll Interval: **{POLL_INTERVAL}s**\n"
-        f"⏰ Max Monitor Time: **30 min**\n"
+        f"⚡ Fast Poll: **{POLL_FAST_ATTEMPTS} × {POLL_INTERVAL_FAST}s** (first 5 min)\n"
+        f"🐢 Slow Poll: **{POLL_SLOW_ATTEMPTS} × {POLL_INTERVAL_SLOW}s** (next 20 min)\n"
+        f"⏰ Max Attempts: **{POLL_FAST_ATTEMPTS + POLL_SLOW_ATTEMPTS}** (~25 min total)\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📋 /list_anime\n"
         f"➕ /add_anime"

@@ -225,6 +225,12 @@ async def _auto_rename(filepath: str, dl_dir: str) -> str:
     temp_out = os.path.join(dl_dir, f"_tmp_{unique_id}.mp4")
     final_out = os.path.join(dl_dir, proper_filename)
 
+    # Agar filename already same hai toh ffmpeg skip karo — sirf metadata rewrite karo
+    # toh check karo: agar source == final_out already same content hai
+    # (same path → kuch nahi karna)
+    if os.path.abspath(filepath) == os.path.abspath(final_out):
+        return filepath
+
     # ffmpeg: title SET karo (external player mein naam dikhega), garbage clear karo
     cmd = [
         'ffmpeg', '-y', '-i', filepath,
@@ -481,7 +487,9 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
                 found_360p = True
                 break
             LOGGER.info(f"[Swift] Scan #{scan_num}/{SCAN_MAX_TRIES} — 360p not yet visible")
-            time.sleep(SCAN_INTERVAL)
+            # Sleep AFTER failed scan, not before first — saves ~1s on fast pages
+            if scan_num < SCAN_MAX_TRIES:
+                time.sleep(SCAN_INTERVAL)
 
         if not found_360p:
             result["error"] = (
@@ -531,7 +539,7 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
                             driver.execute_script("arguments[0].click();", elem)
                             LOGGER.info(f"[Swift] XPATH button clicked: {q}")
                             clicked.append(q)
-                            time.sleep(3)
+                            time.sleep(0.5)  # was 3s — popup close ke liye kafi
                             _close_popups(driver, main)
                             break
                         except Exception:
@@ -552,11 +560,11 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
                 href = lnk["href"]
                 try:
                     driver.execute_script(f"window.open('{href}', '_blank');")
-                    time.sleep(1)
+                    time.sleep(0.3)   # was 1s — popup close ke liye kafi hai
                     _close_popups(driver, main)
                     qualities_clicked.append(q)
                     LOGGER.info(f"[Swift] JS opened: {q} | {href[:60]}")
-                    time.sleep(2)
+                    # 2s sleep remove kiya — next link ke liye zaroorat nahi
                 except Exception as e:
                     LOGGER.warning(f"[Swift] JS open failed for {q}: {e}")
 
@@ -582,7 +590,7 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
                 LOGGER.warning("[Swift] Download timeout (1200s)!")
                 break
 
-            time.sleep(5)
+            time.sleep(2)  # was 5s — faster polling, less idle wait
 
         result["files"] = _get_done_files(dl_dir)
 
@@ -789,7 +797,7 @@ async def _reorder_if_needed(client, message, uploaded_results: list):
             )
             forwarded.append(new_msg)
             LOGGER.info(f"[Swift] Reordered: {q} → new msg_id={new_msg.id}")
-            await asyncio.sleep(1)  # flood control
+            await asyncio.sleep(0.3)  # was 1s — flood control enough at 0.3s
         except Exception as e:
             LOGGER.warning(f"[Swift] Forward failed for {q}: {e}")
 
@@ -854,7 +862,7 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
                 )
             except Exception:
                 pass
-            await asyncio.sleep(8)
+            await asyncio.sleep(5)   # was 8s — progress updates more frequent
 
     prog_task = asyncio.create_task(_progress_updater())
     result = await loop.run_in_executor(None, _scrape_and_download, swift_url, dl_dir, None, quality_filter)
