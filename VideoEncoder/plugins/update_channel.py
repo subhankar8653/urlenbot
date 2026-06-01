@@ -45,6 +45,7 @@ import logging
 import re
 
 from pyrogram import Client, filters, enums
+from pyrogram.errors import StopPropagation
 from pyrogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup, Message
 )
@@ -447,7 +448,7 @@ async def update_post_text_input(client: Client, message: Message):
     if text.lower() in ["/cancel_update_post", "cancel"]:
         _update_post_sessions.pop(user_id, None)
         await message.reply("❌ Cancelled.")
-        return
+        raise StopPropagation
 
     if text.startswith("/"):
         _update_post_sessions.pop(user_id, None)
@@ -462,7 +463,7 @@ async def update_post_text_input(client: Client, message: Message):
             f"**Example:** `https://t.me/+xxxxxxxxxx`\n\n"
             f"_Link nahi dena toh `skip` likho — post button ke bina aayega._"
         )
-        return
+        raise StopPropagation
 
     # ── Step 2: Invite link ──
     if session.get("step") == "link":
@@ -476,7 +477,7 @@ async def update_post_text_input(client: Client, message: Message):
                 "⚠️ Valid invite link do (`https://t.me/...`) ya `skip` likho."
             )
             _update_post_sessions[user_id] = session
-            return
+            raise StopPropagation
         else:
             invite_link = text
 
@@ -499,3 +500,4 @@ async def update_post_text_input(client: Client, message: Message):
                 f"Post aayega par button nahi hoga.\n"
                 f"Link add karna ho toh dobara `/update_post` karo."
             )
+        raise StopPropagation
