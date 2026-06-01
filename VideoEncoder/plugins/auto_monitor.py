@@ -311,9 +311,43 @@ async def _episode_quality_poller(
         proxy_msg = _ProxyMsg(log_message, owner_id, channel_id)
 
 
+        async def _delete_old_bot_msgs(ch_id: int):
+            """
+            Channel mein bot ke last 30 msgs scan karo.
+            Schedule/end message pattern wale delete karo.
+            Videos/documents skip — woh actual episodes hain.
+            Koi command nahi, koi DB nahi — sirf search+delete.
+            """
+            try:
+                deleted = 0
+                async for msg in client.get_chat_history(ch_id, limit=30):
+                    # Video/document/audio skip — woh episodes hain
+                    if msg.video or msg.document or msg.audio:
+                        continue
+                    text = msg.text or msg.caption or ""
+                    if not text.strip():
+                        continue
+                    # Schedule message pattern
+                    is_schedule = "Next episode upload on" in text
+                    # End message: koi bhi non-video bot msg jo schedule nahi
+                    is_end = not is_schedule
+                    if is_schedule or is_end:
+                        try:
+                            await client.delete_messages(ch_id, msg.id)
+                            deleted += 1
+                            await asyncio.sleep(0.3)
+                        except Exception as _de:
+                            LOGGER.warning(f"[AutoMonitor] Old msg delete fail (id={msg.id}): {_de}")
+                LOGGER.info(f"[AutoMonitor] Old schedule/end msgs deleted: {deleted} from {ch_id}")
+            except Exception as _e:
+                LOGGER.warning(f"[AutoMonitor] _delete_old_bot_msgs error: {_e}")
+
         async def _upload_task(filepath, idx):
             if idx > 0:
                 await _half_events[idx - 1].wait()
+            # 360p (idx==0) upload se pehle purane schedule/end msgs delete karo
+            if idx == 0:
+                await _delete_old_bot_msgs(channel_id)
             um = _dummy_msgs.get(filepath, status_msg)
             success, sent_msg, quality = await _upload_one_file(
                 client, proxy_msg, um, filepath, dl_dir, encode=False,
@@ -338,26 +372,26 @@ async def _episode_quality_poller(
                         _final_season = None
                         _final_episode = episode_num
 
-                        # Season: filename se hamesha parse karo (DB mein season store nahi hota)
-                        _fname = ""
-                        try:
-                            if sent_msg.document and sent_msg.document.file_name:
-                                _fname = sent_msg.document.file_name
-                            elif sent_msg.video and sent_msg.video.file_name:
-                                _fname = sent_msg.video.file_name
-                            elif sent_msg.caption:
-                                _fname = _re.sub(r'<[^>]+>', '', sent_msg.caption).strip()
-                        except Exception:
-                            pass
-                        if _fname:
-                            _parsed_name, _parsed_season, _parsed_ep = extract_anime_info(_fname, {})
-                            if not _final_name:
-                                _final_name = _parsed_name or ""
-                            # Season hamesha filename se lo
-                            if _parsed_season is not None:
-                                _final_season = _parsed_season
-                            if _final_episode is None:
-                                _final_episode = _parsed_ep
+                        # Episode/Season: filename se try karo sirf agar DB se nahi mila
+                        if not _final_name or _final_episode is None:
+                            _fname = ""
+                            try:
+                                if sent_msg.document and sent_msg.document.file_name:
+                                    _fname = sent_msg.document.file_name
+                                elif sent_msg.video and sent_msg.video.file_name:
+                                    _fname = sent_msg.video.file_name
+                                elif sent_msg.caption:
+                                    _fname = _re.sub(r'<[^>]+>', '', sent_msg.caption).strip()
+                            except Exception:
+                                pass
+                            if _fname:
+                                _parsed_name, _parsed_season, _parsed_ep = extract_anime_info(_fname, {})
+                                if not _final_name:
+                                    _final_name = _parsed_name or ""
+                                if _final_season is None:
+                                    _final_season = _parsed_season
+                                if _final_episode is None:
+                                    _final_episode = _parsed_ep
 
                         if _final_name:
                             await send_update_post(
