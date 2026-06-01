@@ -44,8 +44,7 @@ Commands registered here (conflict check):
 import logging
 import re
 
-from pyrogram import Client, filters, enums
-from pyrogram.errors import StopPropagation
+from pyrogram import Client, filters, enums, StopPropagation
 from pyrogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup, Message
 )
