@@ -338,26 +338,26 @@ async def _episode_quality_poller(
                         _final_season = None
                         _final_episode = episode_num
 
-                        # Episode/Season: filename se try karo sirf agar DB se nahi mila
-                        if not _final_name or _final_episode is None:
-                            _fname = ""
-                            try:
-                                if sent_msg.document and sent_msg.document.file_name:
-                                    _fname = sent_msg.document.file_name
-                                elif sent_msg.video and sent_msg.video.file_name:
-                                    _fname = sent_msg.video.file_name
-                                elif sent_msg.caption:
-                                    _fname = _re.sub(r'<[^>]+>', '', sent_msg.caption).strip()
-                            except Exception:
-                                pass
-                            if _fname:
-                                _parsed_name, _parsed_season, _parsed_ep = extract_anime_info(_fname, {})
-                                if not _final_name:
-                                    _final_name = _parsed_name or ""
-                                if _final_season is None:
-                                    _final_season = _parsed_season
-                                if _final_episode is None:
-                                    _final_episode = _parsed_ep
+                        # Season: filename se hamesha parse karo (DB mein season store nahi hota)
+                        _fname = ""
+                        try:
+                            if sent_msg.document and sent_msg.document.file_name:
+                                _fname = sent_msg.document.file_name
+                            elif sent_msg.video and sent_msg.video.file_name:
+                                _fname = sent_msg.video.file_name
+                            elif sent_msg.caption:
+                                _fname = _re.sub(r'<[^>]+>', '', sent_msg.caption).strip()
+                        except Exception:
+                            pass
+                        if _fname:
+                            _parsed_name, _parsed_season, _parsed_ep = extract_anime_info(_fname, {})
+                            if not _final_name:
+                                _final_name = _parsed_name or ""
+                            # Season hamesha filename se lo
+                            if _parsed_season is not None:
+                                _final_season = _parsed_season
+                            if _final_episode is None:
+                                _final_episode = _parsed_ep
 
                         if _final_name:
                             await send_update_post(
