@@ -109,11 +109,16 @@ async def send_update_post(
     client,
     anime_name: str,
     season: int | None,
-    episode: int | None,
+    episode: int | None = None,
+    episode_start: int | None = None,
+    episode_end: int | None = None,
 ):
     """
-    360p upload hone pe call karo.
-    Saare update channels pe stylish format post bhejta hai.
+    Update channels pe stylish format post bhejta hai.
+
+    Single episode:  episode=6        → ⚡EP - 06 | Added
+    Episode range:   episode_start=34, episode_end=36  → ⚡EP 34-36 | Added
+    Backward compat: episode=6 bhi kaam karta hai
 
     Post format:
         🔰 Witch Hat Atelier (S01)
@@ -136,8 +141,14 @@ async def send_update_post(
     title_line = f"🔰 **{anime_name} {season_str}**".strip() if season_str else f"🔰 **{anime_name}**"
 
     # ── Episode line ──
+    # Range case: episode_start aur episode_end dono hain
     ep_str = ""
-    if episode:
+    if episode_start and episode_end and episode_start != episode_end:
+        ep_str = f">⚡**EP {episode_start}-{episode_end} | Added**"
+    elif episode_start:
+        ep_num = f"{episode_start:02d}" if episode_start < 100 else str(episode_start)
+        ep_str = f">⚡**EP - {ep_num} | Added**"
+    elif episode:
         ep_num = f"{episode:02d}" if episode < 100 else str(episode)
         ep_str = f">⚡**EP - {ep_num} | Added**"
 

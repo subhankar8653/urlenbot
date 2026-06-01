@@ -167,7 +167,12 @@ async def _episode_quality_poller(
     channel_id: int,
     owner_id: int,
     matched_entry: dict = None,
+    start_ep: int = None,
+    end_ep: int = None,
+    update_post_sent: list = None,
 ):
+    # update_post_sent — mutable list [False] shared across episodes
+    # Pehle episode ke 360p pe True ho jaata hai → baaki episodes skip karte hain
     _scrape_and_download, _upload_one_file, _sort_by_size, _auto_rename, _quality_from, QUALITY_ORDER = _get_swift_fns()
     if matched_entry is None:
         matched_entry = {}
@@ -364,40 +369,43 @@ async def _episode_quality_poller(
                 pass
 
             if success and sent_msg:
-                # ── 360p upload hote hi update channels pe post bhejo ──
+                # ── Pehle episode (start_ep) ka 360p upload hote hi update post bhejo ──
+                # Ek baar bhejne ke baad update_post_sent[0] = True ho jaata hai
                 if quality == "360p":
-                    try:
-                        from .update_channel import send_update_post
-                        from ..utils.auto_caption import extract_anime_info
-                        import re as _re
-
-                        # anime_name DB se directly use karo — most reliable
-                        _final_name = anime_name or ""
-                        _final_episode = episode_num
-
-                        # Season: filepath se parse karo — sent_msg.file_name unreliable hai
-                        # (forwarded/channel messages mein None hota hai)
-                        _final_season = None
+                    LOGGER.info(f"[AutoMonitor] Ep {episode_num}: 360p upload done ✅")
+                    is_first_ep = (start_ep is not None and episode_num == start_ep)
+                    already_sent = (update_post_sent is not None and update_post_sent[0])
+                    if is_first_ep and not already_sent:
                         try:
-                            _fname = os.path.basename(filepath)
-                            if _fname:
-                                _, _parsed_season, _ = extract_anime_info(_fname, {})
-                                _final_season = _parsed_season
-                        except Exception:
-                            pass
+                            from .update_channel import send_update_post
+                            from ..utils.auto_caption import extract_anime_info as _eai
 
-                        if _final_name:
+                            # Season: filepath se parse karo
+                            _season = None
+                            try:
+                                _fname = os.path.basename(filepath)
+                                if _fname:
+                                    _, _season, _ = _eai(_fname, {})
+                            except Exception:
+                                pass
+
+                            _ep_end = end_ep if end_ep else episode_num
+
                             await send_update_post(
                                 client,
-                                anime_name=_final_name,
-                                season=_final_season,
-                                episode=_final_episode,
+                                anime_name=anime_name,
+                                season=_season,
+                                episode_start=episode_num,
+                                episode_end=_ep_end,
                             )
-                            LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ Update post sent after 360p upload for '{_final_name}'")
-                        else:
-                            LOGGER.warning(f"[AutoMonitor] Ep {episode_num}: anime_name empty, update post skip kiya")
-                    except Exception as _ue:
-                        LOGGER.error(f"[AutoMonitor] Update post error: {_ue}")
+                            if update_post_sent is not None:
+                                update_post_sent[0] = True
+                            LOGGER.info(
+                                f"[AutoMonitor] ✅ Update post sent — '{anime_name}' "
+                                f"Ep {episode_num}–{_ep_end}"
+                            )
+                        except Exception as _ue:
+                            LOGGER.error(f"[AutoMonitor] Update post error: {_ue}")
 
             return success, sent_msg, quality
 
@@ -436,13 +444,6 @@ async def _episode_quality_poller(
         except Exception:
             pass
         LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ALL qualities done in {elapsed_min}m")
-
-        # Schedule notification — channel pe "Next episode on Xth Month" ya "END" bhejo
-        try:
-            send_schedule_notification = _get_schedule_fn()
-            await send_schedule_notification(client, channel_id, anime_name, episode_num)
-        except Exception as e:
-            LOGGER.error(f"[AutoMonitor] Schedule notification error: {e}")
     else:
         # 30 min ke baad bhi nahi mila
         missing_str = ' | '.join(sorted(remaining))
@@ -561,7 +562,11 @@ async def auto_monitor_handler(client: Client, message: Message):
 
     total = end_ep - start_ep + 1
 
+    # Shared flag — pehle episode ke 360p pe True hoga, baaki skip karenge
+    update_post_sent = [False]
+
     for i, ep_num in enumerate(range(start_ep, end_ep + 1), 1):
+        is_last = (i == total)
 
         # Swift URL nikalo
         prep_msg = await message.reply(
@@ -589,11 +594,22 @@ async def auto_monitor_handler(client: Client, message: Message):
             client, message, swift_url,
             ep_num, anime_name, channel_id, oid,
             matched_entry=matched,
+            start_ep=start_ep,
+            end_ep=end_ep,
+            update_post_sent=update_post_sent,
         )
 
         # Episodes ke beech thoda gap
-        if i < total:
+        if not is_last:
             await asyncio.sleep(3)
+
+    # ── Sirf last episode ke baad schedule/end message bhejo ──
+    try:
+        send_schedule_notification = _get_schedule_fn()
+        await send_schedule_notification(client, channel_id, anime_name, end_ep)
+        LOGGER.info(f"[AutoMonitor] ✅ Schedule notification sent after last ep {end_ep}")
+    except Exception as e:
+        LOGGER.error(f"[AutoMonitor] Schedule notification error: {e}")
 
 
 # ─────────────────────────────────────────────
