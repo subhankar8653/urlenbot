@@ -44,7 +44,7 @@ Commands registered here (conflict check):
 import logging
 import re
 
-from pyrogram import Client, filters, enums, StopPropagation
+from pyrogram import Client, filters, enums, StopPropagation, ContinuePropagation
 from pyrogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup, Message
 )
@@ -429,19 +429,25 @@ async def cmd_delete_update_post(client: Client, message: Message):
 
 # ─────────────────────────────────────────────
 #  Text input handler for /update_post 2-step flow
-#  group=15 — dusre plugins ke saath koi conflict nahi
+#  group=0 — sabse pehle fire hoga, kisi se conflict nahi
+#  Agar session nahi → ContinuePropagation (agle handlers ko jaane do)
+#  Agar session hai → process karo, StopPropagation (koi aur na pakde)
 # ─────────────────────────────────────────────
-@Client.on_message(filters.text & filters.private, group=15)
+@Client.on_message(filters.text & filters.private, group=0)
 async def update_post_text_input(client: Client, message: Message):
     """update_post ke 2-step input ko handle karo."""
     user_id = message.from_user.id
-    if not _is_auth(user_id):
-        return
 
+    # Auth check — authorized nahi toh agle handlers ko jaane do
+    if not _is_auth(user_id):
+        raise ContinuePropagation
+
+    # Session nahi → hamara kaam nahi, agle handler ko jaane do
     session = _update_post_sessions.get(user_id)
     if not session:
-        return
+        raise ContinuePropagation
 
+    # Session hai — ab sirf hum handle karenge, koi aur nahi
     text = message.text.strip()
 
     if text.lower() in ["/cancel_update_post", "cancel"]:
@@ -451,7 +457,7 @@ async def update_post_text_input(client: Client, message: Message):
 
     if text.startswith("/"):
         _update_post_sessions.pop(user_id, None)
-        return
+        raise ContinuePropagation
 
     # ── Step 1: Anime name ──
     if session.get("step") == "anime":
