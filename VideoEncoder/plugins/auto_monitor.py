@@ -330,22 +330,32 @@ async def _episode_quality_poller(
                     try:
                         from .update_channel import send_update_post
                         from ..utils.auto_caption import extract_anime_info
+                        import re as _re
                         _fname = ""
                         if sent_msg.document and sent_msg.document.file_name:
+                            # Best source: actual file name
                             _fname = sent_msg.document.file_name
+                        elif sent_msg.video and sent_msg.video.file_name:
+                            _fname = sent_msg.video.file_name
                         elif sent_msg.caption:
-                            _fname = sent_msg.caption.replace("<b>", "").replace("</b>", "").strip()
-                        _parsed_name, _season, _episode = extract_anime_info(_fname, {})
-                        _final_name = _parsed_name or anime_name
+                            # Strip ALL html tags, not just <b></b>
+                            _fname = _re.sub(r'<[^>]+>', '', sent_msg.caption).strip()
+                        # anime_name (from DB entry) is most reliable — use as primary
+                        # _parsed_name from filename as secondary only if anime_name missing
+                        _parsed_name, _season, _episode = extract_anime_info(_fname, {}) if _fname else (None, None, None)
+                        _final_name = anime_name or _parsed_name or ""
                         _final_season = _season
                         _final_episode = _episode if _episode else episode_num
-                        await send_update_post(
-                            client,
-                            anime_name=_final_name,
-                            season=_final_season,
-                            episode=_final_episode,
-                        )
-                        LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ Update post sent after 360p upload")
+                        if _final_name:
+                            await send_update_post(
+                                client,
+                                anime_name=_final_name,
+                                season=_final_season,
+                                episode=_final_episode,
+                            )
+                            LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ Update post sent after 360p upload")
+                        else:
+                            LOGGER.warning(f"[AutoMonitor] Ep {episode_num}: anime_name empty, update post skip kiya")
                     except Exception as _ue:
                         LOGGER.error(f"[AutoMonitor] Update post error: {_ue}")
 

@@ -126,10 +126,16 @@ async def send_update_post(
 
     divider = "────────────────────"
 
-    # Invite link dhundo — case-insensitive
+    # Invite link dhundo — normalized fuzzy match
+    # Normalize: lowercase, extra spaces hata, punctuation ignore
+    def _norm(s: str) -> str:
+        import re as _re
+        return _re.sub(r'[\s\-_]+', ' ', s.lower()).strip()
+
     invite_link = None
+    query_norm = _norm(anime_name)
     for key, link in post_map.items():
-        if key == anime_name.lower().strip():
+        if _norm(key) == query_norm:
             invite_link = link
             break
 
@@ -138,6 +144,11 @@ async def send_update_post(
     if ep_str:
         lines.append(ep_str)
     text = "\n".join(lines)
+
+    # Blank post guard — agar sirf divider hi bacha toh send mat karo
+    if not title_line.strip("*").strip():
+        LOGGER.warning(f"[UpdateChannel] anime_name empty, post skip kiya.")
+        return
 
     # Button
     markup = None
