@@ -2,7 +2,43 @@
 update_channel.py
 ==================
 Update Channel System
-... (same docstring)
+
+Flow:
+  - /update_channel [channel_id]          → Update channel add karo
+  - /update_channel_list                  → Saare update channels dekho (with IDs)
+  - /delete_update_channel [channel_id]   → Update channel remove karo
+  - /update_post                          → Anime + invite link ka pair save karo
+                                            (2-step: anime name → invite link)
+  - /update_post_list                     → Saare saved anime → invite link pairs dekho
+  - /delete_update_post [anime_name]      → Kisi anime ka saved post entry remove karo
+
+Auto-trigger:
+  Jab bhi 360p file upload hoti hai kisi anime channel pe (auto_monitor se),
+  toh saare update channels pe ek post jaata hai:
+
+    🔰 Witch Hat Atelier (S01)
+    ──────────────────────────
+    ⚡EP - 06 | Added
+    [❇️ Start the Bot Get Link Here ❇️]   ← button (agar invite link saved hai)
+    Start the Bot Get Link Here           ← plain text link (agar invite link saved hai)
+
+DB storage:
+  - update_channels  → col2, id='update_channels', data: list of {channel_id, channel_title}
+  - update_post_map  → col2, id='update_post_map', data: dict {anime_name_lower: invite_link}
+  Both stored in bot-level col2 (status collection) — user-specific nahi.
+
+Commands registered here (conflict check):
+  /update_channel          — unique
+  /update_channel_list     — unique
+  /delete_update_channel   — unique
+  /update_post             — unique (2-step session, group=15 text handler)
+  /cancel_update_post      — unique (session cancel)
+  /update_post_list        — unique
+  /delete_update_post      — unique
+
+  NOTE: text handler (group=15) sirf tab fire karta hai jab
+  _update_post_sessions mein us user ka session ho.
+  Isliye dusre plugins ke saath koi conflict nahi.
 """
 
 import logging
@@ -77,14 +113,16 @@ async def send_update_post(
 ):
     """
     360p upload hone pe call karo.
-    Saare update channels pe bold-format post bhejta hai.
+    Saare update channels pe stylish format post bhejta hai.
 
     Post format:
-        **Anime Name (S-01)**          ← agar season hai
-        **Anime Name**                 ← agar season nahi
-        ────────────────────
-        **EP - 07 | Added**            ← agar episode hai
-        [Start the Bot Get Link Here]  ← agar invite link saved hai (button)
+        🔰 Witch Hat Atelier (S01)
+        ──────────────────────────
+        ⚡EP - 06 | Added
+        Start the Bot Get Link Here   ← plain text hyperlink (agar invite link saved hai)
+
+    Button (agar invite link saved hai):
+        [❇️ Start the Bot Get Link Here ❇️]
     """
     channels = await _get_update_channels()
     if not channels:
@@ -93,22 +131,19 @@ async def send_update_post(
 
     post_map = await _get_post_map()
 
-    # Season/Episode string
-    season_str = f"(S-{season:02d})" if season else ""
-    title_line = (
-        f"**{anime_name} {season_str}**".strip()
-        if season_str
-        else f"**{anime_name}**"
-    )
+    # ── Title line ──
+    season_str = f"(S{season:02d})" if season else ""
+    title_line = f"🔰 **{anime_name} {season_str}**".strip() if season_str else f"🔰 **{anime_name}**"
 
+    # ── Episode line ──
     ep_str = ""
     if episode:
         ep_num = f"{episode:02d}" if episode < 100 else str(episode)
-        ep_str = f"**EP - {ep_num} | Added**"
+        ep_str = f">⚡**EP - {ep_num} | Added**"
 
-    divider = "────────────────────"
+    divider = "──────────────────────────"
 
-    # Invite link dhundo — normalized fuzzy match
+    # ── Invite link fuzzy match ──
     def _norm(s: str) -> str:
         return re.sub(r'[\s\-_]+', ' ', s.lower()).strip()
 
@@ -119,22 +154,25 @@ async def send_update_post(
             invite_link = link
             break
 
-    # Post text
+    # ── Build text ──
     lines = [title_line, divider]
     if ep_str:
         lines.append(ep_str)
+    # Plain text hyperlink (shows as clickable text in Telegram markdown)
+    if invite_link:
+        lines.append(f"[Start the Bot Get Link Here]({invite_link})")
     text = "\n".join(lines)
 
-    # Blank post guard
-    if not title_line.strip("*").strip():
+    # ── Blank post guard ──
+    if not anime_name.strip():
         LOGGER.warning("[UpdateChannel] anime_name empty, post skip kiya.")
         return
 
-    # Button
+    # ── Button ──
     markup = None
     if invite_link:
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🚀 Start the Bot Get Link Here", url=invite_link)]
+            [InlineKeyboardButton("❇️ Start the Bot Get Link Here ❇️", url=invite_link)]
         ])
 
     for ch in channels:
@@ -147,6 +185,7 @@ async def send_update_post(
                 text=text,
                 reply_markup=markup,
                 parse_mode=enums.ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
             )
             LOGGER.info(
                 f"[UpdateChannel] Post sent to {ch_id} for '{anime_name}' Ep {episode}"
@@ -292,7 +331,7 @@ async def cmd_update_post(client: Client, message: Message):
 
     await message.reply(
         "**Step 1/2 — Anime ka naam do:**\n\n"
-        "**Example:** `Agent of four seasons`\n\n"
+        "**Example:** `Witch Hat Atelier`\n\n"
         "_Cancel karna ho toh `/cancel_update_post` bhejo._"
     )
 
@@ -352,7 +391,7 @@ async def cmd_delete_update_post(client: Client, message: Message):
         for i, anime in enumerate(post_map.keys(), 1):
             text += f"`{i}.` {anime}\n"
         text += "\n**Usage:** `/delete_update_post [anime name]`\n"
-        text += "**Example:** `/delete_update_post agent of four seasons`"
+        text += "**Example:** `/delete_update_post witch hat atelier`"
         await message.reply(text)
         return
 
