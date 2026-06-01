@@ -313,32 +313,37 @@ async def _episode_quality_poller(
 
         async def _delete_old_bot_msgs(ch_id: int):
             """
-            Channel mein bot ke last 30 msgs scan karo.
-            Schedule/end message pattern wale delete karo.
-            Videos/documents skip — woh actual episodes hain.
-            Koi command nahi, koi DB nahi — sirf search+delete.
+            Pichle episode ke schedule/end messages delete karo.
+            Strategy:
+              Step 1: DB mein IDs hain → direct delete (fast + reliable)
+              Step 2: DB empty → skip (naye channel pe pehli baar)
+            Bots ke liye get_chat_history kaam nahi karta channels mein —
+            isliye sirf DB IDs use karte hain.
             """
             try:
-                deleted = 0
-                async for msg in client.get_chat_history(ch_id, limit=30):
-                    # Video/document/audio skip — woh episodes hain
-                    if msg.video or msg.document or msg.audio:
-                        continue
-                    text = msg.text or msg.caption or ""
-                    if not text.strip():
-                        continue
-                    # Schedule message pattern
-                    is_schedule = "Next episode upload on" in text
-                    # End message: koi bhi non-video bot msg jo schedule nahi
-                    is_end = not is_schedule
-                    if is_schedule or is_end:
+                from .schedule_notify import get_last_posted_msg_ids, clear_last_posted_msg_ids
+
+                saved_ids = await get_last_posted_msg_ids(ch_id)
+                if not saved_ids:
+                    LOGGER.info(f"[AutoMonitor] No saved msg IDs for channel {ch_id} — skip delete (first time or already cleared)")
+                    return
+
+                LOGGER.info(f"[AutoMonitor] Deleting {len(saved_ids)} saved schedule/end msgs from {ch_id}: {saved_ids}")
+                try:
+                    await client.delete_messages(ch_id, saved_ids)
+                    LOGGER.info(f"[AutoMonitor] ✅ Deleted {len(saved_ids)} msgs from {ch_id}")
+                except Exception as de:
+                    LOGGER.warning(f"[AutoMonitor] Bulk delete failed ({de}), trying one by one...")
+                    for mid in saved_ids:
                         try:
-                            await client.delete_messages(ch_id, msg.id)
-                            deleted += 1
-                            await asyncio.sleep(0.3)
-                        except Exception as _de:
-                            LOGGER.warning(f"[AutoMonitor] Old msg delete fail (id={msg.id}): {_de}")
-                LOGGER.info(f"[AutoMonitor] Old schedule/end msgs deleted: {deleted} from {ch_id}")
+                            await client.delete_messages(ch_id, mid)
+                            await asyncio.sleep(0.2)
+                        except Exception as e2:
+                            LOGGER.warning(f"[AutoMonitor] Single delete fail (id={mid}): {e2}")
+
+                # DB clear karo taaki dobara delete na ho
+                await clear_last_posted_msg_ids(ch_id)
+
             except Exception as _e:
                 LOGGER.warning(f"[AutoMonitor] _delete_old_bot_msgs error: {_e}")
 
@@ -367,31 +372,19 @@ async def _episode_quality_poller(
                         import re as _re
 
                         # anime_name DB se directly use karo — most reliable
-                        # sent_msg.file_name unreliable hai (forwarded messages mein None hota hai)
                         _final_name = anime_name or ""
-                        _final_season = None
                         _final_episode = episode_num
 
-                        # Episode/Season: filename se try karo sirf agar DB se nahi mila
-                        if not _final_name or _final_episode is None:
-                            _fname = ""
-                            try:
-                                if sent_msg.document and sent_msg.document.file_name:
-                                    _fname = sent_msg.document.file_name
-                                elif sent_msg.video and sent_msg.video.file_name:
-                                    _fname = sent_msg.video.file_name
-                                elif sent_msg.caption:
-                                    _fname = _re.sub(r'<[^>]+>', '', sent_msg.caption).strip()
-                            except Exception:
-                                pass
+                        # Season: filepath se parse karo — sent_msg.file_name unreliable hai
+                        # (forwarded/channel messages mein None hota hai)
+                        _final_season = None
+                        try:
+                            _fname = os.path.basename(filepath)
                             if _fname:
-                                _parsed_name, _parsed_season, _parsed_ep = extract_anime_info(_fname, {})
-                                if not _final_name:
-                                    _final_name = _parsed_name or ""
-                                if _final_season is None:
-                                    _final_season = _parsed_season
-                                if _final_episode is None:
-                                    _final_episode = _parsed_ep
+                                _, _parsed_season, _ = extract_anime_info(_fname, {})
+                                _final_season = _parsed_season
+                        except Exception:
+                            pass
 
                         if _final_name:
                             await send_update_post(

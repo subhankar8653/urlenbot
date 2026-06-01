@@ -234,11 +234,12 @@ def _serialize_message(msg: Message) -> dict | None:
 # ─────────────────────────────────────────────
 #  Send saved end messages to channel
 # ─────────────────────────────────────────────
-async def _send_end_messages_to_channel(channel_id: int, channel_key: str = DEFAULT_END_KEY):
+async def _send_end_messages_to_channel(channel_id: int, channel_key: str = DEFAULT_END_KEY) -> list:
     """
     DB se saved end messages ek ek karke channel pe bhejo.
     channel_key ke liye specific messages check karo,
     nahi toh default use karo.
+    Returns: list of message IDs that were posted (for DB tracking)
     """
     messages = await _get_end_messages(channel_key)
     if not messages:
@@ -246,20 +247,22 @@ async def _send_end_messages_to_channel(channel_id: int, channel_key: str = DEFA
         messages = await _get_end_messages(DEFAULT_END_KEY)
     if not messages:
         LOGGER.info(f"[EndMsg] No end messages at all for channel {channel_id}")
-        return
+        return []
 
     LOGGER.info(f"[EndMsg] Sending {len(messages)} end messages to {channel_id}")
 
+    posted_ids = []
     for item in messages:
         try:
             msg_type = item.get('type')
+            sent = None
 
             if msg_type in ('copy_ref', 'forward'):
                 # Saved buttons agar hain toh manually attach karo
                 reply_markup = None
                 if item.get('buttons'):
                     reply_markup = _deserialize_buttons(item['buttons'])
-                await app.copy_message(
+                sent = await app.copy_message(
                     chat_id=channel_id,
                     from_chat_id=item['from_chat_id'],
                     message_id=item['message_id'],
@@ -267,29 +270,73 @@ async def _send_end_messages_to_channel(channel_id: int, channel_key: str = DEFA
                 )
             elif msg_type == 'sticker':
                 # Sticker copy_message se nahi hota — file_id se bhejo
-                await app.send_sticker(channel_id, item['file_id'])
+                sent = await app.send_sticker(channel_id, item['file_id'])
             elif msg_type == 'text':
-                await app.send_message(channel_id, item['text'])
+                sent = await app.send_message(channel_id, item['text'])
             elif msg_type == 'photo':
-                await app.send_photo(channel_id, item['file_id'], caption=item.get('caption', ''))
+                sent = await app.send_photo(channel_id, item['file_id'], caption=item.get('caption', ''))
             elif msg_type == 'video':
-                await app.send_video(channel_id, item['file_id'], caption=item.get('caption', ''))
+                sent = await app.send_video(channel_id, item['file_id'], caption=item.get('caption', ''))
             elif msg_type == 'animation':
-                await app.send_animation(channel_id, item['file_id'], caption=item.get('caption', ''))
+                sent = await app.send_animation(channel_id, item['file_id'], caption=item.get('caption', ''))
             elif msg_type == 'document':
-                await app.send_document(channel_id, item['file_id'], caption=item.get('caption', ''))
+                sent = await app.send_document(channel_id, item['file_id'], caption=item.get('caption', ''))
             elif msg_type == 'audio':
-                await app.send_audio(channel_id, item['file_id'], caption=item.get('caption', ''))
+                sent = await app.send_audio(channel_id, item['file_id'], caption=item.get('caption', ''))
+
+            if sent and hasattr(sent, 'id'):
+                posted_ids.append(sent.id)
 
             await asyncio.sleep(0.5)
 
         except Exception as e:
             LOGGER.error(f"[EndMsg] Failed to send end message item {item}: {e}")
 
+    return posted_ids
+
 
 # ─────────────────────────────────────────────
 #  Main function — auto_monitor.py se call hoga
 # ─────────────────────────────────────────────
+async def _save_last_posted_msg_ids(channel_id: int, msg_ids: list):
+    """
+    Channel ke liye last posted schedule/end message IDs DB mein save karo.
+    Key: last_ep_msgs_{channel_id}
+    """
+    oid = await _owner_id()
+    if not oid:
+        return
+    key = f"last_ep_msgs_{channel_id}"
+    await db.col.update_one(
+        {'id': oid},
+        {'$set': {key: msg_ids}},
+        upsert=True
+    )
+    LOGGER.info(f"[Schedule] Saved {len(msg_ids)} msg IDs for channel {channel_id}: {msg_ids}")
+
+
+async def get_last_posted_msg_ids(channel_id: int) -> list:
+    """
+    DB se last posted schedule/end message IDs lo.
+    Returns: list of int message IDs, or []
+    """
+    oid = await _owner_id()
+    if not oid:
+        return []
+    user = await db._get_user(oid)
+    key = f"last_ep_msgs_{channel_id}"
+    return user.get(key, [])
+
+
+async def clear_last_posted_msg_ids(channel_id: int):
+    """DB se last posted msg IDs clear karo (delete ke baad call karo)."""
+    oid = await _owner_id()
+    if not oid:
+        return
+    key = f"last_ep_msgs_{channel_id}"
+    await db.col.update_one({'id': oid}, {'$unset': {key: ""}}, upsert=True)
+
+
 async def send_schedule_notification(
     client: Client,
     channel_id: int,
@@ -302,9 +349,11 @@ async def send_schedule_notification(
     Flow:
       1. Schedule set hai → Schedule msg post karo (next date ya END)
       2. End messages HAMESHA post karo (schedule ho ya na ho)
+      3. Saare posted message IDs DB mein save karo (delete ke liye)
     channel_key: channel-specific end messages ke liye (default = DEFAULT_END_KEY)
     """
     schedule = await _get_schedule_for_anime(anime_name)
+    posted_ids = []  # Yahan saare posted msg IDs collect karenge
 
     # Step 1: Schedule message — sirf tab jab schedule set ho
     if schedule:
@@ -314,11 +363,15 @@ async def send_schedule_notification(
 
         try:
             if is_last_ep:
-                await app.send_message(channel_id, "**END**")
+                sent = await app.send_message(channel_id, "**END**")
+                if sent:
+                    posted_ids.append(sent.id)
                 LOGGER.info(f"[Schedule] Last ep {episode_num} → posted END for '{anime_name}'")
             else:
                 next_date = _next_episode_date(interval_days)
-                await app.send_message(channel_id, f"**Next episode upload on {next_date}**")
+                sent = await app.send_message(channel_id, f"**Next episode upload on {next_date}**")
+                if sent:
+                    posted_ids.append(sent.id)
                 LOGGER.info(f"[Schedule] Ep {episode_num} → Next on {next_date} for '{anime_name}'")
         except Exception as e:
             LOGGER.error(f"[Schedule] Schedule msg failed: {e}")
@@ -328,7 +381,12 @@ async def send_schedule_notification(
         LOGGER.info(f"[Schedule] No schedule for '{anime_name}' — skipping schedule msg.")
 
     # Step 2: End messages — schedule ho ya na ho, HAMESHA bhejo
-    await _send_end_messages_to_channel(channel_id, channel_key)
+    end_ids = await _send_end_messages_to_channel(channel_id, channel_key)
+    posted_ids.extend(end_ids)
+
+    # Step 3: Posted IDs DB mein save karo — next episode pe delete ke liye
+    if posted_ids:
+        await _save_last_posted_msg_ids(channel_id, posted_ids)
 
 
 # ─────────────────────────────────────────────
