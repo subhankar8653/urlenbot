@@ -91,6 +91,10 @@ async def _upload_via_user_then_forward(
             message_ids=saved.id,
         )
 
+        # forward_messages LIST return karta hai — pehla message lo
+        if isinstance(resp, list):
+            resp = resp[0] if resp else None
+
         # Log channel mein message already hai — alag se send karne ki zaroorat nahi
         return resp
 
