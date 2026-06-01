@@ -2,51 +2,13 @@
 update_channel.py
 ==================
 Update Channel System
-
-Flow:
-  - /update_channel [channel_id]          → Update channel add karo
-  - /update_channel_list                  → Saare update channels dekho (with IDs)
-  - /delete_update_channel [channel_id]   → Update channel remove karo
-  - /update_post                          → Anime + invite link ka pair save karo
-                                            (2-step: anime name → invite link)
-  - /update_post_list                     → Saare saved anime → invite link pairs dekho
-  - /delete_update_post [anime_name]      → Kisi anime ka saved post entry remove karo
-
-Auto-trigger:
-  Jab bhi 360p file upload hoti hai kisi anime channel pe (auto_monitor se),
-  toh saare update channels pe ek post jaata hai:
-
-    **Agent of four seasons (S-01)**
-    ────────────────────
-    **EP - 07 | Added**
-    [Start the Bot Get Link Here]
-
-  'Start the Bot Get Link Here' ke andar saved invite link hota hai.
-  Agar us anime ka invite link save nahi hai toh button nahi aata.
-
-DB storage:
-  - update_channels  → col2, id='update_channels', data: list of {channel_id, channel_title}
-  - update_post_map  → col2, id='update_post_map', data: dict {anime_name_lower: invite_link}
-  Both stored in bot-level col2 (status collection) — user-specific nahi.
-
-Commands registered here (conflict check):
-  /update_channel          — unique
-  /update_channel_list     — unique
-  /delete_update_channel   — unique
-  /update_post             — unique (2-step session, group=15 text handler)
-  /cancel_update_post      — unique (session cancel)
-  /update_post_list        — unique (NEW)
-  /delete_update_post      — unique (NEW)
-
-  NOTE: text handler (group=15) sirf tab fire karta hai jab
-  _update_post_sessions mein us user ka session ho.
-  Isliye dusre plugins ke saath koi conflict nahi.
+... (same docstring)
 """
 
 import logging
 import re
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup, Message
 )
@@ -184,7 +146,7 @@ async def send_update_post(
                 chat_id=ch_id,
                 text=text,
                 reply_markup=markup,
-                parse_mode="markdown",
+                parse_mode=enums.ParseMode.MARKDOWN,
             )
             LOGGER.info(
                 f"[UpdateChannel] Post sent to {ch_id} for '{anime_name}' Ep {episode}"
@@ -343,7 +305,7 @@ async def cmd_cancel_update_post(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────
-#  /update_post_list  (NEW)
+#  /update_post_list
 # ─────────────────────────────────────────────
 @Client.on_message(filters.command("update_post_list") & filters.private)
 async def cmd_update_post_list(client: Client, message: Message):
@@ -369,7 +331,7 @@ async def cmd_update_post_list(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────
-#  /delete_update_post [anime_name]  (NEW)
+#  /delete_update_post [anime_name]
 # ─────────────────────────────────────────────
 @Client.on_message(filters.command("delete_update_post") & filters.private)
 async def cmd_delete_update_post(client: Client, message: Message):
@@ -379,7 +341,6 @@ async def cmd_delete_update_post(client: Client, message: Message):
 
     parts = message.text.split(None, 1)
     if len(parts) < 2 or not parts[1].strip():
-        # List dikha do taaki user naam dekh sake
         post_map = await _get_post_map()
         if not post_map:
             await message.reply(
@@ -402,7 +363,6 @@ async def cmd_delete_update_post(client: Client, message: Message):
         await message.reply("📭 Koi anime post entry save nahi hai.")
         return
 
-    # Exact match (lowercase) — fuzzy nahi, taaki galti se delete na ho
     def _norm(s: str) -> str:
         return re.sub(r'[\s\-_]+', ' ', s.lower()).strip()
 
@@ -430,9 +390,7 @@ async def cmd_delete_update_post(client: Client, message: Message):
 
 # ─────────────────────────────────────────────
 #  Text input handler for /update_post 2-step flow
-#
-#  group=15 — high group number taaki command handlers pehle chalein
-#  Session check se hi fire karta hai — dusre plugins ko affect nahi karta
+#  group=15 — dusre plugins ke saath koi conflict nahi
 # ─────────────────────────────────────────────
 @Client.on_message(filters.text & filters.private, group=15)
 async def update_post_text_input(client: Client, message: Message):
@@ -441,20 +399,17 @@ async def update_post_text_input(client: Client, message: Message):
     if not _is_auth(user_id):
         return
 
-    # Agar koi active session nahi hai toh seedha return — dusre handlers affect nahi
     session = _update_post_sessions.get(user_id)
     if not session:
         return
 
     text = message.text.strip()
 
-    # Cancel check
     if text.lower() in ["/cancel_update_post", "cancel"]:
         _update_post_sessions.pop(user_id, None)
         await message.reply("❌ Cancelled.")
         return
 
-    # Agar koi aur command aaya toh session clear karo — conflict se bacho
     if text.startswith("/"):
         _update_post_sessions.pop(user_id, None)
         return
@@ -481,7 +436,7 @@ async def update_post_text_input(client: Client, message: Message):
             await message.reply(
                 "⚠️ Valid invite link do (`https://t.me/...`) ya `skip` likho."
             )
-            _update_post_sessions[user_id] = session   # session restore
+            _update_post_sessions[user_id] = session
             return
         else:
             invite_link = text
