@@ -217,7 +217,9 @@ async def _episode_quality_poller(
 
         driver = None
         result = {"files": [], "error": None}
-        downloaded_qualities = set()   # jo already download ho chuke hain
+        downloaded_qualities = set()   # jo qualities click ho chuki hain (Chrome ke andar track)
+        # FIX: Inner loop ke liye apna target set — outer 'remaining' se independent
+        _target_qualities = set(TARGET_QUALITIES)   # {"360p", "720p", "1080p"}
 
         try:
             driver = _make_driver(dl_dir)
@@ -244,14 +246,23 @@ async def _episode_quality_poller(
             _inner_attempt = 0
             _inner_max = POLL_FAST_ATTEMPTS + POLL_SLOW_ATTEMPTS
 
-            while remaining and _inner_attempt < _inner_max:
+            # FIX: Loop condition — downloaded_qualities use karo, outer 'remaining' nahi
+            # Jab tak saari target qualities click nahi hui ya max attempts nahi gaye
+            while _inner_attempt < _inner_max:
+                # Agar saari target qualities click ho gayi — done!
+                if _target_qualities.issubset(downloaded_qualities):
+                    LOGGER.info(f"[AutoMonitor] Ep {episode_num}: All qualities clicked ✅ — exiting loop")
+                    break
+
                 _inner_attempt += 1
                 is_fast   = _inner_attempt <= POLL_FAST_ATTEMPTS
                 interval  = POLL_INTERVAL_FAST if is_fast else POLL_INTERVAL_SLOW
 
+                # Jo abhi baki hain (clicked nahi hue)
+                _still_needed = _target_qualities - downloaded_qualities
                 LOGGER.info(
                     f"[AutoMonitor] Ep {episode_num} Chrome attempt {_inner_attempt}/{_inner_max} "
-                    f"| Remaining: {remaining}"
+                    f"| Still needed: {_still_needed}"
                 )
 
                 # ── 360p gate — max 10s wait ──
@@ -277,8 +288,8 @@ async def _episode_quality_poller(
                 available = {_qf(lnk["quality"]) for lnk in links
                              if _qf(lnk["quality"]) != "unknown"}
 
-                # Jo needed hain aur abhi tak downloaded nahi hue
-                to_download = remaining - downloaded_qualities
+                # FIX: Sirf wo qualities jo still needed hain aur abhi downloaded nahi
+                to_download = _still_needed  # = _target_qualities - downloaded_qualities
 
                 # Page pe available hain unhe hi click karo
                 click_these = [
@@ -287,10 +298,14 @@ async def _episode_quality_poller(
                 ]
 
                 if not click_these:
+                    # Agar page pe needed qualities available hi nahi (e.g. 1080p page pe nahi)
+                    # Toh jo available hain wo note karo — baad mein partial success ho sakti hai
                     LOGGER.info(
                         f"[AutoMonitor] Ep {episode_num}: "
                         f"Available={available}, Need={to_download} — refresh karenge"
                     )
+                    # FIX: Agar koi bhi quality page pe kabhi available nahi aayi after many attempts,
+                    # to loop naturally _inner_max pe khatam hoga — stuck nahi rahega
                     driver.refresh()
                     _close_popups(driver, main)
                     time.sleep(interval)
@@ -323,7 +338,7 @@ async def _episode_quality_poller(
                     done     = _get_done_files(dl_dir)
                     in_prog  = _in_progress(dl_dir)
                     elapsed  = int(time.time() - dl_start)
-                    # Jitne click kiye + jo pehle se hain
+                    # Jitne click kiye hain unhe expect karo
                     expected = len(downloaded_qualities)
                     if len(done) >= expected and not in_prog:
                         break
@@ -337,20 +352,33 @@ async def _episode_quality_poller(
                 # Nayi files result mein add karo
                 result["files"] = _get_done_files(dl_dir)
 
-                # Agar sab mil gaye toh loop khatam
+                # FIX: downloaded_so_far check — agar saari clicked qualities ka file aa gaya
                 downloaded_so_far = {
                     _qf(os.path.basename(f))
                     for f in result["files"]
                 }
-                if remaining.issubset(downloaded_so_far):
+                LOGGER.info(
+                    f"[AutoMonitor] Ep {episode_num}: "
+                    f"Files so far: {downloaded_so_far}, clicked: {downloaded_qualities}"
+                )
+
+                # Agar saari TARGET qualities mil gayi → done
+                if _target_qualities.issubset(downloaded_so_far):
                     LOGGER.info(f"[AutoMonitor] Ep {episode_num}: All qualities downloaded ✅")
                     break
 
-                # Kuch baki hain — page refresh karke next attempt
+                # Kuch baki hain — next attempt
+                still_missing = _target_qualities - downloaded_so_far
                 LOGGER.info(
-                    f"[AutoMonitor] Ep {episode_num}: "
-                    f"Got {downloaded_so_far}, still need {remaining - downloaded_so_far}"
+                    f"[AutoMonitor] Ep {episode_num}: Still missing: {still_missing}, refreshing..."
                 )
+                # FIX: Agar already clicked kar diya lekin file nahi aayi → downloaded_qualities se remove karo
+                # taaki agla attempt dobara click kare
+                for _mq in still_missing:
+                    if _mq in downloaded_qualities:
+                        downloaded_qualities.discard(_mq)
+                        LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Re-queuing {_mq} (file not arrived)")
+
                 driver.refresh()
                 _close_popups(driver, main)
                 time.sleep(interval)
@@ -404,7 +432,8 @@ async def _episode_quality_poller(
         return
 
     # ── Upload — jo files mili unhe upload karo ──
-    new_files = [f for f in all_files if _quality_from(os.path.basename(f)) in remaining]
+    # FIX: remaining abhi bhi full set hai (upload se pehle) — TARGET_QUALITIES use karo directly
+    new_files = [f for f in all_files if _quality_from(os.path.basename(f)) in set(TARGET_QUALITIES)]
 
     if not new_files:
         elapsed_min = int((time.time() - start_time) / 60)
