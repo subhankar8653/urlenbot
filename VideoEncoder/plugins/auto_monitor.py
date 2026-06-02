@@ -293,11 +293,64 @@ async def _episode_quality_poller(
                 result["error"] = "360p button 20s tak nahi mila — page render fail"
                 return result
 
-            _close_popups(driver, main)
-            links = _collect_visible_links(driver)
+            # 360p gate pass hua — ab links collect karo
+            # JS buttons fully render hone mein time lagta hai — retry loop
+            links = []
+            for _retry in range(8):
+                _close_popups(driver, main)
+                links = _collect_visible_links(driver)
+                if links:
+                    LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Links collected retry {_retry+1} — {len(links)} found")
+                    break
+                LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Links empty retry {_retry+1}, waiting 2s...")
+                time.sleep(2)
 
             if not links:
-                result["error"] = "360p dikh gaya par download links nahi mile"
+                # Last resort: page scroll karke JS trigger karo
+                try:
+                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(1)
+                    driver.execute_script("window.scrollTo(0, 0);")
+                    time.sleep(1)
+                    _close_popups(driver, main)
+                    links = _collect_visible_links(driver)
+                    LOGGER.info(f"[AutoMonitor] Ep {episode_num}: After scroll — {len(links)} links")
+                except Exception:
+                    pass
+
+            if not links:
+                # Final fallback: Selenium se saare a.dl-btn directly click karo
+                LOGGER.warning(f"[AutoMonitor] Ep {episode_num}: _collect_visible_links empty — trying direct Selenium click")
+                clicked_fallback = []
+                try:
+                    from selenium.webdriver.common.by import By as _By
+                    dl_btns = driver.find_elements(_By.CSS_SELECTOR, "a.dl-btn")
+                    for btn in dl_btns:
+                        try:
+                            classes = btn.get_attribute("class") or ""
+                            if "d-none" in classes:
+                                continue
+                            href  = btn.get_attribute("href") or ""
+                            label = btn.text.strip()
+                            if not href or href.startswith("about:") or len(href) < 10:
+                                continue
+                            q = _quality_from(label + " " + href)
+                            driver.execute_script(f"window.open('{href}', '_blank');")
+                            time.sleep(0.3)
+                            _close_popups(driver, main)
+                            clicked_fallback.append(q)
+                            LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Fallback clicked {q}")
+                        except Exception as _be:
+                            LOGGER.warning(f"[AutoMonitor] Fallback btn click failed: {_be}")
+                except Exception as _fe:
+                    LOGGER.error(f"[AutoMonitor] Fallback Selenium error: {_fe}")
+
+                if clicked_fallback:
+                    result["qualities_clicked"] = clicked_fallback
+                    time.sleep(5)
+                    return result
+
+                result["error"] = "360p dikh gaya par download links nahi mile — JS render timeout"
                 return result
 
             # Saare visible links click karo — downloads shuru
