@@ -264,7 +264,7 @@ async def _episode_quality_poller(
                     break
                 except Exception as e:
                     LOGGER.warning(f"[AutoMonitor] Page load attempt {_a+1}: {e}")
-                    time.sleep(3)
+                    time.sleep(2)  # was 3s
 
             if not loaded:
                 result["error"] = "Page load fail — Chrome renderer timeout"
@@ -275,13 +275,13 @@ async def _episode_quality_poller(
 
             # 360p gate — max 20s
             found_360p = False
-            for _s in range(20):
+            for _s in range(40):  # 40 × 0.5s = 20s max
                 _close_popups(driver, main)
                 if _scan_for_360p(driver):
                     found_360p = True
                     break
-                if _s < 19:
-                    time.sleep(1)
+                if _s < 39:
+                    time.sleep(0.5)  # was 1s — 2x faster
 
             if not found_360p:
                 result["error"] = "360p button 20s tak nahi mila — page render fail"
@@ -296,16 +296,16 @@ async def _episode_quality_poller(
                 if links:
                     LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Links collected retry {_retry+1} — {len(links)} found")
                     break
-                LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Links empty retry {_retry+1}, waiting 2s...")
-                time.sleep(2)
+                LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Links empty retry {_retry+1}, waiting 1s...")
+                time.sleep(1)
 
             if not links:
                 # Last resort: page scroll karke JS trigger karo
                 try:
                     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    time.sleep(1)
+                    time.sleep(0.5)  # was 1s
                     driver.execute_script("window.scrollTo(0, 0);")
-                    time.sleep(1)
+                    time.sleep(0.5)  # was 1s
                     _close_popups(driver, main)
                     links = _collect_visible_links(driver)
                     LOGGER.info(f"[AutoMonitor] Ep {episode_num}: After scroll — {len(links)} links")
@@ -330,7 +330,7 @@ async def _episode_quality_poller(
                                 continue
                             q = _quality_from(label + " " + href)
                             driver.execute_script(f"window.open('{href}', '_blank');")
-                            time.sleep(0.3)
+                            time.sleep(0.2)  # was 0.3s
                             _close_popups(driver, main)
                             clicked_fallback.append(q)
                             LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Fallback clicked {q}")
@@ -341,7 +341,7 @@ async def _episode_quality_poller(
 
                 if clicked_fallback:
                     result["qualities_clicked"] = clicked_fallback
-                    time.sleep(5)
+                    time.sleep(3)  # was 5s
                     return result
 
                 result["error"] = "360p dikh gaya par download links nahi mile — JS render timeout"
@@ -354,7 +354,7 @@ async def _episode_quality_poller(
                 href = lnk["href"]
                 try:
                     driver.execute_script(f"window.open('{href}', '_blank');")
-                    time.sleep(0.3)
+                    time.sleep(0.2)  # was 0.3s
                     _close_popups(driver, main)
                     clicked.append(q)
                     LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Clicked {q}")
@@ -363,8 +363,8 @@ async def _episode_quality_poller(
 
             result["qualities_clicked"] = clicked
 
-            # Chrome ko thoda rakho — downloads initiate hone do (5s kafi)
-            time.sleep(5)
+            # Downloads initiate hone do — 3s kafi hai (was 5s)
+            time.sleep(3)
 
         except Exception as e:
             result["error"] = str(e)
