@@ -164,7 +164,7 @@ async def _episode_quality_poller(
     start_ep: int = None,
     end_ep: int = None,
     update_post_sent: list = None,
-):
+) -> bool:
     """
     Swift URL milne ke baad:
       - 1 Chrome session → teeno downloads parallel shuru
@@ -172,6 +172,7 @@ async def _episode_quality_poller(
       - 50% chain: 360p 50% hone ke baad hi 720p upload shuru,
                    720p 50% hone ke baad hi 1080p upload shuru
       - Sab kuch async — download aur upload overlap karte hain
+    Returns True agar kam se kam 1 quality successfully upload hui, else False.
     """
     if matched_entry is None:
         matched_entry = {}
@@ -572,7 +573,9 @@ async def _episode_quality_poller(
                 )
             except Exception:
                 pass
-        return
+        # Poll fallback mein jo bhi upload hua uske basis pe return karo
+        uploaded_in_poll = set(TARGET_QUALITIES) - remaining
+        return len(uploaded_in_poll) > 0
 
     expected_count = len(click_result["qualities_clicked"])
     LOGGER.info(f"[AutoMonitor] Ep {episode_num}: {expected_count} downloads started — {click_result['qualities_clicked']}")
@@ -798,21 +801,175 @@ async def _episode_quality_poller(
 
     shutil.rmtree(dl_dir, ignore_errors=True)
 
+    # ── Missing quality retry loop ──
+    # Jo qualities upload nahi hui unhe 25 min tak same swift_url se retry karo
+    uploaded_so_far = set(q for q, _ in uploaded_results)
+    missing_after_chrome = set(TARGET_QUALITIES) - uploaded_so_far
+
+    if missing_after_chrome:
+        from .swift_downloader import (
+            _scrape_and_download, _upload_one_file, _sort_by_size, _quality_from
+        )
+
+        RETRY_FAST_ATTEMPTS = 10
+        RETRY_SLOW_ATTEMPTS = 20
+        retry_attempt = 0
+        retry_remaining = set(missing_after_chrome)
+        _old_msgs_deleted_retry = False
+
+        LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Missing qualities after Chrome — retrying: {retry_remaining}")
+
+        try:
+            await status_msg.edit(
+                f"⏳ **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                f"✅ Uploaded: `{' | '.join(sorted(uploaded_so_far)) or '—'}`\n"
+                f"🔄 Missing retry shuru: `{' | '.join(sorted(retry_remaining))}`"
+            )
+        except Exception:
+            pass
+
+        while retry_remaining:
+            retry_attempt += 1
+            is_fast = retry_attempt <= RETRY_FAST_ATTEMPTS
+            is_slow = RETRY_FAST_ATTEMPTS < retry_attempt <= (RETRY_FAST_ATTEMPTS + RETRY_SLOW_ATTEMPTS)
+            if not is_fast and not is_slow:
+                break
+
+            interval = 30 if is_fast else 60
+            phase_lbl = "⚡ Fast" if is_fast else "🐢 Slow"
+
+            try:
+                await status_msg.edit(
+                    f"⏳ **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                    f"🔄 Quality retry `{retry_attempt}` {phase_lbl}\n"
+                    f"🎯 Dhundh raha hoon: `{' | '.join(sorted(retry_remaining))}`\n"
+                    f"⏰ `{interval}s` baad scan..."
+                )
+            except Exception:
+                pass
+
+            await asyncio.sleep(interval)
+
+            for q_target in list(retry_remaining):
+                retry_session_id = f"monitor_ep{episode_num}_retry{retry_attempt}_{q_target}_{int(time.time())}"
+                retry_dl_dir = os.path.join(download_dir, retry_session_id)
+                os.makedirs(retry_dl_dir, exist_ok=True)
+
+                try:
+                    retry_result = await loop.run_in_executor(
+                        None, _scrape_and_download, swift_url, retry_dl_dir, None, q_target
+                    )
+                except Exception as e:
+                    LOGGER.error(f"[AutoMonitor] Quality retry error ({q_target}): {e}")
+                    shutil.rmtree(retry_dl_dir, ignore_errors=True)
+                    continue
+
+                if retry_result["error"] and not retry_result["files"]:
+                    LOGGER.info(f"[AutoMonitor] Ep {episode_num}: {q_target} not available yet (attempt {retry_attempt})")
+                    shutil.rmtree(retry_dl_dir, ignore_errors=True)
+                    continue
+
+                retry_files = _sort_by_size(retry_result.get("files", []))
+                target_file = next(
+                    (f for f in retry_files if _quality_from(os.path.basename(f)) == q_target),
+                    None
+                )
+
+                if not target_file:
+                    shutil.rmtree(retry_dl_dir, ignore_errors=True)
+                    continue
+
+                # File mili — upload karo
+                try:
+                    await status_msg.edit(
+                        f"✅ **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                        f"`{q_target}` mil gaya! Upload ho raha hai..."
+                    )
+                except Exception:
+                    pass
+
+                retry_um = await log_message.reply(f"📤 **Uploading `{q_target}`** — Ep `{episode_num}` (retry)...")
+
+                if not _old_msgs_deleted_retry and not uploaded_so_far:
+                    _old_msgs_deleted_retry = True
+                    await _delete_old_bot_msgs(channel_id)
+
+                retry_half_ev = asyncio.Event()
+                success, sent_msg_r, quality_r = await _upload_one_file(
+                    client, proxy_msg, retry_um, target_file, retry_dl_dir, encode=False,
+                    on_half=retry_half_ev,
+                )
+                try:
+                    await retry_um.delete()
+                except Exception:
+                    pass
+
+                if success:
+                    uploaded_results.append((quality_r, sent_msg_r))
+                    uploaded_so_far.add(quality_r)
+                    retry_remaining.discard(quality_r)
+                    LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ {quality_r} retry upload done!")
+
+                    # update_post check — 360p pe
+                    if quality_r == "360p":
+                        is_first_ep = (start_ep is not None and episode_num == start_ep)
+                        already_sent = (update_post_sent is not None and update_post_sent[0])
+                        if is_first_ep and not already_sent:
+                            try:
+                                from .update_channel import send_update_post
+                                from ..utils.auto_caption import extract_anime_info as _eai
+                                _season = None
+                                try:
+                                    _, _season, _ = _eai(os.path.basename(target_file), {})
+                                except Exception:
+                                    pass
+                                _ep_end = end_ep if end_ep else episode_num
+                                await send_update_post(
+                                    client, anime_name=anime_name, season=_season,
+                                    episode_start=episode_num, episode_end=_ep_end,
+                                )
+                                if update_post_sent is not None:
+                                    update_post_sent[0] = True
+                            except Exception as _ue:
+                                LOGGER.error(f"[AutoMonitor] Update post retry error: {_ue}")
+
+                shutil.rmtree(retry_dl_dir, ignore_errors=True)
+
+        # Retry loop khatam — final missing log
+        if retry_remaining:
+            LOGGER.warning(f"[AutoMonitor] Ep {episode_num}: Still missing after retries: {retry_remaining}")
+            try:
+                await status_msg.edit(
+                    f"⚠️ **Incomplete!** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                    f"✅ Uploaded: `{' | '.join(sorted(uploaded_so_far)) or '—'}`\n"
+                    f"❌ Timeout ke baad bhi nahi mili: `{' | '.join(sorted(retry_remaining))}`\n\n"
+                    f"RTI pe manually check karo."
+                )
+            except Exception:
+                pass
+
     # ── Final summary ──
     elapsed_min = int((time.time() - start_time) / 60)
-    uploaded_qualities = [q for q, _ in uploaded_results]
+    uploaded_qualities = sorted(
+        [q for q, _ in uploaded_results],
+        key=lambda q: ["360p", "480p", "720p", "1080p"].index(q) if q in ["360p", "480p", "720p", "1080p"] else 99
+    )
     uploaded_count = len(uploaded_results)
 
-    try:
-        await status_msg.edit(
-            f"🎉 **Complete!** | `{anime_name}` | Ep `{episode_num}`\n\n"
-            f"✅ Uploaded : `{uploaded_count}`\n"
-            f"📊 `{' → '.join(uploaded_qualities) or 'N/A'}`\n"
-            f"⏱️ Time: `{elapsed_min}m`"
-        )
-    except Exception:
-        pass
+    if uploaded_count > 0 and not missing_after_chrome - set(uploaded_so_far):
+        # Sab qualities upload ho gayi
+        try:
+            await status_msg.edit(
+                f"🎉 **Complete!** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                f"✅ Uploaded : `{uploaded_count}`\n"
+                f"📊 `{' → '.join(uploaded_qualities) or 'N/A'}`\n"
+                f"⏱️ Time: `{elapsed_min}m`"
+            )
+        except Exception:
+            pass
+
     LOGGER.info(f"[AutoMonitor] Ep {episode_num}: done in {elapsed_min}m — {uploaded_qualities}")
+    return uploaded_count > 0
 
 
 async def _forward_to_anime_channel(client: Client, sent_msg, channel_id: int, anime_name: str):
@@ -916,6 +1073,8 @@ async def auto_monitor_handler(client: Client, message: Message):
 
     # Shared flag — pehle episode ke 360p pe True hoga, baaki skip karenge
     update_post_sent = [False]
+    # Track karo ki kam se kam ek episode successfully upload hua ya nahi
+    any_ep_uploaded = False
 
     for i, ep_num in enumerate(range(start_ep, end_ep + 1), 1):
         is_last = (i == total)
@@ -974,7 +1133,7 @@ async def auto_monitor_handler(client: Client, message: Message):
         )
 
         # Episode fully complete hone ke baad hi agli episode shuru karo (sequential)
-        await _episode_quality_poller(
+        ep_uploaded = await _episode_quality_poller(
             client, message, swift_url,
             ep_num, anime_name, channel_id, oid,
             matched_entry=matched,
@@ -982,18 +1141,24 @@ async def auto_monitor_handler(client: Client, message: Message):
             end_ep=end_ep,
             update_post_sent=update_post_sent,
         )
+        if ep_uploaded:
+            any_ep_uploaded = True
 
         # Episodes ke beech thoda gap
         if not is_last:
             await asyncio.sleep(3)
 
     # ── Sirf last episode ke baad schedule/end message bhejo ──
-    try:
-        send_schedule_notification = _get_schedule_fn()
-        await send_schedule_notification(client, channel_id, anime_name, end_ep)
-        LOGGER.info(f"[AutoMonitor] ✅ Schedule notification sent after last ep {end_ep}")
-    except Exception as e:
-        LOGGER.error(f"[AutoMonitor] Schedule notification error: {e}")
+    # Lekin tabhi jab kam se kam ek episode successfully upload hua ho
+    if any_ep_uploaded:
+        try:
+            send_schedule_notification = _get_schedule_fn()
+            await send_schedule_notification(client, channel_id, anime_name, end_ep)
+            LOGGER.info(f"[AutoMonitor] ✅ Schedule notification sent after last ep {end_ep}")
+        except Exception as e:
+            LOGGER.error(f"[AutoMonitor] Schedule notification error: {e}")
+    else:
+        LOGGER.warning(f"[AutoMonitor] No episodes uploaded — schedule notification skipped.")
 
 
 # ─────────────────────────────────────────────
