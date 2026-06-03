@@ -46,13 +46,6 @@ def _get_rti_fns():
     from .rti_downloader import get_watchmult_link, get_argon_link, argon_to_swift
     return get_watchmult_link, get_argon_link, argon_to_swift
 
-def _get_swift_fns():
-    from .swift_downloader import (
-        _scrape_and_download, _upload_one_file, _sort_by_size,
-        _auto_rename, _quality_from, QUALITY_ORDER
-    )
-    return _scrape_and_download, _upload_one_file, _sort_by_size, _auto_rename, _quality_from, QUALITY_ORDER
-
 def _get_schedule_fn():
     from .schedule_notify import send_schedule_notification
     return send_schedule_notification
@@ -397,14 +390,188 @@ async def _episode_quality_poller(
     click_result = await loop.run_in_executor(None, _chrome_click_all)
 
     if click_result["error"] and not click_result["qualities_clicked"]:
+        # ── Chrome fail hua — V27 ka poll-based fallback shuru karo ──
+        LOGGER.warning(f"[AutoMonitor] Ep {episode_num}: Chrome failed ({click_result['error'][:80]}). Switching to poll fallback...")
+        shutil.rmtree(dl_dir, ignore_errors=True)
+
+        from .swift_downloader import (
+            _scrape_and_download, _upload_one_file, _sort_by_size, _quality_from, QUALITY_ORDER
+        )
+
+        POLL_INTERVAL_FAST = 30
+        POLL_INTERVAL_SLOW = 60
+        POLL_FAST_ATTEMPTS = 10
+        POLL_SLOW_ATTEMPTS = 20
+        TARGET_QUALITIES_SET = set(TARGET_QUALITIES)
+
+        remaining = set(TARGET_QUALITIES_SET)
+        poll_start = time.time()
+        poll_attempt = 0
+        _old_msgs_deleted_poll = False
+
         try:
             await status_msg.edit(
-                f"❌ **AutoMonitor Failed!** | `{anime_name}` | Ep `{episode_num}`\n\n"
-                f"`{click_result['error'][:150]}`"
+                f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                f"⚠️ Chrome fail — Poll mode shuru\n"
+                f"🎯 Dhundh raha hoon: `{' | '.join(sorted(remaining))}`"
             )
         except Exception:
             pass
-        shutil.rmtree(dl_dir, ignore_errors=True)
+
+        while remaining:
+            poll_attempt += 1
+            is_fast = poll_attempt <= POLL_FAST_ATTEMPTS
+            is_slow = POLL_FAST_ATTEMPTS < poll_attempt <= (POLL_FAST_ATTEMPTS + POLL_SLOW_ATTEMPTS)
+            if not is_fast and not is_slow:
+                break  # max attempts khatam
+
+            interval = POLL_INTERVAL_FAST if is_fast else POLL_INTERVAL_SLOW
+            elapsed_min = int((time.time() - poll_start) / 60)
+            phase_lbl = "⚡ Fast" if is_fast else "🐢 Slow"
+
+            try:
+                await status_msg.edit(
+                    f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                    f"🔄 Poll `{poll_attempt}` {phase_lbl} | Elapsed: `{elapsed_min}m`\n"
+                    f"🎯 Baki: `{' | '.join(sorted(remaining))}`\n"
+                    f"⏳ Swift page scan ho raha hai..."
+                )
+            except Exception:
+                pass
+
+            poll_session_id = f"monitor_ep{episode_num}_poll{poll_attempt}_{int(time.time())}"
+            poll_dl_dir = os.path.join(download_dir, poll_session_id)
+            os.makedirs(poll_dl_dir, exist_ok=True)
+
+            try:
+                poll_result = await loop.run_in_executor(
+                    None, _scrape_and_download, swift_url, poll_dl_dir, None, None
+                )
+            except Exception as e:
+                LOGGER.error(f"[AutoMonitor] Poll Ep {episode_num} attempt {poll_attempt} error: {e}")
+                shutil.rmtree(poll_dl_dir, ignore_errors=True)
+                await asyncio.sleep(interval)
+                continue
+
+            if poll_result["error"] and not poll_result["files"]:
+                shutil.rmtree(poll_dl_dir, ignore_errors=True)
+                await asyncio.sleep(interval)
+                continue
+
+            poll_files = poll_result.get("files", [])
+            if not poll_files:
+                shutil.rmtree(poll_dl_dir, ignore_errors=True)
+                await asyncio.sleep(interval)
+                continue
+
+            poll_files = _sort_by_size(poll_files)
+            new_files = [fp for fp in poll_files if _quality_from(os.path.basename(fp)) in remaining]
+
+            if not new_files:
+                shutil.rmtree(poll_dl_dir, ignore_errors=True)
+                await asyncio.sleep(interval)
+                continue
+
+            # Files mili — upload karo
+            qualities_found = [_quality_from(os.path.basename(f)) for f in new_files]
+            try:
+                await status_msg.edit(
+                    f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                    f"✅ Poll mili: `{' | '.join(qualities_found)}`\n"
+                    f"📤 Upload ho raha hai..."
+                )
+            except Exception:
+                pass
+
+            _dummy_msgs_poll = {}
+            for fp in new_files:
+                q = _quality_from(os.path.basename(fp))
+                try:
+                    dm = await log_message.reply(f"📤 **Uploading `{q}`** — Ep `{episode_num}`...")
+                    _dummy_msgs_poll[fp] = dm
+                except Exception:
+                    _dummy_msgs_poll[fp] = status_msg
+
+            _half_events_poll = [asyncio.Event() for _ in new_files]
+
+            async def _poll_upload_task(filepath, idx):
+                nonlocal _old_msgs_deleted_poll
+                if idx > 0:
+                    await _half_events_poll[idx - 1].wait()
+                if idx == 0 and not _old_msgs_deleted_poll:
+                    _old_msgs_deleted_poll = True
+                    await _delete_old_bot_msgs(channel_id)
+                um = _dummy_msgs_poll.get(filepath, status_msg)
+                success, sent_msg, quality = await _upload_one_file(
+                    client, proxy_msg, um, filepath, poll_dl_dir, encode=False,
+                    on_half=_half_events_poll[idx],
+                )
+                try:
+                    await um.delete()
+                except Exception:
+                    pass
+                if success and sent_msg and quality == "360p":
+                    is_first_ep = (start_ep is not None and episode_num == start_ep)
+                    already_sent = (update_post_sent is not None and update_post_sent[0])
+                    if is_first_ep and not already_sent:
+                        try:
+                            from .update_channel import send_update_post
+                            from ..utils.auto_caption import extract_anime_info as _eai
+                            _season = None
+                            try:
+                                _, _season, _ = _eai(os.path.basename(filepath), {})
+                            except Exception:
+                                pass
+                            _ep_end = end_ep if end_ep else episode_num
+                            await send_update_post(
+                                client, anime_name=anime_name, season=_season,
+                                episode_start=episode_num, episode_end=_ep_end,
+                            )
+                            if update_post_sent is not None:
+                                update_post_sent[0] = True
+                        except Exception as _ue:
+                            LOGGER.error(f"[AutoMonitor] Update post error: {_ue}")
+                return success, sent_msg, quality
+
+            poll_results = await asyncio.gather(
+                *[_poll_upload_task(fp, i) for i, fp in enumerate(new_files)],
+                return_exceptions=True,
+            )
+
+            for r in poll_results:
+                if isinstance(r, Exception):
+                    continue
+                success, sent_msg, quality = r
+                if success:
+                    remaining.discard(quality)
+
+            shutil.rmtree(poll_dl_dir, ignore_errors=True)
+
+            if remaining:
+                await asyncio.sleep(interval)
+
+        # Poll loop khatam
+        poll_elapsed = int((time.time() - poll_start) / 60)
+        if not remaining:
+            try:
+                await status_msg.edit(
+                    f"🎉 **Complete (Poll)!** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                    f"✅ Saari qualities upload ho gayi!\n"
+                    f"⏱️ Total time: `{poll_elapsed}m`"
+                )
+            except Exception:
+                pass
+        else:
+            missing_str = ' | '.join(sorted(remaining))
+            try:
+                await status_msg.edit(
+                    f"⚠️ **Incomplete!** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                    f"❌ Timeout ke baad bhi nahi mili: `{missing_str}`\n"
+                    f"✅ Jo mili: `{' | '.join(q for q in TARGET_QUALITIES if q not in remaining)}`\n\n"
+                    f"RTI pe manually check karo."
+                )
+            except Exception:
+                pass
         return
 
     expected_count = len(click_result["qualities_clicked"])
