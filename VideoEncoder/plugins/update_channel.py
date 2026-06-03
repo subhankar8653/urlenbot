@@ -11,10 +11,16 @@ Flow:
                                             (2-step: anime name → invite link)
   - /update_post_list                     → Saare saved anime → invite link pairs dekho
   - /delete_update_post [anime_name]      → Kisi anime ka saved post entry remove karo
+  - /updatechannel on|off                 → Update channel posting toggle karo
+  - /latest_post_delete                   → Last sent update channel post delete karo
 
 Auto-trigger:
   Jab bhi 360p file upload hoti hai kisi anime channel pe (auto_monitor se),
-  toh saare update channels pe ek post jaata hai:
+  toh SIRF wohi update channels pe post jaata hai jinka anime name
+  update_post_map mein saved hai (exact ya fuzzy match).
+
+  Agar anime ka koi entry update_post_map mein nahi → post NAHI jaayega.
+  Agar /updatechannel off hai → post NAHI jaayega.
 
     🔰 Witch Hat Atelier (S01)
     ──────────────────────────
@@ -25,6 +31,8 @@ Auto-trigger:
 DB storage:
   - update_channels  → col2, id='update_channels', data: list of {channel_id, channel_title}
   - update_post_map  → col2, id='update_post_map', data: dict {anime_name_lower: invite_link}
+  - update_toggle    → col2, id='update_toggle', data: {enabled: True/False}
+  - latest_post_ids  → col2, id='latest_post_ids', data: list of {channel_id, message_id}
   Both stored in bot-level col2 (status collection) — user-specific nahi.
 
 Commands registered here (conflict check):
@@ -35,8 +43,10 @@ Commands registered here (conflict check):
   /cancel_update_post      — unique (session cancel)
   /update_post_list        — unique
   /delete_update_post      — unique
+  /updatechannel           — unique (on/off toggle)
+  /latest_post_delete      — unique
 
-  NOTE: text handler (group=15) sirf tab fire karta hai jab
+  NOTE: text handler (group=0) sirf tab fire karta hai jab
   _update_post_sessions mein us user ka session ho.
   Isliye dusre plugins ke saath koi conflict nahi.
 """
@@ -65,6 +75,13 @@ _update_post_sessions: dict = {}   # { user_id: {'step': 'anime'|'link', 'anime'
 # ─────────────────────────────────────────────
 def _is_auth(user_id: int) -> bool:
     return user_id in owner or user_id in sudo_users
+
+
+# ─────────────────────────────────────────────
+#  Normalize helper
+# ─────────────────────────────────────────────
+def _norm(s: str) -> str:
+    return re.sub(r'[\s\-_]+', ' ', s.lower()).strip()
 
 
 # ─────────────────────────────────────────────
@@ -102,6 +119,40 @@ async def _save_post_map(data: dict):
     )
 
 
+# ── Toggle helpers ──
+async def _get_update_toggle() -> bool:
+    """True = on (default), False = off."""
+    doc = await db.col2.find_one({'id': 'update_toggle'})
+    if not doc:
+        return True  # default on
+    return doc.get('enabled', True)
+
+
+async def _set_update_toggle(enabled: bool):
+    await db.col2.update_one(
+        {'id': 'update_toggle'},
+        {'$set': {'enabled': enabled}},
+        upsert=True,
+    )
+
+
+# ── Latest post IDs helpers ──
+async def _get_latest_post_ids() -> list:
+    """Last sent messages ka list [{channel_id, message_id}]."""
+    doc = await db.col2.find_one({'id': 'latest_post_ids'})
+    if not doc:
+        return []
+    return doc.get('posts', [])
+
+
+async def _save_latest_post_ids(posts: list):
+    await db.col2.update_one(
+        {'id': 'latest_post_ids'},
+        {'$set': {'posts': posts}},
+        upsert=True,
+    )
+
+
 # ─────────────────────────────────────────────
 #  PUBLIC: 360p upload hone pe auto_monitor call karega
 # ─────────────────────────────────────────────
@@ -116,19 +167,20 @@ async def send_update_post(
     """
     Update channels pe stylish format post bhejta hai.
 
+    RULES:
+      1. /updatechannel off hai toh kuch nahi hoga.
+      2. Sirf wohi anime ka post jaayega jiska entry update_post_map mein hai
+         (exact/fuzzy match). Agar entry nahi → post skip.
+
     Single episode:  episode=6        → ⚡EP - 06 | Added
     Episode range:   episode_start=34, episode_end=36  → ⚡EP 34-36 | Added
-    Backward compat: episode=6 bhi kaam karta hai
-
-    Post format:
-        🔰 Witch Hat Atelier (S01)
-        ──────────────────────────
-        ⚡EP - 06 | Added
-        Start the Bot Get Link Here   ← plain text hyperlink (agar invite link saved hai)
-
-    Button (agar invite link saved hai):
-        [❇️ Start the Bot Get Link Here ❇️]
     """
+    # ── Toggle check ──
+    enabled = await _get_update_toggle()
+    if not enabled:
+        LOGGER.info(f"[UpdateChannel] Toggle OFF hai, '{anime_name}' ka post skip kiya.")
+        return
+
     channels = await _get_update_channels()
     if not channels:
         LOGGER.warning("[UpdateChannel] send_update_post called but no update channels saved.")
@@ -136,12 +188,28 @@ async def send_update_post(
 
     post_map = await _get_post_map()
 
+    # ── Anime match check — REQUIRED ──
+    # Sirf tab post hoga jab anime update_post_map mein registered ho
+    query_norm = _norm(anime_name)
+    invite_link = None
+    matched = False
+    for key, link in post_map.items():
+        if _norm(key) == query_norm:
+            invite_link = link
+            matched = True
+            break
+
+    if not matched:
+        LOGGER.info(
+            f"[UpdateChannel] '{anime_name}' update_post_map mein nahi hai — post skip kiya."
+        )
+        return
+
     # ── Title line ──
     season_str = f"(S{season:02d})" if season else ""
     title_line = f"🔰 **{anime_name} {season_str}**".strip() if season_str else f"🔰 **{anime_name}**"
 
     # ── Episode line ──
-    # Range case: episode_start aur episode_end dono hain
     ep_str = ""
     if episode_start and episode_end and episode_start != episode_end:
         ep_str = f">⚡**EP {episode_start}-{episode_end} | Added**"
@@ -154,27 +222,14 @@ async def send_update_post(
 
     divider = "──────────────────────────"
 
-    # ── Invite link fuzzy match ──
-    def _norm(s: str) -> str:
-        return re.sub(r'[\s\-_]+', ' ', s.lower()).strip()
-
-    invite_link = None
-    query_norm = _norm(anime_name)
-    for key, link in post_map.items():
-        if _norm(key) == query_norm:
-            invite_link = link
-            break
-
     # ── Build text ──
     lines = [title_line, divider]
     if ep_str:
         lines.append(ep_str)
-    # Plain text hyperlink (shows as clickable text in Telegram markdown)
     if invite_link:
         lines.append(f"[Start the Bot Get Link Here]({invite_link})")
     text = "\n".join(lines)
 
-    # ── Blank post guard ──
     if not anime_name.strip():
         LOGGER.warning("[UpdateChannel] anime_name empty, post skip kiya.")
         return
@@ -186,23 +241,117 @@ async def send_update_post(
             [InlineKeyboardButton("❇️ Start the Bot Get Link Here ❇️", url=invite_link)]
         ])
 
+    # ── Send and store latest post IDs ──
+    new_latest = []
     for ch in channels:
         ch_id = ch.get("channel_id")
         if not ch_id:
             continue
         try:
-            await client.send_message(
+            sent = await client.send_message(
                 chat_id=ch_id,
                 text=text,
                 reply_markup=markup,
                 parse_mode=enums.ParseMode.MARKDOWN,
                 disable_web_page_preview=True,
             )
+            new_latest.append({"channel_id": ch_id, "message_id": sent.id})
             LOGGER.info(
-                f"[UpdateChannel] Post sent to {ch_id} for '{anime_name}' Ep {episode}"
+                f"[UpdateChannel] Post sent to {ch_id} for '{anime_name}' Ep {episode or episode_start} (msg_id={sent.id})"
             )
         except Exception as e:
             LOGGER.error(f"[UpdateChannel] Failed to send to {ch_id}: {e}")
+
+    # Save latest post IDs (overwrite with fresh batch)
+    if new_latest:
+        await _save_latest_post_ids(new_latest)
+
+
+# ─────────────────────────────────────────────
+#  /updatechannel on|off — Toggle
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("updatechannel") & filters.private)
+async def cmd_updatechannel_toggle(client: Client, message: Message):
+    """Update channel posting on/off karo."""
+    if not _is_auth(message.from_user.id):
+        return
+
+    parts = message.text.split(None, 1)
+    if len(parts) < 2 or parts[1].strip().lower() not in ("on", "off"):
+        current = await _get_update_toggle()
+        status = "🟢 ON" if current else "🔴 OFF"
+        await message.reply(
+            f"📢 **Update Channel Posting**\n\n"
+            f"Current Status: **{status}**\n\n"
+            f"Toggle karne ke liye:\n"
+            f"• `/updatechannel on` — posting enable karo\n"
+            f"• `/updatechannel off` — posting band karo"
+        )
+        return
+
+    action = parts[1].strip().lower()
+    enabled = (action == "on")
+    await _set_update_toggle(enabled)
+
+    if enabled:
+        await message.reply(
+            "✅ **Update Channel Posting: ON**\n\n"
+            "Ab 360p uploads pe update channel pe post jaayega\n"
+            "_(sirf registered anime ke liye)_"
+        )
+    else:
+        await message.reply(
+            "🔴 **Update Channel Posting: OFF**\n\n"
+            "Ab koi bhi post update channel pe nahi jaayega\n"
+            "jab tak `/updatechannel on` na karo."
+        )
+
+
+# ─────────────────────────────────────────────
+#  /latest_post_delete — Last update post delete karo
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("latest_post_delete") & filters.private)
+async def cmd_latest_post_delete(client: Client, message: Message):
+    """Update channel pe last bheja gaya post delete karo."""
+    if not _is_auth(message.from_user.id):
+        return
+
+    posts = await _get_latest_post_ids()
+    if not posts:
+        await message.reply(
+            "📭 Koi latest post nahi mila delete karne ke liye.\n\n"
+            "Pehle koi update post bhejo."
+        )
+        return
+
+    deleted = []
+    failed = []
+    for entry in posts:
+        ch_id = entry.get("channel_id")
+        msg_id = entry.get("message_id")
+        if not ch_id or not msg_id:
+            continue
+        try:
+            await client.delete_messages(chat_id=ch_id, message_ids=msg_id)
+            deleted.append(f"Channel `{ch_id}` → Msg `{msg_id}`")
+            LOGGER.info(f"[UpdateChannel] Deleted latest post: channel={ch_id}, msg={msg_id}")
+        except Exception as e:
+            failed.append(f"Channel `{ch_id}` → ❌ `{e}`")
+            LOGGER.error(f"[UpdateChannel] Delete failed: channel={ch_id}, msg={msg_id}, err={e}")
+
+    # Clear saved IDs after delete attempt
+    await _save_latest_post_ids([])
+
+    if deleted:
+        del_text = "\n".join(deleted)
+        text = f"🗑️ **Latest Post Deleted!**\n\n{del_text}"
+        if failed:
+            fail_text = "\n".join(failed)
+            text += f"\n\n⚠️ **Failed:**\n{fail_text}"
+        await message.reply(text)
+    else:
+        fail_text = "\n".join(failed) if failed else "Unknown error"
+        await message.reply(f"❌ Delete nahi ho paya:\n\n{fail_text}")
 
 
 # ─────────────────────────────────────────────
@@ -262,7 +411,7 @@ async def cmd_update_channel(client: Client, message: Message):
         f"✅ **Update Channel Added!**\n\n"
         f"📢 **{channel_title}**\n"
         f"🆔 `{channel_id}`\n\n"
-        f"Ab jab bhi koi 360p upload hoga, yahan post aayega."
+        f"Ab jab bhi registered anime ka 360p upload hoga, yahan post aayega."
     )
 
 
@@ -276,19 +425,24 @@ async def cmd_update_channel_list(client: Client, message: Message):
         return
 
     channels = await _get_update_channels()
+    toggle = await _get_update_toggle()
+    status = "🟢 ON" if toggle else "🔴 OFF"
+
     if not channels:
         await message.reply(
-            "📭 Koi update channel add nahi hai.\n\n"
-            "Add karne ke liye: `/update_channel [channel_id]`"
+            f"📭 Koi update channel add nahi hai.\n\n"
+            f"Posting Status: **{status}**\n\n"
+            f"Add karne ke liye: `/update_channel [channel_id]`"
         )
         return
 
-    text = f"📢 **Update Channels ({len(channels)})**\n\n"
+    text = f"📢 **Update Channels ({len(channels)})** | Posting: **{status}**\n\n"
     for i, ch in enumerate(channels, 1):
         text += f"`{i}.` **{ch.get('channel_title', 'Unknown')}**\n"
         text += f"    🆔 `{ch.get('channel_id')}`\n\n"
 
-    text += "💡 Remove: `/delete_update_channel [channel_id]`"
+    text += "💡 Remove: `/delete_update_channel [channel_id]`\n"
+    text += "💡 Toggle: `/updatechannel on` | `/updatechannel off`"
     await message.reply(text)
 
 
@@ -367,11 +521,13 @@ async def cmd_update_post_list(client: Client, message: Message):
     if not post_map:
         await message.reply(
             "📭 Koi anime post entry save nahi hai.\n\n"
-            "Add karne ke liye: `/update_post`"
+            "Add karne ke liye: `/update_post`\n\n"
+            "⚠️ **Note:** Sirf yahan registered anime ka hi update channel pe post jaayega!"
         )
         return
 
-    text = f"📋 **Saved Anime Posts ({len(post_map)})**\n\n"
+    text = f"📋 **Saved Anime Posts ({len(post_map)})**\n"
+    text += "_Sirf inhi anime ka post update channel pe jaayega_\n\n"
     for i, (anime, link) in enumerate(post_map.items(), 1):
         link_display = f"[link]({link})" if link else "_(no link)_"
         text += f"`{i}.` **{anime}**\n    🔗 {link_display}\n\n"
@@ -413,9 +569,6 @@ async def cmd_delete_update_post(client: Client, message: Message):
         await message.reply("📭 Koi anime post entry save nahi hai.")
         return
 
-    def _norm(s: str) -> str:
-        return re.sub(r'[\s\-_]+', ' ', s.lower()).strip()
-
     matched_key = None
     for key in post_map:
         if _norm(key) == _norm(query):
@@ -434,7 +587,8 @@ async def cmd_delete_update_post(client: Client, message: Message):
 
     await message.reply(
         f"✅ **Deleted!**\n\n"
-        f"📺 `{matched_key}` remove ho gaya update post list se."
+        f"📺 `{matched_key}` remove ho gaya update post list se.\n\n"
+        f"Ab is anime ka koi post update channel pe nahi jaayega."
     )
 
 
