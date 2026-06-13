@@ -552,9 +552,13 @@ async def _episode_quality_poller(
                 # ── Bot Mode: deep link lo aur post pe button add karo ──
                 if success and sent_msg and _bot_mode_active and _bot_post_mgr:
                     try:
+                        LOGGER.info(f"[BotMode] Waiting for Link Ready for {quality} msg_id={sent_msg.id if sent_msg else 'None'}")
                         _deep_link = await _get_suhani_bot_link(sent_msg)
                         if _deep_link:
+                            LOGGER.info(f"[BotMode] Got link for {quality}: {_deep_link[:60]}")
                             await _bot_post_mgr.add_quality(quality, _deep_link)
+                        else:
+                            LOGGER.warning(f"[BotMode] No link found for {quality} — skipping button")
                     except Exception as _bme:
                         LOGGER.error(f"[BotMode] add_quality (poll) error: {_bme}")
                 return success, sent_msg, quality
@@ -780,9 +784,13 @@ async def _episode_quality_poller(
             # ── Bot Mode: deep link lo aur post pe button add karo ──
             if success and sent_msg and _bot_mode_active and _bot_post_mgr:
                 try:
+                    LOGGER.info(f"[BotMode] Waiting for Link Ready for {quality} msg_id={sent_msg.id if sent_msg else 'None'}")
                     _deep_link = await _get_suhani_bot_link(sent_msg)
                     if _deep_link:
+                        LOGGER.info(f"[BotMode] Got link for {quality}: {_deep_link[:60]}")
                         await _bot_post_mgr.add_quality(quality, _deep_link)
+                    else:
+                        LOGGER.warning(f"[BotMode] No link found for {quality} — skipping button")
                 except Exception as _bme:
                     LOGGER.error(f"[BotMode] add_quality (chrome) error: {_bme}")
 
@@ -972,9 +980,13 @@ async def _episode_quality_poller(
                     # ── Bot Mode: deep link lo aur post pe button add karo ──
                     if _bot_mode_active and _bot_post_mgr:
                         try:
+                            LOGGER.info(f"[BotMode] Waiting for Link Ready for {quality_r} msg_id={sent_msg_r.id if sent_msg_r else 'None'}")
                             _deep_link = await _get_suhani_bot_link(sent_msg_r)
                             if _deep_link:
+                                LOGGER.info(f"[BotMode] Got link for {quality_r}: {_deep_link[:60]}")
                                 await _bot_post_mgr.add_quality(quality_r, _deep_link)
+                            else:
+                                LOGGER.warning(f"[BotMode] No link found for {quality_r} — skipping button")
                         except Exception as _bme:
                             LOGGER.error(f"[BotMode] add_quality (retry) error: {_bme}")
 
@@ -1033,45 +1045,56 @@ async def _get_upload_mode_for_owner() -> str:
         return 'file_mode'
 
 
-async def _get_suhani_bot_link(log_channel_msg, timeout: int = 30) -> str | None:
+async def _get_suhani_bot_link(log_channel_msg, timeout: int = 45) -> str | None:
     """
     Log channel pe upload ke baad dusra bot 'Link Ready!' message bhejta hai.
     Us message se https://t.me/Get_Suhani_bot?start=... URL uthao.
 
     log_channel_msg = woh message jo log channel pe upload hua (sent_msg)
-    timeout = kitne seconds tak wait karo (default 30s)
+    timeout = kitne seconds tak wait karo (default 45s)
     """
     if not log_channel_msg:
         return None
 
-    from .. import log as _LOG_CHANNEL_ID
     import re as _re
+    from .. import log as _LOG_CHANNEL_ID
 
     uploaded_msg_id = log_channel_msg.id
-    # Link Ready message uploaded message ke BAAD aayega
-    # 30s tak har 2s pe check karo
+    LOGGER.info(f"[BotMode] Polling for Link Ready after msg_id={uploaded_msg_id}")
 
-    deadline = asyncio.get_event_loop().time() + timeout
-    while asyncio.get_event_loop().time() < deadline:
+    start_time = asyncio.get_event_loop().time()
+    check_from_id = uploaded_msg_id + 1  # uploaded ke baad se check karo
+
+    while asyncio.get_event_loop().time() - start_time < timeout:
+        await asyncio.sleep(3)
         try:
-            # Log channel ke recent messages scan karo
-            async for msg in app.get_chat_history(_LOG_CHANNEL_ID, limit=10):
-                # Sirf uploaded message ke baad wale messages dekho
-                if msg.id <= uploaded_msg_id:
-                    break
-                # "Link Ready" text check karo
-                text = msg.text or msg.caption or ""
-                if "Link Ready" in text or "t.me/Get_Suhani_bot" in text:
-                    # URL extract karo
-                    m = _re.search(r'https://t\.me/Get_Suhani_bot\?start=\S+', text)
-                    if m:
-                        LOGGER.info(f"[BotMode] Link Ready URL found: {m.group(0)[:60]}")
-                        return m.group(0)
+            # uploaded_msg_id ke baad ke messages check karo (max 5 messages)
+            for offset in range(5):
+                target_id = check_from_id + offset
+                try:
+                    msgs = await app.get_messages(_LOG_CHANNEL_ID, target_id)
+                    if not msgs:
+                        continue
+                    # Single message ya list dono handle karo
+                    msg_list = msgs if isinstance(msgs, list) else [msgs]
+                    for m in msg_list:
+                        if not m or not m.text:
+                            continue
+                        text = m.text or ""
+                        if "t.me/Get_Suhani_bot" in text:
+                            match = _re.search(r'https://t\.me/Get_Suhani_bot\?start=\S+', text)
+                            if match:
+                                url = match.group(0).strip()
+                                LOGGER.info(f"[BotMode] ✅ Link Ready found at msg_id={target_id}: {url[:60]}")
+                                return url
+                except Exception:
+                    pass
+            # Update check_from_id — agla iteration mein aage se dekho
+            check_from_id += 1
         except Exception as _e:
-            LOGGER.warning(f"[BotMode] link poll error: {_e}")
-        await asyncio.sleep(2)
+            LOGGER.warning(f"[BotMode] poll error: {_e}")
 
-    LOGGER.warning(f"[BotMode] Link Ready timeout for msg_id={uploaded_msg_id}")
+    LOGGER.warning(f"[BotMode] ⏰ Link Ready timeout (45s) for msg_id={uploaded_msg_id}")
     return None
 
 
