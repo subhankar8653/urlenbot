@@ -206,7 +206,9 @@ async def _episode_quality_poller(
         except Exception as _e:
             LOGGER.warning(f"[AutoMonitor] _delete_old_bot_msgs error: {_e}")
 
-    # ── ProxyMsg — upload channel_id pe jaaye ──
+    # ── ProxyMsg — upload target pe jaaye ──
+    # file_mode: channel_id pe directly upload
+    # bot_mode: log channel pe upload (taaki sent_msg.link mil sake for buttons)
     class _ProxyMsg:
         def __init__(self, original_msg, uid, upload_chat_id):
             self._msg = original_msg
@@ -226,7 +228,13 @@ async def _episode_quality_poller(
         async def reply_audio(self, audio, **kwargs):
             return await app.send_audio(chat_id=self.chat.id, audio=audio, **kwargs)
 
-    proxy_msg = _ProxyMsg(log_message, owner_id, channel_id)
+    # Bot mode mein log channel pe upload karo (link milega),
+    # file_mode mein channel pe seedha upload
+    if _bot_mode_active:
+        from .. import log as _LOG_CHANNEL_ID
+        proxy_msg = _ProxyMsg(log_message, owner_id, _LOG_CHANNEL_ID)
+    else:
+        proxy_msg = _ProxyMsg(log_message, owner_id, channel_id)
 
     # ── DL folder ──
     session_id = f"monitor_ep{episode_num}_{int(time.time())}"
@@ -1024,20 +1032,16 @@ async def _get_upload_mode_for_owner() -> str:
 
 async def _get_suhani_bot_link(log_channel_msg) -> str | None:
     """
-    Log channel pe upload hua message ka Suhani bot deep link banao.
-    Format: https://t.me/Get_Suhani_bot?start=<base64(chatid_msgid)>
+    Log channel pe upload hua message ka link return karo.
+    sent_msg.link = Telegram message link (t.me/c/... ya t.me/...)
+    Yeh wahi link hai jo log channel pe already ban raha hai.
     """
     if not log_channel_msg:
         return None
     try:
-        import base64
-        chat_id = log_channel_msg.chat.id
-        msg_id  = log_channel_msg.id
-        raw     = f"{chat_id}_{msg_id}".encode()
-        encoded = base64.urlsafe_b64encode(raw).decode().rstrip('=')
-        return f"https://t.me/Get_Suhani_bot?start={encoded}"
+        return log_channel_msg.link
     except Exception as _e:
-        LOGGER.warning(f"[BotMode] deep link error: {_e}")
+        LOGGER.warning(f"[BotMode] link error: {_e}")
         return None
 
 
