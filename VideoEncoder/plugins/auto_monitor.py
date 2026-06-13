@@ -1057,13 +1057,15 @@ async def _get_upload_mode_for_owner() -> str:
 
 
 
-async def _get_suhani_bot_link(log_channel_msg, timeout: int = 45) -> str | None:
+async def _get_suhani_bot_link(log_channel_msg, timeout: int = 30) -> str | None:
     """
-    Log channel pe upload ke baad dusra bot 'Link Ready!' message bhejta hai.
+    Log channel pe upload ke baad dusra bot 'Link Ready!' message bhejta hai
+    — wo message hamesha uploaded video ke turant baad (msg_id + 1) hota hai,
+    aur 1-3 second ke andar ban jaata hai.
     Us message se https://t.me/Get_Suhani_bot?start=... URL uthao.
 
     log_channel_msg = woh message jo log channel pe upload hua (sent_msg)
-    timeout = kitne seconds tak wait karo (default 45s)
+    timeout = kitne seconds tak wait karo (default 30s)
     """
     if not log_channel_msg:
         return None
@@ -1071,23 +1073,20 @@ async def _get_suhani_bot_link(log_channel_msg, timeout: int = 45) -> str | None
     import re as _re
     from .. import log as _LOG_CHANNEL_ID
 
-    uploaded_msg_id = log_channel_msg.id
-    LOGGER.info(f"[BotMode] Polling for Link Ready after msg_id={uploaded_msg_id}")
+    target_id = log_channel_msg.id + 1
+    LOGGER.info(f"[BotMode] Polling for Link Ready at msg_id={target_id}")
 
     start_time = asyncio.get_event_loop().time()
-    check_from_id = uploaded_msg_id + 1  # uploaded ke baad se check karo
 
     while asyncio.get_event_loop().time() - start_time < timeout:
-        await asyncio.sleep(3)
         try:
-            # uploaded_msg_id ke baad ke messages check karo (max 5 messages)
-            for offset in range(5):
-                target_id = check_from_id + offset
+            # target_id aur uske aas-paas ke 2-3 messages bhi check karo
+            # (agar koi extra message beech mein aa jaye)
+            for tid in (target_id, target_id + 1, target_id + 2):
                 try:
-                    msgs = await app.get_messages(_LOG_CHANNEL_ID, target_id)
+                    msgs = await app.get_messages(_LOG_CHANNEL_ID, tid)
                     if not msgs:
                         continue
-                    # Single message ya list dono handle karo
                     msg_list = msgs if isinstance(msgs, list) else [msgs]
                     for m in msg_list:
                         if not m or not m.text:
@@ -1097,17 +1096,20 @@ async def _get_suhani_bot_link(log_channel_msg, timeout: int = 45) -> str | None
                             match = _re.search(r'https://t\.me/Get_Suhani_bot\?start=\S+', text)
                             if match:
                                 url = match.group(0).strip()
-                                LOGGER.info(f"[BotMode] ✅ Link Ready found at msg_id={target_id}: {url[:60]}")
+                                LOGGER.info(f"[BotMode] ✅ Link Ready found at msg_id={tid}: {url[:60]}")
                                 return url
                 except Exception:
                     pass
-            # Update check_from_id — agla iteration mein aage se dekho
-            check_from_id += 1
         except Exception as _e:
             LOGGER.warning(f"[BotMode] poll error: {_e}")
 
-    LOGGER.warning(f"[BotMode] ⏰ Link Ready timeout (45s) for msg_id={uploaded_msg_id}")
+        await asyncio.sleep(1.5)
+
+    LOGGER.warning(f"[BotMode] ⏰ Link Ready timeout ({timeout}s) for msg_id={target_id}")
     return None
+
+
+
 
 
 class _BotModePostManager:
