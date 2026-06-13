@@ -19,9 +19,8 @@ ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
 
 COPY . .
 
-# Python dependencies
-RUN pip3 install --no-cache-dir --upgrade pip --isolated && \
-    pip3 install --no-cache-dir -r requirements.txt
+# Python dependencies (pip upgrade skip — hash mismatch issue)
+RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Run the bot
 CMD ["python3", "-m", "VideoEncoder"]
