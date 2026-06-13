@@ -206,6 +206,15 @@ async def _episode_quality_poller(
         except Exception as _e:
             LOGGER.warning(f"[AutoMonitor] _delete_old_bot_msgs error: {_e}")
 
+    # ── Bot Mode check ── (ProxyMsg banane se PEHLE karna zaroori hai,
+    # warna _bot_mode_active use-before-assign error aata hai)
+    _upload_mode    = await _get_upload_mode_for_owner()
+    _bot_mode_active = (_upload_mode == 'bot_mode')
+    _bot_post_mgr: _BotModePostManager | None = None
+    if _bot_mode_active:
+        _bot_post_mgr = _BotModePostManager(client, channel_id, anime_name, episode_num)
+        LOGGER.info(f"[AutoMonitor] Ep {episode_num}: BOT MODE active")
+
     # ── ProxyMsg — upload target pe jaaye ──
     # file_mode: channel_id pe directly upload
     # bot_mode: log channel pe upload (taaki sent_msg.link mil sake for buttons)
@@ -246,14 +255,6 @@ async def _episode_quality_poller(
         f"🌐 Chrome khul raha hai...\n"
         f"🔗 `{swift_url}`"
     )
-
-    # ── Bot Mode check ──
-    _upload_mode    = await _get_upload_mode_for_owner()
-    _bot_mode_active = (_upload_mode == 'bot_mode')
-    _bot_post_mgr: _BotModePostManager | None = None
-    if _bot_mode_active:
-        _bot_post_mgr = _BotModePostManager(client, channel_id, anime_name, episode_num)
-        LOGGER.info(f"[AutoMonitor] Ep {episode_num}: BOT MODE active")
 
     # ──────────────────────────────────────────────────────
     #  STEP 1: Chrome se teeno links click karo (blocking)
