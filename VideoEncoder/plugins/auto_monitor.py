@@ -1120,6 +1120,8 @@ class _BotModePostManager:
 
     QUALITY_ORDER = ["360p", "480p", "720p", "1080p"]
     QUALITY_EMOJI = {"360p": "🟢", "480p": "🟡", "720p": "🟢", "1080p": "🔴"}
+    # Telegram Bot API 9.4+ button colors: "success" (green), "destructive" (red), "primary" (blue)
+    QUALITY_STYLE = {"360p": "success", "480p": "success", "720p": "success", "1080p": "destructive"}
 
     def __init__(self, client, channel_id: int, anime_name: str, episode_num: int):
         self.client      = client
@@ -1129,14 +1131,27 @@ class _BotModePostManager:
         self.post_msg_id: int | None = None
         self._buttons: dict[str, str] = {}
         self._lock       = asyncio.Lock()
+        # Agar pyrofork version 'style' param support nahi karta to fallback ho jao
+        self._style_supported = True
+
+    def _make_button(self, q: str, url: str) -> InlineKeyboardButton:
+        emoji = self.QUALITY_EMOJI.get(q, "▶️")
+        text = f"{emoji} {q} ↗"
+        if self._style_supported:
+            try:
+                return InlineKeyboardButton(text=text, url=url, style=self.QUALITY_STYLE.get(q, "primary"))
+            except TypeError:
+                self._style_supported = False
+                LOGGER.warning("[BotMode] InlineKeyboardButton 'style' unsupported — falling back without color")
+        return InlineKeyboardButton(text=text, url=url)
 
     def _build_keyboard(self) -> InlineKeyboardMarkup | None:
         row = []
         for q in self.QUALITY_ORDER:
             if q in self._buttons:
-                emoji = self.QUALITY_EMOJI.get(q, "▶️")
-                row.append(InlineKeyboardButton(text=f"{emoji} {q} ↗", url=self._buttons[q]))
+                row.append(self._make_button(q, self._buttons[q]))
         return InlineKeyboardMarkup([row]) if row else None
+
 
     def _build_caption(self) -> str:
         ep_str = f"Episode {self.episode_num:02d}" if self.episode_num else "Episode ??"
