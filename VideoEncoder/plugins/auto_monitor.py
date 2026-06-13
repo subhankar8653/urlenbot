@@ -34,7 +34,7 @@ import shutil
 import time
 
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.enums import ParseMode
 
 from .. import LOGGER, app, owner, sudo_users, download_dir
@@ -558,7 +558,15 @@ async def _episode_quality_poller(
                         _deep_link = await _get_suhani_bot_link(sent_msg)
                         if _deep_link:
                             LOGGER.info(f"[BotMode] Got link for {quality}: {_deep_link[:60]}")
-                            await _bot_post_mgr.add_quality(quality, _deep_link)
+                            # Season extract karo (sirf 360p pe, tab post create hota hai)
+                            _bm_season = None
+                            if quality == "360p":
+                                try:
+                                    from ..utils.auto_caption import extract_anime_info as _eai2
+                                    _, _bm_season, _ = _eai2(os.path.basename(filepath), {})
+                                except Exception:
+                                    pass
+                            await _bot_post_mgr.add_quality(quality, _deep_link, season=_bm_season)
                         else:
                             LOGGER.warning(f"[BotMode] No link found for {quality} — skipping button")
                     except Exception as _bme:
@@ -790,7 +798,14 @@ async def _episode_quality_poller(
                     _deep_link = await _get_suhani_bot_link(sent_msg)
                     if _deep_link:
                         LOGGER.info(f"[BotMode] Got link for {quality}: {_deep_link[:60]}")
-                        await _bot_post_mgr.add_quality(quality, _deep_link)
+                        _bm_season = None
+                        if quality == "360p":
+                            try:
+                                from ..utils.auto_caption import extract_anime_info as _eai2
+                                _, _bm_season, _ = _eai2(os.path.basename(filepath), {})
+                            except Exception:
+                                pass
+                        await _bot_post_mgr.add_quality(quality, _deep_link, season=_bm_season)
                     else:
                         LOGGER.warning(f"[BotMode] No link found for {quality} — skipping button")
                 except Exception as _bme:
@@ -986,7 +1001,14 @@ async def _episode_quality_poller(
                             _deep_link = await _get_suhani_bot_link(sent_msg_r)
                             if _deep_link:
                                 LOGGER.info(f"[BotMode] Got link for {quality_r}: {_deep_link[:60]}")
-                                await _bot_post_mgr.add_quality(quality_r, _deep_link)
+                                _bm_season = None
+                                if quality_r == "360p":
+                                    try:
+                                        from ..utils.auto_caption import extract_anime_info as _eai2
+                                        _, _bm_season, _ = _eai2(os.path.basename(target_file), {})
+                                    except Exception:
+                                        pass
+                                await _bot_post_mgr.add_quality(quality_r, _deep_link, season=_bm_season)
                             else:
                                 LOGGER.warning(f"[BotMode] No link found for {quality_r} — skipping button")
                         except Exception as _bme:
@@ -1116,66 +1138,90 @@ class _BotModePostManager:
     """
     Ek episode ke liye channel pe ek post manage karo.
     Pehli quality → nayi post. Agle quality → same post edit.
+
+    Progressive flow (360p → 720p → 1080p):
+      - 360p upload:  [➲ 360p] [⏳ 720p uploading...]  [⏳ 1080p uploading...]
+      - 720p upload:  [➲ 360p] [➲ 720p]               [⏳ 1080p uploading...]
+      - 1080p upload: [➲ 360p] [➲ 720p]               [➲ 1080p]
     """
 
-    QUALITY_ORDER = ["360p", "480p", "720p", "1080p"]
-    QUALITY_EMOJI = {"360p": "🟢", "480p": "🟡", "720p": "🟢", "1080p": "🔴"}
-    # Telegram Bot API 9.4+ button colors: "success" (green), "danger" (red), "primary" (blue)
-    QUALITY_STYLE = {"360p": "success", "480p": "success", "720p": "success", "1080p": "danger"}
+    # Sirf ye 3 qualities is bot mein upload hoti hain
+    UPLOAD_QUALITIES = ["360p", "720p", "1080p"]
+    # Full order (agar kabhi 480p bhi aaye to sahi jagah pe aaye)
+    QUALITY_ORDER    = ["360p", "480p", "720p", "1080p"]
 
     def __init__(self, client, channel_id: int, anime_name: str, episode_num: int):
         self.client      = client
         self.channel_id  = channel_id
         self.anime_name  = anime_name
         self.episode_num = episode_num
+        self.season_num: int | None = None   # add_quality(season=...) se set hoga
         self.post_msg_id: int | None = None
-        self._buttons: dict[str, str] = {}
+        self._buttons: dict[str, str] = {}   # quality → deep_link_url (ready ones)
         self._lock       = asyncio.Lock()
-        # Agar pyrofork version 'style' param support nahi karta to fallback ho jao
-        self._style_supported = True
 
-    def _make_button(self, q: str, url: str) -> InlineKeyboardButton:
-        emoji = self.QUALITY_EMOJI.get(q, "▶️")
-        text = f"{emoji} {q} ↗"
-        if self._style_supported:
-            try:
-                return InlineKeyboardButton(text=text, url=url, style=self.QUALITY_STYLE.get(q, "primary"))
-            except TypeError:
-                self._style_supported = False
-                LOGGER.warning("[BotMode] InlineKeyboardButton 'style' unsupported — falling back without color")
-        return InlineKeyboardButton(text=text, url=url)
+    # ── Caption ──────────────────────────────────────────────────────────
+    def _build_caption(self) -> str:
+        s = f"{self.season_num:02d}" if self.season_num else "01"
+        e = f"{self.episode_num:02d}" if self.episode_num else "??"
+        return f"➲ Season {s} Episode {e}"
 
+    # ── Keyboard ─────────────────────────────────────────────────────────
     def _build_keyboard(self) -> InlineKeyboardMarkup | None:
+        """
+        Ready qualities → url button (➲ 360p)
+        Pending qualities → callback popup button (⏳ 720p uploading...)
+        Pending = upload nahi hua abhi tak (not in self._buttons)
+        """
         row = []
         for q in self.QUALITY_ORDER:
+            if q not in self.UPLOAD_QUALITIES:
+                continue  # 480p skip
+
             if q in self._buttons:
-                row.append(self._make_button(q, self._buttons[q]))
+                # Ready button
+                row.append(InlineKeyboardButton(
+                    text=f"➲ {q}",
+                    url=self._buttons[q],
+                ))
+            else:
+                # Check: koi bhi higher quality ready hai kya?
+                # Agar nahi — matlab ye abhi pending hai, popup button dono
+                # Higher pending = woh qualities jo UPLOAD_QUALITIES mein hain
+                # aur abhi tak ready nahi hain
+                # Sirf tab pending button add karo jab koi lower quality ready ho
+                # (matlab post already exist karta hai)
+                if self.post_msg_id is not None or self._buttons:
+                    row.append(InlineKeyboardButton(
+                        text=f"⏳ {q} uploading...",
+                        callback_data=f"bm_pending_{q}",
+                    ))
+
         return InlineKeyboardMarkup([row]) if row else None
 
-
-    def _build_caption(self) -> str:
-        ep_str = f"Episode {self.episode_num:02d}" if self.episode_num else "Episode ??"
-        qualities_ready = [q for q in self.QUALITY_ORDER if q in self._buttons]
-        qual_str = " | ".join(qualities_ready) if qualities_ready else "Coming soon..."
-        return (
-            f"🎌 <b>{self.anime_name}</b>\n"
-            f"📺 <b>{ep_str}</b>\n\n"
-            f"✅ Available: <code>{qual_str}</code>"
-        )
-
-    async def add_quality(self, quality: str, deep_link_url: str):
+    # ── Add quality ───────────────────────────────────────────────────────
+    async def add_quality(self, quality: str, deep_link_url: str, season: int | None = None):
         """Quality ka button add/update karo — pehli baar post banao, baad mein edit."""
         async with self._lock:
+            if season is not None:
+                self.season_num = season
+
             self._buttons[quality] = deep_link_url
             keyboard = self._build_keyboard()
             caption  = self._build_caption()
 
             if self.post_msg_id is None:
+                # Pehli quality — nayi post banao
+                # Pending buttons bhi add karo (baaki jo abhi nahi aayi)
+                # _build_keyboard already handles it via post_msg_id check
+                # But first post mein post_msg_id=None, so pending won't show yet
+                # → manually build with pending for first post
+                first_keyboard = self._build_first_keyboard()
                 try:
                     sent = await self.client.send_message(
                         chat_id=self.channel_id,
                         text=caption,
-                        reply_markup=keyboard,
+                        reply_markup=first_keyboard,
                         parse_mode=ParseMode.HTML,
                         disable_web_page_preview=True,
                     )
@@ -1187,6 +1233,7 @@ class _BotModePostManager:
                 except Exception as e:
                     LOGGER.error(f"[BotMode] Post create error: {e}")
             else:
+                # Existing post edit karo
                 try:
                     await self.client.edit_message_text(
                         chat_id=self.channel_id,
@@ -1202,6 +1249,26 @@ class _BotModePostManager:
                     )
                 except Exception as e:
                     LOGGER.error(f"[BotMode] Post edit error: {e}")
+
+    def _build_first_keyboard(self) -> InlineKeyboardMarkup | None:
+        """
+        Pehli quality ke baad keyboard — ready + saari pending (higher) qualities.
+        """
+        row = []
+        for q in self.QUALITY_ORDER:
+            if q not in self.UPLOAD_QUALITIES:
+                continue
+            if q in self._buttons:
+                row.append(InlineKeyboardButton(
+                    text=f"➲ {q}",
+                    url=self._buttons[q],
+                ))
+            else:
+                row.append(InlineKeyboardButton(
+                    text=f"⏳ {q} uploading...",
+                    callback_data=f"bm_pending_{q}",
+                ))
+        return InlineKeyboardMarkup([row]) if row else None
 
 
 async def _forward_to_anime_channel(client: Client, sent_msg, channel_id: int, anime_name: str):
@@ -1669,3 +1736,21 @@ async def cmd_monitor_status(client: Client, message: Message):
         f"📋 /list_anime\n"
         f"➕ /add_anime"
     )
+
+
+# ─────────────────────────────────────────────
+#  Bot Mode — Pending quality popup callback
+#  User "⏳ 720p uploading..." pe click kare toh toast show karo
+# ─────────────────────────────────────────────
+@Client.on_callback_query(filters.regex(r"^bm_pending_(.+)$"))
+async def bm_pending_callback(client: Client, cb: CallbackQuery):
+    """Pending quality button pe click → toast popup answer karo."""
+    quality = cb.matches[0].group(1)
+    try:
+        await cb.answer(
+            f"⏳ {quality} abhi upload nahi hua hai, thoda wait karo!",
+            show_alert=True,
+        )
+    except Exception as e:
+        LOGGER.warning(f"[BotMode] bm_pending_callback answer error: {e}")
+
