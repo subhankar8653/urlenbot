@@ -1,7 +1,7 @@
 """
 upload_mode_plugin.py
 =====================
-Dо upload modes:
+Two upload modes:
 
   /file_mode  →  FILE_MODE  (default)
                Jaise abhi hai — direct video file channel pe upload hoti hai.
@@ -14,12 +14,13 @@ Dо upload modes:
                  • Har button ka URL = Suhani bot deep link (log channel se)
 
 Commands:
-  /file_mode  → FILE_MODE on karo
-  /bot_mode   → BOT_MODE on karo
-  /upload_mode_status → current mode dekho
+  /file_mode           → FILE_MODE on karo
+  /bot_mode            → BOT_MODE on karo
+  /upload_mode_status  → current mode dekho
 """
 
 from pyrogram import Client, filters
+from pyrogram.enums import ParseMode
 from pyrogram.types import Message
 
 from .. import app, owner, sudo_users
@@ -35,10 +36,7 @@ def _is_authorized(user_id: int) -> bool:
 # ─────────────────────────────────────────────
 
 async def get_upload_mode(user_id: int) -> str:
-    """
-    Returns: 'file_mode' ya 'bot_mode'
-    Default: 'file_mode'
-    """
+    """Returns: 'file_mode' ya 'bot_mode'. Default: 'file_mode'"""
     user = await db._get_user(user_id)
     return user.get('upload_mode', 'file_mode')
 
@@ -68,7 +66,7 @@ async def cmd_file_mode(bot: Client, message: Message):
         "Ab bot <b>seedha video file</b> channel pe upload karega.\n"
         "(Purana wala default behaviour)\n\n"
         "🔄 Bot mode ke liye: /bot_mode",
-        parse_mode="HTML",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -91,7 +89,7 @@ async def cmd_bot_mode(bot: Client, message: Message):
         "• Jaise-jaise qualities upload hongi, same post edit hoga\n"
         "• Har button = Suhani bot deep link\n\n"
         "📁 File mode ke liye: /file_mode",
-        parse_mode="HTML",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -115,5 +113,5 @@ async def cmd_upload_mode_status(bot: Client, message: Message):
         f"📊 <b>Current Upload Mode</b>\n\n"
         f"{mode_text}\n\n"
         f"/file_mode  |  /bot_mode",
-        parse_mode="HTML",
+        parse_mode=ParseMode.HTML,
     )
