@@ -1120,8 +1120,8 @@ class _BotModePostManager:
 
     QUALITY_ORDER = ["360p", "480p", "720p", "1080p"]
     QUALITY_EMOJI = {"360p": "🟢", "480p": "🟡", "720p": "🟢", "1080p": "🔴"}
-    # Telegram Bot API 9.4+ button colors: "success" (green), "destructive" (red), "primary" (blue)
-    QUALITY_STYLE = {"360p": "success", "480p": "success", "720p": "success", "1080p": "destructive"}
+    # Telegram Bot API 9.4+ button colors: "success" (green), "danger" (red), "primary" (blue)
+    QUALITY_STYLE = {"360p": "success", "480p": "success", "720p": "success", "1080p": "danger"}
 
     def __init__(self, client, channel_id: int, anime_name: str, episode_num: int):
         self.client      = client
