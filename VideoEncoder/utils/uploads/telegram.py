@@ -54,11 +54,13 @@ async def _make_uploader_client(user_id: int):
 #       (alag se log send karne ki zaroorat nahi)
 # ─────────────────────────────────────────────
 async def _upload_via_user_then_forward(
-    uc, message, msg, new_file, send_kwargs, media_type="video"
+    uc, message, msg, new_file, send_kwargs, media_type="video",
+    skip_forward=False
 ):
     """
     1. User client → log channel mein upload (user admin hai)
     2. Bot → log channel se target chat mein forward_messages
+       (skip_forward=True hoga to forward skip hoga — bot_mode ke liye)
     3. No cleanup needed — log channel mein rehna chahiye file
     """
     # Strip progress & reply_to from kwargs — log channel ko nahi chahiye
@@ -85,6 +87,10 @@ async def _upload_via_user_then_forward(
             )
 
         # ── Step 2: Bot se LOG_CHANNEL → target chat forward ──
+        # bot_mode mein skip karo — sirf log channel pe rehega
+        if skip_forward:
+            return saved  # log channel ka message return karo (link ke liye)
+
         resp = await app.forward_messages(
             chat_id=message.chat.id,
             from_chat_id=log,
@@ -234,7 +240,8 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
 # ─────────────────────────────────────────────
 async def upload_video(message, msg, new_file, caption, c_time, thumb,
                        duration, width, height, file_name=None, cover=None,
-                       uploader_client=None, progress=None, progress_args=None):
+                       uploader_client=None, progress=None, progress_args=None,
+                       skip_forward=False):
     # progress/progress_args override — caller custom progress callback de sakta hai
     # (e.g. swift_downloader 50% staggered upload ke liye)
     _progress_fn   = progress      if progress      is not None else progress_for_pyrogram
@@ -261,28 +268,35 @@ async def upload_video(message, msg, new_file, caption, c_time, thumb,
         try:
             # User → log channel upload, bot → log channel se forward
             resp = await _upload_via_user_then_forward(
-                uploader_client, message, msg, new_file, send_kwargs, media_type="video"
+                uploader_client, message, msg, new_file, send_kwargs, media_type="video",
+                skip_forward=skip_forward
             )
         except Exception:
             resp = None
 
     if resp is None:
-        # Bot fallback — directly upload
-        resp = await message.reply_video(new_file, **send_kwargs)
+        if skip_forward:
+            # Bot mode fallback — seedha log channel pe upload karo
+            log_kwargs = {k: v for k, v in send_kwargs.items()
+                          if k not in ("progress", "progress_args")}
+            resp = await app.send_video(log, new_file, **log_kwargs)
+        else:
+            # Normal fallback — target chat pe upload
+            resp = await message.reply_video(new_file, **send_kwargs)
 
-        # Log channel mein bhi bhejo (bot fallback case mein, cover bhi include)
-        if resp:
-            log_kwargs = dict(
-                thumb=thumb, caption=caption,
-                duration=duration, width=width,
-                height=height, parse_mode=ParseMode.HTML,
-            )
-            if cover:
-                log_kwargs['cover'] = cover
-            try:
-                await app.send_video(log, resp.video.file_id, **log_kwargs)
-            except Exception:
-                pass
+            # Log channel mein bhi bhejo (bot fallback case mein)
+            if resp:
+                log_kwargs = dict(
+                    thumb=thumb, caption=caption,
+                    duration=duration, width=width,
+                    height=height, parse_mode=ParseMode.HTML,
+                )
+                if cover:
+                    log_kwargs['cover'] = cover
+                try:
+                    await app.send_video(log, resp.video.file_id, **log_kwargs)
+                except Exception:
+                    pass
 
     return resp  # Message object return karo (swift ke liye .id chahiye)
 
