@@ -20,7 +20,7 @@ ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
 COPY . .
 
 # Python dependencies
-RUN pip3 install --no-cache-dir --upgrade pip && \
+RUN pip3 install --no-cache-dir --upgrade pip --isolated && \
     pip3 install --no-cache-dir -r requirements.txt
 
 # Run the bot
