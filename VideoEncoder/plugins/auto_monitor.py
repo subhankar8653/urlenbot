@@ -179,8 +179,6 @@ async def _episode_quality_poller(
         matched_entry = {}
 
     from .swift_downloader import (
-        _make_driver, _close_popups, _scan_for_360p,
-        _collect_visible_links, _get_done_files, _in_progress,
         _upload_one_file, _sort_by_size, _quality_from, QUALITY_ORDER
     )
 
@@ -253,527 +251,121 @@ async def _episode_quality_poller(
 
     status_msg = await log_message.reply(
         f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
-        f"🌐 Chrome khul raha hai...\n"
-        f"🔗 `{swift_url}`"
+        f"⏳ Swift page scan ho raha hai..."
     )
 
     # ──────────────────────────────────────────────────────
-    #  STEP 1: Chrome se teeno links click karo (blocking)
-    #  Returns list of clicked quality names — downloads
-    #  background mein dl_dir mein aa rahe hain
+    #  Direct Poll Mode — Chrome attempt skip, seedha scrape
     # ──────────────────────────────────────────────────────
-    def _chrome_click_all() -> dict:
-        """
-        1 Chrome session: page open → 360p gate → saare links click.
-        Download Chrome ke download manager mein shuru ho jaata hai.
-        Returns {"qualities_clicked": [...], "error": str|None}
-        """
-        driver = None
-        result = {"qualities_clicked": [], "error": None}
-        try:
-            driver = _make_driver(dl_dir)
-            LOGGER.info(f"[AutoMonitor] Chrome opened for Ep {episode_num}")
+    from .swift_downloader import (
+        _scrape_and_download, _upload_one_file, _sort_by_size, _quality_from, QUALITY_ORDER
+    )
 
-            loaded = False
-            for _a in range(3):
-                try:
-                    driver.get(swift_url)
-                    loaded = True
-                    break
-                except Exception as e:
-                    LOGGER.warning(f"[AutoMonitor] Page load attempt {_a+1}: {e}")
-                    time.sleep(2)  # was 3s
+    POLL_INTERVAL_FAST = 30
+    POLL_INTERVAL_SLOW = 60
+    POLL_FAST_ATTEMPTS = 10
+    POLL_SLOW_ATTEMPTS = 20
+    TARGET_QUALITIES_SET = set(TARGET_QUALITIES)
 
-            if not loaded:
-                result["error"] = "Page load fail — Chrome renderer timeout"
-                return result
+    remaining = set(TARGET_QUALITIES_SET)
+    poll_start = time.time()
+    poll_attempt = 0
+    _old_msgs_deleted_poll = False
 
-            main = driver.current_window_handle
-            _close_popups(driver, main)
+    while remaining:
+        poll_attempt += 1
+        is_fast = poll_attempt <= POLL_FAST_ATTEMPTS
+        is_slow = POLL_FAST_ATTEMPTS < poll_attempt <= (POLL_FAST_ATTEMPTS + POLL_SLOW_ATTEMPTS)
+        if not is_fast and not is_slow:
+            break
 
-            # 360p gate — max 20s
-            found_360p = False
-            for _s in range(40):  # 40 × 0.5s = 20s max
-                _close_popups(driver, main)
-                if _scan_for_360p(driver):
-                    found_360p = True
-                    break
-                if _s < 39:
-                    time.sleep(0.5)  # was 1s — 2x faster
-
-            if not found_360p:
-                result["error"] = "360p button 20s tak nahi mila — page render fail"
-                return result
-
-            # 360p gate pass hua — ab links collect karo
-            # JS buttons fully render hone mein time lagta hai — retry loop
-            links = []
-            for _retry in range(8):
-                _close_popups(driver, main)
-                links = _collect_visible_links(driver)
-                if links:
-                    LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Links collected retry {_retry+1} — {len(links)} found")
-                    break
-                LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Links empty retry {_retry+1}, waiting 1s...")
-                time.sleep(1)
-
-            if not links:
-                # Last resort: page scroll karke JS trigger karo
-                try:
-                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    time.sleep(0.5)  # was 1s
-                    driver.execute_script("window.scrollTo(0, 0);")
-                    time.sleep(0.5)  # was 1s
-                    _close_popups(driver, main)
-                    links = _collect_visible_links(driver)
-                    LOGGER.info(f"[AutoMonitor] Ep {episode_num}: After scroll — {len(links)} links")
-                except Exception:
-                    pass
-
-            if not links:
-                # Final fallback: Selenium se saare a.dl-btn directly click karo
-                LOGGER.warning(f"[AutoMonitor] Ep {episode_num}: _collect_visible_links empty — trying direct Selenium click")
-                clicked_fallback = []
-                try:
-                    from selenium.webdriver.common.by import By as _By
-                    dl_btns = driver.find_elements(_By.CSS_SELECTOR, "a.dl-btn")
-                    for btn in dl_btns:
-                        try:
-                            classes = btn.get_attribute("class") or ""
-                            if "d-none" in classes:
-                                continue
-                            href  = btn.get_attribute("href") or ""
-                            label = btn.text.strip()
-                            if not href or href.startswith("about:") or len(href) < 10:
-                                continue
-                            q = _quality_from(label + " " + href)
-                            driver.execute_script(f"window.open('{href}', '_blank');")
-                            time.sleep(0.2)  # was 0.3s
-                            _close_popups(driver, main)
-                            clicked_fallback.append(q)
-                            LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Fallback clicked {q}")
-                        except Exception as _be:
-                            LOGGER.warning(f"[AutoMonitor] Fallback btn click failed: {_be}")
-                except Exception as _fe:
-                    LOGGER.error(f"[AutoMonitor] Fallback Selenium error: {_fe}")
-
-                if clicked_fallback:
-                    result["qualities_clicked"] = clicked_fallback
-                    time.sleep(3)  # was 5s
-                    return result
-
-                result["error"] = "360p dikh gaya par download links nahi mile — JS render timeout"
-                return result
-
-            # Saare visible links click karo — downloads shuru
-            clicked = []
-            for lnk in links[:4]:
-                q    = _quality_from(lnk["quality"])
-                href = lnk["href"]
-                try:
-                    driver.execute_script(f"window.open('{href}', '_blank');")
-                    time.sleep(0.2)  # was 0.3s
-                    _close_popups(driver, main)
-                    clicked.append(q)
-                    LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Clicked {q}")
-                except Exception as e:
-                    LOGGER.warning(f"[AutoMonitor] Click failed {q}: {e}")
-
-            result["qualities_clicked"] = clicked
-
-            # Downloads initiate hone do — 3s kafi hai (was 5s)
-            time.sleep(3)
-
-        except Exception as e:
-            result["error"] = str(e)
-            LOGGER.error(f"[AutoMonitor] Chrome session error: {e}")
-        finally:
-            if driver:
-                try:
-                    driver.quit()
-                    LOGGER.info(f"[AutoMonitor] Chrome closed for Ep {episode_num}")
-                except Exception:
-                    pass
-        return result
-
-    # Chrome run karo — async block nahi hoga
-    try:
-        await status_msg.edit(
-            f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
-            f"🌐 Links fetch ho rahe hain..."
-        )
-    except Exception:
-        pass
-
-    click_result = await loop.run_in_executor(None, _chrome_click_all)
-
-    if click_result["error"] and not click_result["qualities_clicked"]:
-        # ── Chrome fail hua — V27 ka poll-based fallback shuru karo ──
-        LOGGER.warning(f"[AutoMonitor] Ep {episode_num}: Chrome failed ({click_result['error'][:80]}). Switching to poll fallback...")
-        shutil.rmtree(dl_dir, ignore_errors=True)
-
-        from .swift_downloader import (
-            _scrape_and_download, _upload_one_file, _sort_by_size, _quality_from, QUALITY_ORDER
-        )
-
-        POLL_INTERVAL_FAST = 30
-        POLL_INTERVAL_SLOW = 60
-        POLL_FAST_ATTEMPTS = 10
-        POLL_SLOW_ATTEMPTS = 20
-        TARGET_QUALITIES_SET = set(TARGET_QUALITIES)
-
-        remaining = set(TARGET_QUALITIES_SET)
-        poll_start = time.time()
-        poll_attempt = 0
-        _old_msgs_deleted_poll = False
+        interval = POLL_INTERVAL_FAST if is_fast else POLL_INTERVAL_SLOW
+        elapsed_min = int((time.time() - poll_start) / 60)
+        phase_lbl = "⚡ Fast" if is_fast else "🐢 Slow"
 
         try:
             await status_msg.edit(
                 f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
-                f"🔄 Poll `1` ⚡ Fast | Elapsed: `0m`\n"
-                f"🎯 Baki: `{' | '.join(sorted(TARGET_QUALITIES))}`\n"
+                f"🔄 Poll `{poll_attempt}` {phase_lbl} | Elapsed: `{elapsed_min}m`\n"
+                f"🎯 Baki: `{' | '.join(sorted(remaining))}`\n"
                 f"⏳ Swift page scan ho raha hai..."
             )
         except Exception:
             pass
 
-        while remaining:
-            poll_attempt += 1
-            is_fast = poll_attempt <= POLL_FAST_ATTEMPTS
-            is_slow = POLL_FAST_ATTEMPTS < poll_attempt <= (POLL_FAST_ATTEMPTS + POLL_SLOW_ATTEMPTS)
-            if not is_fast and not is_slow:
-                break  # max attempts khatam
+        poll_session_id = f"monitor_ep{episode_num}_poll{poll_attempt}_{int(time.time())}"
+        poll_dl_dir = os.path.join(download_dir, poll_session_id)
+        os.makedirs(poll_dl_dir, exist_ok=True)
 
-            interval = POLL_INTERVAL_FAST if is_fast else POLL_INTERVAL_SLOW
-            elapsed_min = int((time.time() - poll_start) / 60)
-            phase_lbl = "⚡ Fast" if is_fast else "🐢 Slow"
-
-            try:
-                await status_msg.edit(
-                    f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
-                    f"🔄 Poll `{poll_attempt}` {phase_lbl} | Elapsed: `{elapsed_min}m`\n"
-                    f"🎯 Baki: `{' | '.join(sorted(remaining))}`\n"
-                    f"⏳ Swift page scan ho raha hai..."
-                )
-            except Exception:
-                pass
-
-            poll_session_id = f"monitor_ep{episode_num}_poll{poll_attempt}_{int(time.time())}"
-            poll_dl_dir = os.path.join(download_dir, poll_session_id)
-            os.makedirs(poll_dl_dir, exist_ok=True)
-
-            try:
-                poll_result = await loop.run_in_executor(
-                    None, _scrape_and_download, swift_url, poll_dl_dir, None, None
-                )
-            except Exception as e:
-                LOGGER.error(f"[AutoMonitor] Poll Ep {episode_num} attempt {poll_attempt} error: {e}")
-                shutil.rmtree(poll_dl_dir, ignore_errors=True)
-                await asyncio.sleep(interval)
-                continue
-
-            if poll_result["error"] and not poll_result["files"]:
-                shutil.rmtree(poll_dl_dir, ignore_errors=True)
-                await asyncio.sleep(interval)
-                continue
-
-            poll_files = poll_result.get("files", [])
-            if not poll_files:
-                shutil.rmtree(poll_dl_dir, ignore_errors=True)
-                await asyncio.sleep(interval)
-                continue
-
-            poll_files = _sort_by_size(poll_files)
-            new_files = [fp for fp in poll_files if _quality_from(os.path.basename(fp)) in remaining]
-
-            if not new_files:
-                shutil.rmtree(poll_dl_dir, ignore_errors=True)
-                await asyncio.sleep(interval)
-                continue
-
-            # Files mili — upload karo
-            qualities_found = [_quality_from(os.path.basename(f)) for f in new_files]
-            try:
-                await status_msg.edit(
-                    f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
-                    f"✅ Poll mili: `{' | '.join(qualities_found)}`\n"
-                    f"📤 Upload ho raha hai..."
-                )
-            except Exception:
-                pass
-
-            _dummy_msgs_poll = {}
-            for fp in new_files:
-                q = _quality_from(os.path.basename(fp))
-                try:
-                    dm = await log_message.reply(f"📤 **Uploading `{q}`** — Ep `{episode_num}`...")
-                    _dummy_msgs_poll[fp] = dm
-                except Exception:
-                    _dummy_msgs_poll[fp] = status_msg
-
-            _half_events_poll = [asyncio.Event() for _ in new_files]
-
-            async def _poll_upload_task(filepath, idx):
-                nonlocal _old_msgs_deleted_poll
-                if idx > 0:
-                    await _half_events_poll[idx - 1].wait()
-                if idx == 0 and not _old_msgs_deleted_poll:
-                    _old_msgs_deleted_poll = True
-                    await _delete_old_bot_msgs(channel_id)
-                um = _dummy_msgs_poll.get(filepath, status_msg)
-                success, sent_msg, quality = await _upload_one_file(
-                    client, proxy_msg, um, filepath, poll_dl_dir, encode=False,
-                    on_half=_half_events_poll[idx],
-                    skip_forward=_bot_mode_active,
-                )
-                try:
-                    await um.delete()
-                except Exception:
-                    pass
-                if success and sent_msg and quality == "360p":
-                    is_first_ep = (start_ep is not None and episode_num == start_ep)
-                    already_sent = (update_post_sent is not None and update_post_sent[0])
-                    if is_first_ep and not already_sent:
-                        try:
-                            from .update_channel import send_update_post
-                            from ..utils.auto_caption import extract_anime_info as _eai
-                            _season = None
-                            try:
-                                _, _season, _ = _eai(os.path.basename(filepath), {})
-                            except Exception:
-                                pass
-                            _ep_end = end_ep if end_ep else episode_num
-                            await send_update_post(
-                                client, anime_name=anime_name, season=_season,
-                                episode_start=episode_num, episode_end=_ep_end,
-                            )
-                            if update_post_sent is not None:
-                                update_post_sent[0] = True
-                        except Exception as _ue:
-                            LOGGER.error(f"[AutoMonitor] Update post error: {_ue}")
-                # ── Bot Mode: deep link lo aur post pe button add karo ──
-                if success and sent_msg and _bot_mode_active and _bot_post_mgr:
-                    try:
-                        LOGGER.info(f"[BotMode] Waiting for Link Ready for {quality} msg_id={sent_msg.id if sent_msg else 'None'}")
-                        _deep_link = await _get_suhani_bot_link(sent_msg)
-                        if _deep_link:
-                            LOGGER.info(f"[BotMode] Got link for {quality}: {_deep_link[:60]}")
-                            # Season + language extract karo (sirf 360p pe, tab post create hota hai)
-                            _bm_season = None
-                            _bm_lang = None
-                            if quality == "360p":
-                                try:
-                                    from ..utils.auto_caption import extract_anime_info as _eai2, detect_language_from_filename as _dlf
-                                    _, _bm_season, _ = _eai2(os.path.basename(filepath), {})
-                                    _langs = _dlf(os.path.basename(filepath))
-                                    _bm_lang = " + ".join(_langs) if _langs else "Hindi"
-                                except Exception:
-                                    pass
-                            await _bot_post_mgr.add_quality(quality, _deep_link, season=_bm_season, language=_bm_lang)
-                        else:
-                            LOGGER.warning(f"[BotMode] No link found for {quality} — skipping button")
-                    except Exception as _bme:
-                        LOGGER.error(f"[BotMode] add_quality (poll) error: {_bme}")
-                return success, sent_msg, quality
-
-            poll_results = await asyncio.gather(
-                *[_poll_upload_task(fp, i) for i, fp in enumerate(new_files)],
-                return_exceptions=True,
+        try:
+            poll_result = await loop.run_in_executor(
+                None, _scrape_and_download, swift_url, poll_dl_dir, None, None
             )
-
-            for r in poll_results:
-                if isinstance(r, Exception):
-                    continue
-                success, sent_msg, quality = r
-                if success:
-                    remaining.discard(quality)
-
+        except Exception as e:
+            LOGGER.error(f"[AutoMonitor] Poll Ep {episode_num} attempt {poll_attempt} error: {e}")
             shutil.rmtree(poll_dl_dir, ignore_errors=True)
+            await asyncio.sleep(interval)
+            continue
 
-            if remaining:
-                await asyncio.sleep(interval)
+        if poll_result["error"] and not poll_result["files"]:
+            shutil.rmtree(poll_dl_dir, ignore_errors=True)
+            await asyncio.sleep(interval)
+            continue
 
-        # Poll loop khatam
-        poll_elapsed = int((time.time() - poll_start) / 60)
-        if not remaining:
-            try:
-                await status_msg.edit(
-                    f"🎉 **Complete (Poll)!** | `{anime_name}` | Ep `{episode_num}`\n\n"
-                    f"✅ Saari qualities upload ho gayi!\n"
-                    f"⏱️ Total time: `{poll_elapsed}m`"
-                )
-            except Exception:
-                pass
-        else:
-            missing_str = ' | '.join(sorted(remaining))
-            try:
-                await status_msg.edit(
-                    f"⚠️ **Incomplete!** | `{anime_name}` | Ep `{episode_num}`\n\n"
-                    f"❌ Timeout ke baad bhi nahi mili: `{missing_str}`\n"
-                    f"✅ Jo mili: `{' | '.join(q for q in TARGET_QUALITIES if q not in remaining)}`\n\n"
-                    f"RTI pe manually check karo."
-                )
-            except Exception:
-                pass
-        # Poll fallback mein jo bhi upload hua uske basis pe return karo
-        uploaded_in_poll = set(TARGET_QUALITIES) - remaining
-        return len(uploaded_in_poll) > 0
+        poll_files = poll_result.get("files", [])
+        if not poll_files:
+            shutil.rmtree(poll_dl_dir, ignore_errors=True)
+            await asyncio.sleep(interval)
+            continue
 
-    expected_count = len(click_result["qualities_clicked"])
-    LOGGER.info(f"[AutoMonitor] Ep {episode_num}: {expected_count} downloads started — {click_result['qualities_clicked']}")
+        poll_files = _sort_by_size(poll_files)
+        new_files = [fp for fp in poll_files if _quality_from(os.path.basename(fp)) in remaining]
 
-    # ──────────────────────────────────────────────────────
-    #  STEP 2: File watcher — jaise hi ek file complete ho
-    #  uska Event set karo taaki upload shuru ho sake
-    # ──────────────────────────────────────────────────────
+        if not new_files:
+            shutil.rmtree(poll_dl_dir, ignore_errors=True)
+            await asyncio.sleep(interval)
+            continue
 
-    # Tracked files: {filepath: asyncio.Event} — event set = file ready for upload
-    _file_ready_events: dict[str, asyncio.Event] = {}
-    _file_ready_lock = asyncio.Lock()
-    _all_done_event = asyncio.Event()
-
-    # 50% chain events — order: size ke hisaab se (360p=smallest → first)
-    # file[0] ka half_event fire hone pe file[1] upload shuru
-    # file[1] ka half_event fire hone pe file[2] upload shuru
-    # ye events watcher ke baad files sort hone ke baad assign honge
-    _half_events_map: dict[str, asyncio.Event] = {}   # filepath → on_half event
-
-    async def _file_watcher():
-        """
-        Poller: har 2s pe dl_dir check karo.
-        Nayi complete file mili → uska ready event set karo.
-        Sab aa gaye → _all_done_event set karo.
-        """
-        seen = set()
-        timeout_start = time.time()
-        MAX_WAIT = 1800  # 30 min max
-
-        while True:
-            if time.time() - timeout_start > MAX_WAIT:
-                LOGGER.warning(f"[AutoMonitor] Ep {episode_num}: File watcher timeout!")
-                break
-
-            done_files = _get_done_files(dl_dir)
-            for fp in done_files:
-                if fp not in seen:
-                    seen.add(fp)
-                    async with _file_ready_lock:
-                        if fp not in _file_ready_events:
-                            ev = asyncio.Event()
-                            _file_ready_events[fp] = ev
-                        _file_ready_events[fp].set()
-                        q = _quality_from(os.path.basename(fp))
-                        LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ {q} download complete → upload ready")
-
-            # Sab expected files aa gayi?
-            if len(seen) >= expected_count and not _in_progress(dl_dir):
-                _all_done_event.set()
-                break
-
-            await asyncio.sleep(2)
-
-        # Edge case: jo bhi mili unhe ready mark karo
-        for fp in _get_done_files(dl_dir):
-            async with _file_ready_lock:
-                if fp not in _file_ready_events:
-                    ev = asyncio.Event()
-                    _file_ready_events[fp] = ev
-                _file_ready_events[fp].set()
-
-        _all_done_event.set()
-
-    # ──────────────────────────────────────────────────────
-    #  STEP 3: Upload orchestrator
-    #  - Sab files ka wait karo (all_done)
-    #  - Sort karo quality order mein
-    #  - Phir 50% chain ke saath upload karo
-    #  - Har file apna download-ready event wait karti hai
-    #    AUR pichli file ka 50% event bhi
-    # ──────────────────────────────────────────────────────
-
-    uploaded_results = []
-    _old_msgs_deleted = False
-
-    async def _upload_pipeline():
-        nonlocal _old_msgs_deleted
-
-        # Pehle sab files aane ka wait karo
-        await _all_done_event.wait()
-
-        all_files = _sort_by_size(_get_done_files(dl_dir))
-        if not all_files:
-            try:
-                await status_msg.edit(
-                    f"❌ **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
-                    f"Koi file download nahi hui."
-                )
-            except Exception:
-                pass
-            return
-
-        # 50% chain events banao — ek per file
-        half_events = [asyncio.Event() for _ in all_files]
-
-        # Status update
-        qualities_list = ' → '.join(_quality_from(os.path.basename(f)) for f in all_files)
+        qualities_found = [_quality_from(os.path.basename(f)) for f in new_files]
         try:
             await status_msg.edit(
-                f"✅ **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
-                f"📦 `{qualities_list}`\n"
-                f"📤 Upload pipeline shuru..."
+                f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                f"✅ Mili: `{' | '.join(qualities_found)}`\n"
+                f"📤 Upload ho raha hai..."
             )
         except Exception:
             pass
 
-        # Status messages banao
-        dummy_msgs = {}
-        for fp in all_files:
+        _dummy_msgs_poll = {}
+        for fp in new_files:
             q = _quality_from(os.path.basename(fp))
             try:
                 dm = await log_message.reply(f"📤 **Uploading `{q}`** — Ep `{episode_num}`...")
-                dummy_msgs[fp] = dm
+                _dummy_msgs_poll[fp] = dm
             except Exception:
-                dummy_msgs[fp] = status_msg
+                _dummy_msgs_poll[fp] = status_msg
 
-        async def _upload_one(filepath, idx):
-            nonlocal _old_msgs_deleted
+        _half_events_poll = [asyncio.Event() for _ in new_files]
 
-            # WAIT 1: Apni file ka download complete hone ka wait
-            ready_ev = _file_ready_events.get(filepath)
-            if ready_ev:
-                await ready_ev.wait()
-            else:
-                # Edge case: watcher se pehle hi yahan pahunch gaye
-                while filepath not in _file_ready_events:
-                    await asyncio.sleep(1)
-                await _file_ready_events[filepath].wait()
-
-            # WAIT 2: 50% chain — pichli file 50% hone ka wait
+        async def _poll_upload_task(filepath, idx):
+            nonlocal _old_msgs_deleted_poll
             if idx > 0:
-                await half_events[idx - 1].wait()
-
-            # Pehli file se pehle old messages delete
-            if idx == 0 and not _old_msgs_deleted:
-                _old_msgs_deleted = True
+                await _half_events_poll[idx - 1].wait()
+            if idx == 0 and not _old_msgs_deleted_poll:
+                _old_msgs_deleted_poll = True
                 await _delete_old_bot_msgs(channel_id)
-
-            q = _quality_from(os.path.basename(filepath))
-            LOGGER.info(f"[AutoMonitor] Ep {episode_num}: 🚀 Upload start — {q}")
-
-            um = dummy_msgs.get(filepath, status_msg)
+            um = _dummy_msgs_poll.get(filepath, status_msg)
             success, sent_msg, quality = await _upload_one_file(
-                client, proxy_msg, um, filepath, dl_dir, encode=False,
-                on_half=half_events[idx],
+                client, proxy_msg, um, filepath, poll_dl_dir, encode=False,
+                on_half=_half_events_poll[idx],
                 skip_forward=_bot_mode_active,
             )
             try:
                 await um.delete()
             except Exception:
                 pass
-
-            # update_post — first episode ka 360p pe
             if success and sent_msg and quality == "360p":
-                is_first_ep  = (start_ep is not None and episode_num == start_ep)
+                is_first_ep = (start_ep is not None and episode_num == start_ep)
                 already_sent = (update_post_sent is not None and update_post_sent[0])
                 if is_first_ep and not already_sent:
                     try:
@@ -793,14 +385,10 @@ async def _episode_quality_poller(
                             update_post_sent[0] = True
                     except Exception as _ue:
                         LOGGER.error(f"[AutoMonitor] Update post error: {_ue}")
-
-            # ── Bot Mode: deep link lo aur post pe button add karo ──
             if success and sent_msg and _bot_mode_active and _bot_post_mgr:
                 try:
-                    LOGGER.info(f"[BotMode] Waiting for Link Ready for {quality} msg_id={sent_msg.id if sent_msg else 'None'}")
                     _deep_link = await _get_suhani_bot_link(sent_msg)
                     if _deep_link:
-                        LOGGER.info(f"[BotMode] Got link for {quality}: {_deep_link[:60]}")
                         _bm_season = None
                         _bm_lang = None
                         if quality == "360p":
@@ -813,253 +401,58 @@ async def _episode_quality_poller(
                                 pass
                         await _bot_post_mgr.add_quality(quality, _deep_link, season=_bm_season, language=_bm_lang)
                     else:
-                        LOGGER.warning(f"[BotMode] No link found for {quality} — skipping button")
+                        LOGGER.warning(f"[BotMode] No link for {quality}")
                 except Exception as _bme:
-                    LOGGER.error(f"[BotMode] add_quality (chrome) error: {_bme}")
-
+                    LOGGER.error(f"[BotMode] add_quality error: {_bme}")
             return success, sent_msg, quality
 
-        results = await asyncio.gather(
-            *[_upload_one(fp, i) for i, fp in enumerate(all_files)],
+        poll_results = await asyncio.gather(
+            *[_poll_upload_task(fp, i) for i, fp in enumerate(new_files)],
             return_exceptions=True,
         )
 
-        for r in results:
+        for r in poll_results:
             if isinstance(r, Exception):
-                LOGGER.error(f"[AutoMonitor] Upload task error: {r}")
                 continue
             success, sent_msg, quality = r
             if success:
-                uploaded_results.append((quality, sent_msg))
-                LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ {quality} uploaded!")
+                remaining.discard(quality)
 
-    # Progress updater — download phase ke liye
-    async def _dl_progress():
-        s = time.time()
-        while not _all_done_event.is_set():
-            done    = _get_done_files(dl_dir)
-            in_prog = _in_progress(dl_dir)
-            elapsed = int(time.time() - s)
-            total_mb = sum(
-                os.path.getsize(f) for f in glob.glob(os.path.join(dl_dir, "*"))
-                if os.path.isfile(f)
-            ) / (1024 * 1024)
-            ready_qs = [_quality_from(os.path.basename(f)) for f in done]
-            try:
-                await status_msg.edit(
-                    f"⬇️ **AutoMonitor Downloading...**\n\n"
-                    f"🎌 `{anime_name}` | Ep `{episode_num}`\n"
-                    f"✅ Ready : `{' | '.join(ready_qs) or '—'}`\n"
-                    f"📥 In Progress : `{len(in_prog)}`\n"
-                    f"💾 Downloaded : `{total_mb:.1f} MB`\n"
-                    f"⏱️ Elapsed : `{elapsed}s`"
-                )
-            except Exception:
-                pass
-            await asyncio.sleep(5)
+        shutil.rmtree(poll_dl_dir, ignore_errors=True)
 
-    # Teeno tasks parallel chalao
-    await asyncio.gather(
-        _file_watcher(),
-        _upload_pipeline(),
-        _dl_progress(),
-    )
-
-    shutil.rmtree(dl_dir, ignore_errors=True)
-
-    # ── Missing quality retry loop ──
-    # Jo qualities upload nahi hui unhe 25 min tak same swift_url se retry karo
-    uploaded_so_far = set(q for q, _ in uploaded_results)
-    missing_after_chrome = set(TARGET_QUALITIES) - uploaded_so_far
-
-    if missing_after_chrome:
-        from .swift_downloader import (
-            _scrape_and_download, _upload_one_file, _sort_by_size, _quality_from
-        )
-
-        RETRY_FAST_ATTEMPTS = 10
-        RETRY_SLOW_ATTEMPTS = 20
-        retry_attempt = 0
-        retry_remaining = set(missing_after_chrome)
-        _old_msgs_deleted_retry = False
-
-        LOGGER.info(f"[AutoMonitor] Ep {episode_num}: Missing qualities after Chrome — retrying: {retry_remaining}")
-
-        try:
-            await status_msg.edit(
-                f"⏳ **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
-                f"✅ Uploaded: `{' | '.join(sorted(uploaded_so_far)) or '—'}`\n"
-                f"🔄 Missing retry shuru: `{' | '.join(sorted(retry_remaining))}`"
-            )
-        except Exception:
-            pass
-
-        while retry_remaining:
-            retry_attempt += 1
-            is_fast = retry_attempt <= RETRY_FAST_ATTEMPTS
-            is_slow = RETRY_FAST_ATTEMPTS < retry_attempt <= (RETRY_FAST_ATTEMPTS + RETRY_SLOW_ATTEMPTS)
-            if not is_fast and not is_slow:
-                break
-
-            interval = 30 if is_fast else 60
-            phase_lbl = "⚡ Fast" if is_fast else "🐢 Slow"
-
-            try:
-                await status_msg.edit(
-                    f"⏳ **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
-                    f"🔄 Quality retry `{retry_attempt}` {phase_lbl}\n"
-                    f"🎯 Dhundh raha hoon: `{' | '.join(sorted(retry_remaining))}`\n"
-                    f"⏰ `{interval}s` baad scan..."
-                )
-            except Exception:
-                pass
-
+        if remaining:
             await asyncio.sleep(interval)
 
-            for q_target in list(retry_remaining):
-                retry_session_id = f"monitor_ep{episode_num}_retry{retry_attempt}_{q_target}_{int(time.time())}"
-                retry_dl_dir = os.path.join(download_dir, retry_session_id)
-                os.makedirs(retry_dl_dir, exist_ok=True)
-
-                try:
-                    retry_result = await loop.run_in_executor(
-                        None, _scrape_and_download, swift_url, retry_dl_dir, None, q_target
-                    )
-                except Exception as e:
-                    LOGGER.error(f"[AutoMonitor] Quality retry error ({q_target}): {e}")
-                    shutil.rmtree(retry_dl_dir, ignore_errors=True)
-                    continue
-
-                if retry_result["error"] and not retry_result["files"]:
-                    LOGGER.info(f"[AutoMonitor] Ep {episode_num}: {q_target} not available yet (attempt {retry_attempt})")
-                    shutil.rmtree(retry_dl_dir, ignore_errors=True)
-                    continue
-
-                retry_files = _sort_by_size(retry_result.get("files", []))
-                target_file = next(
-                    (f for f in retry_files if _quality_from(os.path.basename(f)) == q_target),
-                    None
-                )
-
-                if not target_file:
-                    shutil.rmtree(retry_dl_dir, ignore_errors=True)
-                    continue
-
-                # File mili — upload karo
-                try:
-                    await status_msg.edit(
-                        f"✅ **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
-                        f"`{q_target}` mil gaya! Upload ho raha hai..."
-                    )
-                except Exception:
-                    pass
-
-                retry_um = await log_message.reply(f"📤 **Uploading `{q_target}`** — Ep `{episode_num}` (retry)...")
-
-                if not _old_msgs_deleted_retry and not uploaded_so_far:
-                    _old_msgs_deleted_retry = True
-                    await _delete_old_bot_msgs(channel_id)
-
-                retry_half_ev = asyncio.Event()
-                success, sent_msg_r, quality_r = await _upload_one_file(
-                    client, proxy_msg, retry_um, target_file, retry_dl_dir, encode=False,
-                    on_half=retry_half_ev,
-                    skip_forward=_bot_mode_active,
-                )
-                try:
-                    await retry_um.delete()
-                except Exception:
-                    pass
-
-                if success:
-                    uploaded_results.append((quality_r, sent_msg_r))
-                    uploaded_so_far.add(quality_r)
-                    retry_remaining.discard(quality_r)
-                    LOGGER.info(f"[AutoMonitor] Ep {episode_num}: ✅ {quality_r} retry upload done!")
-
-                    # update_post check — 360p pe
-                    if quality_r == "360p":
-                        is_first_ep = (start_ep is not None and episode_num == start_ep)
-                        already_sent = (update_post_sent is not None and update_post_sent[0])
-                        if is_first_ep and not already_sent:
-                            try:
-                                from .update_channel import send_update_post
-                                from ..utils.auto_caption import extract_anime_info as _eai
-                                _season = None
-                                try:
-                                    _, _season, _ = _eai(os.path.basename(target_file), {})
-                                except Exception:
-                                    pass
-                                _ep_end = end_ep if end_ep else episode_num
-                                await send_update_post(
-                                    client, anime_name=anime_name, season=_season,
-                                    episode_start=episode_num, episode_end=_ep_end,
-                                )
-                                if update_post_sent is not None:
-                                    update_post_sent[0] = True
-                            except Exception as _ue:
-                                LOGGER.error(f"[AutoMonitor] Update post retry error: {_ue}")
-
-                    # ── Bot Mode: deep link lo aur post pe button add karo ──
-                    if _bot_mode_active and _bot_post_mgr:
-                        try:
-                            LOGGER.info(f"[BotMode] Waiting for Link Ready for {quality_r} msg_id={sent_msg_r.id if sent_msg_r else 'None'}")
-                            _deep_link = await _get_suhani_bot_link(sent_msg_r)
-                            if _deep_link:
-                                LOGGER.info(f"[BotMode] Got link for {quality_r}: {_deep_link[:60]}")
-                                _bm_season = None
-                                _bm_lang = None
-                                if quality_r == "360p":
-                                    try:
-                                        from ..utils.auto_caption import extract_anime_info as _eai2, detect_language_from_filename as _dlf
-                                        _, _bm_season, _ = _eai2(os.path.basename(target_file), {})
-                                        _langs = _dlf(os.path.basename(target_file))
-                                        _bm_lang = " + ".join(_langs) if _langs else "Hindi"
-                                    except Exception:
-                                        pass
-                                await _bot_post_mgr.add_quality(quality_r, _deep_link, season=_bm_season, language=_bm_lang)
-                            else:
-                                LOGGER.warning(f"[BotMode] No link found for {quality_r} — skipping button")
-                        except Exception as _bme:
-                            LOGGER.error(f"[BotMode] add_quality (retry) error: {_bme}")
-
-                shutil.rmtree(retry_dl_dir, ignore_errors=True)
-
-        # Retry loop khatam — final missing log
-        if retry_remaining:
-            LOGGER.warning(f"[AutoMonitor] Ep {episode_num}: Still missing after retries: {retry_remaining}")
-            try:
-                await status_msg.edit(
-                    f"⚠️ **Incomplete!** | `{anime_name}` | Ep `{episode_num}`\n\n"
-                    f"✅ Uploaded: `{' | '.join(sorted(uploaded_so_far)) or '—'}`\n"
-                    f"❌ Timeout ke baad bhi nahi mili: `{' | '.join(sorted(retry_remaining))}`\n\n"
-                    f"RTI pe manually check karo."
-                )
-            except Exception:
-                pass
-
-    # ── Final summary ──
-    elapsed_min = int((time.time() - start_time) / 60)
+    # Poll loop khatam
+    poll_elapsed = int((time.time() - poll_start) / 60)
     uploaded_qualities = sorted(
-        [q for q, _ in uploaded_results],
+        set(TARGET_QUALITIES) - remaining,
         key=lambda q: ["360p", "480p", "720p", "1080p"].index(q) if q in ["360p", "480p", "720p", "1080p"] else 99
     )
-    uploaded_count = len(uploaded_results)
 
-    if uploaded_count > 0 and not missing_after_chrome - set(uploaded_so_far):
-        # Sab qualities upload ho gayi
+    if not remaining:
         try:
             await status_msg.edit(
                 f"🎉 **Complete!** | `{anime_name}` | Ep `{episode_num}`\n\n"
-                f"✅ Uploaded : `{uploaded_count}`\n"
-                f"📊 `{' → '.join(uploaded_qualities) or 'N/A'}`\n"
-                f"⏱️ Time: `{elapsed_min}m`"
+                f"✅ Uploaded: `{' → '.join(uploaded_qualities)}`\n"
+                f"⏱️ Time: `{poll_elapsed}m`"
+            )
+        except Exception:
+            pass
+    else:
+        missing_str = ' | '.join(sorted(remaining))
+        try:
+            await status_msg.edit(
+                f"⚠️ **Incomplete!** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                f"❌ Timeout ke baad bhi nahi mili: `{missing_str}`\n"
+                f"✅ Jo mili: `{' | '.join(uploaded_qualities) or '—'}`\n\n"
+                f"RTI pe manually check karo."
             )
         except Exception:
             pass
 
-    LOGGER.info(f"[AutoMonitor] Ep {episode_num}: done in {elapsed_min}m — {uploaded_qualities}")
-    return uploaded_count > 0
+    LOGGER.info(f"[AutoMonitor] Ep {episode_num}: done in {poll_elapsed}m — {uploaded_qualities}")
+    return len(uploaded_qualities) > 0
 
 
 # ─────────────────────────────────────────────
