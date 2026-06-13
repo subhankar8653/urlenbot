@@ -34,7 +34,7 @@ import shutil
 import time
 
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from .. import LOGGER, app, owner, sudo_users, download_dir
 from ..utils.database.access_db import db
@@ -238,6 +238,14 @@ async def _episode_quality_poller(
         f"🌐 Chrome khul raha hai...\n"
         f"🔗 `{swift_url}`"
     )
+
+    # ── Bot Mode check ──
+    _upload_mode    = await _get_upload_mode_for_owner()
+    _bot_mode_active = (_upload_mode == 'bot_mode')
+    _bot_post_mgr: _BotModePostManager | None = None
+    if _bot_mode_active:
+        _bot_post_mgr = _BotModePostManager(client, channel_id, anime_name, episode_num)
+        LOGGER.info(f"[AutoMonitor] Ep {episode_num}: BOT MODE active")
 
     # ──────────────────────────────────────────────────────
     #  STEP 1: Chrome se teeno links click karo (blocking)
@@ -532,6 +540,14 @@ async def _episode_quality_poller(
                                 update_post_sent[0] = True
                         except Exception as _ue:
                             LOGGER.error(f"[AutoMonitor] Update post error: {_ue}")
+                # ── Bot Mode: deep link lo aur post pe button add karo ──
+                if success and sent_msg and _bot_mode_active and _bot_post_mgr:
+                    try:
+                        _deep_link = await _get_suhani_bot_link(sent_msg)
+                        if _deep_link:
+                            await _bot_post_mgr.add_quality(quality, _deep_link)
+                    except Exception as _bme:
+                        LOGGER.error(f"[BotMode] add_quality (poll) error: {_bme}")
                 return success, sent_msg, quality
 
             poll_results = await asyncio.gather(
@@ -751,6 +767,15 @@ async def _episode_quality_poller(
                     except Exception as _ue:
                         LOGGER.error(f"[AutoMonitor] Update post error: {_ue}")
 
+            # ── Bot Mode: deep link lo aur post pe button add karo ──
+            if success and sent_msg and _bot_mode_active and _bot_post_mgr:
+                try:
+                    _deep_link = await _get_suhani_bot_link(sent_msg)
+                    if _deep_link:
+                        await _bot_post_mgr.add_quality(quality, _deep_link)
+                except Exception as _bme:
+                    LOGGER.error(f"[BotMode] add_quality (chrome) error: {_bme}")
+
             return success, sent_msg, quality
 
         results = await asyncio.gather(
@@ -933,6 +958,15 @@ async def _episode_quality_poller(
                             except Exception as _ue:
                                 LOGGER.error(f"[AutoMonitor] Update post retry error: {_ue}")
 
+                    # ── Bot Mode: deep link lo aur post pe button add karo ──
+                    if _bot_mode_active and _bot_post_mgr:
+                        try:
+                            _deep_link = await _get_suhani_bot_link(sent_msg_r)
+                            if _deep_link:
+                                await _bot_post_mgr.add_quality(quality_r, _deep_link)
+                        except Exception as _bme:
+                            LOGGER.error(f"[BotMode] add_quality (retry) error: {_bme}")
+
                 shutil.rmtree(retry_dl_dir, ignore_errors=True)
 
         # Retry loop khatam — final missing log
@@ -970,6 +1004,118 @@ async def _episode_quality_poller(
 
     LOGGER.info(f"[AutoMonitor] Ep {episode_num}: done in {elapsed_min}m — {uploaded_qualities}")
     return uploaded_count > 0
+
+
+# ─────────────────────────────────────────────
+#  Bot Mode Helpers
+# ─────────────────────────────────────────────
+
+async def _get_upload_mode_for_owner() -> str:
+    """Owner ka current upload mode return karo — 'file_mode' ya 'bot_mode'."""
+    try:
+        from .upload_mode_plugin import get_upload_mode
+        oid = await _owner_id()
+        if not oid:
+            return 'file_mode'
+        return await get_upload_mode(oid)
+    except Exception:
+        return 'file_mode'
+
+
+async def _get_suhani_bot_link(log_channel_msg) -> str | None:
+    """
+    Log channel pe upload hua message ka Suhani bot deep link banao.
+    Format: https://t.me/Get_Suhani_bot?start=<base64(chatid_msgid)>
+    """
+    if not log_channel_msg:
+        return None
+    try:
+        import base64
+        chat_id = log_channel_msg.chat.id
+        msg_id  = log_channel_msg.id
+        raw     = f"{chat_id}_{msg_id}".encode()
+        encoded = base64.urlsafe_b64encode(raw).decode().rstrip('=')
+        return f"https://t.me/Get_Suhani_bot?start={encoded}"
+    except Exception as _e:
+        LOGGER.warning(f"[BotMode] deep link error: {_e}")
+        return None
+
+
+class _BotModePostManager:
+    """
+    Ek episode ke liye channel pe ek post manage karo.
+    Pehli quality → nayi post. Agle quality → same post edit.
+    """
+
+    QUALITY_ORDER = ["360p", "480p", "720p", "1080p"]
+    QUALITY_EMOJI = {"360p": "🟢", "480p": "🟡", "720p": "🟢", "1080p": "🔴"}
+
+    def __init__(self, client, channel_id: int, anime_name: str, episode_num: int):
+        self.client      = client
+        self.channel_id  = channel_id
+        self.anime_name  = anime_name
+        self.episode_num = episode_num
+        self.post_msg_id: int | None = None
+        self._buttons: dict[str, str] = {}
+        self._lock       = asyncio.Lock()
+
+    def _build_keyboard(self) -> InlineKeyboardMarkup | None:
+        row = []
+        for q in self.QUALITY_ORDER:
+            if q in self._buttons:
+                emoji = self.QUALITY_EMOJI.get(q, "▶️")
+                row.append(InlineKeyboardButton(text=f"{emoji} {q} ↗", url=self._buttons[q]))
+        return InlineKeyboardMarkup([row]) if row else None
+
+    def _build_caption(self) -> str:
+        ep_str = f"Episode {self.episode_num:02d}" if self.episode_num else "Episode ??"
+        qualities_ready = [q for q in self.QUALITY_ORDER if q in self._buttons]
+        qual_str = " | ".join(qualities_ready) if qualities_ready else "Coming soon..."
+        return (
+            f"🎌 <b>{self.anime_name}</b>\n"
+            f"📺 <b>{ep_str}</b>\n\n"
+            f"✅ Available: <code>{qual_str}</code>"
+        )
+
+    async def add_quality(self, quality: str, deep_link_url: str):
+        """Quality ka button add/update karo — pehli baar post banao, baad mein edit."""
+        async with self._lock:
+            self._buttons[quality] = deep_link_url
+            keyboard = self._build_keyboard()
+            caption  = self._build_caption()
+
+            if self.post_msg_id is None:
+                try:
+                    sent = await self.client.send_message(
+                        chat_id=self.channel_id,
+                        text=caption,
+                        reply_markup=keyboard,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                    self.post_msg_id = sent.id
+                    LOGGER.info(
+                        f"[BotMode] Post created — {self.anime_name} Ep {self.episode_num} "
+                        f"msg_id={sent.id} quality={quality}"
+                    )
+                except Exception as e:
+                    LOGGER.error(f"[BotMode] Post create error: {e}")
+            else:
+                try:
+                    await self.client.edit_message_text(
+                        chat_id=self.channel_id,
+                        message_id=self.post_msg_id,
+                        text=caption,
+                        reply_markup=keyboard,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                    LOGGER.info(
+                        f"[BotMode] Post edited — {self.anime_name} Ep {self.episode_num} "
+                        f"msg_id={self.post_msg_id} added={quality}"
+                    )
+                except Exception as e:
+                    LOGGER.error(f"[BotMode] Post edit error: {e}")
 
 
 async def _forward_to_anime_channel(client: Client, sent_msg, channel_id: int, anime_name: str):
