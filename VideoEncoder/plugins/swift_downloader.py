@@ -611,7 +611,7 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
 #  Single file upload — returns sent Message object (for reorder)
 # ─────────────────────────────────────────────
 async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, encode: bool,
-                           on_half: asyncio.Event = None):
+                           on_half: asyncio.Event = None, skip_forward: bool = False):
     """
     Ek file upload karo.
     Returns: (success: bool, sent_message: Message | None, quality: str)
@@ -724,6 +724,7 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
                 uploader_client=uc,
                 progress=_progress_with_half,
                 progress_args=("📤 Uploading...", msg, c_time),
+                skip_forward=skip_forward,
             )
         finally:
             # Upload complete hone pe bhi event fire karo

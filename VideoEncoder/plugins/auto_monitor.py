@@ -228,13 +228,10 @@ async def _episode_quality_poller(
         async def reply_audio(self, audio, **kwargs):
             return await app.send_audio(chat_id=self.chat.id, audio=audio, **kwargs)
 
-    # Bot mode mein log channel pe upload karo (link milega),
-    # file_mode mein channel pe seedha upload
-    if _bot_mode_active:
-        from .. import log as _LOG_CHANNEL_ID
-        proxy_msg = _ProxyMsg(log_message, owner_id, _LOG_CHANNEL_ID)
-    else:
-        proxy_msg = _ProxyMsg(log_message, owner_id, channel_id)
+    # proxy_msg.chat.id = channel_id hamesha
+    # bot_mode mein skip_forward=True pass karenge _upload_one_file ko
+    # taaki file log channel pe rahe, channel pe forward na ho
+    proxy_msg = _ProxyMsg(log_message, owner_id, channel_id)
 
     # ── DL folder ──
     session_id = f"monitor_ep{episode_num}_{int(time.time())}"
@@ -522,6 +519,7 @@ async def _episode_quality_poller(
                 success, sent_msg, quality = await _upload_one_file(
                     client, proxy_msg, um, filepath, poll_dl_dir, encode=False,
                     on_half=_half_events_poll[idx],
+                    skip_forward=_bot_mode_active,
                 )
                 try:
                     await um.delete()
@@ -746,6 +744,7 @@ async def _episode_quality_poller(
             success, sent_msg, quality = await _upload_one_file(
                 client, proxy_msg, um, filepath, dl_dir, encode=False,
                 on_half=half_events[idx],
+                skip_forward=_bot_mode_active,
             )
             try:
                 await um.delete()
@@ -931,6 +930,7 @@ async def _episode_quality_poller(
                 success, sent_msg_r, quality_r = await _upload_one_file(
                     client, proxy_msg, retry_um, target_file, retry_dl_dir, encode=False,
                     on_half=retry_half_ev,
+                    skip_forward=_bot_mode_active,
                 )
                 try:
                     await retry_um.delete()
