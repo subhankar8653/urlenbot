@@ -1035,15 +1035,25 @@ async def _episode_quality_poller(
 # ─────────────────────────────────────────────
 
 async def _get_upload_mode_for_owner() -> str:
-    """Owner ka current upload mode return karo — 'file_mode' ya 'bot_mode'."""
+    """
+    Kisi bhi owner/sudo user ne 'bot_mode' set kiya hai to wahi use karo.
+    (owner[0] use karna unreliable hai — kyunki OWNER_ID multiple ids
+    ho sakta hai aur set() order guarantee nahi karta)
+    """
     try:
         from .upload_mode_plugin import get_upload_mode
-        oid = await _owner_id()
-        if not oid:
-            return 'file_mode'
-        return await get_upload_mode(oid)
+        from .. import owner as _OWNERS, sudo_users as _SUDOS
+        for _uid in list(_OWNERS) + list(_SUDOS):
+            try:
+                _mode = await get_upload_mode(_uid)
+                if _mode == 'bot_mode':
+                    return 'bot_mode'
+            except Exception:
+                continue
+        return 'file_mode'
     except Exception:
         return 'file_mode'
+
 
 
 async def _get_suhani_bot_link(log_channel_msg, timeout: int = 45) -> str | None:
