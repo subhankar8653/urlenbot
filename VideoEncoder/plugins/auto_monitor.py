@@ -35,6 +35,7 @@ import time
 
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.enums import ParseMode
 
 from .. import LOGGER, app, owner, sudo_users, download_dir
 from ..utils.database.access_db import db
@@ -1158,7 +1159,7 @@ class _BotModePostManager:
                         chat_id=self.channel_id,
                         text=caption,
                         reply_markup=keyboard,
-                        parse_mode="HTML",
+                        parse_mode=ParseMode.HTML,
                         disable_web_page_preview=True,
                     )
                     self.post_msg_id = sent.id
@@ -1175,7 +1176,7 @@ class _BotModePostManager:
                         message_id=self.post_msg_id,
                         text=caption,
                         reply_markup=keyboard,
-                        parse_mode="HTML",
+                        parse_mode=ParseMode.HTML,
                         disable_web_page_preview=True,
                     )
                     LOGGER.info(
