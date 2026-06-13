@@ -400,8 +400,7 @@ async def _episode_quality_poller(
     try:
         await status_msg.edit(
             f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
-            f"🌐 Chrome khul raha hai — links click ho rahe hain...\n"
-            f"🔗 `{swift_url}`"
+            f"🌐 Links fetch ho rahe hain..."
         )
     except Exception:
         pass
@@ -431,8 +430,9 @@ async def _episode_quality_poller(
         try:
             await status_msg.edit(
                 f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
-                f"⚠️ Chrome fail — Poll mode shuru\n"
-                f"🎯 Dhundh raha hoon: `{' | '.join(sorted(remaining))}`"
+                f"🔄 Poll `1` ⚡ Fast | Elapsed: `0m`\n"
+                f"🎯 Baki: `{' | '.join(sorted(TARGET_QUALITIES))}`\n"
+                f"⏳ Swift page scan ho raha hai..."
             )
         except Exception:
             pass
@@ -558,15 +558,18 @@ async def _episode_quality_poller(
                         _deep_link = await _get_suhani_bot_link(sent_msg)
                         if _deep_link:
                             LOGGER.info(f"[BotMode] Got link for {quality}: {_deep_link[:60]}")
-                            # Season extract karo (sirf 360p pe, tab post create hota hai)
+                            # Season + language extract karo (sirf 360p pe, tab post create hota hai)
                             _bm_season = None
+                            _bm_lang = None
                             if quality == "360p":
                                 try:
-                                    from ..utils.auto_caption import extract_anime_info as _eai2
+                                    from ..utils.auto_caption import extract_anime_info as _eai2, detect_language_from_filename as _dlf
                                     _, _bm_season, _ = _eai2(os.path.basename(filepath), {})
+                                    _langs = _dlf(os.path.basename(filepath))
+                                    _bm_lang = " + ".join(_langs) if _langs else "Hindi"
                                 except Exception:
                                     pass
-                            await _bot_post_mgr.add_quality(quality, _deep_link, season=_bm_season)
+                            await _bot_post_mgr.add_quality(quality, _deep_link, season=_bm_season, language=_bm_lang)
                         else:
                             LOGGER.warning(f"[BotMode] No link found for {quality} — skipping button")
                     except Exception as _bme:
@@ -799,13 +802,16 @@ async def _episode_quality_poller(
                     if _deep_link:
                         LOGGER.info(f"[BotMode] Got link for {quality}: {_deep_link[:60]}")
                         _bm_season = None
+                        _bm_lang = None
                         if quality == "360p":
                             try:
-                                from ..utils.auto_caption import extract_anime_info as _eai2
+                                from ..utils.auto_caption import extract_anime_info as _eai2, detect_language_from_filename as _dlf
                                 _, _bm_season, _ = _eai2(os.path.basename(filepath), {})
+                                _langs = _dlf(os.path.basename(filepath))
+                                _bm_lang = " + ".join(_langs) if _langs else "Hindi"
                             except Exception:
                                 pass
-                        await _bot_post_mgr.add_quality(quality, _deep_link, season=_bm_season)
+                        await _bot_post_mgr.add_quality(quality, _deep_link, season=_bm_season, language=_bm_lang)
                     else:
                         LOGGER.warning(f"[BotMode] No link found for {quality} — skipping button")
                 except Exception as _bme:
@@ -1002,13 +1008,16 @@ async def _episode_quality_poller(
                             if _deep_link:
                                 LOGGER.info(f"[BotMode] Got link for {quality_r}: {_deep_link[:60]}")
                                 _bm_season = None
+                                _bm_lang = None
                                 if quality_r == "360p":
                                     try:
-                                        from ..utils.auto_caption import extract_anime_info as _eai2
+                                        from ..utils.auto_caption import extract_anime_info as _eai2, detect_language_from_filename as _dlf
                                         _, _bm_season, _ = _eai2(os.path.basename(target_file), {})
+                                        _langs = _dlf(os.path.basename(target_file))
+                                        _bm_lang = " + ".join(_langs) if _langs else "Hindi"
                                     except Exception:
                                         pass
-                                await _bot_post_mgr.add_quality(quality_r, _deep_link, season=_bm_season)
+                                await _bot_post_mgr.add_quality(quality_r, _deep_link, season=_bm_season, language=_bm_lang)
                             else:
                                 LOGGER.warning(f"[BotMode] No link found for {quality_r} — skipping button")
                         except Exception as _bme:
@@ -1155,16 +1164,18 @@ class _BotModePostManager:
         self.channel_id  = channel_id
         self.anime_name  = anime_name
         self.episode_num = episode_num
-        self.season_num: int | None = None   # add_quality(season=...) se set hoga
+        self.season_num: int | None = None    # add_quality(season=...) se set hoga
+        self.language_str: str = "Hindi"      # add_quality(language=...) se set hoga
         self.post_msg_id: int | None = None
-        self._buttons: dict[str, str] = {}   # quality → deep_link_url (ready ones)
+        self._buttons: dict[str, str] = {}    # quality → deep_link_url (ready ones)
         self._lock       = asyncio.Lock()
 
     # ── Caption ──────────────────────────────────────────────────────────
     def _build_caption(self) -> str:
         s = f"{self.season_num:02d}" if self.season_num else "01"
         e = f"{self.episode_num:02d}" if self.episode_num else "??"
-        return f"➲ Season {s} Episode {e}"
+        lang = self.language_str or "Hindi"
+        return f"<b>➲ Season {s} Episode {e} {lang}</b>"
 
     # ── Keyboard ─────────────────────────────────────────────────────────
     def _build_keyboard(self) -> InlineKeyboardMarkup | None:
@@ -1200,11 +1211,13 @@ class _BotModePostManager:
         return InlineKeyboardMarkup([row]) if row else None
 
     # ── Add quality ───────────────────────────────────────────────────────
-    async def add_quality(self, quality: str, deep_link_url: str, season: int | None = None):
+    async def add_quality(self, quality: str, deep_link_url: str, season: int | None = None, language: str | None = None):
         """Quality ka button add/update karo — pehli baar post banao, baad mein edit."""
         async with self._lock:
             if season is not None:
                 self.season_num = season
+            if language is not None:
+                self.language_str = language
 
             self._buttons[quality] = deep_link_url
             keyboard = self._build_keyboard()
