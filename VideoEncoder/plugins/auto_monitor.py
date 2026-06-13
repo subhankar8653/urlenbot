@@ -228,10 +228,13 @@ async def _episode_quality_poller(
         async def reply_audio(self, audio, **kwargs):
             return await app.send_audio(chat_id=self.chat.id, audio=audio, **kwargs)
 
-    # proxy_msg.chat.id = channel_id hamesha
-    # bot_mode mein skip_forward=True pass karenge _upload_one_file ko
-    # taaki file log channel pe rahe, channel pe forward na ho
-    proxy_msg = _ProxyMsg(log_message, owner_id, channel_id)
+    # bot_mode: proxy_msg.chat.id = LOG_CHANNEL (file wahan upload hogi)
+    # file_mode: proxy_msg.chat.id = channel_id (seedha channel pe)
+    if _bot_mode_active:
+        from .. import log as _LOG_CH
+        proxy_msg = _ProxyMsg(log_message, owner_id, _LOG_CH)
+    else:
+        proxy_msg = _ProxyMsg(log_message, owner_id, channel_id)
 
     # ── DL folder ──
     session_id = f"monitor_ep{episode_num}_{int(time.time())}"
