@@ -1030,19 +1030,46 @@ async def _get_upload_mode_for_owner() -> str:
         return 'file_mode'
 
 
-async def _get_suhani_bot_link(log_channel_msg) -> str | None:
+async def _get_suhani_bot_link(log_channel_msg, timeout: int = 30) -> str | None:
     """
-    Log channel pe upload hua message ka link return karo.
-    sent_msg.link = Telegram message link (t.me/c/... ya t.me/...)
-    Yeh wahi link hai jo log channel pe already ban raha hai.
+    Log channel pe upload ke baad dusra bot 'Link Ready!' message bhejta hai.
+    Us message se https://t.me/Get_Suhani_bot?start=... URL uthao.
+
+    log_channel_msg = woh message jo log channel pe upload hua (sent_msg)
+    timeout = kitne seconds tak wait karo (default 30s)
     """
     if not log_channel_msg:
         return None
-    try:
-        return log_channel_msg.link
-    except Exception as _e:
-        LOGGER.warning(f"[BotMode] link error: {_e}")
-        return None
+
+    from .. import log as _LOG_CHANNEL_ID
+    import re as _re
+
+    uploaded_msg_id = log_channel_msg.id
+    # Link Ready message uploaded message ke BAAD aayega
+    # 30s tak har 2s pe check karo
+
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            # Log channel ke recent messages scan karo
+            async for msg in app.get_chat_history(_LOG_CHANNEL_ID, limit=10):
+                # Sirf uploaded message ke baad wale messages dekho
+                if msg.id <= uploaded_msg_id:
+                    break
+                # "Link Ready" text check karo
+                text = msg.text or msg.caption or ""
+                if "Link Ready" in text or "t.me/Get_Suhani_bot" in text:
+                    # URL extract karo
+                    m = _re.search(r'https://t\.me/Get_Suhani_bot\?start=\S+', text)
+                    if m:
+                        LOGGER.info(f"[BotMode] Link Ready URL found: {m.group(0)[:60]}")
+                        return m.group(0)
+        except Exception as _e:
+            LOGGER.warning(f"[BotMode] link poll error: {_e}")
+        await asyncio.sleep(2)
+
+    LOGGER.warning(f"[BotMode] Link Ready timeout for msg_id={uploaded_msg_id}")
+    return None
 
 
 class _BotModePostManager:
