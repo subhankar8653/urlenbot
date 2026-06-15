@@ -549,3 +549,19 @@ class Database:
             {'$set': {'auto_channels': []}},
             upsert=True,
         )
+
+    # ── Episode post tracking (multi-run quality upload support) ──────────────
+    async def get_ep_post(self, key: str) -> dict:
+        """DB se episode post data lo (msg_id + buttons)."""
+        doc = await self.col.find_one({'_ep_post_key': key})
+        if doc:
+            return {'msg_id': doc.get('msg_id'), 'buttons': doc.get('buttons', {})}
+        return {}
+
+    async def set_ep_post(self, key: str, data: dict):
+        """Episode post data save karo."""
+        await self.col.update_one(
+            {'_ep_post_key': key},
+            {'$set': {'_ep_post_key': key, 'msg_id': data.get('msg_id'), 'buttons': data.get('buttons', {})}},
+            upsert=True,
+        )
