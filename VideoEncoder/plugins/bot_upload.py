@@ -18,7 +18,9 @@ Commands:
 
 import asyncio
 import os
+import random
 import re
+import string
 
 import aiohttp
 from pyrogram import Client, filters
@@ -29,12 +31,16 @@ from .. import LOGGER, app
 from ..utils.database.access_db import db
 from ..utils.helper import check_chat, output
 
-
+OMDB_API_KEY = os.getenv("OMDB_API_KEY", "")
 
 # ─── In-memory sessions ────────────────────────────────────────────────────
 _border_session: set = set()        # user_ids currently in /border setup mode
 _season_session: set = set()        # user_ids currently in /season_sticker setup mode
 _text_template_session: dict = {}   # { user_id: "end" }  (set_end inline-prompt mode)
+
+# How many times to send the "Join This Channel" decorative message
+JOIN_REPEAT_TEXT = "📌⚡️ 𝕁𝕠𝕚𝕟 𝕋𝕙𝕚𝕤 ℂ𝕙𝕒𝕟𝕟𝕖𝕝 ⚡️📌"
+JOIN_REPEAT_COUNT = 400
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -208,37 +214,31 @@ async def done_cmd(bot: Client, message: Message):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-#  IMDB info fetch (imdbapi.dev — no API key needed)
+#  IMDB info fetch (OMDB API)
 # ─────────────────────────────────────────────────────────────────────────
 async def _fetch_imdb_info(anime_name: str) -> dict | None:
-    """imdbapi.dev se info fetch karo. No API key required."""
+    """OMDB API se basic info fetch karo. Returns None agar key missing/fail."""
+    if not OMDB_API_KEY:
+        return None
     try:
-        import urllib.parse
-        query = urllib.parse.quote(anime_name)
-        url = f"https://api.imdbapi.dev/titles?query={query}&limit=1"
         async with aiohttp.ClientSession() as sess:
+            url = f"https://www.omdbapi.com/?apikey={OMDB_API_KEY}&t={anime_name}"
             async with sess.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 data = await resp.json()
     except Exception as e:
         LOGGER.error(f"[bot_upload] IMDB fetch failed: {e}")
         return None
 
-    titles = data.get("titles", [])
-    if not titles:
+    if data.get("Response") != "True":
         return None
 
-    t = titles[0]
-    genres = t.get("genres", [])
-    rating = t.get("rating", {})
-    poster = t.get("primaryImage", {}).get("url", "")
-
     return {
-        "title": t.get("primaryTitle", anime_name),
-        "year": str(t.get("startYear", "N/A")),
-        "genre": ", ".join(genres) if genres else "N/A",
-        "plot": t.get("plot", ""),
-        "rating": str(rating.get("aggregateRating", "N/A")),
-        "poster": poster,
+        "title": data.get("Title", anime_name),
+        "year": data.get("Year", "N/A"),
+        "genre": data.get("Genre", "N/A"),
+        "plot": data.get("Plot", ""),
+        "rating": data.get("imdbRating", "N/A"),
+        "poster": data.get("Poster", ""),
     }
 
 
@@ -308,7 +308,32 @@ async def bot_upload_cmd(bot: Client, message: Message):
 
     status = await message.reply(f"<b>🚀 /bot_upload started</b>\nChannel: <code>{channel_id}</code>\nAnime: <b>{anime_name}</b> | Season {season_no}")
 
-    # ── Step 1: IMDB info ──
+    # ── Step 1: "Join This Channel" message, sent JOIN_REPEAT_COUNT times ──
+    # Batches of 100 sent concurrently, then a short pause between batches.
+    await status.edit(f"<b>📌 'Join This Channel' bhej raha hoon ({JOIN_REPEAT_COUNT}x)...</b>")
+    BATCH_SIZE = 100
+    BATCH_GAP = 3  # seconds between batches
+
+    async def _send_join_msg():
+        while True:
+            try:
+                await app.send_message(channel_id, JOIN_REPEAT_TEXT)
+                return
+            except FloodWait as fw:
+                await asyncio.sleep(fw.value)
+            except Exception:
+                return
+
+    sent_count = 0
+    while sent_count < JOIN_REPEAT_COUNT:
+        batch_n = min(BATCH_SIZE, JOIN_REPEAT_COUNT - sent_count)
+        await asyncio.gather(*[_send_join_msg() for _ in range(batch_n)])
+        sent_count += batch_n
+        await status.edit(f"<b>📌 'Join This Channel'</b> — {sent_count}/{JOIN_REPEAT_COUNT} sent...")
+        if sent_count < JOIN_REPEAT_COUNT:
+            await asyncio.sleep(BATCH_GAP)
+
+    # ── Step 2: IMDB info ──
     info = await _fetch_imdb_info(anime_name)
     try:
         if info:
@@ -395,13 +420,17 @@ async def bot_upload_cmd(bot: Client, message: Message):
                     await post_mgr.add_quality(quality, link)
                     batch_msg_ids[quality].append(sent_msg.id)
 
-    # ── /url <link> -e  (3-pass: 480p all eps -> 720p all eps -> 1080p all eps) ──
+    # ── /url <link> -e [unique_code]  ──
+    # unique_code optional hai — diya toh existing episode messages edit honge
     elif source_part.lower().startswith("/url"):
-        m = re.match(r"^/url\s+(\S+)", source_part, re.IGNORECASE)
+        # Parse: /url <link> -e [code]
+        m = re.match(r"^/url\s+(\S+)(?:\s+-e)?(?:\s+(SB_[A-Za-z0-9]+))?", source_part, re.IGNORECASE)
         if not m:
             await status.edit("❌ <code>/url</code> source format galat hai.")
             return
         url = m.group(1)
+        resume_code = m.group(2)  # None agar naya run hai
+
         direct = direct_link_generator(url)
         if direct:
             url = direct
@@ -430,6 +459,14 @@ async def bot_upload_cmd(bot: Client, message: Message):
         post_managers: dict = {}
         from .. import download_dir as DL_DIR
 
+        # Unique session code — naya ya resume
+        if resume_code:
+            session_code = resume_code
+            await status.edit(f"<b>🔄 Resume mode: <code>{session_code}</code></b>\nPurane episode messages pe quality add hogi...")
+        else:
+            rand = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
+            session_code = f"SB_{rand}"
+
         for quality in ["360p", "480p", "720p", "1080p"]:
             for ep_num in episodes_sorted:
                 fp = ep_files.get(ep_num, {}).get(quality)
@@ -443,12 +480,30 @@ async def bot_upload_cmd(bot: Client, message: Message):
                     continue
 
                 if ep_num not in post_managers:
-                    post_managers[ep_num] = EpisodePostManager(app, channel_id, anime_name, ep_num, season_no)
+                    # session_code + ep_num = unique DB key
+                    post_managers[ep_num] = EpisodePostManager(
+                        app, channel_id, anime_name, ep_num, season_no,
+                        session_code=session_code
+                    )
 
                 link = await _get_suhani_bot_link(sent_msg)
                 if link:
                     await post_managers[ep_num].add_quality(quality, link)
                     batch_msg_ids[quality].append(sent_msg.id)
+
+        # Upload complete — user ko DM mein session code bhejo
+        try:
+            await app.send_message(
+                message.from_user.id,
+                f"✅ <b>Upload complete!</b>\n\n"
+                f"📦 <b>Session Code:</b> <code>{session_code}</code>\n\n"
+                f"720p/1080p add karne ke liye yeh command use karo:\n"
+                f"<code>/bot_upload {channel_id} {anime_name} | {season_no} | /url &lt;720p_link&gt; -e {session_code}</code>",
+                parse_mode="html",
+            )
+        except Exception as e:
+            LOGGER.warning(f"[bot_upload] DM send failed: {e}")
+            await status.edit(f"✅ Done! Session Code: <code>{session_code}</code>")
 
     else:
         await status.edit("❌ Source spec samajh nahi aaya. <code>/rti</code> ya <code>/url ... -e</code> use karo.")
