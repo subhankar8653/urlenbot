@@ -140,7 +140,7 @@ async def url_upload_cmd(bot: Client, message: Message):
             }
             await _show_url_options(msg, user_id, filepath)
         else:
-            # Auto mode: SAARI files process + upload karo
+            # Auto mode: SAARI files process + upload karo (urlpreset settings apply hongi)
             await msg.edit(f"<b>📦 Extracted {total} files! Processing...</b>")
             user_id = message.from_user.id
             for idx, fp in enumerate(all_files, 1):
@@ -152,7 +152,9 @@ async def url_upload_cmd(bot: Client, message: Message):
                     "msg": status_msg,
                     "orig_name": os.path.basename(fp),
                     "message": message,
+                    "has_eng_sub": False,
                 }
+                # urlpreset ki saari settings apply hongi _auto_process_and_upload mein
                 await _auto_process_and_upload(bot, user_id, status_msg, message)
             await msg.delete()
         return
