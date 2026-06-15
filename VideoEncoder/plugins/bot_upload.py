@@ -1,17 +1,19 @@
 """
-bot_upload.py — Phase 1
-========================
-Global config commands + /bot_upload skeleton (intro → IMDB → border/season sticker).
+bot_upload.py
+==============
+Global config commands + /bot_upload pipeline.
 
 Commands:
-  /set_intro <template>   — Intro message template (placeholders: {anime_name}, {season})
   /set_end <template>     — End message template (placeholders: {anime_name}, {season},
                              {q480}, {q720}, {q1080})
   /border                 — Start border-sticker setup. Send sticker, then /done
   /season_sticker         — Start/continue season-sticker collection. Send sticker
                              per season in order, then /done
-  /bot_upload <channel_id> <anime_name> | <season_no>
-                           — Phase 1: sends intro → IMDB info → border + season sticker
+  /bot_upload <channel_id> <anime_name> | <season_no> | <source>
+                           — Full pipeline: "Join This Channel" x400 → IMDB info →
+                             episode upload (RTI/url -e) → batch links →
+                             border → batch summary → /set_end → next season sticker →
+                             default auto-upload end messages.
 """
 
 import asyncio
@@ -32,68 +34,18 @@ OMDB_API_KEY = os.getenv("OMDB_API_KEY", "")
 _border_session: set = set()        # user_ids currently in /border setup mode
 _season_session: set = set()        # user_ids currently in /season_sticker setup mode
 _text_template_session: dict = {}   # { user_id: "end" }  (set_end inline-prompt mode)
-_intro_collect_session: dict = {}   # { user_id: [line1, line2, ...] }  /set_intro multi-msg collection
+
+# How many times to send the "Join This Channel" decorative message
+JOIN_REPEAT_TEXT = "📌⚡️ 𝕁𝕠𝕚𝕟 𝕋𝕙𝕚𝕤 ℂ𝕙𝕒𝕟𝕟𝕖𝕝 ⚡️📌"
+JOIN_REPEAT_COUNT = 400
 
 
 # ─────────────────────────────────────────────────────────────────────────
 #  /set_intro & /set_end
 # ─────────────────────────────────────────────────────────────────────────
-@Client.on_message(filters.command("set_intro"))
-async def set_intro_cmd(bot: Client, message: Message):
-    c = await check_chat(message, chat="Both")
-    if not c:
-        return
-
-    args = message.text.split(None, 1)
-    if len(args) > 1 and args[1].strip():
-        await db.set_intro_template(message.from_user.id, args[1].strip())
-        await message.reply(
-            "✅ <b>Intro template saved!</b>\n\nUse /bot_upload se test karo.",
-            reply_markup=output,
-        )
-        return
-
-    _intro_collect_session[message.from_user.id] = []
-    await message.reply(
-        "<b>✏️ Intro template collection mode ON!</b>\n\n"
-        "Ab apne saare messages ek-ek karke bhejo (jitne chahiye, e.g. 300 dot/lines).\n"
-        "Sab combine ho jayenge (naye line se separated).\n\n"
-        "Placeholders use kar sakte ho:\n"
-        "<code>{anime_name}</code> — Anime ka naam\n"
-        "<code>{season}</code> — Season number\n\n"
-        "Khatam karne ke liye <code>/complete</code> bhejo.\n"
-        "<i>Cancel karne ke liye <code>/cancel</code> bhejo.</i>",
-    )
-
-
-@Client.on_message(filters.command("complete"))
-async def complete_cmd(bot: Client, message: Message):
-    user_id = message.from_user.id
-    if user_id not in _intro_collect_session:
-        await message.reply("ℹ️ Koi active /set_intro collection nahi chal raha.")
-        return
-
-    lines = _intro_collect_session.pop(user_id)
-    if not lines:
-        await message.reply("⚠️ Koi message collect nahi hua. Template save nahi hua.")
-        return
-
-    template = "\n".join(lines)
-    await db.set_intro_template(user_id, template)
-    await message.reply(
-        f"✅ <b>Intro template saved!</b> ({len(lines)} lines)\n\nUse /bot_upload se test karo.",
-        reply_markup=output,
-    )
-
-
-@Client.on_message(filters.command("cancel"))
-async def cancel_collect_cmd(bot: Client, message: Message):
-    user_id = message.from_user.id
-    if user_id in _intro_collect_session:
-        _intro_collect_session.pop(user_id, None)
-        await message.reply("❌ Intro collection cancelled.")
-    else:
-        await message.reply("ℹ️ Koi active collection nahi chal raha.")
+#  (set_intro removed — /bot_upload now sends a fixed "Join This Channel"
+#   sticker-style text message JOIN_REPEAT_COUNT times instead of a template)
+# ─────────────────────────────────────────────────────────────────────────
 
 
 @Client.on_message(filters.command("set_end"))
@@ -123,16 +75,11 @@ async def set_end_cmd(bot: Client, message: Message):
 
 
 @Client.on_message(filters.text & filters.private & ~filters.command([
-    "set_intro", "set_end", "border", "season_sticker", "done", "bot_upload", "complete", "cancel"
+    "set_end", "border", "season_sticker", "done", "bot_upload"
 ]), group=4)
 async def template_text_input(bot: Client, message: Message):
-    """Catches messages for intro multi-collection or the /set_end inline prompt."""
+    """Catches the next text message after the /set_end inline prompt."""
     user_id = message.from_user.id
-
-    # Intro multi-message collection mode
-    if user_id in _intro_collect_session:
-        _intro_collect_session[user_id].append(message.text)
-        return
 
     kind = _text_template_session.get(user_id)
     if not kind:
@@ -358,41 +305,17 @@ async def bot_upload_cmd(bot: Client, message: Message):
 
     status = await message.reply(f"<b>🚀 /bot_upload started</b>\nChannel: <code>{channel_id}</code>\nAnime: <b>{anime_name}</b> | Season {season_no}")
 
-    # ── Step 1: Intro message(s) ──
-    intro_template = await db.get_intro_template(user_id)
-    if intro_template:
-        intro_text = intro_template.format(anime_name=anime_name, season=season_no)
-        TELEGRAM_MSG_LIMIT = 4096
-        lines = intro_text.split("\n")
-        chunks = []
-        current = ""
-        for line in lines:
-            candidate = (current + "\n" + line) if current else line
-            if len(candidate) > TELEGRAM_MSG_LIMIT:
-                if current:
-                    chunks.append(current)
-                # agar single line bhi limit se bada hai, force-split karo
-                while len(line) > TELEGRAM_MSG_LIMIT:
-                    chunks.append(line[:TELEGRAM_MSG_LIMIT])
-                    line = line[TELEGRAM_MSG_LIMIT:]
-                current = line
-            else:
-                current = candidate
-        if current:
-            chunks.append(current)
-
-        try:
-            for chunk in chunks:
-                await app.send_message(channel_id, chunk)
-                await asyncio.sleep(0.5)  # flood-wait se bachne ke liye
-        except Exception as e:
-            await status.edit(f"❌ Intro msg fail ho gaya: <code>{e}</code>")
-            return
-    else:
-        await status.edit(
-            "⚠️ Intro template set nahi hai. <code>/set_intro</code> use karo.\n"
-            "Skip kar raha hoon..."
-        )
+    # ── Step 1: "Join This Channel" message, sent JOIN_REPEAT_COUNT times ──
+    await status.edit(f"<b>📌 'Join This Channel' bhej raha hoon ({JOIN_REPEAT_COUNT}x)...</b>")
+    try:
+        for i in range(JOIN_REPEAT_COUNT):
+            await app.send_message(channel_id, JOIN_REPEAT_TEXT)
+            await asyncio.sleep(0.4)  # flood-wait se bachne ke liye
+            if (i + 1) % 50 == 0:
+                await status.edit(f"<b>📌 'Join This Channel'</b> — {i + 1}/{JOIN_REPEAT_COUNT} sent...")
+    except Exception as e:
+        await status.edit(f"❌ 'Join This Channel' msgs fail ho gaye: <code>{e}</code>")
+        return
 
     # ── Step 2: IMDB info ──
     info = await _fetch_imdb_info(anime_name)
@@ -540,20 +463,18 @@ async def bot_upload_cmd(bot: Client, message: Message):
         await status.edit("❌ Source spec samajh nahi aaya. <code>/rti</code> ya <code>/url ... -e</code> use karo.")
         return
 
-    # ── Batch links per quality ──
+    # ── Batch links per quality (with gap between each to avoid bot collision) ──
     await status.edit("<b>📦 Batch links banaye ja rahe hain...</b>")
     batch_links: dict = {}
     for quality, ids in batch_msg_ids.items():
         if ids:
+            await status.edit(f"<b>📦 Batch creating: {quality}</b> ({len(ids)} files)...")
             link = await create_batch_link(app, ids)
             if link:
                 batch_links[quality] = link
+            await asyncio.sleep(8)  # gap between batches — avoids overlap/glitches
 
     from ..utils.bot_upload_engine import send_batch_summary_post
-
-    # ── Final summary post to channel: "Season XX Full Batch Hindi" + quality buttons ──
-    if batch_links:
-        await send_batch_summary_post(app, channel_id, season_no, batch_links)
 
     # ── Border sticker ──
     border = await db.get_bot_border(user_id)
@@ -566,9 +487,33 @@ async def bot_upload_cmd(bot: Client, message: Message):
         except Exception as e:
             LOGGER.error(f"[bot_upload] Border send (end) failed: {e}")
 
-    # ── End message ──
+    # ── Final summary post to channel: "Season XX Full Batch Hindi" + quality buttons ──
+    if batch_links:
+        await send_batch_summary_post(app, channel_id, season_no, batch_links)
+
+    # ── /set_end template ──
     end_template = await db.get_end_template(user_id)
     await send_end_message(app, channel_id, end_template, anime_name, season_no, batch_links)
+
+    # ── Next season's sticker ──
+    season_stickers = await db.get_season_stickers(user_id)
+    next_season = season_no + 1
+    if 1 <= next_season <= len(season_stickers):
+        sticker = season_stickers[next_season - 1]
+        try:
+            if sticker["type"] == "sticker":
+                await app.send_sticker(channel_id, sticker["file_id"])
+            else:
+                await app.send_photo(channel_id, sticker["file_id"])
+        except Exception as e:
+            LOGGER.error(f"[bot_upload] Next season sticker send failed: {e}")
+
+    # ── Default auto-upload end message(s) ──
+    try:
+        from .schedule_notify import _send_end_messages_to_channel
+        await _send_end_messages_to_channel(channel_id)
+    except Exception as e:
+        LOGGER.error(f"[bot_upload] Default end messages send failed: {e}")
 
     summary = "\n".join(f"• {q}: {l}" for q, l in batch_links.items()) or "—"
     await status.edit(
