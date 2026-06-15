@@ -29,16 +29,12 @@ from .. import LOGGER, app
 from ..utils.database.access_db import db
 from ..utils.helper import check_chat, output
 
-OMDB_API_KEY = os.getenv("OMDB_API_KEY", "")
+
 
 # ─── In-memory sessions ────────────────────────────────────────────────────
 _border_session: set = set()        # user_ids currently in /border setup mode
 _season_session: set = set()        # user_ids currently in /season_sticker setup mode
 _text_template_session: dict = {}   # { user_id: "end" }  (set_end inline-prompt mode)
-
-# How many times to send the "Join This Channel" decorative message
-JOIN_REPEAT_TEXT = "📌⚡️ 𝕁𝕠𝕚𝕟 𝕋𝕙𝕚𝕤 ℂ𝕙𝕒𝕟𝕟𝕖𝕝 ⚡️📌"
-JOIN_REPEAT_COUNT = 300
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -212,31 +208,37 @@ async def done_cmd(bot: Client, message: Message):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-#  IMDB info fetch (OMDB API)
+#  IMDB info fetch (imdbapi.dev — no API key needed)
 # ─────────────────────────────────────────────────────────────────────────
 async def _fetch_imdb_info(anime_name: str) -> dict | None:
-    """OMDB API se basic info fetch karo. Returns None agar key missing/fail."""
-    if not OMDB_API_KEY:
-        return None
+    """imdbapi.dev se info fetch karo. No API key required."""
     try:
+        import urllib.parse
+        query = urllib.parse.quote(anime_name)
+        url = f"https://api.imdbapi.dev/titles?query={query}&limit=1"
         async with aiohttp.ClientSession() as sess:
-            url = f"https://www.omdbapi.com/?apikey={OMDB_API_KEY}&t={anime_name}"
             async with sess.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 data = await resp.json()
     except Exception as e:
         LOGGER.error(f"[bot_upload] IMDB fetch failed: {e}")
         return None
 
-    if data.get("Response") != "True":
+    titles = data.get("titles", [])
+    if not titles:
         return None
 
+    t = titles[0]
+    genres = t.get("genres", [])
+    rating = t.get("rating", {})
+    poster = t.get("primaryImage", {}).get("url", "")
+
     return {
-        "title": data.get("Title", anime_name),
-        "year": data.get("Year", "N/A"),
-        "genre": data.get("Genre", "N/A"),
-        "plot": data.get("Plot", ""),
-        "rating": data.get("imdbRating", "N/A"),
-        "poster": data.get("Poster", ""),
+        "title": t.get("primaryTitle", anime_name),
+        "year": str(t.get("startYear", "N/A")),
+        "genre": ", ".join(genres) if genres else "N/A",
+        "plot": t.get("plot", ""),
+        "rating": str(rating.get("aggregateRating", "N/A")),
+        "poster": poster,
     }
 
 
@@ -306,26 +308,7 @@ async def bot_upload_cmd(bot: Client, message: Message):
 
     status = await message.reply(f"<b>🚀 /bot_upload started</b>\nChannel: <code>{channel_id}</code>\nAnime: <b>{anime_name}</b> | Season {season_no}")
 
-    # ── Step 1: "Join This Channel" message, sent JOIN_REPEAT_COUNT times ──
-    # 0.3s gap = ~90 sec total for 300 msgs, no FloodWait triggers.
-    await status.edit(f"<b>📌 'Join This Channel' bhej raha hoon ({JOIN_REPEAT_COUNT}x)...</b>")
-
-    sent_count = 0
-    while sent_count < JOIN_REPEAT_COUNT:
-        try:
-            await app.send_message(channel_id, JOIN_REPEAT_TEXT)
-            sent_count += 1
-            if sent_count % 30 == 0:
-                await status.edit(f"<b>📌 'Join This Channel'</b> — {sent_count}/{JOIN_REPEAT_COUNT} sent...")
-            await asyncio.sleep(0.3)  # 300ms gap — FloodWait nahi aayega
-        except FloodWait as fw:
-            LOGGER.warning(f"[bot_upload] FloodWait {fw.value}s at {sent_count}/{JOIN_REPEAT_COUNT}")
-            await asyncio.sleep(fw.value)
-        except Exception as e:
-            LOGGER.error(f"[bot_upload] Join msg failed at {sent_count}: {e}")
-            sent_count += 1  # skip and continue
-
-    # ── Step 2: IMDB info ──
+    # ── Step 1: IMDB info ──
     info = await _fetch_imdb_info(anime_name)
     try:
         if info:
