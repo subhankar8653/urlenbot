@@ -30,7 +30,8 @@ OMDB_API_KEY = os.getenv("OMDB_API_KEY", "")
 # ─── In-memory sessions ────────────────────────────────────────────────────
 _border_session: set = set()        # user_ids currently in /border setup mode
 _season_session: set = set()        # user_ids currently in /season_sticker setup mode
-_text_template_session: dict = {}   # { user_id: "intro" | "end" }
+_text_template_session: dict = {}   # { user_id: "end" }  (set_end inline-prompt mode)
+_intro_collect_session: dict = {}   # { user_id: [line1, line2, ...] }  /set_intro multi-msg collection
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -51,14 +52,47 @@ async def set_intro_cmd(bot: Client, message: Message):
         )
         return
 
-    _text_template_session[message.from_user.id] = "intro"
+    _intro_collect_session[message.from_user.id] = []
     await message.reply(
-        "<b>✏️ Intro template bhejo:</b>\n\n"
+        "<b>✏️ Intro template collection mode ON!</b>\n\n"
+        "Ab apne saare messages ek-ek karke bhejo (jitne chahiye, e.g. 300 dot/lines).\n"
+        "Sab combine ho jayenge (naye line se separated).\n\n"
         "Placeholders use kar sakte ho:\n"
         "<code>{anime_name}</code> — Anime ka naam\n"
         "<code>{season}</code> — Season number\n\n"
-        "<i>Send <code>-</code> to cancel.</i>",
+        "Khatam karne ke liye <code>/complete</code> bhejo.\n"
+        "<i>Cancel karne ke liye <code>/cancel</code> bhejo.</i>",
     )
+
+
+@Client.on_message(filters.command("complete"))
+async def complete_cmd(bot: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in _intro_collect_session:
+        await message.reply("ℹ️ Koi active /set_intro collection nahi chal raha.")
+        return
+
+    lines = _intro_collect_session.pop(user_id)
+    if not lines:
+        await message.reply("⚠️ Koi message collect nahi hua. Template save nahi hua.")
+        return
+
+    template = "\n".join(lines)
+    await db.set_intro_template(user_id, template)
+    await message.reply(
+        f"✅ <b>Intro template saved!</b> ({len(lines)} lines)\n\nUse /bot_upload se test karo.",
+        reply_markup=output,
+    )
+
+
+@Client.on_message(filters.command("cancel"))
+async def cancel_collect_cmd(bot: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id in _intro_collect_session:
+        _intro_collect_session.pop(user_id, None)
+        await message.reply("❌ Intro collection cancelled.")
+    else:
+        await message.reply("ℹ️ Koi active collection nahi chal raha.")
 
 
 @Client.on_message(filters.command("set_end"))
@@ -88,11 +122,17 @@ async def set_end_cmd(bot: Client, message: Message):
 
 
 @Client.on_message(filters.text & filters.private & ~filters.command([
-    "set_intro", "set_end", "border", "season_sticker", "done", "bot_upload"
+    "set_intro", "set_end", "border", "season_sticker", "done", "bot_upload", "complete", "cancel"
 ]), group=4)
 async def template_text_input(bot: Client, message: Message):
-    """Catches the next text message after /set_intro or /set_end (no inline arg)."""
+    """Catches messages for intro multi-collection or the /set_end inline prompt."""
     user_id = message.from_user.id
+
+    # Intro multi-message collection mode
+    if user_id in _intro_collect_session:
+        _intro_collect_session[user_id].append(message.text)
+        return
+
     kind = _text_template_session.get(user_id)
     if not kind:
         return  # not our business
@@ -104,12 +144,8 @@ async def template_text_input(bot: Client, message: Message):
         return
 
     _text_template_session.pop(user_id, None)
-    if kind == "intro":
-        await db.set_intro_template(user_id, text)
-        await message.reply("✅ <b>Intro template saved!</b>", reply_markup=output)
-    else:
-        await db.set_end_template(user_id, text)
-        await message.reply("✅ <b>End template saved!</b>", reply_markup=output)
+    await db.set_end_template(user_id, text)
+    await message.reply("✅ <b>End template saved!</b>", reply_markup=output)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -399,7 +435,7 @@ async def bot_upload_cmd(bot: Client, message: Message):
     from ..plugins.url_upload import _download_url, _extract_archive_all, _safe_filename
     from ..utils.direct_link_generator import direct_link_generator
 
-    batch_msg_ids: dict = {"480p": [], "720p": [], "1080p": []}
+    batch_msg_ids: dict = {"360p": [], "480p": [], "720p": [], "1080p": []}
 
     # ── /rti <url> <start>-<end>  (or "<start> <end>") ──
     rti_match = re.match(r"^/rti\s+(\S+)\s+(\d+)\s*[-\s]\s*(\d+)", source_part, re.IGNORECASE)
@@ -414,7 +450,7 @@ async def bot_upload_cmd(bot: Client, message: Message):
                 continue
 
             post_mgr = EpisodePostManager(app, channel_id, anime_name, ep_num, season_no)
-            for quality in ["480p", "720p", "1080p"]:
+            for quality in ["360p", "480p", "720p", "1080p"]:
                 sent_msg = uploaded.get(quality)
                 if not sent_msg:
                     continue
@@ -450,7 +486,7 @@ async def bot_upload_cmd(bot: Client, message: Message):
         for fp in all_files:
             ep = episode_from_filename(os.path.basename(fp))
             q = _quality_from(os.path.basename(fp))
-            if ep is None:
+            if ep is None or q == "2160p":
                 continue
             ep_files.setdefault(ep, {})[q] = fp
 
@@ -458,7 +494,7 @@ async def bot_upload_cmd(bot: Client, message: Message):
         post_managers: dict = {}
         from .. import download_dir as DL_DIR
 
-        for quality in ["480p", "720p", "1080p"]:
+        for quality in ["360p", "480p", "720p", "1080p"]:
             for ep_num in episodes_sorted:
                 fp = ep_files.get(ep_num, {}).get(quality)
                 if not fp or not os.path.isfile(fp):
@@ -490,6 +526,23 @@ async def bot_upload_cmd(bot: Client, message: Message):
             link = await create_batch_link(app, ids)
             if link:
                 batch_links[quality] = link
+
+    from ..utils.bot_upload_engine import send_batch_summary_post
+
+    # ── Final summary post to channel: "Season XX Full Batch Hindi" + quality buttons ──
+    if batch_links:
+        await send_batch_summary_post(app, channel_id, season_no, batch_links)
+
+    # ── Border sticker ──
+    border = await db.get_bot_border(user_id)
+    if border:
+        try:
+            if border["type"] == "sticker":
+                await app.send_sticker(channel_id, border["file_id"])
+            else:
+                await app.send_photo(channel_id, border["file_id"])
+        except Exception as e:
+            LOGGER.error(f"[bot_upload] Border send (end) failed: {e}")
 
     # ── End message ──
     end_template = await db.get_end_template(user_id)
