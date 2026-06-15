@@ -44,7 +44,10 @@ def episode_from_filename(filename: str) -> int | None:
 #  EpisodePostManager — per-episode channel post (480p/720p/1080p buttons)
 # ─────────────────────────────────────────────────────────────────────────
 class EpisodePostManager:
-    UPLOAD_QUALITIES = ["480p", "720p", "1080p"]
+    # Order matters: lowest available quality shown first, 2160p never shown
+    QUALITY_ORDER = ["360p", "480p", "720p", "1080p"]
+    # Qualities for which a "⏳ uploading..." placeholder makes sense if missing
+    PENDING_CANDIDATES = ["720p", "1080p"]
 
     def __init__(self, client: Client, channel_id: int, anime_name: str,
                  episode_num: int, season_num: int = 1, language: str = "Hindi"):
@@ -61,18 +64,36 @@ class EpisodePostManager:
     def _caption(self) -> str:
         s = f"{self.season_num:02d}"
         e = f"{self.episode_num:02d}"
-        return f"<b>➲ {self.anime_name} | Season {s} Episode {e} {self.language}</b>"
+        return f"<b>➲ Season {s} Episode {e} {self.language}</b>"
 
-    def _keyboard(self, first: bool = False) -> InlineKeyboardMarkup | None:
+    def _keyboard(self) -> InlineKeyboardMarkup | None:
+        """
+        Lowest-available-quality first (360p OR 480p, whichever exists — never both).
+        Then 720p, then 1080p. 2160p never shown.
+        Pending placeholder only for 720p/1080p if not yet ready.
+        """
         row = []
-        for q in self.UPLOAD_QUALITIES:
+
+        # 360p / 480p — whichever is the lowest one that's ready; show only that one
+        low_q = None
+        if "360p" in self._buttons:
+            low_q = "360p"
+        elif "480p" in self._buttons:
+            low_q = "480p"
+        if low_q:
+            row.append(InlineKeyboardButton(text=f"➲ {low_q}", url=self._buttons[low_q]))
+
+        for q in ["720p", "1080p"]:
             if q in self._buttons:
                 row.append(InlineKeyboardButton(text=f"➲ {q}", url=self._buttons[q]))
-            elif first or self.post_msg_id is not None or self._buttons:
+            else:
                 row.append(InlineKeyboardButton(text=f"⏳ {q} uploading...", callback_data=f"bm_pending_{q}"))
+
         return InlineKeyboardMarkup([row]) if row else None
 
     async def add_quality(self, quality: str, deep_link_url: str):
+        if quality == "2160p":
+            return  # never displayed
         async with self._lock:
             self._buttons[quality] = deep_link_url
             caption = self._caption()
@@ -80,7 +101,7 @@ class EpisodePostManager:
                 try:
                     sent = await self.client.send_message(
                         chat_id=self.channel_id, text=caption,
-                        reply_markup=self._keyboard(first=True),
+                        reply_markup=self._keyboard(),
                         parse_mode=ParseMode.HTML, disable_web_page_preview=True,
                     )
                     self.post_msg_id = sent.id
@@ -209,6 +230,8 @@ async def run_episode_rti(client: Client, message: Message, status_msg: Message,
     uploaded = {}
     for fp in files:
         q = _quality_from(os.path.basename(fp))
+        if q == "2160p":
+            continue  # 2160p is never uploaded
         await status_msg.edit(f"📤 **Ep {ep_num}/{total}** — uploading `{q}`...")
         success, sent_msg, quality = await upload_file_to_log(client, message, status_msg, fp, dl_dir)
         if success and sent_msg:
@@ -221,6 +244,36 @@ async def run_episode_rti(client: Client, message: Message, status_msg: Message,
         pass
 
     return uploaded
+
+
+async def send_batch_summary_post(client: Client, channel_id: int, season_num: int,
+                                   batch_links: dict, language: str = "Hindi") -> int | None:
+    """
+    Posts 'Season XX Full Batch Hindi' with quality buttons (360p/480p, 720p, 1080p)
+    pointing to the batch links, to the channel. Returns the sent message id.
+    """
+    s = f"{season_num:02d}"
+    caption = f"<b>➲ Season {s} Full Batch {language}</b>"
+
+    row = []
+    low_q = "360p" if "360p" in batch_links else ("480p" if "480p" in batch_links else None)
+    if low_q:
+        row.append(InlineKeyboardButton(text=f"➲ {low_q}", url=batch_links[low_q]))
+    for q in ["720p", "1080p"]:
+        if q in batch_links:
+            row.append(InlineKeyboardButton(text=f"➲ {q}", url=batch_links[q]))
+
+    keyboard = InlineKeyboardMarkup([row]) if row else None
+
+    try:
+        sent = await client.send_message(
+            chat_id=channel_id, text=caption, reply_markup=keyboard,
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        )
+        return sent.id
+    except Exception as e:
+        LOGGER.error(f"[BotUpload] Batch summary post error: {e}")
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────
