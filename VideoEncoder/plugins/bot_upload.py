@@ -38,7 +38,7 @@ _text_template_session: dict = {}   # { user_id: "end" }  (set_end inline-prompt
 
 # How many times to send the "Join This Channel" decorative message
 JOIN_REPEAT_TEXT = "📌⚡️ 𝕁𝕠𝕚𝕟 𝕋𝕙𝕚𝕤 ℂ𝕙𝕒𝕟𝕟𝕖𝕝 ⚡️📌"
-JOIN_REPEAT_COUNT = 400
+JOIN_REPEAT_COUNT = 300
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -307,7 +307,7 @@ async def bot_upload_cmd(bot: Client, message: Message):
     status = await message.reply(f"<b>🚀 /bot_upload started</b>\nChannel: <code>{channel_id}</code>\nAnime: <b>{anime_name}</b> | Season {season_no}")
 
     # ── Step 1: "Join This Channel" message, sent JOIN_REPEAT_COUNT times ──
-    # Sequential send with 50ms gap — FloodWait se bachne ka fastest tarika.
+    # 0.3s gap = ~90 sec total for 300 msgs, no FloodWait triggers.
     await status.edit(f"<b>📌 'Join This Channel' bhej raha hoon ({JOIN_REPEAT_COUNT}x)...</b>")
 
     sent_count = 0
@@ -315,9 +315,9 @@ async def bot_upload_cmd(bot: Client, message: Message):
         try:
             await app.send_message(channel_id, JOIN_REPEAT_TEXT)
             sent_count += 1
-            if sent_count % 20 == 0:
+            if sent_count % 30 == 0:
                 await status.edit(f"<b>📌 'Join This Channel'</b> — {sent_count}/{JOIN_REPEAT_COUNT} sent...")
-            await asyncio.sleep(0.05)  # 50ms gap — smooth aur fast
+            await asyncio.sleep(0.3)  # 300ms gap — FloodWait nahi aayega
         except FloodWait as fw:
             LOGGER.warning(f"[bot_upload] FloodWait {fw.value}s at {sent_count}/{JOIN_REPEAT_COUNT}")
             await asyncio.sleep(fw.value)
