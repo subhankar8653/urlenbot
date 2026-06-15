@@ -307,20 +307,29 @@ async def bot_upload_cmd(bot: Client, message: Message):
     status = await message.reply(f"<b>🚀 /bot_upload started</b>\nChannel: <code>{channel_id}</code>\nAnime: <b>{anime_name}</b> | Season {season_no}")
 
     # ── Step 1: "Join This Channel" message, sent JOIN_REPEAT_COUNT times ──
+    # Batches of 100 sent concurrently, then a short pause between batches.
     await status.edit(f"<b>📌 'Join This Channel' bhej raha hoon ({JOIN_REPEAT_COUNT}x)...</b>")
-    i = 0
-    while i < JOIN_REPEAT_COUNT:
-        try:
-            await app.send_message(channel_id, JOIN_REPEAT_TEXT)
-            await asyncio.sleep(0.05)  # fast — flood-wait risk low for plain text
-            i += 1
-            if i % 50 == 0:
-                await status.edit(f"<b>📌 'Join This Channel'</b> — {i}/{JOIN_REPEAT_COUNT} sent...")
-        except FloodWait as fw:
-            await asyncio.sleep(fw.value)
-        except Exception as e:
-            await status.edit(f"❌ 'Join This Channel' msgs fail ho gaye: <code>{e}</code>")
-            return
+    BATCH_SIZE = 100
+    BATCH_GAP = 3  # seconds between batches
+
+    async def _send_join_msg():
+        while True:
+            try:
+                await app.send_message(channel_id, JOIN_REPEAT_TEXT)
+                return
+            except FloodWait as fw:
+                await asyncio.sleep(fw.value)
+            except Exception:
+                return
+
+    sent_count = 0
+    while sent_count < JOIN_REPEAT_COUNT:
+        batch_n = min(BATCH_SIZE, JOIN_REPEAT_COUNT - sent_count)
+        await asyncio.gather(*[_send_join_msg() for _ in range(batch_n)])
+        sent_count += batch_n
+        await status.edit(f"<b>📌 'Join This Channel'</b> — {sent_count}/{JOIN_REPEAT_COUNT} sent...")
+        if sent_count < JOIN_REPEAT_COUNT:
+            await asyncio.sleep(BATCH_GAP)
 
     # ── Step 2: IMDB info ──
     info = await _fetch_imdb_info(anime_name)
