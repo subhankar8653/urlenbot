@@ -183,9 +183,14 @@ LINK_PATTERN = re.compile(r'https://t\.me/\S+\?start=\S+')
 
 async def _wait_for_bot_reply(client: Client, after_msg_id: int, contains: list[str],
                                timeout: int = 60) -> Message | None:
+    """
+    after_msg_id ke baad aane wale messages mein contains keywords dhundo.
+    after_msg_id+1 se shuru karke +10 tak scan karo har poll mein.
+    """
     start = time.time()
+    check_from = after_msg_id + 1
     while time.time() - start < timeout:
-        for tid in range(after_msg_id + 1, after_msg_id + 5):
+        for tid in range(check_from, check_from + 10):
             try:
                 m = await client.get_messages(LOG_CHANNEL, tid)
                 if m and m.text and any(c.lower() in m.text.lower() for c in contains):
@@ -200,6 +205,9 @@ async def create_batch_link(client: Client, message_ids: list[int], timeout: int
     """
     /batch -> forward all message_ids (within LOG_CHANNEL) -> /complete -> parse link.
     Returns deep-link URL or None.
+
+    Key insight: /complete bhejne ke baad bot ka reply = complete_msg.id + 1
+    Isliye directly woh message fetch karo — reliable aur fast.
     """
     if not message_ids:
         return None
@@ -210,17 +218,25 @@ async def create_batch_link(client: Client, message_ids: list[int], timeout: int
         LOGGER.error(f"[BotUpload] /batch send failed: {e}")
         return None
 
-    ready = await _wait_for_bot_reply(client, start_msg.id, ["batch mode on"], timeout=30)
+    # /batch reply ka wait — "Batch Mode ON" confirm hone tak
+    ready = await _wait_for_bot_reply(client, start_msg.id, ["batch mode on", "batch"], timeout=30)
     if not ready:
         LOGGER.warning("[BotUpload] Batch Mode ON reply not detected, proceeding anyway")
+        await asyncio.sleep(3)
 
+    # Saari files forward karo
     try:
-        await client.forward_messages(chat_id=LOG_CHANNEL, from_chat_id=LOG_CHANNEL,
-                                        message_ids=message_ids)
+        await client.forward_messages(
+            chat_id=LOG_CHANNEL,
+            from_chat_id=LOG_CHANNEL,
+            message_ids=message_ids,
+        )
     except Exception as e:
         LOGGER.error(f"[BotUpload] Forwarding for batch failed: {e}")
+        return None
 
-    await asyncio.sleep(2)
+    # Forwards process hone ka wait
+    await asyncio.sleep(3)
 
     try:
         complete_msg = await client.send_message(LOG_CHANNEL, "/complete")
@@ -228,12 +244,28 @@ async def create_batch_link(client: Client, message_ids: list[int], timeout: int
         LOGGER.error(f"[BotUpload] /complete send failed: {e}")
         return None
 
-    reply = await _wait_for_bot_reply(client, complete_msg.id, ["t.me/"], timeout=timeout)
-    if not reply:
-        return None
+    LOGGER.info(f"[BotUpload] /complete sent at msg_id={complete_msg.id}. Batch link next msg pe hoga.")
 
-    m = LINK_PATTERN.search(reply.text)
-    return m.group(0) if m else None
+    # /complete ke baad bot reply = complete_msg.id + 1 (direct fetch, fast path)
+    expected_id = complete_msg.id + 1
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        await asyncio.sleep(2)
+        try:
+            m = await client.get_messages(LOG_CHANNEL, expected_id)
+            if m and m.text:
+                match = LINK_PATTERN.search(m.text)
+                if match:
+                    LOGGER.info(f"[BotUpload] Batch link found at msg_id={expected_id}: {match.group(0)}")
+                    return match.group(0)
+                # Message aaya but link nahi — bot ne kuch aur reply diya, next try
+                LOGGER.warning(f"[BotUpload] msg {expected_id} no link (text='{m.text[:60]}'), trying +1")
+                expected_id += 1
+        except Exception:
+            pass  # Message abhi nahi aaya — loop continue
+
+    LOGGER.error("[BotUpload] Batch link timeout — koi link nahi mila")
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────
