@@ -550,9 +550,9 @@ class Database:
             upsert=True,
         )
 
-    # ── Episode post tracking (multi-run quality upload support) ──────────────
+    # ── Episode post tracking (unique session code support) ───────────────────
     async def get_ep_post(self, key: str) -> dict:
-        """DB se episode post data lo (msg_id + buttons)."""
+        """Session code + episode ke liye saved msg_id aur buttons lo."""
         doc = await self.col.find_one({'_ep_post_key': key})
         if doc:
             return {'msg_id': doc.get('msg_id'), 'buttons': doc.get('buttons', {})}
