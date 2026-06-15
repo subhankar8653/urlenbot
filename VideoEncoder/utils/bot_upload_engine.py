@@ -50,16 +50,19 @@ class EpisodePostManager:
     PENDING_CANDIDATES = ["720p", "1080p"]
 
     def __init__(self, client: Client, channel_id: int, anime_name: str,
-                 episode_num: int, season_num: int = 1, language: str = "Hindi"):
+                 episode_num: int, season_num: int = 1, language: str = "Hindi",
+                 session_code: str | None = None):
         self.client = client
         self.channel_id = channel_id
         self.anime_name = anime_name
         self.episode_num = episode_num
         self.season_num = season_num
         self.language = language
+        self.session_code = session_code  # unique code for multi-run support
         self.post_msg_id: int | None = None
         self._buttons: dict[str, str] = {}
         self._lock = asyncio.Lock()
+        self._db_loaded = False
 
     def _caption(self) -> str:
         s = f"{self.season_num:02d}"
@@ -91,36 +94,53 @@ class EpisodePostManager:
 
         return InlineKeyboardMarkup([row]) if row else None
 
-    async def _db_key(self) -> str:
-        return f"ep_post_{self.channel_id}_{self.season_num}_{self.episode_num}"
+    def _db_key(self) -> str | None:
+        """Unique DB key — session_code + episode number."""
+        if not self.session_code:
+            return None
+        return f"{self.session_code}_ep{self.episode_num:03d}"
 
     async def _load_from_db(self):
-        """DB se existing post_msg_id aur buttons load karo (for multi-run support)."""
-        from .database.access_db import db as _db
-        key = await self._db_key()
-        data = await _db.get_ep_post(key)
-        if data:
-            self.post_msg_id = data.get("msg_id")
-            for q, url in data.get("buttons", {}).items():
-                if q not in self._buttons:
-                    self._buttons[q] = url
+        """DB se existing post_msg_id aur buttons load karo."""
+        key = self._db_key()
+        if not key or self._db_loaded:
+            return
+        self._db_loaded = True
+        try:
+            from .database.access_db import db as _db
+            data = await _db.get_ep_post(key)
+            if data:
+                self.post_msg_id = data.get("msg_id")
+                for q, url in data.get("buttons", {}).items():
+                    if q not in self._buttons:
+                        self._buttons[q] = url
+                LOGGER.info(f"[EpisodePost] Loaded from DB: key={key} msg_id={self.post_msg_id} buttons={list(self._buttons.keys())}")
+        except Exception as e:
+            LOGGER.warning(f"[EpisodePost] DB load failed: {e}")
 
     async def _save_to_db(self):
-        from .database.access_db import db as _db
-        key = await self._db_key()
-        await _db.set_ep_post(key, {"msg_id": self.post_msg_id, "buttons": dict(self._buttons)})
+        """Current state DB mein save karo."""
+        key = self._db_key()
+        if not key:
+            return
+        try:
+            from .database.access_db import db as _db
+            await _db.set_ep_post(key, {"msg_id": self.post_msg_id, "buttons": dict(self._buttons)})
+        except Exception as e:
+            LOGGER.warning(f"[EpisodePost] DB save failed: {e}")
 
     async def add_quality(self, quality: str, deep_link_url: str):
         if quality == "2160p":
             return  # never displayed
         async with self._lock:
-            # DB se load karo — 2nd run (720p) pe existing msg_id milega
-            if self.post_msg_id is None and not self._buttons:
-                await self._load_from_db()
+            # Pehli baar: DB se load karo (resume mode mein existing msg_id milega)
+            await self._load_from_db()
 
             self._buttons[quality] = deep_link_url
             caption = self._caption()
+
             if self.post_msg_id is None:
+                # Naya message banao
                 try:
                     sent = await self.client.send_message(
                         chat_id=self.channel_id, text=caption,
@@ -132,6 +152,7 @@ class EpisodePostManager:
                 except Exception as e:
                     LOGGER.error(f"[BotUpload] Post create error: {e}")
             else:
+                # Existing message edit karo (resume mode)
                 try:
                     await self.client.edit_message_text(
                         chat_id=self.channel_id, message_id=self.post_msg_id,
@@ -162,20 +183,15 @@ LINK_PATTERN = re.compile(r'https://t\.me/\S+\?start=\S+')
 
 async def _wait_for_bot_reply(client: Client, after_msg_id: int, contains: list[str],
                                timeout: int = 60) -> Message | None:
-    """
-    after_msg_id ke baad aane wala message dhundo jo contains wale strings mein se koi ek rakhe.
-    get_chat_history se scan karo — exact message_id guess karne ki zarurat nahi.
-    """
     start = time.time()
     while time.time() - start < timeout:
-        try:
-            async for m in client.get_chat_history(LOG_CHANNEL, limit=10):
-                if m.id <= after_msg_id:
-                    break
+        for tid in range(after_msg_id + 1, after_msg_id + 5):
+            try:
+                m = await client.get_messages(LOG_CHANNEL, tid)
                 if m and m.text and any(c.lower() in m.text.lower() for c in contains):
                     return m
-        except Exception:
-            pass
+            except Exception:
+                pass
         await asyncio.sleep(2)
     return None
 
