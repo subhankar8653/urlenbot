@@ -14,6 +14,7 @@ Commands:
                            — Phase 1: sends intro → IMDB info → border + season sticker
 """
 
+import asyncio
 import os
 import re
 
@@ -357,12 +358,33 @@ async def bot_upload_cmd(bot: Client, message: Message):
 
     status = await message.reply(f"<b>🚀 /bot_upload started</b>\nChannel: <code>{channel_id}</code>\nAnime: <b>{anime_name}</b> | Season {season_no}")
 
-    # ── Step 1: Intro message ──
+    # ── Step 1: Intro message(s) ──
     intro_template = await db.get_intro_template(user_id)
     if intro_template:
         intro_text = intro_template.format(anime_name=anime_name, season=season_no)
+        TELEGRAM_MSG_LIMIT = 4096
+        lines = intro_text.split("\n")
+        chunks = []
+        current = ""
+        for line in lines:
+            candidate = (current + "\n" + line) if current else line
+            if len(candidate) > TELEGRAM_MSG_LIMIT:
+                if current:
+                    chunks.append(current)
+                # agar single line bhi limit se bada hai, force-split karo
+                while len(line) > TELEGRAM_MSG_LIMIT:
+                    chunks.append(line[:TELEGRAM_MSG_LIMIT])
+                    line = line[TELEGRAM_MSG_LIMIT:]
+                current = line
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+
         try:
-            await app.send_message(channel_id, intro_text)
+            for chunk in chunks:
+                await app.send_message(channel_id, chunk)
+                await asyncio.sleep(0.5)  # flood-wait se bachne ke liye
         except Exception as e:
             await status.edit(f"❌ Intro msg fail ho gaya: <code>{e}</code>")
             return
