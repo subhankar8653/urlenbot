@@ -91,10 +91,33 @@ class EpisodePostManager:
 
         return InlineKeyboardMarkup([row]) if row else None
 
+    async def _db_key(self) -> str:
+        return f"ep_post_{self.channel_id}_{self.season_num}_{self.episode_num}"
+
+    async def _load_from_db(self):
+        """DB se existing post_msg_id aur buttons load karo (for multi-run support)."""
+        from .database.access_db import db as _db
+        key = await self._db_key()
+        data = await _db.get_ep_post(key)
+        if data:
+            self.post_msg_id = data.get("msg_id")
+            for q, url in data.get("buttons", {}).items():
+                if q not in self._buttons:
+                    self._buttons[q] = url
+
+    async def _save_to_db(self):
+        from .database.access_db import db as _db
+        key = await self._db_key()
+        await _db.set_ep_post(key, {"msg_id": self.post_msg_id, "buttons": dict(self._buttons)})
+
     async def add_quality(self, quality: str, deep_link_url: str):
         if quality == "2160p":
             return  # never displayed
         async with self._lock:
+            # DB se load karo — 2nd run (720p) pe existing msg_id milega
+            if self.post_msg_id is None and not self._buttons:
+                await self._load_from_db()
+
             self._buttons[quality] = deep_link_url
             caption = self._caption()
             if self.post_msg_id is None:
@@ -105,6 +128,7 @@ class EpisodePostManager:
                         parse_mode=ParseMode.HTML, disable_web_page_preview=True,
                     )
                     self.post_msg_id = sent.id
+                    await self._save_to_db()
                 except Exception as e:
                     LOGGER.error(f"[BotUpload] Post create error: {e}")
             else:
@@ -114,6 +138,7 @@ class EpisodePostManager:
                         text=caption, reply_markup=self._keyboard(),
                         parse_mode=ParseMode.HTML, disable_web_page_preview=True,
                     )
+                    await self._save_to_db()
                 except Exception as e:
                     LOGGER.error(f"[BotUpload] Post edit error: {e}")
 
@@ -137,15 +162,20 @@ LINK_PATTERN = re.compile(r'https://t\.me/\S+\?start=\S+')
 
 async def _wait_for_bot_reply(client: Client, after_msg_id: int, contains: list[str],
                                timeout: int = 60) -> Message | None:
+    """
+    after_msg_id ke baad aane wala message dhundo jo contains wale strings mein se koi ek rakhe.
+    get_chat_history se scan karo — exact message_id guess karne ki zarurat nahi.
+    """
     start = time.time()
     while time.time() - start < timeout:
-        for tid in range(after_msg_id + 1, after_msg_id + 5):
-            try:
-                m = await client.get_messages(LOG_CHANNEL, tid)
+        try:
+            async for m in client.get_chat_history(LOG_CHANNEL, limit=10):
+                if m.id <= after_msg_id:
+                    break
                 if m and m.text and any(c.lower() in m.text.lower() for c in contains):
                     return m
-            except Exception:
-                pass
+        except Exception:
+            pass
         await asyncio.sleep(2)
     return None
 
