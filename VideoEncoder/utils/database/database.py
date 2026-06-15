@@ -495,6 +495,53 @@ class Database:
             return True
         return False
 
+    # ─────────────────────────────────────────────
+    #  Bot Upload — Global Config (border, season stickers, templates)
+    # ─────────────────────────────────────────────
+    async def set_bot_border(self, user_id: int, file_id: str, media_type: str):
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'bot_border': {'file_id': file_id, 'type': media_type}}},
+            upsert=True,
+        )
+
+    async def get_bot_border(self, user_id: int):
+        user = await self._get_user(user_id)
+        return user.get('bot_border')
+
+    async def set_season_stickers(self, user_id: int, stickers: list):
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'bot_season_stickers': stickers}},
+            upsert=True,
+        )
+
+    async def get_season_stickers(self, user_id: int) -> list:
+        user = await self._get_user(user_id)
+        return user.get('bot_season_stickers', [])
+
+    async def set_intro_template(self, user_id: int, template: str):
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'bot_intro_template': template}},
+            upsert=True,
+        )
+
+    async def get_intro_template(self, user_id: int) -> str:
+        user = await self._get_user(user_id)
+        return user.get('bot_intro_template', '')
+
+    async def set_end_template(self, user_id: int, template: str):
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'bot_end_template': template}},
+            upsert=True,
+        )
+
+    async def get_end_template(self, user_id: int) -> str:
+        user = await self._get_user(user_id)
+        return user.get('bot_end_template', '')
+
     async def clear_channels(self, user_id: int):
         """Saare channels clear karo."""
         await self.col.update_one(
