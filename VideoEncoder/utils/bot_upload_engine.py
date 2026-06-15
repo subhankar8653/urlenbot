@@ -246,11 +246,14 @@ async def create_batch_link(client: Client, message_ids: list[int], timeout: int
 
     LOGGER.info(f"[BotUpload] /complete sent at msg_id={complete_msg.id}. Batch link next msg pe hoga.")
 
+    # /complete ke baad pehle 5s wait karo — bot ko process karne ka time chahiye
+    await asyncio.sleep(5)
+
     # /complete ke baad bot reply = complete_msg.id + 1 (direct fetch, fast path)
     expected_id = complete_msg.id + 1
     deadline = time.time() + timeout
     while time.time() < deadline:
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
         try:
             m = await client.get_messages(LOG_CHANNEL, expected_id)
             if m and m.text:
