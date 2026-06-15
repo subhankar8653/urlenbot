@@ -22,6 +22,7 @@ import re
 
 import aiohttp
 from pyrogram import Client, filters
+from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 
 from .. import LOGGER, app
@@ -307,15 +308,19 @@ async def bot_upload_cmd(bot: Client, message: Message):
 
     # ── Step 1: "Join This Channel" message, sent JOIN_REPEAT_COUNT times ──
     await status.edit(f"<b>📌 'Join This Channel' bhej raha hoon ({JOIN_REPEAT_COUNT}x)...</b>")
-    try:
-        for i in range(JOIN_REPEAT_COUNT):
+    i = 0
+    while i < JOIN_REPEAT_COUNT:
+        try:
             await app.send_message(channel_id, JOIN_REPEAT_TEXT)
-            await asyncio.sleep(0.4)  # flood-wait se bachne ke liye
-            if (i + 1) % 50 == 0:
-                await status.edit(f"<b>📌 'Join This Channel'</b> — {i + 1}/{JOIN_REPEAT_COUNT} sent...")
-    except Exception as e:
-        await status.edit(f"❌ 'Join This Channel' msgs fail ho gaye: <code>{e}</code>")
-        return
+            await asyncio.sleep(0.05)  # fast — flood-wait risk low for plain text
+            i += 1
+            if i % 50 == 0:
+                await status.edit(f"<b>📌 'Join This Channel'</b> — {i}/{JOIN_REPEAT_COUNT} sent...")
+        except FloodWait as fw:
+            await asyncio.sleep(fw.value)
+        except Exception as e:
+            await status.edit(f"❌ 'Join This Channel' msgs fail ho gaye: <code>{e}</code>")
+            return
 
     # ── Step 2: IMDB info ──
     info = await _fetch_imdb_info(anime_name)
