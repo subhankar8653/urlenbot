@@ -10,7 +10,7 @@ Commands:
   /season_sticker         — Start/continue season-sticker collection. Send sticker
                              per season in order, then /done
   /bot_upload <channel_id> <anime_name> | <season_no> | <source>
-                           — Full pipeline: "Join This Channel" x400 → IMDB info →
+                           — Full pipeline: IMDB info →
                              episode upload (RTI/url -e) → batch links →
                              border → batch summary → /set_end → next season sticker →
                              default auto-upload end messages.
@@ -38,16 +38,11 @@ _border_session: set = set()        # user_ids currently in /border setup mode
 _season_session: set = set()        # user_ids currently in /season_sticker setup mode
 _text_template_session: dict = {}   # { user_id: "end" }  (set_end inline-prompt mode)
 
-# How many times to send the "Join This Channel" decorative message
-JOIN_REPEAT_TEXT = "📌⚡️ 𝕁𝕠𝕚𝕟 𝕋𝕙𝕚𝕤 ℂ𝕙𝕒𝕟𝕟𝕖𝕝 ⚡️📌"
-JOIN_REPEAT_COUNT = 400
 
 
 # ─────────────────────────────────────────────────────────────────────────
 #  /set_intro & /set_end
 # ─────────────────────────────────────────────────────────────────────────
-#  (set_intro removed — /bot_upload now sends a fixed "Join This Channel"
-#   sticker-style text message JOIN_REPEAT_COUNT times instead of a template)
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -307,31 +302,6 @@ async def bot_upload_cmd(bot: Client, message: Message):
         return
 
     status = await message.reply(f"<b>🚀 /bot_upload started</b>\nChannel: <code>{channel_id}</code>\nAnime: <b>{anime_name}</b> | Season {season_no}")
-
-    # ── Step 1: "Join This Channel" message, sent JOIN_REPEAT_COUNT times ──
-    # Batches of 100 sent concurrently, then a short pause between batches.
-    await status.edit(f"<b>📌 'Join This Channel' bhej raha hoon ({JOIN_REPEAT_COUNT}x)...</b>")
-    BATCH_SIZE = 100
-    BATCH_GAP = 3  # seconds between batches
-
-    async def _send_join_msg():
-        while True:
-            try:
-                await app.send_message(channel_id, JOIN_REPEAT_TEXT)
-                return
-            except FloodWait as fw:
-                await asyncio.sleep(fw.value)
-            except Exception:
-                return
-
-    sent_count = 0
-    while sent_count < JOIN_REPEAT_COUNT:
-        batch_n = min(BATCH_SIZE, JOIN_REPEAT_COUNT - sent_count)
-        await asyncio.gather(*[_send_join_msg() for _ in range(batch_n)])
-        sent_count += batch_n
-        await status.edit(f"<b>📌 'Join This Channel'</b> — {sent_count}/{JOIN_REPEAT_COUNT} sent...")
-        if sent_count < JOIN_REPEAT_COUNT:
-            await asyncio.sleep(BATCH_GAP)
 
     # ── Step 2: IMDB info ──
     info = await _fetch_imdb_info(anime_name)
