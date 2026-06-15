@@ -1264,6 +1264,89 @@ async def clear_swap_rules(bot: Client, message: Message):
     await message.reply("✅ All swap rules cleared.")
 
 
+# ─── Public: urlpreset apply (bot_upload.py bhi use karta hai) ───────────────
+
+async def apply_urlpreset_to_file(filepath: str, user_id: int, msg: Message) -> tuple[str, bool]:
+    """
+    User ki /urlpreset settings file pe apply karo.
+    Returns: (processed_filepath, has_eng_sub)
+    bot_upload.py upload se pehle is function ko call karta hai.
+    """
+    auto = await db.get_url_auto_settings(user_id)
+    has_eng_sub = False
+
+    # 1. Remove Subtitles
+    if auto.get("rm_sub"):
+        new_path = await _remove_subtitles(filepath, msg)
+        if new_path:
+            filepath = new_path
+
+    # 2. Remove Audio
+    if auto.get("rm_audio"):
+        new_path = await _remove_audio(filepath, msg)
+        if new_path:
+            filepath = new_path
+
+    # 3. Hindi Audio Only (sirf jab rm_audio OFF ho)
+    elif auto.get("hindi_only"):
+        audio_streams = get_audio_streams(filepath)
+        hindi_indices = [s["index"] for s in audio_streams if _is_hindi_stream(s)]
+        if hindi_indices:
+            new_path = await _keep_audio_streams(filepath, hindi_indices, msg)
+            if new_path:
+                filepath = new_path
+        else:
+            stream_info = ", ".join(f"#{s['index']}:{s.get('lang','?')}" for s in audio_streams)
+            LOGGER.warning(f"[urlpreset] Hindi audio nahi mila. Streams: {stream_info}")
+
+    # 4. Eng Sub Only (sirf jab rm_sub OFF ho)
+    if not auto.get("rm_sub") and auto.get("eng_sub_only"):
+        sub_streams = get_subtitle_streams(filepath)
+        eng_indices = [s["index"] for s in sub_streams if _is_english_sub_stream(s)]
+        if eng_indices:
+            new_path = await _keep_subtitle_streams(filepath, eng_indices, msg)
+            if new_path:
+                has_eng_sub = True
+                filepath = new_path
+
+    # 5. Convert to AAC (sirf jab rm_audio OFF ho)
+    if not auto.get("rm_audio") and auto.get("to_aac"):
+        already_aac = await _check_all_audio_aac(filepath)
+        if not already_aac:
+            new_path = await _convert_audio_to_aac(filepath, msg)
+            if new_path:
+                filepath = new_path
+
+    # 6. Name Swap
+    if auto.get("name_swap"):
+        swap_rules = await db.get_swap(user_id)
+        if swap_rules:
+            old_name = os.path.basename(filepath)
+            new_name = apply_name_swap(old_name, swap_rules)
+            if new_name != old_name:
+                new_path = os.path.join(os.path.dirname(filepath), new_name)
+                try:
+                    os.rename(filepath, new_path)
+                    filepath = new_path
+                except Exception as e:
+                    LOGGER.error(f"[urlpreset] Name swap rename failed: {e}")
+
+    # 7. Apply Metadata
+    if auto.get("apply_metadata"):
+        full_meta = await db.get_full_metadata(user_id)
+        if full_meta.get("enabled") and any([
+            full_meta.get("movie_name"), full_meta.get("video_title"),
+            full_meta.get("audio_title"), full_meta.get("subtitle_title"),
+            full_meta.get("comment"),
+        ]):
+            resolved = _resolve_meta_placeholders(full_meta, filepath)
+            new_path = await _apply_full_metadata(filepath, resolved, msg)
+            if new_path:
+                filepath = new_path
+
+    return filepath, has_eng_sub
+
+
 # ─── Helper functions ─────────────────────────────────────────────────────────
 
 async def _get_filename_from_url(url: str) -> str:

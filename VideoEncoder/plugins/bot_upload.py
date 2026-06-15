@@ -363,7 +363,7 @@ async def bot_upload_cmd(bot: Client, message: Message):
     )
     from ..plugins.swift_downloader import _quality_from
     from ..plugins.auto_monitor import _get_suhani_bot_link
-    from ..plugins.url_upload import _download_url, _extract_archive_all, _safe_filename
+    from ..plugins.url_upload import _download_url, _extract_archive_all, _safe_filename, apply_urlpreset_to_file
     from ..utils.direct_link_generator import direct_link_generator
 
     batch_msg_ids: dict = {"360p": [], "480p": [], "720p": [], "1080p": []}
@@ -444,6 +444,8 @@ async def bot_upload_cmd(bot: Client, message: Message):
                     continue
 
                 await status.edit(f"<b>📤 Ep {ep_num} — {quality}</b> uploading...")
+                # ── urlpreset settings apply karo (Hindi only, sub filter, etc.) ──
+                fp, _has_eng_sub = await apply_urlpreset_to_file(fp, user_id, status)
                 success, sent_msg, _q = await upload_file_to_log(app, message, status, fp, DL_DIR)
 
                 if not success or not sent_msg:
