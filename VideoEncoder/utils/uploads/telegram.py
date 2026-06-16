@@ -33,8 +33,8 @@ async def _make_uploader_client(user_id: int):
             api_id=api_id,
             api_hash=api_hash,
             in_memory=True,
-            max_concurrent_transmissions=20,
-            workers=32,
+            max_concurrent_transmissions=4,  # FIX: 20 → 4 (deadlock fix)
+            workers=16,
             sleep_threshold=60,
         )
         await uc.connect()
