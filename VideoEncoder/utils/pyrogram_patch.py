@@ -4,9 +4,9 @@ pyrogram_patch.py
 Pyrogram ke upload internals ko patch karta hai max speed ke liye.
 
 Fixes:
-  1. Part size: 512KB → 2MB  (4x faster per-chunk)
-  2. Queue size: 1 → workers_count  (parallel workers actually parallel honge)
-  3. workers_count: max_concurrent_transmissions se leta hai (20 set hai user client mein)
+  1. Part size: 512KB (Telegram default, safe for all clients)
+  2. Workers: 4 parallel (20 se deadlock hota tha — queue full → main loop block)
+  3. Queue size: unlimited (maxsize=workers se deadlock hota tha)
 """
 
 import asyncio
@@ -29,9 +29,12 @@ from pyrogram.methods.advanced.save_file import SaveFile
 log = logging.getLogger(__name__)
 
 # ── Tunable constants ──────────────────────────────────────────────────────────
-# 2MB chunks — Telegram max allowed per part for non-premium (premium = 4MB)
-# Zyada = zyada data per TCP round-trip = faster
-_PART_SIZE = 512 * 1024   # 512 KB — Telegram default, bot + user dono ke liye safe
+_PART_SIZE = 512 * 1024   # 512 KB — Telegram default, safe for all clients
+
+# Parallel workers per upload:
+# - 20 workers + 20-maxsize queue = deadlock (main loop blocks on queue.put when full)
+# - 4 workers = safe, fast enough for most connections, no deadlock
+_WORKERS_COUNT = 4
 
 
 async def save_file(
@@ -50,6 +53,7 @@ async def save_file(
             while True:
                 data = await queue.get()
                 if data is None:
+                    queue.task_done()
                     return
                 try:
                     await session.invoke(data)
@@ -84,9 +88,9 @@ async def save_file(
         file_total_parts = int(math.ceil(file_size / part_size))
         is_big = file_size > 10 * 1024 * 1024
 
-        # Workers = max_concurrent_transmissions (20 for user client, 4 for bot)
-        # Queue size must match workers so all can run in parallel (was 1 = serial!)
-        workers_count = self.max_concurrent_transmissions if is_big else 1
+        # FIX: workers = 4 (was max_concurrent_transmissions = 20 → deadlock)
+        # FIX: queue maxsize = 0 (unlimited) — was workers_count → main loop blocked on put()
+        workers_count = _WORKERS_COUNT if is_big else 1
 
         is_missing_part = file_id is not None
         file_id = file_id or self.rnd_id()
@@ -97,8 +101,8 @@ async def save_file(
             await self.storage.test_mode(), is_media=True
         )
 
-        # FIX: queue size = workers_count so all workers get data simultaneously
-        queue = asyncio.Queue(workers_count)
+        # maxsize=0 = unlimited queue — main loop kabhi block nahi hoga queue.put() pe
+        queue = asyncio.Queue(0)
         workers = [self.loop.create_task(worker(session)) for _ in range(workers_count)]
 
         try:
