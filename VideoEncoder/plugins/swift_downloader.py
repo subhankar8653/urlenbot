@@ -611,7 +611,8 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
 #  Single file upload — returns sent Message object (for reorder)
 # ─────────────────────────────────────────────
 async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, encode: bool,
-                           on_half: asyncio.Event = None, skip_forward: bool = False):
+                           on_half: asyncio.Event = None, skip_forward: bool = False,
+                           uploader_client=None):
     """
     Ek file upload karo.
     Returns: (success: bool, sent_message: Message | None, quality: str)
@@ -697,7 +698,10 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
         caption = f"<b>{fname}</b>"
         disk_fname = os.path.basename(filepath)
 
-        uc = await _make_uploader_client(message.from_user.id)
+        # uploader_client bahar se pass hoga (shared) — andar mat banao
+        # Andar banane se same session_string se do alag uc bante hain
+        # aur parallel uploads mein socket conflict hota hai → read() crash
+        uc = uploader_client
         sent_msg = None
 
         # ── 50% staggered upload ke liye custom progress wrapper ──
@@ -731,11 +735,7 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
             # (agar file bahut chhoti ho aur 50% progress callback nahi aaya)
             if on_half and not _half_fired:
                 on_half.set()
-            if uc:
-                try:
-                    await uc.disconnect()
-                except Exception:
-                    pass
+            # uc yahan disconnect mat karo — caller karega (shared client hai)
 
         if not custom_thumb_used and thumb and os.path.isfile(thumb):
             try:
@@ -931,6 +931,11 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
     # file[i+1] is event ka wait karega shuru hone se pehle
     _half_events = [asyncio.Event() for _ in files]
 
+    # ── Shared uploader client — ek hi uc banao, saare uploads mein share karo ──
+    # Alag alag uc banane se same session_string pe parallel socket reads hoti hain
+    # → "read() called while another coroutine is already waiting" crash
+    _shared_uc = await _make_uploader_client(message.from_user.id)
+
     async def _upload_task_staggered(filepath, idx):
         """
         idx = 0  → immediately start
@@ -946,6 +951,7 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
         success, sent_msg, quality = await _upload_one_file(
             client, message, um, filepath, dl_dir, encode,
             on_half=_half_events[idx],   # 50% pe yeh event fire hoga
+            uploader_client=_shared_uc,  # shared client pass karo
         )
         # Status message delete karo — clean chat
         try:
@@ -954,10 +960,18 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
             pass
         return success, sent_msg, quality
 
-    results = await asyncio.gather(
-        *[_upload_task_staggered(fp, i) for i, fp in enumerate(files)],
-        return_exceptions=True
-    )
+    try:
+        results = await asyncio.gather(
+            *[_upload_task_staggered(fp, i) for i, fp in enumerate(files)],
+            return_exceptions=True
+        )
+    finally:
+        # Saare uploads complete hone ke baad shared uc disconnect karo
+        if _shared_uc:
+            try:
+                await _shared_uc.disconnect()
+            except Exception:
+                pass
 
     # Results parse karo
     uploaded_results = []  # [(quality, sent_message), ...]
