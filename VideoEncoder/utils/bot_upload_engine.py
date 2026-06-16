@@ -77,6 +77,9 @@ class EpisodePostManager:
         """
         row = []
 
+        # Quality → colored emoji mapping
+        _Q_EMOJI = {"360p": "🟢", "480p": "🔵", "720p": "🟡", "1080p": "🔴"}
+
         # 360p / 480p — whichever is the lowest one that's ready; show only that one
         low_q = None
         if "360p" in self._buttons:
@@ -84,11 +87,13 @@ class EpisodePostManager:
         elif "480p" in self._buttons:
             low_q = "480p"
         if low_q:
-            row.append(InlineKeyboardButton(text=f"➲ {low_q}", url=self._buttons[low_q]))
+            em = _Q_EMOJI.get(low_q, "🔵")
+            row.append(InlineKeyboardButton(text=f"{em} {low_q}", url=self._buttons[low_q]))
 
         for q in ["720p", "1080p"]:
+            em = _Q_EMOJI.get(q, "🔵")
             if q in self._buttons:
-                row.append(InlineKeyboardButton(text=f"➲ {q}", url=self._buttons[q]))
+                row.append(InlineKeyboardButton(text=f"{em} {q}", url=self._buttons[q]))
             else:
                 row.append(InlineKeyboardButton(text=f"⏳ {q} uploading...", callback_data=f"bm_pending_{q}"))
 
@@ -336,13 +341,16 @@ async def send_batch_summary_post(client: Client, channel_id: int, season_num: i
     s = f"{season_num:02d}"
     caption = f"<b>➲ Season {s} Full Batch {language}</b>"
 
+    _Q_EMOJI = {"360p": "🟢", "480p": "🔵", "720p": "🟡", "1080p": "🔴"}
     row = []
     low_q = "360p" if "360p" in batch_links else ("480p" if "480p" in batch_links else None)
     if low_q:
-        row.append(InlineKeyboardButton(text=f"➲ {low_q}", url=batch_links[low_q]))
+        em = _Q_EMOJI.get(low_q, "🔵")
+        row.append(InlineKeyboardButton(text=f"{em} {low_q}", url=batch_links[low_q]))
     for q in ["720p", "1080p"]:
         if q in batch_links:
-            row.append(InlineKeyboardButton(text=f"➲ {q}", url=batch_links[q]))
+            em = _Q_EMOJI.get(q, "🔵")
+            row.append(InlineKeyboardButton(text=f"{em} {q}", url=batch_links[q]))
 
     keyboard = InlineKeyboardMarkup([row]) if row else None
 
