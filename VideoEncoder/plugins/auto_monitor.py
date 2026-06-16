@@ -181,7 +181,6 @@ async def _episode_quality_poller(
     from .swift_downloader import (
         _upload_one_file, _sort_by_size, _quality_from, QUALITY_ORDER
     )
-    from ..utils.uploads.telegram import _make_uploader_client
 
     start_time = time.time()
     loop = asyncio.get_event_loop()
@@ -348,11 +347,6 @@ async def _episode_quality_poller(
 
         _half_events_poll = [asyncio.Event() for _ in new_files]
 
-        # ── Shared uploader client — ek hi uc banao ──
-        # asyncio.gather mein parallel tasks ko alag alag uc dene se
-        # same session_string pe socket conflict → read() crash hota hai
-        _shared_uc_poll = await _make_uploader_client(owner_id)
-
         async def _poll_upload_task(filepath, idx):
             nonlocal _old_msgs_deleted_poll
             if idx > 0:
@@ -365,7 +359,6 @@ async def _episode_quality_poller(
                 client, proxy_msg, um, filepath, poll_dl_dir, encode=False,
                 on_half=_half_events_poll[idx],
                 skip_forward=_bot_mode_active,
-                uploader_client=_shared_uc_poll,  # shared client pass karo
             )
             try:
                 await um.delete()
@@ -413,18 +406,10 @@ async def _episode_quality_poller(
                     LOGGER.error(f"[BotMode] add_quality error: {_bme}")
             return success, sent_msg, quality
 
-        try:
-            poll_results = await asyncio.gather(
-                *[_poll_upload_task(fp, i) for i, fp in enumerate(new_files)],
-                return_exceptions=True,
-            )
-        finally:
-            # Saare uploads ke baad shared uc disconnect karo
-            if _shared_uc_poll:
-                try:
-                    await _shared_uc_poll.disconnect()
-                except Exception:
-                    pass
+        poll_results = await asyncio.gather(
+            *[_poll_upload_task(fp, i) for i, fp in enumerate(new_files)],
+            return_exceptions=True,
+        )
 
         for r in poll_results:
             if isinstance(r, Exception):
@@ -592,6 +577,7 @@ class _BotModePostManager:
         Pending qualities → callback popup button (⏳ 720p uploading...)
         Pending = upload nahi hua abhi tak (not in self._buttons)
         """
+        _Q_EMOJI = {"360p": "🟢", "480p": "🔵", "720p": "🟡", "1080p": "🔴"}
         row = []
         for q in self.QUALITY_ORDER:
             if q not in self.UPLOAD_QUALITIES:
@@ -599,17 +585,12 @@ class _BotModePostManager:
 
             if q in self._buttons:
                 # Ready button
+                em = _Q_EMOJI.get(q, "🔵")
                 row.append(InlineKeyboardButton(
-                    text=f"➲ {q}",
+                    text=f"{em} {q}",
                     url=self._buttons[q],
                 ))
             else:
-                # Check: koi bhi higher quality ready hai kya?
-                # Agar nahi — matlab ye abhi pending hai, popup button dono
-                # Higher pending = woh qualities jo UPLOAD_QUALITIES mein hain
-                # aur abhi tak ready nahi hain
-                # Sirf tab pending button add karo jab koi lower quality ready ho
-                # (matlab post already exist karta hai)
                 if self.post_msg_id is not None or self._buttons:
                     row.append(InlineKeyboardButton(
                         text=f"⏳ {q} uploading...",
@@ -675,13 +656,15 @@ class _BotModePostManager:
         """
         Pehli quality ke baad keyboard — ready + saari pending (higher) qualities.
         """
+        _Q_EMOJI = {"360p": "🟢", "480p": "🔵", "720p": "🟡", "1080p": "🔴"}
         row = []
         for q in self.QUALITY_ORDER:
             if q not in self.UPLOAD_QUALITIES:
                 continue
             if q in self._buttons:
+                em = _Q_EMOJI.get(q, "🔵")
                 row.append(InlineKeyboardButton(
-                    text=f"➲ {q}",
+                    text=f"{em} {q}",
                     url=self._buttons[q],
                 ))
             else:
