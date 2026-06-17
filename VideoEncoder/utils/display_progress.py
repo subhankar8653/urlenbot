@@ -115,11 +115,27 @@ async def progress_for_pyrogram(current: int, total: int, ud_type: str, message,
             f"⏳ **ETA :** `{TimeFormatter(eta) if speed > 0 else 'Calculating...'}`"
         )
 
-        await message.edit(text=text)
-
         if current == total:
+            # 100% ho gaya — Telegram server pe finalize hogi file
+            # User ko dikhao ki processing chal rahi hai (stuck nahi hai)
             _cleanup_speed(task_id)
             _last_update.pop(task_id, None)
+            try:
+                await message.edit(
+                    f"**{ud_type}**
+
+"
+                    f"`{'█' * 15}` **100.0%**
+
+"
+                    f"📦 **Size :** `{humanbytes(total)}` / `{humanbytes(total)}`
+"
+                    f"⏳ **Finalizing...** (Telegram processing)"
+                )
+            except Exception:
+                pass
+        else:
+            await message.edit(text=text)
 
     except Exception:
         pass
