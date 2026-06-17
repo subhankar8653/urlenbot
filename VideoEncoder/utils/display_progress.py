@@ -121,17 +121,13 @@ async def progress_for_pyrogram(current: int, total: int, ud_type: str, message,
             _cleanup_speed(task_id)
             _last_update.pop(task_id, None)
             try:
-                await message.edit(
-                    f"**{ud_type}**
-
-"
-                    f"`{'█' * 15}` **100.0%**
-
-"
-                    f"📦 **Size :** `{humanbytes(total)}` / `{humanbytes(total)}`
-"
+                finalizing_text = (
+                    f"**{ud_type}**\n\n"
+                    f"`{'█' * 15}` **100.0%**\n\n"
+                    f"📦 **Size :** `{humanbytes(total)}` / `{humanbytes(total)}`\n"
                     f"⏳ **Finalizing...** (Telegram processing)"
                 )
+                await message.edit(text=finalizing_text)
             except Exception:
                 pass
         else:
