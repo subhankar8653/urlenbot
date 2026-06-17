@@ -698,10 +698,10 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
         caption = f"<b>{fname}</b>"
         disk_fname = os.path.basename(filepath)
 
-        # uploader_client bahar se pass hoga (shared) — andar mat banao
-        # Andar banane se same session_string se do alag uc bante hain
-        # aur parallel uploads mein socket conflict hota hai → read() crash
-        uc = uploader_client
+        # uploader_client=None hoga staggered flow mein — har file ka fresh uc
+        # Staggered chain ensure karti hai ki ek time pe sirf ek upload active hai
+        # isliye same session_string pe socket conflict nahi hoga
+        uc = uploader_client if uploader_client is not None else await _make_uploader_client(message.from_user.id)
         sent_msg = None
 
         # ── 50% staggered upload ke liye custom progress wrapper ──
@@ -735,7 +735,12 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
             # (agar file bahut chhoti ho aur 50% progress callback nahi aaya)
             if on_half and not _half_fired:
                 on_half.set()
-            # uc yahan disconnect mat karo — caller karega (shared client hai)
+            # Per-file fresh uc — yahan disconnect karo
+            if uc and uploader_client is None:
+                try:
+                    await uc.disconnect()
+                except Exception:
+                    pass
 
         if not custom_thumb_used and thumb and os.path.isfile(thumb):
             try:
@@ -931,47 +936,43 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
     # file[i+1] is event ka wait karega shuru hone se pehle
     _half_events = [asyncio.Event() for _ in files]
 
-    # ── Shared uploader client — ek hi uc banao, saare uploads mein share karo ──
-    # Alag alag uc banane se same session_string pe parallel socket reads hoti hain
-    # → "read() called while another coroutine is already waiting" crash
-    _shared_uc = await _make_uploader_client(message.from_user.id)
-
     async def _upload_task_staggered(filepath, idx):
         """
         idx = 0  → immediately start
         idx = 1  → wait for files[0] to reach 50%
         idx = 2  → wait for files[1] to reach 50%
         etc.
+
+        Har file ka APNA fresh uc — OLD (fast) approach.
+        Staggered chain ensure karti hai ki ek time pe sirf ek file actively
+        upload ho rahi hai, isliye socket conflict nahi hoga.
+        Alag uc = full bandwidth per file (shared uc bottleneck tha).
         """
         # Apni turn ka wait karo (pichli file 50% tak pahunche)
         if idx > 0:
             await _half_events[idx - 1].wait()
 
         um = _dummy_msgs.get(filepath, msg)
+        # uploader_client=None → _upload_one_file ke andar fresh uc banega
         success, sent_msg, quality = await _upload_one_file(
             client, message, um, filepath, dl_dir, encode,
-            on_half=_half_events[idx],   # 50% pe yeh event fire hoga
-            uploader_client=_shared_uc,  # shared client pass karo
+            on_half=_half_events[idx],
+            uploader_client=None,
         )
-        # Status message delete karo — clean chat
+        # sent_msg milne ke baad delete — user ko stuck na lage
         try:
-            await um.delete()
+            if success and sent_msg:
+                await um.delete()
+            else:
+                await um.edit(f"❌ Upload failed: `{quality}`")
         except Exception:
             pass
         return success, sent_msg, quality
 
-    try:
-        results = await asyncio.gather(
-            *[_upload_task_staggered(fp, i) for i, fp in enumerate(files)],
-            return_exceptions=True
-        )
-    finally:
-        # Saare uploads complete hone ke baad shared uc disconnect karo
-        if _shared_uc:
-            try:
-                await _shared_uc.disconnect()
-            except Exception:
-                pass
+    results = await asyncio.gather(
+        *[_upload_task_staggered(fp, i) for i, fp in enumerate(files)],
+        return_exceptions=True
+    )
 
     # Results parse karo
     uploaded_results = []  # [(quality, sent_message), ...]
