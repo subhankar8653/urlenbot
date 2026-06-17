@@ -18,7 +18,7 @@ from pyrogram.enums import ParseMode
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from .. import LOGGER, log as LOG_CHANNEL
-from .uploads.telegram import upload_video, get_thumbnail
+from .uploads.telegram import upload_video, get_thumbnail, _make_uploader_client
 from ..plugins.swift_downloader import (
     _quality_from, _sort_by_size, _upload_one_file, _scrape_and_download,
     QUALITY_ORDER,
@@ -174,8 +174,25 @@ class EpisodePostManager:
 # ─────────────────────────────────────────────────────────────────────────
 async def upload_file_to_log(client: Client, message: Message, status_msg: Message,
                               filepath: str, dl_dir: str):
-    return await _upload_one_file(client, message, status_msg, filepath, dl_dir,
-                                    encode=False, skip_forward=True)
+    """
+    Ek file ko log channel pe upload karo (skip_forward=True).
+    Shared uploader client banao taaki user client se fast upload ho aur
+    progress callback bhi kaam kare (bot fallback mein progress nahi aata).
+    """
+    uc = None
+    try:
+        uc = await _make_uploader_client(message.from_user.id)
+        result = await _upload_one_file(
+            client, message, status_msg, filepath, dl_dir,
+            encode=False, skip_forward=True, uploader_client=uc,
+        )
+        return result
+    finally:
+        if uc:
+            try:
+                await uc.disconnect()
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────────────────
