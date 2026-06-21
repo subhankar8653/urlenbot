@@ -71,16 +71,21 @@ class EpisodePostManager:
 
     def _keyboard(self) -> InlineKeyboardMarkup | None:
         """
-        Lowest-available-quality first (360p OR 480p, whichever exists — never both).
-        Then 720p, then 1080p. 2160p never shown.
-        Pending placeholder only for 720p/1080p if not yet ready.
+        Sirf wo qualities dikhao jo upload ho gayi hain.
+        Koi placeholder/pending button nahi — jab quality ready hogi tab button add hoga.
+
+        Layout:
+          - 360p OR 480p (lowest available, ek hi dikhega)
+          - 720p (sirf agar uploaded)
+          - 1080p (sirf agar uploaded)
+        Sab ek hi row mein.
         """
         row = []
 
         # Quality → colored emoji mapping
         _Q_EMOJI = {"360p": "🟢", "480p": "🔵", "720p": "🟡", "1080p": "🔴"}
 
-        # 360p / 480p — whichever is the lowest one that's ready; show only that one
+        # 360p / 480p — lowest jo ready hai, sirf wahi ek
         low_q = None
         if "360p" in self._buttons:
             low_q = "360p"
@@ -90,12 +95,12 @@ class EpisodePostManager:
             em = _Q_EMOJI.get(low_q, "🔵")
             row.append(InlineKeyboardButton(text=f"{em} {low_q}", url=self._buttons[low_q]))
 
+        # 720p aur 1080p — sirf tab dikhao jab uploaded ho
         for q in ["720p", "1080p"]:
-            em = _Q_EMOJI.get(q, "🔵")
             if q in self._buttons:
+                em = _Q_EMOJI.get(q, "🔵")
                 row.append(InlineKeyboardButton(text=f"{em} {q}", url=self._buttons[q]))
-            else:
-                row.append(InlineKeyboardButton(text=f"⏳ {q} uploading...", callback_data=f"bm_pending_{q}"))
+            # agar upload nahi hua — koi button nahi, koi placeholder nahi
 
         return InlineKeyboardMarkup([row]) if row else None
 
