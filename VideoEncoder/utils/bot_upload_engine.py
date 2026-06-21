@@ -21,7 +21,7 @@ try:
 except ImportError:
     ButtonStyle = None
     _BUTTON_STYLE_SUPPORTED = False
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageEntity
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from .. import LOGGER, log as LOG_CHANNEL
 from .uploads.telegram import upload_video, get_thumbnail, _make_uploader_client
@@ -43,9 +43,9 @@ from ..plugins.rti_downloader import get_watchmult_link, get_argon_link, argon_t
 #  (crash kabhi nahi hoga).
 # ─────────────────────────────────────────────────────────────────────────
 _BUTTON_STYLE = {
-    "low":   (ButtonStyle.PRIMARY if _BUTTON_STYLE_SUPPORTED else None, 6246969377288098637, "🔵"),  # Blue   — 🔗
-    "720p":  (ButtonStyle.SUCCESS if _BUTTON_STYLE_SUPPORTED else None, 6246841619190912436, "🟢"),  # Green  — 🍀
-    "1080p": (ButtonStyle.DANGER  if _BUTTON_STYLE_SUPPORTED else None, 6244729981339964487, "🔴"),  # Red    — ☄️
+    "low":   (ButtonStyle.PRIMARY if _BUTTON_STYLE_SUPPORTED else None, 5440389890787281213, "🔵"),  # Blue   — 🔗
+    "720p":  (ButtonStyle.SUCCESS if _BUTTON_STYLE_SUPPORTED else None, 5355142851615283756, "🟢"),  # Green  — 🍀
+    "1080p": (ButtonStyle.DANGER  if _BUTTON_STYLE_SUPPORTED else None, 5354968347094046619, "🔴"),  # Red    — ☄️
 }
 
 # Startup diagnostic — sirf ek baar check karo ki installed pyrogram/kurigram
@@ -70,37 +70,16 @@ except Exception:
 
 
 def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
-    """
-    Custom emoji button banana — MessageEntity approach use karta hai.
-    Button text = "<emoji_placeholder> <quality>" jisme pehla char placeholder hai,
-    aur uske liye custom_emoji entity set hoti hai.
-    Yeh Telegram Bot API ka standard tarika hai custom emoji in button text ke liye.
-    """
     style, icon_id, fallback_emoji = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
-
-    # Placeholder char (1 char) + space + quality text
-    # custom_emoji entity offset=0, length=1 (sirf placeholder pe)
-    btn_text = f"{fallback_emoji} {text}"
-
-    try:
-        entity = MessageEntity(
-            type="custom_emoji",
-            offset=0,
-            length=len(fallback_emoji),
-            custom_emoji_id=str(icon_id),
-        )
-        if _BUTTON_STYLE_SUPPORTED:
-            try:
-                return InlineKeyboardButton(
-                    text=btn_text, url=url, style=style, entities=[entity],
-                )
-            except Exception:
-                pass
-        return InlineKeyboardButton(text=btn_text, url=url, entities=[entity])
-    except Exception as e:
-        LOGGER.warning(f"[BotUpload] Custom emoji entity failed ({text}): {e}")
-        # Last resort: plain fallback emoji
-        return InlineKeyboardButton(text=btn_text, url=url)
+    if _BUTTON_STYLE_SUPPORTED:
+        try:
+            return InlineKeyboardButton(
+                text=text, url=url, icon_custom_emoji_id=icon_id, style=style,
+            )
+        except Exception as e:
+            LOGGER.warning(f"[BotUpload] Colour button failed ({text}), falling back to emoji: {e}")
+    # Fallback: plain emoji-prefixed url button (pyrofork ButtonStyle support na ho tab)
+    return InlineKeyboardButton(text=f"{fallback_emoji} {text}", url=url)
 
 
 
