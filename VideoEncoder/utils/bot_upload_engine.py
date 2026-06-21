@@ -14,7 +14,7 @@ import re
 import time
 
 from pyrogram import Client
-from pyrogram.enums import ParseMode
+from pyrogram.enums import ParseMode, ButtonStyle
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from .. import LOGGER, log as LOG_CHANNEL
@@ -25,6 +25,26 @@ from ..plugins.swift_downloader import (
 )
 from ..plugins.auto_monitor import _get_suhani_bot_link
 from ..plugins.rti_downloader import get_watchmult_link, get_argon_link, argon_to_swift
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Colour buttons — quality -> (ButtonStyle, custom_emoji_id)
+#  low_q slot  = 360p ya 480p (jo bhi pehle ready ho)  -> Blue
+#  720p slot                                            -> Green
+#  1080p slot                                           -> Red
+# ─────────────────────────────────────────────────────────────────────────
+_BUTTON_STYLE = {
+    "low":   (ButtonStyle.PRIMARY, 5440389890787281213),  # Blue
+    "720p":  (ButtonStyle.SUCCESS, 5355142851615283756),  # Green
+    "1080p": (ButtonStyle.DANGER,  5354968347094046619),  # Red
+}
+
+
+def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
+    style, icon_id = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
+    return InlineKeyboardButton(
+        text=text, url=url, icon_custom_emoji_id=icon_id, style=style,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -75,15 +95,12 @@ class EpisodePostManager:
         Koi placeholder/pending button nahi — jab quality ready hogi tab button add hoga.
 
         Layout:
-          - 360p OR 480p (lowest available, ek hi dikhega)
-          - 720p (sirf agar uploaded)
-          - 1080p (sirf agar uploaded)
+          - 360p OR 480p (lowest available, ek hi dikhega) — Blue
+          - 720p (sirf agar uploaded) — Green
+          - 1080p (sirf agar uploaded) — Red
         Sab ek hi row mein.
         """
         row = []
-
-        # Quality → colored emoji mapping
-        _Q_EMOJI = {"360p": "🟢", "480p": "🔵", "720p": "🟡", "1080p": "🔴"}
 
         # 360p / 480p — lowest jo ready hai, sirf wahi ek
         low_q = None
@@ -92,14 +109,12 @@ class EpisodePostManager:
         elif "480p" in self._buttons:
             low_q = "480p"
         if low_q:
-            em = _Q_EMOJI.get(low_q, "🔵")
-            row.append(InlineKeyboardButton(text=f"{em} {low_q}", url=self._buttons[low_q]))
+            row.append(_quality_button(low_q, self._buttons[low_q], "low"))
 
         # 720p aur 1080p — sirf tab dikhao jab uploaded ho
         for q in ["720p", "1080p"]:
             if q in self._buttons:
-                em = _Q_EMOJI.get(q, "🔵")
-                row.append(InlineKeyboardButton(text=f"{em} {q}", url=self._buttons[q]))
+                row.append(_quality_button(q, self._buttons[q], q))
             # agar upload nahi hua — koi button nahi, koi placeholder nahi
 
         return InlineKeyboardMarkup([row]) if row else None
@@ -303,7 +318,8 @@ async def create_batch_link(client: Client, message_ids: list[int], timeout: int
 #  Returns: { quality: sent_msg } for whatever uploaded successfully
 # ─────────────────────────────────────────────────────────────────────────
 async def run_episode_rti(client: Client, message: Message, status_msg: Message,
-                           page_url: str, ep_num: int, total: int) -> dict:
+                           page_url: str, ep_num: int, total: int,
+                           post_mgr: "EpisodePostManager | None" = None) -> dict:
     from .. import download_dir
 
     wmq_link, _ = get_watchmult_link(page_url, ep_num)
@@ -344,6 +360,14 @@ async def run_episode_rti(client: Client, message: Message, status_msg: Message,
         success, sent_msg, quality = await upload_file_to_log(client, message, status_msg, fp, dl_dir)
         if success and sent_msg:
             uploaded[quality] = sent_msg
+            # ── Button turant add karo (poore episode ka wait mat karo) ──
+            if post_mgr:
+                try:
+                    link = await _get_suhani_bot_link(sent_msg)
+                    if link:
+                        await post_mgr.add_quality(quality, link)
+                except Exception as e:
+                    LOGGER.error(f"[BotUpload] RTI immediate add_quality failed ({quality}): {e}")
 
     try:
         import shutil
@@ -363,16 +387,13 @@ async def send_batch_summary_post(client: Client, channel_id: int, season_num: i
     s = f"{season_num:02d}"
     caption = f"<b>➲ Season {s} Full Batch {language}</b>"
 
-    _Q_EMOJI = {"360p": "🟢", "480p": "🔵", "720p": "🟡", "1080p": "🔴"}
     row = []
     low_q = "360p" if "360p" in batch_links else ("480p" if "480p" in batch_links else None)
     if low_q:
-        em = _Q_EMOJI.get(low_q, "🔵")
-        row.append(InlineKeyboardButton(text=f"{em} {low_q}", url=batch_links[low_q]))
+        row.append(_quality_button(low_q, batch_links[low_q], "low"))
     for q in ["720p", "1080p"]:
         if q in batch_links:
-            em = _Q_EMOJI.get(q, "🔵")
-            row.append(InlineKeyboardButton(text=f"{em} {q}", url=batch_links[q]))
+            row.append(_quality_button(q, batch_links[q], q))
 
     keyboard = InlineKeyboardMarkup([row]) if row else None
 
