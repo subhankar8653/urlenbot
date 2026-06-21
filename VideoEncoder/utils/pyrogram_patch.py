@@ -96,9 +96,18 @@ async def save_file(
         file_id = file_id or self.rnd_id()
         md5_sum = md5() if not is_big and not is_missing_part else None
 
+        # FIX: keyword args use kiye (positional nahi) — kuch kurigram versions
+        # mein Session.__init__ ke parameters ka order badal gaya hai (naye
+        # features ke saath), jisse positional call galat slot mein values
+        # daal deta tha aur "missing required positional arguments" crash
+        # deta tha. Keyword args se chahe order kuch bhi ho, sahi jagah par
+        # hi value jaayegi — kabhi bhi crash nahi hoga.
         session = Session(
-            self, await self.storage.dc_id(), await self.storage.auth_key(),
-            await self.storage.test_mode(), is_media=True
+            client=self,
+            dc_id=await self.storage.dc_id(),
+            auth_key=await self.storage.auth_key(),
+            test_mode=await self.storage.test_mode(),
+            is_media=True,
         )
 
         # maxsize=0 = unlimited queue — main loop kabhi block nahi hoga queue.put() pe

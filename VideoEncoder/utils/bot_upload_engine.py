@@ -35,18 +35,38 @@ from ..plugins.rti_downloader import get_watchmult_link, get_argon_link, argon_t
 
 # ─────────────────────────────────────────────────────────────────────────
 #  Colour buttons — quality -> (ButtonStyle, custom_emoji_id, fallback_emoji)
-#  low_q slot  = 360p ya 480p (jo bhi pehle ready ho)  -> Blue
-#  720p slot                                            -> Green
-#  1080p slot                                           -> Red
+#  low_q slot  = 360p ya 480p (jo bhi pehle ready ho)  -> Blue   (🔗 link)
+#  720p slot                                            -> Green  (🍀 clover)
+#  1080p slot                                           -> Red    (☄️ comet)
 #  Agar installed pyrofork version mein ButtonStyle/icon_custom_emoji_id
 #  support nahi hai, to plain emoji-prefixed text button pe fallback hoga
 #  (crash kabhi nahi hoga).
 # ─────────────────────────────────────────────────────────────────────────
 _BUTTON_STYLE = {
-    "low":   (ButtonStyle.PRIMARY if _BUTTON_STYLE_SUPPORTED else None, 5440389890787281213, "🔵"),  # Blue
-    "720p":  (ButtonStyle.SUCCESS if _BUTTON_STYLE_SUPPORTED else None, 5355142851615283756, "🟢"),  # Green
-    "1080p": (ButtonStyle.DANGER  if _BUTTON_STYLE_SUPPORTED else None, 5354968347094046619, "🔴"),  # Red
+    "low":   (ButtonStyle.PRIMARY if _BUTTON_STYLE_SUPPORTED else None, 6246969377288098637, "🔵"),  # Blue   — 🔗
+    "720p":  (ButtonStyle.SUCCESS if _BUTTON_STYLE_SUPPORTED else None, 6246841619190912436, "🟢"),  # Green  — 🍀
+    "1080p": (ButtonStyle.DANGER  if _BUTTON_STYLE_SUPPORTED else None, 6244729981339964487, "🔴"),  # Red    — ☄️
 }
+
+# Startup diagnostic — sirf ek baar check karo ki installed pyrogram/kurigram
+# version InlineKeyboardButton mein 'style' aur 'icon_custom_emoji_id' params
+# accept karta hai ya nahi. Agar nahi karta, to colour button hamesha plain
+# emoji-prefixed fallback pe jaayega — yeh log dekh ke confirm kar sakte ho
+# ki kurigram version colour button support karta hai ya update chahiye.
+try:
+    import inspect as _inspect
+    _ikb_params = set(_inspect.signature(InlineKeyboardButton.__init__).parameters)
+    if _BUTTON_STYLE_SUPPORTED and {"style", "icon_custom_emoji_id"} <= _ikb_params:
+        LOGGER.info("[BotUpload] Colour buttons ENABLED (style + icon_custom_emoji_id supported by installed kurigram)")
+    else:
+        LOGGER.warning(
+            "[BotUpload] Colour buttons DISABLED — installed kurigram version's "
+            "InlineKeyboardButton doesn't accept 'style'/'icon_custom_emoji_id'. "
+            "Falling back to plain emoji-prefixed buttons. Update kurigram "
+            "(pip install -U kurigram) to enable real colour buttons."
+        )
+except Exception:
+    pass
 
 
 def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
@@ -60,6 +80,7 @@ def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
             LOGGER.warning(f"[BotUpload] Colour button failed ({text}), falling back to emoji: {e}")
     # Fallback: plain emoji-prefixed url button (pyrofork ButtonStyle support na ho tab)
     return InlineKeyboardButton(text=f"{fallback_emoji} {text}", url=url)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────
