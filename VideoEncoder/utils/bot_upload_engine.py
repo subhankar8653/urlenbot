@@ -69,6 +69,43 @@ except Exception:
     pass
 
 
+# ─────────────────────────────────────────────────────────────────────────
+#  Premium emoji IDs for caption prefix (➲ replacement) and quality buttons
+# ─────────────────────────────────────────────────────────────────────────
+# Caption prefix emoji (➲ ki jagah)
+_CAPTION_EMOJI_ID = 6179062315090977332  # ✅ verified premium emoji
+
+# Quality button caption emojis (360p/480p, 720p, 1080p)
+_QUALITY_EMOJI_IDS = {
+    "low":   6178956770564645948,   # 🔗-style blue
+    "720p":  6179433490459665818,   # 🍀-style green
+    "1080p": 6179270925947510542,   # ⚡-style red
+}
+
+
+def _make_caption_with_entity(text_without_prefix: str) -> tuple[str, list]:
+    """
+    '➲ Season 01 Episode 01 Hindi' jaisa caption banao lekin
+    pehle char ki jagah premium emoji entity use karo.
+    Returns: (full_text, [MessageEntity])
+    """
+    placeholder = "➲"  # 1 char placeholder (same length as original)
+    full_text = f"<b>{placeholder} {text_without_prefix}</b>"
+    # strip HTML for offset calculation — placeholder is char 0 in plain text
+    # But since parse_mode=HTML, entities offset is in the PLAIN text after HTML parsing
+    # plain text = "➲ Season 01 Episode 01 Hindi" — offset=0, length=1
+    try:
+        entity = MessageEntity(
+            type="custom_emoji",
+            offset=0,
+            length=len(placeholder),
+            custom_emoji_id=str(_CAPTION_EMOJI_ID),
+        )
+        return full_text, [entity]
+    except Exception:
+        return full_text, []
+
+
 def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
     style, icon_id, fallback_emoji = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
     if _BUTTON_STYLE_SUPPORTED:
@@ -120,10 +157,10 @@ class EpisodePostManager:
         self._lock = asyncio.Lock()
         self._db_loaded = False
 
-    def _caption(self) -> str:
+    def _caption(self) -> tuple:
         s = f"{self.season_num:02d}"
         e = f"{self.episode_num:02d}"
-        return f"<b>➲ Season {s} Episode {e} {self.language}</b>"
+        return _make_caption_with_entity(f"Season {s} Episode {e} {self.language}")
 
     def _keyboard(self) -> InlineKeyboardMarkup | None:
         """
@@ -198,15 +235,16 @@ class EpisodePostManager:
             await self._load_from_db()
 
             self._buttons[quality] = deep_link_url
-            caption = self._caption()
+            caption_text, caption_entities = self._caption()
 
             if self.post_msg_id is None:
                 # Naya message banao
                 try:
                     sent = await self.client.send_message(
-                        chat_id=self.channel_id, text=caption,
+                        chat_id=self.channel_id, text=caption_text,
                         reply_markup=self._keyboard(),
                         parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                        entities=caption_entities if caption_entities else None,
                     )
                     self.post_msg_id = sent.id
                     await self._save_to_db()
@@ -217,8 +255,9 @@ class EpisodePostManager:
                 try:
                     await self.client.edit_message_text(
                         chat_id=self.channel_id, message_id=self.post_msg_id,
-                        text=caption, reply_markup=self._keyboard(),
+                        text=caption_text, reply_markup=self._keyboard(),
                         parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                        entities=caption_entities if caption_entities else None,
                     )
                     await self._save_to_db()
                 except Exception as e:
