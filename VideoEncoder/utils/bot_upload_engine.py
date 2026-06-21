@@ -14,7 +14,13 @@ import re
 import time
 
 from pyrogram import Client
-from pyrogram.enums import ParseMode, ButtonStyle
+from pyrogram.enums import ParseMode
+try:
+    from pyrogram.enums import ButtonStyle
+    _BUTTON_STYLE_SUPPORTED = True
+except ImportError:
+    ButtonStyle = None
+    _BUTTON_STYLE_SUPPORTED = False
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from .. import LOGGER, log as LOG_CHANNEL
@@ -28,23 +34,32 @@ from ..plugins.rti_downloader import get_watchmult_link, get_argon_link, argon_t
 
 
 # ─────────────────────────────────────────────────────────────────────────
-#  Colour buttons — quality -> (ButtonStyle, custom_emoji_id)
+#  Colour buttons — quality -> (ButtonStyle, custom_emoji_id, fallback_emoji)
 #  low_q slot  = 360p ya 480p (jo bhi pehle ready ho)  -> Blue
 #  720p slot                                            -> Green
 #  1080p slot                                           -> Red
+#  Agar installed pyrofork version mein ButtonStyle/icon_custom_emoji_id
+#  support nahi hai, to plain emoji-prefixed text button pe fallback hoga
+#  (crash kabhi nahi hoga).
 # ─────────────────────────────────────────────────────────────────────────
 _BUTTON_STYLE = {
-    "low":   (ButtonStyle.PRIMARY, 5440389890787281213),  # Blue
-    "720p":  (ButtonStyle.SUCCESS, 5355142851615283756),  # Green
-    "1080p": (ButtonStyle.DANGER,  5354968347094046619),  # Red
+    "low":   (ButtonStyle.PRIMARY if _BUTTON_STYLE_SUPPORTED else None, 5440389890787281213, "🔵"),  # Blue
+    "720p":  (ButtonStyle.SUCCESS if _BUTTON_STYLE_SUPPORTED else None, 5355142851615283756, "🟢"),  # Green
+    "1080p": (ButtonStyle.DANGER  if _BUTTON_STYLE_SUPPORTED else None, 5354968347094046619, "🔴"),  # Red
 }
 
 
 def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
-    style, icon_id = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
-    return InlineKeyboardButton(
-        text=text, url=url, icon_custom_emoji_id=icon_id, style=style,
-    )
+    style, icon_id, fallback_emoji = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
+    if _BUTTON_STYLE_SUPPORTED:
+        try:
+            return InlineKeyboardButton(
+                text=text, url=url, icon_custom_emoji_id=icon_id, style=style,
+            )
+        except Exception as e:
+            LOGGER.warning(f"[BotUpload] Colour button failed ({text}), falling back to emoji: {e}")
+    # Fallback: plain emoji-prefixed url button (pyrofork ButtonStyle support na ho tab)
+    return InlineKeyboardButton(text=f"{fallback_emoji} {text}", url=url)
 
 
 # ─────────────────────────────────────────────────────────────────────────
