@@ -43,9 +43,9 @@ from ..plugins.rti_downloader import get_watchmult_link, get_argon_link, argon_t
 #  (crash kabhi nahi hoga).
 # ─────────────────────────────────────────────────────────────────────────
 _BUTTON_STYLE = {
-    "low":   (ButtonStyle.PRIMARY if _BUTTON_STYLE_SUPPORTED else None, 6246969377288098637, "🔵"),  # Blue   — 🔗
-    "720p":  (ButtonStyle.SUCCESS if _BUTTON_STYLE_SUPPORTED else None, 6246841619190912436, "🟢"),  # Green  — 🍀
-    "1080p": (ButtonStyle.DANGER  if _BUTTON_STYLE_SUPPORTED else None, 6244729981339964487, "🔴"),  # Red    — ☄️
+    "low":   (ButtonStyle.PRIMARY if _BUTTON_STYLE_SUPPORTED else None, 6178956770564645948, "🔵"),  # Blue
+    "720p":  (ButtonStyle.SUCCESS if _BUTTON_STYLE_SUPPORTED else None, 6179433490459665818, "🟢"),  # Green
+    "1080p": (ButtonStyle.DANGER  if _BUTTON_STYLE_SUPPORTED else None, 6179270925947510542, "🔴"),  # Red
 }
 
 # Startup diagnostic — sirf ek baar check karo ki installed pyrogram/kurigram
