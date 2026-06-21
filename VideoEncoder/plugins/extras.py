@@ -83,7 +83,10 @@ async def test_emoji_cmd(client, message: Message):
     injected_ids = []  # (offset_in_final_text, emoji_id)
 
     def replace_tag(m):
-        injected_ids.append(m.group(1))
+        # group(1) for [emoji_id:X] format, group(2) for emoji_id:X format
+        eid = m.group(1) or (m.group(2) if m.lastindex and m.lastindex >= 2 else None)
+        if eid:
+            injected_ids.append(eid)
         return PLACEHOLDER
 
     processed_text = emoji_id_pattern.sub(replace_tag, raw_text)
@@ -93,14 +96,13 @@ async def test_emoji_cmd(client, message: Message):
 
     # 2a. Message ke existing custom_emoji entities (agar user ne premium emoji type kiya)
     if message.entities:
-        # User ke message mein /testemoji -100X text — text part offset calculate karo
-        # command + space + channel_id + space = skip karna hai
-        cmd_len = len(args[0]) + 1 + len(args[1]) + 1  # "/testemoji -100X "
+        # command + space + channel_id + space = skip offset
+        cmd_len = len(args[0]) + 1 + len(args[1]) + 1
         for ent in message.entities:
-            if ent.type.value == "custom_emoji" and ent.offset >= cmd_len:
+            # Pyrogram mein ent.type ek enum hai — str() se compare karo
+            ent_type = str(ent.type).split(".")[-1].lower()  # "MessageEntityType.CUSTOM_EMOJI" → "custom_emoji"
+            if ent_type == "custom_emoji" and ent.offset >= cmd_len:
                 new_offset = ent.offset - cmd_len
-                # processed_text mein [emoji_id:] tags hatne se offset shift ho sakta hai
-                # Simple approach: find karo PLACEHOLDER chars ke baad
                 entities.append(_MessageEntity(
                     type="custom_emoji",
                     offset=new_offset,
