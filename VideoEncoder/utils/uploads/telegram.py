@@ -58,7 +58,7 @@ async def _make_uploader_client(user_id: int):
             api_id=api_id,
             api_hash=api_hash,
             in_memory=True,
-            max_concurrent_transmissions=20,
+            max_concurrent_transmissions=4,  # FIX: 20 → 4 (app client mein yeh already fix tha, yahan reh gaya tha — isi se deadlock + pyrogram_patch.py ki zaroorat padi thi)
             workers=32,
             sleep_threshold=60,
         )
