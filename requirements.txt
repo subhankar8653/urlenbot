@@ -1,5 +1,5 @@
 # Required
-pyrofork==2.3.68
+kurigram==2.2.22
 TgCrypto
 python-dotenv
 hachoir
