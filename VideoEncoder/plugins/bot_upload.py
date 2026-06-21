@@ -376,19 +376,16 @@ async def bot_upload_cmd(bot: Client, message: Message):
 
         for ep_num in range(start_ep, end_ep + 1):
             await status.edit(f"<b>🎬 Episode {ep_num}/{end_ep}</b> processing...")
-            uploaded = await run_episode_rti(app, message, status, page_url, ep_num, end_ep)
+            post_mgr = EpisodePostManager(app, channel_id, anime_name, ep_num, season_no)
+            uploaded = await run_episode_rti(app, message, status, page_url, ep_num, end_ep, post_mgr=post_mgr)
             if not uploaded:
                 continue
 
-            post_mgr = EpisodePostManager(app, channel_id, anime_name, ep_num, season_no)
             for quality in ["360p", "480p", "720p", "1080p"]:
                 sent_msg = uploaded.get(quality)
                 if not sent_msg:
                     continue
-                link = await _get_suhani_bot_link(sent_msg)
-                if link:
-                    await post_mgr.add_quality(quality, link)
-                    batch_msg_ids[quality].append(sent_msg.id)
+                batch_msg_ids[quality].append(sent_msg.id)
 
     # ── /url <link> -e [unique_code]  ──
     # unique_code optional hai — diya toh existing episode messages edit honge
