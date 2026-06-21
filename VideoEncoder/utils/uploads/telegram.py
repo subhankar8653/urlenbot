@@ -7,11 +7,36 @@ import time
 from pyrogram import Client
 from pyrogram.enums import ParseMode
 from pyrogram.errors import ChannelInvalid, ChannelPrivate, ChatIdInvalid, PeerIdInvalid
-from ... import app, download_dir, log, api_id, api_hash
+from ... import app, download_dir, log, api_id, api_hash, LOGGER
 from ..database.access_db import db
 from ..auto_caption import smart_caption
 from ..display_progress import progress_for_pyrogram
 from ..encoding import get_duration, get_thumbnail, get_width_height
+
+
+# ─────────────────────────────────────────────
+#  cover-safe send wrapper
+#  ───────────────────────
+#  Kuch kurigram/pyrogram versions (e.g. kurigram==2.2.22) ke
+#  send_video()/reply_video() mein 'cover' kwarg support nahi hota
+#  (TypeError: got an unexpected keyword argument 'cover').
+#  Yeh wrapper pehle 'cover' ke saath try karta hai, aur agar wahi
+#  specific TypeError aaye to automatically 'cover' hata ke retry
+#  karta hai — kabhi bhi crash nahi hoga, chahe library 'cover'
+#  support kare ya na kare.
+# ─────────────────────────────────────────────
+async def _send_video_cover_safe(send_fn, **kwargs):
+    try:
+        return await send_fn(**kwargs)
+    except TypeError as e:
+        if "cover" in kwargs and "cover" in str(e):
+            LOGGER.warning(
+                f"[Upload] Installed pyrogram/kurigram 'cover' kwarg "
+                f"support nahi karta, bina cover ke retry kar rahe hain: {e}"
+            )
+            kwargs.pop("cover", None)
+            return await send_fn(**kwargs)
+        raise
 
 
 # ─────────────────────────────────────────────
@@ -70,7 +95,8 @@ async def _upload_via_user_then_forward(
     try:
         # ── Step 1: User client se LOG_CHANNEL mein upload ──
         if media_type == "video":
-            saved = await uc.send_video(
+            saved = await _send_video_cover_safe(
+                uc.send_video,
                 chat_id=log,
                 video=new_file,
                 progress=send_kwargs.get("progress"),
@@ -279,10 +305,10 @@ async def upload_video(message, msg, new_file, caption, c_time, thumb,
             # Bot mode fallback — seedha log channel pe upload karo
             log_kwargs = {k: v for k, v in send_kwargs.items()
                           if k not in ("progress", "progress_args")}
-            resp = await app.send_video(log, new_file, **log_kwargs)
+            resp = await _send_video_cover_safe(app.send_video, chat_id=log, video=new_file, **log_kwargs)
         else:
             # Normal fallback — target chat pe upload
-            resp = await message.reply_video(new_file, **send_kwargs)
+            resp = await _send_video_cover_safe(message.reply_video, video=new_file, **send_kwargs)
 
             # Log channel mein bhi bhejo (bot fallback case mein)
             if resp:
@@ -294,7 +320,7 @@ async def upload_video(message, msg, new_file, caption, c_time, thumb,
                 if cover:
                     log_kwargs['cover'] = cover
                 try:
-                    await app.send_video(log, resp.video.file_id, **log_kwargs)
+                    await _send_video_cover_safe(app.send_video, chat_id=log, video=resp.video.file_id, **log_kwargs)
                 except Exception:
                     pass
 
