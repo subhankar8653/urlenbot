@@ -83,12 +83,28 @@ _QUALITY_EMOJI_IDS = {
 }
 
 
-def _make_caption_with_entity(text_without_prefix: str) -> str:
+def _make_caption_with_entity(text_without_prefix: str) -> tuple:
     """
-    HTML parse_mode ke saath <tg-emoji> tag use karo — yeh Telegram Bot API 9.4+ ka standard hai.
-    Format: <tg-emoji emoji-id="ID">fallback</tg-emoji>
+    Entities approach — parse_mode=DISABLED ke saath.
+    Plain text: "➲ Season 01 Episode 01 Hindi"
+    Entity 1: bold, offset=0, length=total
+    Entity 2: custom_emoji, offset=0, length=1 (sirf ➲ char)
     """
-    return f'<b><tg-emoji emoji-id="{_CAPTION_EMOJI_ID}">➲</tg-emoji> {text_without_prefix}</b>'
+    placeholder = "➲"
+    full_text = f"{placeholder} {text_without_prefix}"
+    total_len = len(full_text)
+    entities = []
+    try:
+        entities.append(MessageEntity(type="bold", offset=0, length=total_len))
+        entities.append(MessageEntity(
+            type="custom_emoji",
+            offset=0,
+            length=len(placeholder),
+            custom_emoji_id=str(_CAPTION_EMOJI_ID),
+        ))
+    except Exception as e:
+        LOGGER.warning(f"[BotUpload] Caption entity failed: {e}")
+    return full_text, entities
 
 
 def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
@@ -142,7 +158,7 @@ class EpisodePostManager:
         self._lock = asyncio.Lock()
         self._db_loaded = False
 
-    def _caption(self) -> str:
+    def _caption(self) -> tuple:
         s = f"{self.season_num:02d}"
         e = f"{self.episode_num:02d}"
         return _make_caption_with_entity(f"Season {s} Episode {e} {self.language}")
@@ -220,7 +236,7 @@ class EpisodePostManager:
             await self._load_from_db()
 
             self._buttons[quality] = deep_link_url
-            caption_text = self._caption()
+            caption_text, caption_entities = self._caption()
 
             if self.post_msg_id is None:
                 # Naya message banao
@@ -228,7 +244,8 @@ class EpisodePostManager:
                     sent = await self.client.send_message(
                         chat_id=self.channel_id, text=caption_text,
                         reply_markup=self._keyboard(),
-                        parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                        parse_mode=ParseMode.DISABLED, disable_web_page_preview=True,
+                        entities=caption_entities if caption_entities else None,
                     )
                     self.post_msg_id = sent.id
                     await self._save_to_db()
@@ -240,7 +257,8 @@ class EpisodePostManager:
                     await self.client.edit_message_text(
                         chat_id=self.channel_id, message_id=self.post_msg_id,
                         text=caption_text, reply_markup=self._keyboard(),
-                        parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                        parse_mode=ParseMode.DISABLED, disable_web_page_preview=True,
+                        entities=caption_entities if caption_entities else None,
                     )
                     await self._save_to_db()
                 except Exception as e:
