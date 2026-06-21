@@ -1,5 +1,5 @@
 # Required
-pyrofork
+pyrofork==2.3.68
 TgCrypto
 python-dotenv
 hachoir
