@@ -85,25 +85,29 @@ _QUALITY_EMOJI_IDS = {
 
 def _make_caption_with_entity(text_without_prefix: str) -> tuple[str, list]:
     """
-    '➲ Season 01 Episode 01 Hindi' jaisa caption banao lekin
-    pehle char ki jagah premium emoji entity use karo.
-    Returns: (full_text, [MessageEntity])
+    parse_mode=HTML aur entities saath kaam nahi karte Pyrogram mein.
+    Isliye parse_mode=None use karo aur sab entities manually do:
+      - bold  → MessageEntity(type="bold", offset=0, length=total)
+      - emoji → MessageEntity(type="custom_emoji", offset=0, length=1)
+    Plain text: "➲ Season 01 Episode 01 Hindi"
     """
-    placeholder = "➲"  # 1 char placeholder (same length as original)
-    full_text = f"<b>{placeholder} {text_without_prefix}</b>"
-    # strip HTML for offset calculation — placeholder is char 0 in plain text
-    # But since parse_mode=HTML, entities offset is in the PLAIN text after HTML parsing
-    # plain text = "➲ Season 01 Episode 01 Hindi" — offset=0, length=1
+    placeholder = "➲"  # 1 char — custom_emoji entity iske upar lagegi
+    full_text = f"{placeholder} {text_without_prefix}"
+    total_len = len(full_text)
+    entities = []
     try:
-        entity = MessageEntity(
+        # Bold — poora text bold
+        entities.append(MessageEntity(type="bold", offset=0, length=total_len))
+        # Custom emoji — sirf pehla char (placeholder)
+        entities.append(MessageEntity(
             type="custom_emoji",
             offset=0,
             length=len(placeholder),
             custom_emoji_id=str(_CAPTION_EMOJI_ID),
-        )
-        return full_text, [entity]
+        ))
     except Exception:
-        return full_text, []
+        pass
+    return full_text, entities
 
 
 def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
@@ -243,7 +247,7 @@ class EpisodePostManager:
                     sent = await self.client.send_message(
                         chat_id=self.channel_id, text=caption_text,
                         reply_markup=self._keyboard(),
-                        parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                        parse_mode=ParseMode.DISABLED, disable_web_page_preview=True,
                         entities=caption_entities if caption_entities else None,
                     )
                     self.post_msg_id = sent.id
@@ -256,7 +260,7 @@ class EpisodePostManager:
                     await self.client.edit_message_text(
                         chat_id=self.channel_id, message_id=self.post_msg_id,
                         text=caption_text, reply_markup=self._keyboard(),
-                        parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                        parse_mode=ParseMode.DISABLED, disable_web_page_preview=True,
                         entities=caption_entities if caption_entities else None,
                     )
                     await self._save_to_db()
