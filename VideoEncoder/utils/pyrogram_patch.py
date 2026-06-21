@@ -189,6 +189,29 @@ async def save_file(
                 fp.close()
 
 
-# Apply patch
-SaveFile.save_file = save_file
-pyrogram.Client.save_file = save_file
+# ─────────────────────────────────────────────────────────────────────────
+# PATCH DISABLED (2026-06-21)
+# ─────────────────────────────────────────────────────────────────────────
+# Yeh patch sirf ek workaround tha for the original deadlock caused by
+# `max_concurrent_transmissions=20` on the uploader_user client
+# (telegram.py -> _make_uploader_client). Us client ko ab seedha
+# max_concurrent_transmissions=4 par fix kar diya gaya hai (jaisa app
+# client mein already tha) — jo asli, public, documented Pyrogram/kurigram
+# API hai isi cheez ko control karne ke liye.
+#
+# Is patch ko hand-rolled `Session(...)` banana padta tha jiska constructor
+# har kurigram update mein silently badal sakta hai (jaisa abhi hua —
+# 'auth_key'/'test_mode' positional mismatch, phir 'server_address'/'port'
+# required argument missing — yeh dono iss baat ka signal hain ki kurigram
+# ki Session class ka internal API is patch se already kaafi door drift
+# kar chuka hai). Isliye ab is patch ko apply nahi kiya ja raha — kurigram
+# ka apna built-in, version-matched save_file() use hoga, jo hamesha us
+# installed version ke saath sahi se compatible rahega.
+#
+# Agar future mein dobara koi deadlock dikhe, pehle Client(...) ka
+# max_concurrent_transmissions kam karke dekho (public API) — is patch ko
+# wapas enable mat karo, kyunki yeh kurigram internals par directly depend
+# karta hai jo bina warning ke badal sakte hain.
+# ─────────────────────────────────────────────────────────────────────────
+# SaveFile.save_file = save_file
+# pyrogram.Client.save_file = save_file
