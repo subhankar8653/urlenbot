@@ -71,15 +71,19 @@ except Exception:
 
 def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
     style, icon_id, fallback_emoji = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
+    # Custom emoji text format: <tg-emoji emoji-id='ID'>fallback</tg-emoji>
+    # Telegram renders premium emoji in button text when parse_mode=HTML is used.
+    # Yeh approach bina icon_custom_emoji_id ke bhi kaam karta hai.
+    custom_emoji_text = f"<tg-emoji emoji-id='{icon_id}'>{fallback_emoji}</tg-emoji> {text}"
     if _BUTTON_STYLE_SUPPORTED:
         try:
             return InlineKeyboardButton(
-                text=text, url=url, icon_custom_emoji_id=icon_id, style=style,
+                text=custom_emoji_text, url=url, style=style,
             )
         except Exception as e:
             LOGGER.warning(f"[BotUpload] Colour button failed ({text}), falling back to emoji: {e}")
-    # Fallback: plain emoji-prefixed url button (pyrofork ButtonStyle support na ho tab)
-    return InlineKeyboardButton(text=f"{fallback_emoji} {text}", url=url)
+    # Fallback: custom emoji text button (works on all pyrofork/kurigram versions)
+    return InlineKeyboardButton(text=custom_emoji_text, url=url)
 
 
 
