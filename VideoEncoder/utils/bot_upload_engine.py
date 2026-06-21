@@ -21,7 +21,7 @@ try:
 except ImportError:
     ButtonStyle = None
     _BUTTON_STYLE_SUPPORTED = False
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageEntity
 
 from .. import LOGGER, log as LOG_CHANNEL
 from .uploads.telegram import upload_video, get_thumbnail, _make_uploader_client
@@ -70,20 +70,37 @@ except Exception:
 
 
 def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
+    """
+    Custom emoji button banana — MessageEntity approach use karta hai.
+    Button text = "<emoji_placeholder> <quality>" jisme pehla char placeholder hai,
+    aur uske liye custom_emoji entity set hoti hai.
+    Yeh Telegram Bot API ka standard tarika hai custom emoji in button text ke liye.
+    """
     style, icon_id, fallback_emoji = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
-    # Custom emoji text format: <tg-emoji emoji-id='ID'>fallback</tg-emoji>
-    # Telegram renders premium emoji in button text when parse_mode=HTML is used.
-    # Yeh approach bina icon_custom_emoji_id ke bhi kaam karta hai.
-    custom_emoji_text = f"<tg-emoji emoji-id='{icon_id}'>{fallback_emoji}</tg-emoji> {text}"
-    if _BUTTON_STYLE_SUPPORTED:
-        try:
-            return InlineKeyboardButton(
-                text=custom_emoji_text, url=url, style=style,
-            )
-        except Exception as e:
-            LOGGER.warning(f"[BotUpload] Colour button failed ({text}), falling back to emoji: {e}")
-    # Fallback: custom emoji text button (works on all pyrofork/kurigram versions)
-    return InlineKeyboardButton(text=custom_emoji_text, url=url)
+
+    # Placeholder char (1 char) + space + quality text
+    # custom_emoji entity offset=0, length=1 (sirf placeholder pe)
+    btn_text = f"{fallback_emoji} {text}"
+
+    try:
+        entity = MessageEntity(
+            type="custom_emoji",
+            offset=0,
+            length=len(fallback_emoji),
+            custom_emoji_id=str(icon_id),
+        )
+        if _BUTTON_STYLE_SUPPORTED:
+            try:
+                return InlineKeyboardButton(
+                    text=btn_text, url=url, style=style, entities=[entity],
+                )
+            except Exception:
+                pass
+        return InlineKeyboardButton(text=btn_text, url=url, entities=[entity])
+    except Exception as e:
+        LOGGER.warning(f"[BotUpload] Custom emoji entity failed ({text}): {e}")
+        # Last resort: plain fallback emoji
+        return InlineKeyboardButton(text=btn_text, url=url)
 
 
 
