@@ -71,13 +71,16 @@ def _make_caption_with_entity(text_without_prefix: str) -> tuple:
 
 
 def _quality_button_dict(text: str, url: str, slot: str) -> dict:
-    """Bot API ke liye button dict — styled + custom emoji."""
-    style, icon_id, _ = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
+    """
+    Bot API ke liye button dict.
+    NOTE: Standard Bot API mein inline buttons mein custom_emoji support nahi hota.
+    Style (color) bhi sirf Telegram client ke internal API mein hota hai — Bot API ignore karta hai.
+    Isliye fallback_emoji prefix use karo text mein — yeh sabse reliable hai.
+    """
+    _, _, fallback_emoji = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
     return {
-        "text": text,
+        "text": f"{fallback_emoji} {text}",
         "url": url,
-        "style": style,
-        "icon_custom_emoji_id": str(icon_id),
     }
 
 
