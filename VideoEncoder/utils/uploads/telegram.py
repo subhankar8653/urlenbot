@@ -27,30 +27,28 @@ from ..encoding import get_duration, get_thumbnail, get_width_height
 # ─────────────────────────────────────────────
 async def _send_video_cover_safe(send_fn, **kwargs):
     # kurigram 2.2.22 ke send_video/reply_video mein 'file_name' aur 'cover'
-    # kwargs support nahi hote — pehle strip karke try karo, agar phir bhi
-    # TypeError aaye to raise karo.
-    _unsupported = ("file_name", "cover")
+    # kwargs support nahi hote — pehle with all kwargs try karo,
+    # TypeError aane pe sirf wahi kwarg strip karo jo error mein mention hai.
+    _maybe_unsupported = ("file_name", "cover")
     try:
         return await send_fn(**kwargs)
     except TypeError as e:
         err_str = str(e)
         stripped_any = False
-        for kw in _unsupported:
+        for kw in _maybe_unsupported:
             if kw in kwargs and kw in err_str:
-                LOGGER.warning(
-                    f"[Upload] '{kw}' kwarg support nahi, hata ke retry: {e}"
-                )
-                kwargs.pop(kw, None)
+                LOGGER.warning(f"[Upload] '{kw}' kwarg unsupported, hata ke retry: {e}")
+                kwargs.pop(kw)
                 stripped_any = True
         if stripped_any:
-            # Retry without the unsupported kwarg(s)
             try:
                 return await send_fn(**kwargs)
             except TypeError as e2:
-                # Koi aur unsupported kwarg? One more pass
-                for kw in _unsupported:
-                    if kw in kwargs and kw in str(e2):
-                        kwargs.pop(kw, None)
+                # Ek aur pass — koi aur kwarg bhi unsupported ho sakta hai
+                err_str2 = str(e2)
+                for kw in _maybe_unsupported:
+                    if kw in kwargs and kw in err_str2:
+                        kwargs.pop(kw)
                 return await send_fn(**kwargs)
         raise
 
@@ -237,9 +235,14 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
                 uploader_client=uc
             )
         else:
+            # cover = custom_thumb path (agar set hai) — Telegram video player mein
+            # cover image dikhta hai (alag from thumb jo media gallery mein hota hai)
+            _cover = thumb if custom_thumb and thumb and os.path.isfile(thumb) else None
             _resp = await upload_video(
                 message, msg, new_file, bold_caption,
-                c_time, thumb, duration, width, height, new_filename, custom_thumb,
+                c_time, thumb, duration, width, height,
+                file_name=new_filename,
+                cover=_cover,
                 uploader_client=uc
             )
             link = _resp.link if _resp else None
