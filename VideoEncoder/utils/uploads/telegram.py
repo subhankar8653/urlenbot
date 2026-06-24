@@ -97,49 +97,90 @@ async def _upload_via_user_then_forward(
     skip_forward=False
 ):
     """
-    1. User client → log channel mein upload (user admin hai)
-    2. Bot → log channel se target chat mein forward_messages
-       (skip_forward=True hoga to forward skip hoga — bot_mode ke liye)
-    3. No cleanup needed — log channel mein rehna chahiye file
+    Strategy (cover ke saath sahi kaam karne ke liye):
+
+    NORMAL mode (skip_forward=False):
+      1. User client → seedha TARGET CHAT mein upload karo (cover ke saath) ✅
+      2. Bot → LOG_CHANNEL mein alag se log bhejo (bina cover, file_id se)
+
+    BOT mode (skip_forward=True):
+      1. User client → LOG_CHANNEL mein upload karo (cover ke saath)
+      2. Forward skip — sirf log channel pe rehega
+
+    WHY: forward_messages aur copy_message dono Telegram mein cover preserve
+    nahi karte. Seedha target chat mein upload karna hi ek reliable tarika hai.
     """
-    # Strip progress, reply_to aur file_name (kurigram unsupported) — cover RAKHNA hai!
-    # cover = Telegram video player background image, forward mein preserve nahi hoti
-    # isliye user client upload mein cover pass karna zaroori hai
+    # Strip progress, reply_to, file_name (kurigram unsupported) — cover RAKHNA hai!
     _strip_keys = ("reply_to_message_id", "progress", "progress_args", "file_name")
     safe_kwargs = {k: v for k, v in send_kwargs.items() if k not in _strip_keys}
+
     try:
-        # ── Step 1: User client se LOG_CHANNEL mein upload ──
+        if skip_forward:
+            # ── Bot mode: LOG_CHANNEL mein upload (cover ke saath try) ──
+            if media_type == "video":
+                saved = await _send_video_cover_safe(
+                    uc.send_video,
+                    chat_id=log,
+                    video=new_file,
+                    progress=send_kwargs.get("progress"),
+                    progress_args=send_kwargs.get("progress_args"),
+                    **safe_kwargs,
+                )
+            else:
+                saved = await uc.send_document(
+                    chat_id=log,
+                    document=new_file,
+                    progress=send_kwargs.get("progress"),
+                    progress_args=send_kwargs.get("progress_args"),
+                    **safe_kwargs,
+                )
+            return saved
+
+        # ── Normal mode: seedha TARGET CHAT mein upload karo (cover ke saath) ──
+        # reply_to_message_id bhi add karo target chat ke liye
+        target_kwargs = dict(safe_kwargs)
+        reply_to = send_kwargs.get("reply_to_message_id")
+        if reply_to:
+            target_kwargs["reply_to_message_id"] = reply_to
+
         if media_type == "video":
-            saved = await _send_video_cover_safe(
+            resp = await _send_video_cover_safe(
                 uc.send_video,
-                chat_id=log,
+                chat_id=message.chat.id,
                 video=new_file,
                 progress=send_kwargs.get("progress"),
                 progress_args=send_kwargs.get("progress_args"),
-                **safe_kwargs,
+                **target_kwargs,
             )
         else:
-            saved = await uc.send_document(
-                chat_id=log,
+            resp = await uc.send_document(
+                chat_id=message.chat.id,
                 document=new_file,
                 progress=send_kwargs.get("progress"),
                 progress_args=send_kwargs.get("progress_args"),
-                **safe_kwargs,
+                **target_kwargs,
             )
 
-        # ── Step 2: Bot se LOG_CHANNEL → target chat copy ──
-        # forward_messages nahi — cover metadata forward mein preserve nahi hoti!
-        # copy_message use karo — cover bhi sahi se copy hoti hai
-        if skip_forward:
-            return saved  # log channel ka message return karo (link ke liye)
+        # ── Log channel mein alag se bhejo (bina cover, file_id se — fast) ──
+        if resp:
+            try:
+                log_kwargs = {k: v for k, v in safe_kwargs.items()
+                              if k not in ("cover", "supports_streaming")}
+                if media_type == "video" and resp.video:
+                    await app.send_video(
+                        chat_id=log,
+                        video=resp.video.file_id,
+                        **log_kwargs,
+                    )
+                elif media_type == "doc" and resp.document:
+                    await app.send_document(
+                        chat_id=log,
+                        document=resp.document.file_id,
+                        **log_kwargs,
+                    )
+            except Exception:
+                pass  # Log fail hona main upload ko affect na kare
 
-        resp = await app.copy_message(
-            chat_id=message.chat.id,
-            from_chat_id=log,
-            message_id=saved.id,
-        )
-
-        # copy_message single Message object return karta hai (list nahi)
         return resp
 
     except Exception as e:
