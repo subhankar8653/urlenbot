@@ -88,13 +88,13 @@ def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
 
 
 async def _bot_api_send_message(chat_id: int, text: str, entities: list,
-                                 reply_markup: dict) -> bool:
+                                 reply_markup: dict) -> int | None:
     """
     httpx se Bot API call — styled buttons + custom emoji.
-    Returns True agar success, False agar fail.
+    Returns message_id (int) agar success, None agar fail.
     """
     if not _BOT_TOKEN:
-        return False
+        return None
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
@@ -109,11 +109,12 @@ async def _bot_api_send_message(chat_id: int, text: str, entities: list,
             data = resp.json()
             if not data.get("ok"):
                 LOGGER.warning(f"[BotUpload] Bot API sendMessage failed: {data.get('description')}")
-                return False
-            return True
+                return None
+            # Response mein directly message_id milta hai
+            return data["result"]["message_id"]
     except Exception as e:
         LOGGER.warning(f"[BotUpload] Bot API call failed: {e}")
-        return False
+        return None
 
 
 async def _bot_api_edit_message(chat_id: int, message_id: int, text: str,
@@ -265,11 +266,14 @@ class EpisodePostManager:
 
             if self.post_msg_id is None:
                 # Naya message banao — Bot API se (styled buttons + custom emoji)
-                success = await _bot_api_send_message(
+                # Response mein seedha message_id milta hai — race condition nahi
+                msg_id = await _bot_api_send_message(
                     self.channel_id, caption_text,
                     caption_entities or [], keyboard or {"inline_keyboard": []},
                 )
-                if not success:
+                if msg_id:
+                    self.post_msg_id = msg_id
+                else:
                     # Pyrogram fallback
                     try:
                         pyrogram_kb = None
@@ -285,14 +289,6 @@ class EpisodePostManager:
                         self.post_msg_id = sent.id
                     except Exception as e:
                         LOGGER.error(f"[BotUpload] Post create error: {e}")
-                else:
-                    # Bot API ne send kiya — msg_id nahi milega seedha
-                    # Workaround: pyrogram se last message fetch karo
-                    try:
-                        async for msg in self.client.get_chat_history(self.channel_id, limit=1):
-                            self.post_msg_id = msg.id
-                    except Exception:
-                        pass
                 await self._save_to_db()
             else:
                 # Existing message edit karo (resume mode) — Bot API se
@@ -527,13 +523,10 @@ async def send_batch_summary_post(client: Client, channel_id: int, season_num: i
     keyboard = {"inline_keyboard": [row]} if row else {"inline_keyboard": []}
 
     # Bot API se send karo — styled buttons + premium emoji
-    success = await _bot_api_send_message(channel_id, caption_text, caption_entities, keyboard)
-    if success:
-        try:
-            async for msg in client.get_chat_history(channel_id, limit=1):
-                return msg.id
-        except Exception:
-            return None
+    # Response mein seedha message_id milta hai
+    msg_id = await _bot_api_send_message(channel_id, caption_text, caption_entities, keyboard)
+    if msg_id:
+        return msg_id
 
     # Pyrogram fallback
     try:
