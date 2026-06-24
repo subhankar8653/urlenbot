@@ -26,16 +26,32 @@ from ..encoding import get_duration, get_thumbnail, get_width_height
 #  support kare ya na kare.
 # ─────────────────────────────────────────────
 async def _send_video_cover_safe(send_fn, **kwargs):
+    # kurigram 2.2.22 ke send_video/reply_video mein 'file_name' aur 'cover'
+    # kwargs support nahi hote — pehle strip karke try karo, agar phir bhi
+    # TypeError aaye to raise karo.
+    _unsupported = ("file_name", "cover")
     try:
         return await send_fn(**kwargs)
     except TypeError as e:
-        if "cover" in kwargs and "cover" in str(e):
-            LOGGER.warning(
-                f"[Upload] Installed pyrogram/kurigram 'cover' kwarg "
-                f"support nahi karta, bina cover ke retry kar rahe hain: {e}"
-            )
-            kwargs.pop("cover", None)
-            return await send_fn(**kwargs)
+        err_str = str(e)
+        stripped_any = False
+        for kw in _unsupported:
+            if kw in kwargs and kw in err_str:
+                LOGGER.warning(
+                    f"[Upload] '{kw}' kwarg support nahi, hata ke retry: {e}"
+                )
+                kwargs.pop(kw, None)
+                stripped_any = True
+        if stripped_any:
+            # Retry without the unsupported kwarg(s)
+            try:
+                return await send_fn(**kwargs)
+            except TypeError as e2:
+                # Koi aur unsupported kwarg? One more pass
+                for kw in _unsupported:
+                    if kw in kwargs and kw in str(e2):
+                        kwargs.pop(kw, None)
+                return await send_fn(**kwargs)
         raise
 
 
@@ -88,9 +104,9 @@ async def _upload_via_user_then_forward(
        (skip_forward=True hoga to forward skip hoga — bot_mode ke liye)
     3. No cleanup needed — log channel mein rehna chahiye file
     """
-    # Strip progress & reply_to from kwargs — log channel ko nahi chahiye
-    safe_kwargs = {k: v for k, v in send_kwargs.items()
-                   if k not in ("reply_to_message_id", "progress", "progress_args")}
+    # Strip progress, reply_to aur kurigram-unsupported kwargs
+    _strip_keys = ("reply_to_message_id", "progress", "progress_args", "file_name", "cover")
+    safe_kwargs = {k: v for k, v in send_kwargs.items() if k not in _strip_keys}
 
     try:
         # ── Step 1: User client se LOG_CHANNEL mein upload ──
@@ -528,7 +544,6 @@ async def _upload_to_user_channels(
                     duration=duration,
                     width=width,
                     height=height,
-                    file_name=filename,
                     thumb=thumb,
                     supports_streaming=True,
                 )
@@ -554,7 +569,6 @@ async def _upload_to_user_channels(
                         duration=duration,
                         width=width,
                         height=height,
-                        file_name=filename,
                         thumb=thumb,
                         supports_streaming=True,
                     )
