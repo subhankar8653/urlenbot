@@ -693,7 +693,10 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
             thumb = get_thumbnail(filepath, dl_dir, duration / 4 if duration else 0)
             custom_thumb_used = False
 
-        cover = thumb if thumb and os.path.isfile(thumb) else None
+        # cover = file_id (Telegram file_id) — local path nahi!
+        # thumb (local path) = gallery preview thumbnail
+        # cover (file_id) = video player background cover pic
+        cover = custom_thumb_id if custom_thumb_id and custom_thumb_used else None
         width, height = get_width_height(filepath)
         caption = f"<b>{fname}</b>"
         disk_fname = os.path.basename(filepath)
