@@ -102,10 +102,11 @@ async def _upload_via_user_then_forward(
        (skip_forward=True hoga to forward skip hoga — bot_mode ke liye)
     3. No cleanup needed — log channel mein rehna chahiye file
     """
-    # Strip progress, reply_to aur kurigram-unsupported kwargs
-    _strip_keys = ("reply_to_message_id", "progress", "progress_args", "file_name", "cover")
+    # Strip progress, reply_to aur file_name (kurigram unsupported) — cover RAKHNA hai!
+    # cover = Telegram video player background image, forward mein preserve nahi hoti
+    # isliye user client upload mein cover pass karna zaroori hai
+    _strip_keys = ("reply_to_message_id", "progress", "progress_args", "file_name")
     safe_kwargs = {k: v for k, v in send_kwargs.items() if k not in _strip_keys}
-
     try:
         # ── Step 1: User client se LOG_CHANNEL mein upload ──
         if media_type == "video":
@@ -126,22 +127,19 @@ async def _upload_via_user_then_forward(
                 **safe_kwargs,
             )
 
-        # ── Step 2: Bot se LOG_CHANNEL → target chat forward ──
-        # bot_mode mein skip karo — sirf log channel pe rehega
+        # ── Step 2: Bot se LOG_CHANNEL → target chat copy ──
+        # forward_messages nahi — cover metadata forward mein preserve nahi hoti!
+        # copy_message use karo — cover bhi sahi se copy hoti hai
         if skip_forward:
             return saved  # log channel ka message return karo (link ke liye)
 
-        resp = await app.forward_messages(
+        resp = await app.copy_message(
             chat_id=message.chat.id,
             from_chat_id=log,
-            message_ids=saved.id,
+            message_id=saved.id,
         )
 
-        # forward_messages LIST return karta hai — pehla message lo
-        if isinstance(resp, list):
-            resp = resp[0] if resp else None
-
-        # Log channel mein message already hai — alag se send karne ki zaroorat nahi
+        # copy_message single Message object return karta hai (list nahi)
         return resp
 
     except Exception as e:
