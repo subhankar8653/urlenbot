@@ -401,7 +401,6 @@ async def saveget(client: Client, message: Message):
                 height=height,
                 thumb=thumb,
                 supports_streaming=True,
-                file_name=fname,
                 parse_mode=ParseMode.HTML,
                 progress=progress_for_pyrogram,
                 progress_args=("📤 Uploading...", status_msg, c_time),
