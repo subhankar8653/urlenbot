@@ -13,14 +13,10 @@ import os
 import re
 import time
 
+import httpx
+
 from pyrogram import Client
 from pyrogram.enums import ParseMode
-try:
-    from pyrogram.enums import ButtonStyle
-    _BUTTON_STYLE_SUPPORTED = True
-except ImportError:
-    ButtonStyle = None
-    _BUTTON_STYLE_SUPPORTED = False
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from .. import LOGGER, log as LOG_CHANNEL
@@ -32,92 +28,119 @@ from ..plugins.swift_downloader import (
 from ..plugins.auto_monitor import _get_suhani_bot_link
 from ..plugins.rti_downloader import get_watchmult_link, get_argon_link, argon_to_swift
 
+# ─────────────────────────────────────────────────────────────────────────
+#  Bot API token — styled buttons + custom emoji ke liye httpx use karenge
+# ─────────────────────────────────────────────────────────────────────────
+_BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 # ─────────────────────────────────────────────────────────────────────────
-#  Colour buttons — quality -> (ButtonStyle, custom_emoji_id, fallback_emoji)
-#  low_q slot  = 360p ya 480p (jo bhi pehle ready ho)  -> Blue   (🔗 link)
-#  720p slot                                            -> Green  (🍀 clover)
-#  1080p slot                                           -> Red    (☄️ comet)
-#  Agar installed pyrofork version mein ButtonStyle/icon_custom_emoji_id
-#  support nahi hai, to plain emoji-prefixed text button pe fallback hoga
-#  (crash kabhi nahi hoga).
+#  Colour buttons — quality -> (style, custom_emoji_id, fallback_emoji)
+#  Bot API ke through send karenge — kurigram/pyrofork dependency nahi
 # ─────────────────────────────────────────────────────────────────────────
 _BUTTON_STYLE = {
-    "low":   (ButtonStyle.PRIMARY if _BUTTON_STYLE_SUPPORTED else None, 6178956770564645948, "🔵"),  # Blue
-    "720p":  (ButtonStyle.SUCCESS if _BUTTON_STYLE_SUPPORTED else None, 6179433490459665818, "🟢"),  # Green
-    "1080p": (ButtonStyle.DANGER  if _BUTTON_STYLE_SUPPORTED else None, 6179270925947510542, "🔴"),  # Red
+    "low":   ("primary", 6178956770564645948, "🔵"),  # Blue
+    "720p":  ("success", 6179433490459665818, "🟢"),  # Green
+    "1080p": ("danger",  6179270925947510542, "🔴"),  # Red
 }
-
-# Startup diagnostic — sirf ek baar check karo ki installed pyrogram/kurigram
-# version InlineKeyboardButton mein 'style' aur 'icon_custom_emoji_id' params
-# accept karta hai ya nahi. Agar nahi karta, to colour button hamesha plain
-# emoji-prefixed fallback pe jaayega — yeh log dekh ke confirm kar sakte ho
-# ki kurigram version colour button support karta hai ya update chahiye.
-try:
-    import inspect as _inspect
-    _ikb_params = set(_inspect.signature(InlineKeyboardButton.__init__).parameters)
-    if _BUTTON_STYLE_SUPPORTED and {"style", "icon_custom_emoji_id"} <= _ikb_params:
-        LOGGER.info("[BotUpload] Colour buttons ENABLED (style + icon_custom_emoji_id supported by installed kurigram)")
-    else:
-        LOGGER.warning(
-            "[BotUpload] Colour buttons DISABLED — installed kurigram version's "
-            "InlineKeyboardButton doesn't accept 'style'/'icon_custom_emoji_id'. "
-            "Falling back to plain emoji-prefixed buttons. Update kurigram "
-            "(pip install -U kurigram) to enable real colour buttons."
-        )
-except Exception:
-    pass
-
 
 # ─────────────────────────────────────────────────────────────────────────
 #  Premium emoji IDs for caption prefix (➲ replacement) and quality buttons
 # ─────────────────────────────────────────────────────────────────────────
-# Caption prefix emoji (➲ ki jagah)
 _CAPTION_EMOJI_ID = 6179062315090977332  # ✅ verified premium emoji
 
-# Quality button caption emojis (360p/480p, 720p, 1080p)
 _QUALITY_EMOJI_IDS = {
-    "low":   6178956770564645948,   # 🔗-style blue
-    "720p":  6179433490459665818,   # 🍀-style green
-    "1080p": 6179270925947510542,   # ⚡-style red
+    "low":   6178956770564645948,
+    "720p":  6179433490459665818,
+    "1080p": 6179270925947510542,
 }
 
 
 def _make_caption_with_entity(text_without_prefix: str) -> tuple:
     """
-    Entities approach — parse_mode=DISABLED ke saath.
-    Plain text: "➲ Season 01 Episode 01 Hindi"
-    Entity 1: bold, offset=0, length=total
-    Entity 2: custom_emoji, offset=0, length=1 (sirf ➲ char)
+    Entities approach — Bot API ke liye plain dict format.
     """
     placeholder = "➲"
     full_text = f"{placeholder} {text_without_prefix}"
     total_len = len(full_text)
-    entities = []
-    try:
-        entities.append(MessageEntity(type="bold", offset=0, length=total_len))
-        entities.append(MessageEntity(
-            type="custom_emoji",
-            offset=0,
-            length=len(placeholder),
-            custom_emoji_id=str(_CAPTION_EMOJI_ID),
-        ))
-    except Exception as e:
-        LOGGER.warning(f"[BotUpload] Caption entity failed: {e}")
+    entities = [
+        {"type": "bold", "offset": 0, "length": total_len},
+        {"type": "custom_emoji", "offset": 0, "length": len(placeholder),
+         "custom_emoji_id": str(_CAPTION_EMOJI_ID)},
+    ]
     return full_text, entities
 
 
+def _quality_button_dict(text: str, url: str, slot: str) -> dict:
+    """Bot API ke liye button dict — styled + custom emoji."""
+    style, icon_id, _ = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
+    return {
+        "text": text,
+        "url": url,
+        "style": style,
+        "icon_custom_emoji_id": str(icon_id),
+    }
+
+
 def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
-    style, icon_id, fallback_emoji = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
-    if _BUTTON_STYLE_SUPPORTED:
-        try:
-            return InlineKeyboardButton(
-                text=text, url=url, icon_custom_emoji_id=icon_id, style=style,
-            )
-        except Exception as e:
-            LOGGER.warning(f"[BotUpload] Colour button failed ({text}), falling back to emoji: {e}")
-    # Fallback: plain emoji-prefixed url button (pyrofork ButtonStyle support na ho tab)
+    """Pyrogram fallback — sirf tab jab Bot API na ho."""
+    _, _, fallback_emoji = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
     return InlineKeyboardButton(text=f"{fallback_emoji} {text}", url=url)
+
+
+async def _bot_api_send_message(chat_id: int, text: str, entities: list,
+                                 reply_markup: dict) -> bool:
+    """
+    httpx se Bot API call — styled buttons + custom emoji.
+    Returns True agar success, False agar fail.
+    """
+    if not _BOT_TOKEN:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "entities": entities,
+                    "reply_markup": reply_markup,
+                }
+            )
+            data = resp.json()
+            if not data.get("ok"):
+                LOGGER.warning(f"[BotUpload] Bot API sendMessage failed: {data.get('description')}")
+                return False
+            return True
+    except Exception as e:
+        LOGGER.warning(f"[BotUpload] Bot API call failed: {e}")
+        return False
+
+
+async def _bot_api_edit_message(chat_id: int, message_id: int, text: str,
+                                 entities: list, reply_markup: dict) -> bool:
+    """httpx se Bot API editMessageText — styled buttons update ke liye."""
+    if not _BOT_TOKEN:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{_BOT_TOKEN}/editMessageText",
+                json={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": text,
+                    "entities": entities,
+                    "reply_markup": reply_markup,
+                }
+            )
+            data = resp.json()
+            if not data.get("ok"):
+                LOGGER.warning(f"[BotUpload] Bot API editMessage failed: {data.get('description')}")
+                return False
+            return True
+    except Exception as e:
+        LOGGER.warning(f"[BotUpload] Bot API edit failed: {e}")
+        return False
 
 
 
@@ -183,15 +206,15 @@ class EpisodePostManager:
         elif "480p" in self._buttons:
             low_q = "480p"
         if low_q:
-            row.append(_quality_button(low_q, self._buttons[low_q], "low"))
+            row.append(_quality_button_dict(low_q, self._buttons[low_q], "low"))
 
         # 720p aur 1080p — sirf tab dikhao jab uploaded ho
         for q in ["720p", "1080p"]:
             if q in self._buttons:
-                row.append(_quality_button(q, self._buttons[q], q))
-            # agar upload nahi hua — koi button nahi, koi placeholder nahi
+                row.append(_quality_button_dict(q, self._buttons[q], q))
 
-        return InlineKeyboardMarkup([row]) if row else None
+        # Bot API format: {"inline_keyboard": [[btn, btn], ...]}
+        return {"inline_keyboard": [row]} if row else None
 
     def _db_key(self) -> str | None:
         """Unique DB key — session_code + episode number."""
@@ -238,31 +261,61 @@ class EpisodePostManager:
             self._buttons[quality] = deep_link_url
             caption_text, caption_entities = self._caption()
 
+            keyboard = self._keyboard()
+
             if self.post_msg_id is None:
-                # Naya message banao
-                try:
-                    sent = await self.client.send_message(
-                        chat_id=self.channel_id, text=caption_text,
-                        reply_markup=self._keyboard(),
-                        parse_mode=ParseMode.DISABLED, disable_web_page_preview=True,
-                        entities=caption_entities if caption_entities else None,
-                    )
-                    self.post_msg_id = sent.id
-                    await self._save_to_db()
-                except Exception as e:
-                    LOGGER.error(f"[BotUpload] Post create error: {e}")
+                # Naya message banao — Bot API se (styled buttons + custom emoji)
+                success = await _bot_api_send_message(
+                    self.channel_id, caption_text,
+                    caption_entities or [], keyboard or {"inline_keyboard": []},
+                )
+                if not success:
+                    # Pyrogram fallback
+                    try:
+                        pyrogram_kb = None
+                        if keyboard:
+                            row = [InlineKeyboardButton(text=b.get("text",""), url=b.get("url",""))
+                                   for b in keyboard["inline_keyboard"][0]]
+                            pyrogram_kb = InlineKeyboardMarkup([row])
+                        sent = await self.client.send_message(
+                            chat_id=self.channel_id, text=caption_text,
+                            reply_markup=pyrogram_kb,
+                            parse_mode=ParseMode.DISABLED, disable_web_page_preview=True,
+                        )
+                        self.post_msg_id = sent.id
+                    except Exception as e:
+                        LOGGER.error(f"[BotUpload] Post create error: {e}")
+                else:
+                    # Bot API ne send kiya — msg_id nahi milega seedha
+                    # Workaround: pyrogram se last message fetch karo
+                    try:
+                        async for msg in self.client.get_chat_history(self.channel_id, limit=1):
+                            self.post_msg_id = msg.id
+                    except Exception:
+                        pass
+                await self._save_to_db()
             else:
-                # Existing message edit karo (resume mode)
-                try:
-                    await self.client.edit_message_text(
-                        chat_id=self.channel_id, message_id=self.post_msg_id,
-                        text=caption_text, reply_markup=self._keyboard(),
-                        parse_mode=ParseMode.DISABLED, disable_web_page_preview=True,
-                        entities=caption_entities if caption_entities else None,
-                    )
-                    await self._save_to_db()
-                except Exception as e:
-                    LOGGER.error(f"[BotUpload] Post edit error: {e}")
+                # Existing message edit karo (resume mode) — Bot API se
+                success = await _bot_api_edit_message(
+                    self.channel_id, self.post_msg_id, caption_text,
+                    caption_entities or [], keyboard or {"inline_keyboard": []},
+                )
+                if not success:
+                    # Pyrogram fallback
+                    try:
+                        pyrogram_kb = None
+                        if keyboard:
+                            row = [InlineKeyboardButton(text=b.get("text",""), url=b.get("url",""))
+                                   for b in keyboard["inline_keyboard"][0]]
+                            pyrogram_kb = InlineKeyboardMarkup([row])
+                        await self.client.edit_message_text(
+                            chat_id=self.channel_id, message_id=self.post_msg_id,
+                            text=caption_text, reply_markup=pyrogram_kb,
+                            parse_mode=ParseMode.DISABLED, disable_web_page_preview=True,
+                        )
+                    except Exception as e:
+                        LOGGER.error(f"[BotUpload] Post edit error: {e}")
+                await self._save_to_db()
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -461,21 +514,37 @@ async def send_batch_summary_post(client: Client, channel_id: int, season_num: i
     pointing to the batch links, to the channel. Returns the sent message id.
     """
     s = f"{season_num:02d}"
-    caption = f"<b>➲ Season {s} Full Batch {language}</b>"
+    caption_text, caption_entities = _make_caption_with_entity(f"Season {s} Full Batch {language}")
 
     row = []
     low_q = "360p" if "360p" in batch_links else ("480p" if "480p" in batch_links else None)
     if low_q:
-        row.append(_quality_button(low_q, batch_links[low_q], "low"))
+        row.append(_quality_button_dict(low_q, batch_links[low_q], "low"))
     for q in ["720p", "1080p"]:
         if q in batch_links:
-            row.append(_quality_button(q, batch_links[q], q))
+            row.append(_quality_button_dict(q, batch_links[q], q))
 
-    keyboard = InlineKeyboardMarkup([row]) if row else None
+    keyboard = {"inline_keyboard": [row]} if row else {"inline_keyboard": []}
 
+    # Bot API se send karo — styled buttons + premium emoji
+    success = await _bot_api_send_message(channel_id, caption_text, caption_entities, keyboard)
+    if success:
+        try:
+            async for msg in client.get_chat_history(channel_id, limit=1):
+                return msg.id
+        except Exception:
+            return None
+
+    # Pyrogram fallback
     try:
+        pyrogram_kb = None
+        if row:
+            pyrogram_row = [InlineKeyboardButton(text=b["text"], url=b["url"]) for b in row]
+            pyrogram_kb = InlineKeyboardMarkup([pyrogram_row])
         sent = await client.send_message(
-            chat_id=channel_id, text=caption, reply_markup=keyboard,
+            chat_id=channel_id,
+            text=f"<b>➲ Season {s} Full Batch {language}</b>",
+            reply_markup=pyrogram_kb,
             parse_mode=ParseMode.HTML, disable_web_page_preview=True,
         )
         return sent.id
