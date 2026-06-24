@@ -235,9 +235,10 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
                 uploader_client=uc
             )
         else:
-            # cover = custom_thumb path (agar set hai) — Telegram video player mein
-            # cover image dikhta hai (alag from thumb jo media gallery mein hota hai)
-            _cover = thumb if custom_thumb and thumb and os.path.isfile(thumb) else None
+            # cover = custom_thumb FILE_ID (DB se mila Telegram file_id) —
+            # Local path nahi, file_id chahiye cover ke liye (aiogram bot ki tarah)
+            # thumb (local path) = gallery preview; cover (file_id) = video player background
+            _cover = custom_thumb if custom_thumb else None
             _resp = await upload_video(
                 message, msg, new_file, bold_caption,
                 c_time, thumb, duration, width, height,
