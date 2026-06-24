@@ -26,9 +26,9 @@ from ..encoding import get_duration, get_thumbnail, get_width_height
 #  support kare ya na kare.
 # ─────────────────────────────────────────────
 async def _send_video_cover_safe(send_fn, **kwargs):
-    # kurigram 2.2.22 ke send_video/reply_video mein 'file_name' aur 'cover'
+    # kurigram/pyrogram ke send_video mein 'file_name' aur 'cover'
     # kwargs support nahi hote — pehle with all kwargs try karo,
-    # TypeError aane pe sirf wahi kwarg strip karo jo error mein mention hai.
+    # TypeError aane pe unsupported kwarg strip karke retry karo.
     _maybe_unsupported = ("file_name", "cover")
     try:
         return await send_fn(**kwargs)
@@ -36,7 +36,9 @@ async def _send_video_cover_safe(send_fn, **kwargs):
         err_str = str(e)
         stripped_any = False
         for kw in _maybe_unsupported:
-            if kw in kwargs and kw in err_str:
+            # FIX: sirf kwargs mein exist check karo — err_str match zaruri nahi
+            # kyunki error message format library se library alag hota hai
+            if kw in kwargs and (kw in err_str or "unexpected keyword argument" in err_str):
                 LOGGER.warning(f"[Upload] '{kw}' kwarg unsupported, hata ke retry: {e}")
                 kwargs.pop(kw)
                 stripped_any = True
@@ -44,10 +46,10 @@ async def _send_video_cover_safe(send_fn, **kwargs):
             try:
                 return await send_fn(**kwargs)
             except TypeError as e2:
-                # Ek aur pass — koi aur kwarg bhi unsupported ho sakta hai
                 err_str2 = str(e2)
-                for kw in _maybe_unsupported:
-                    if kw in kwargs and kw in err_str2:
+                for kw in list(_maybe_unsupported):
+                    if kw in kwargs and (kw in err_str2 or "unexpected keyword argument" in err_str2):
+                        LOGGER.warning(f"[Upload] '{kw}' 2nd pass strip: {e2}")
                         kwargs.pop(kw)
                 return await send_fn(**kwargs)
         raise
@@ -364,21 +366,18 @@ async def upload_video(message, msg, new_file, caption, c_time, thumb,
             # Bot mode fallback — seedha log channel pe upload karo
             log_kwargs = {k: v for k, v in send_kwargs.items()
                           if k not in ("progress", "progress_args")}
-            resp = await _send_video_cover_safe(app.send_video, chat_id=log, video=new_file, **log_kwargs)
+            try:
+                resp = await _send_video_cover_safe(app.send_video, chat_id=log, video=new_file, **log_kwargs)
+            except Exception as _e:
+                LOGGER.error(f"[Upload] Bot fallback (skip_forward) failed: {_e}")
+                resp = None
         else:
             # Normal fallback — target chat pe upload
-            # app.send_video (pyrogram) use karo — cover kwarg support karta hai
-            # message.reply_video (kurigram) cover support nahi karta
-            _fb_kwargs = {k: v for k, v in send_kwargs.items()
-                          if k not in ("progress", "progress_args")}
-            resp = await app.send_video(
-                chat_id=message.chat.id,
-                video=new_file,
-                reply_to_message_id=send_kwargs.get("reply_to_message_id"),
-                progress=send_kwargs.get("progress"),
-                progress_args=send_kwargs.get("progress_args"),
-                **{k: v for k, v in _fb_kwargs.items() if k != "reply_to_message_id"},
-            )
+            try:
+                resp = await _send_video_cover_safe(message.reply_video, video=new_file, **send_kwargs)
+            except Exception as _e:
+                LOGGER.error(f"[Upload] Bot fallback failed: {_e}")
+                resp = None
 
             # Log channel mein bhi bhejo (bot fallback case mein)
             if resp:
