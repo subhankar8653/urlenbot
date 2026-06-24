@@ -367,7 +367,18 @@ async def upload_video(message, msg, new_file, caption, c_time, thumb,
             resp = await _send_video_cover_safe(app.send_video, chat_id=log, video=new_file, **log_kwargs)
         else:
             # Normal fallback — target chat pe upload
-            resp = await _send_video_cover_safe(message.reply_video, video=new_file, **send_kwargs)
+            # app.send_video (pyrogram) use karo — cover kwarg support karta hai
+            # message.reply_video (kurigram) cover support nahi karta
+            _fb_kwargs = {k: v for k, v in send_kwargs.items()
+                          if k not in ("progress", "progress_args")}
+            resp = await app.send_video(
+                chat_id=message.chat.id,
+                video=new_file,
+                reply_to_message_id=send_kwargs.get("reply_to_message_id"),
+                progress=send_kwargs.get("progress"),
+                progress_args=send_kwargs.get("progress_args"),
+                **{k: v for k, v in _fb_kwargs.items() if k != "reply_to_message_id"},
+            )
 
             # Log channel mein bhi bhejo (bot fallback case mein)
             if resp:
