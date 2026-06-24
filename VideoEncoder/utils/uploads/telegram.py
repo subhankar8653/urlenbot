@@ -314,6 +314,7 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
                 width=width,
                 height=height,
                 filename=new_filename,
+                cover=_cover,
             )
         except Exception as e:
             # Channel upload fail ho toh main upload ko affect na kare
@@ -545,6 +546,7 @@ async def _upload_to_user_channels(
     width: int,
     height: int,
     filename: str,
+    cover=None,            # ← cover pic file_id (Telegram) — video player background
 ):
     """
     User ke linked channels mein file upload karo.
@@ -598,6 +600,7 @@ async def _upload_to_user_channels(
                     width=width,
                     height=height,
                     thumb=thumb,
+                    cover=cover,
                     supports_streaming=True,
                 )
 
@@ -623,6 +626,7 @@ async def _upload_to_user_channels(
                         width=width,
                         height=height,
                         thumb=thumb,
+                        cover=cover,
                         supports_streaming=True,
                     )
                 except Exception as e:
