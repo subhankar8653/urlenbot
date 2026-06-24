@@ -1,5 +1,5 @@
 # Required
-kurigram>=2.3.0
+kurigram==2.2.23
 TgCrypto
 python-dotenv
 hachoir
