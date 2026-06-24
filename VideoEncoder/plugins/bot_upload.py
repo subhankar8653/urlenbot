@@ -33,6 +33,45 @@ from ..utils.helper import check_chat, output
 
 OMDB_API_KEY = os.getenv("OMDB_API_KEY", "")
 
+# ─────────────────────────────────────────────────────────────────────────
+#  /getemoji — Premium emoji ka custom_emoji_id nikalo
+#  Use: Bot ko koi bhi premium emoji wala message bhejo
+#  Bot reply karega us emoji ka ID lekar
+# ─────────────────────────────────────────────────────────────────────────
+@Client.on_message(filters.command("getemoji"))
+async def get_emoji_cmd(bot: Client, message: Message):
+    """Reply mein premium emoji bhejo — uska ID milega."""
+    reply = message.reply_to_message
+    target = reply if reply else message
+
+    found = []
+    if target.entities:
+        for e in target.entities:
+            if e.type.value == "custom_emoji" and e.custom_emoji_id:
+                found.append(e.custom_emoji_id)
+    if target.caption_entities:
+        for e in target.caption_entities:
+            if e.type.value == "custom_emoji" and e.custom_emoji_id:
+                found.append(e.custom_emoji_id)
+
+    if found:
+        ids_text = "\n".join(f"<code>{eid}</code>" for eid in found)
+        await message.reply(
+            f"✅ <b>Custom Emoji ID(s) mili:</b>\n\n{ids_text}\n\n"
+            f"<i>Inhe <code>bot_upload_engine.py</code> mein paste karo</i>",
+            parse_mode="html",
+        )
+    else:
+        await message.reply(
+            "❌ <b>Koi premium emoji nahi mila.</b>\n\n"
+            "Is tarah use karo:\n"
+            "1. Premium emoji wala message bhejo\n"
+            "2. Us message ko reply karo <code>/getemoji</code> se\n\n"
+            "<i>Ya seedha <code>/getemoji</code> ke saath premium emoji wala message bhejo</i>",
+            parse_mode="html",
+        )
+
+
 # ─── In-memory sessions ────────────────────────────────────────────────────
 _border_session: set = set()        # user_ids currently in /border setup mode
 _season_session: set = set()        # user_ids currently in /season_sticker setup mode
