@@ -34,13 +34,14 @@ from ..plugins.rti_downloader import get_watchmult_link, get_argon_link, argon_t
 _BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 # ─────────────────────────────────────────────────────────────────────────
-#  Colour buttons — quality -> (style, custom_emoji_id, fallback_emoji)
-#  Bot API ke through send karenge — kurigram/pyrofork dependency nahi
+#  Colour buttons — quality -> (custom_emoji_id, fallback_emoji)
+#  Pyrofork InlineKeyboardButton mein custom_emoji_id seedha pass hota hai
+#  Bot API bypass — MTProto se send hoga, emoji buttons mein dikhega
 # ─────────────────────────────────────────────────────────────────────────
 _BUTTON_STYLE = {
-    "low":   ("primary", 6178956770564645948, "🔵"),  # Blue
-    "720p":  ("success", 6179433490459665818, "🟢"),  # Green
-    "1080p": ("danger",  6179270925947510542, "🔴"),  # Red
+    "low":   (6178956770564645948, "🔵"),  # Blue
+    "720p":  (6179433490459665818, "🟢"),  # Green
+    "1080p": (6179270925947510542, "🔴"),  # Red
 }
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -55,39 +56,36 @@ _QUALITY_EMOJI_IDS = {
 }
 
 
-def _make_caption_with_entity(text_without_prefix: str) -> tuple:
+def _make_caption_with_entity(text_without_prefix: str) -> str:
     """
-    Entities approach — Bot API ke liye plain dict format.
+    Pyrogram ke liye HTML caption with tg-emoji tag.
+    MTProto se send hoga — premium emoji caption mein dikhega.
     """
     placeholder = "➲"
-    full_text = f"{placeholder} {text_without_prefix}"
-    total_len = len(full_text)
-    entities = [
-        {"type": "bold", "offset": 0, "length": total_len},
-        {"type": "custom_emoji", "offset": 0, "length": len(placeholder),
-         "custom_emoji_id": str(_CAPTION_EMOJI_ID)},
-    ]
-    return full_text, entities
+    full_text = f"<b><tg-emoji emoji-id=\"{_CAPTION_EMOJI_ID}\">{placeholder}</tg-emoji> {text_without_prefix}</b>"
+    return full_text
 
 
 def _quality_button_dict(text: str, url: str, slot: str) -> dict:
-    """
-    Bot API ke liye button dict.
-    NOTE: Standard Bot API mein inline buttons mein custom_emoji support nahi hota.
-    Style (color) bhi sirf Telegram client ke internal API mein hota hai — Bot API ignore karta hai.
-    Isliye fallback_emoji prefix use karo text mein — yeh sabse reliable hai.
-    """
-    _, _, fallback_emoji = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
-    return {
-        "text": f"{fallback_emoji} {text}",
-        "url": url,
-    }
+    """Legacy dict — sirf reference ke liye."""
+    _, fallback_emoji = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
+    return {"text": f"{fallback_emoji} {text}", "url": url}
 
 
 def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
-    """Pyrogram fallback — sirf tab jab Bot API na ho."""
-    _, _, fallback_emoji = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
-    return InlineKeyboardButton(text=f"{fallback_emoji} {text}", url=url)
+    """
+    Pyrofork InlineKeyboardButton with custom_emoji_id.
+    MTProto se send hoga — emoji button mein dikhega.
+    """
+    emoji_id, fallback_emoji = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
+    try:
+        return InlineKeyboardButton(
+            text=f"{fallback_emoji} {text}",
+            url=url,
+            custom_emoji_id=emoji_id,
+        )
+    except TypeError:
+        return InlineKeyboardButton(text=f"{fallback_emoji} {text}", url=url)
 
 
 async def _bot_api_send_message(chat_id: int, text: str, entities: list,
@@ -185,7 +183,7 @@ class EpisodePostManager:
         self._lock = asyncio.Lock()
         self._db_loaded = False
 
-    def _caption(self) -> tuple:
+    def _caption(self) -> str:
         s = f"{self.season_num:02d}"
         e = f"{self.episode_num:02d}"
         return _make_caption_with_entity(f"Season {s} Episode {e} {self.language}")
@@ -193,7 +191,7 @@ class EpisodePostManager:
     def _keyboard(self) -> InlineKeyboardMarkup | None:
         """
         Sirf wo qualities dikhao jo upload ho gayi hain.
-        Koi placeholder/pending button nahi — jab quality ready hogi tab button add hoga.
+        Pyrogram InlineKeyboardMarkup with custom_emoji_id buttons.
 
         Layout:
           - 360p OR 480p (lowest available, ek hi dikhega) — Blue
@@ -210,15 +208,14 @@ class EpisodePostManager:
         elif "480p" in self._buttons:
             low_q = "480p"
         if low_q:
-            row.append(_quality_button_dict(low_q, self._buttons[low_q], "low"))
+            row.append(_quality_button(low_q, self._buttons[low_q], "low"))
 
         # 720p aur 1080p — sirf tab dikhao jab uploaded ho
         for q in ["720p", "1080p"]:
             if q in self._buttons:
-                row.append(_quality_button_dict(q, self._buttons[q], q))
+                row.append(_quality_button(q, self._buttons[q], q))
 
-        # Bot API format: {"inline_keyboard": [[btn, btn], ...]}
-        return {"inline_keyboard": [row]} if row else None
+        return InlineKeyboardMarkup([row]) if row else None
 
     def _db_key(self) -> str | None:
         """Unique DB key — session_code + episode number."""
@@ -263,57 +260,36 @@ class EpisodePostManager:
             await self._load_from_db()
 
             self._buttons[quality] = deep_link_url
-            caption_text, caption_entities = self._caption()
-
-            keyboard = self._keyboard()
+            caption_html = self._caption()   # HTML string with tg-emoji
+            keyboard = self._keyboard()       # InlineKeyboardMarkup with custom_emoji_id
 
             if self.post_msg_id is None:
-                # Naya message banao — Bot API se (styled buttons + custom emoji)
-                # Response mein seedha message_id milta hai — race condition nahi
-                msg_id = await _bot_api_send_message(
-                    self.channel_id, caption_text,
-                    caption_entities or [], keyboard or {"inline_keyboard": []},
-                )
-                if msg_id:
-                    self.post_msg_id = msg_id
-                else:
-                    # Pyrogram fallback
-                    try:
-                        pyrogram_kb = None
-                        if keyboard:
-                            row = [InlineKeyboardButton(text=b.get("text",""), url=b.get("url",""))
-                                   for b in keyboard["inline_keyboard"][0]]
-                            pyrogram_kb = InlineKeyboardMarkup([row])
-                        sent = await self.client.send_message(
-                            chat_id=self.channel_id, text=caption_text,
-                            reply_markup=pyrogram_kb,
-                            parse_mode=ParseMode.DISABLED, disable_web_page_preview=True,
-                        )
-                        self.post_msg_id = sent.id
-                    except Exception as e:
-                        LOGGER.error(f"[BotUpload] Post create error: {e}")
+                # Naya post — seedha pyrogram se (MTProto — custom emoji buttons dikhenge)
+                try:
+                    sent = await self.client.send_message(
+                        chat_id=self.channel_id,
+                        text=caption_html,
+                        reply_markup=keyboard,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                    self.post_msg_id = sent.id
+                except Exception as e:
+                    LOGGER.error(f"[BotUpload] Post create error: {e}")
                 await self._save_to_db()
             else:
-                # Existing message edit karo (resume mode) — Bot API se
-                success = await _bot_api_edit_message(
-                    self.channel_id, self.post_msg_id, caption_text,
-                    caption_entities or [], keyboard or {"inline_keyboard": []},
-                )
-                if not success:
-                    # Pyrogram fallback
-                    try:
-                        pyrogram_kb = None
-                        if keyboard:
-                            row = [InlineKeyboardButton(text=b.get("text",""), url=b.get("url",""))
-                                   for b in keyboard["inline_keyboard"][0]]
-                            pyrogram_kb = InlineKeyboardMarkup([row])
-                        await self.client.edit_message_text(
-                            chat_id=self.channel_id, message_id=self.post_msg_id,
-                            text=caption_text, reply_markup=pyrogram_kb,
-                            parse_mode=ParseMode.DISABLED, disable_web_page_preview=True,
-                        )
-                    except Exception as e:
-                        LOGGER.error(f"[BotUpload] Post edit error: {e}")
+                # Edit existing post — pyrogram se
+                try:
+                    await self.client.edit_message_text(
+                        chat_id=self.channel_id,
+                        message_id=self.post_msg_id,
+                        text=caption_html,
+                        reply_markup=keyboard,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                except Exception as e:
+                    LOGGER.error(f"[BotUpload] Post edit error: {e}")
                 await self._save_to_db()
 
 
@@ -509,39 +485,29 @@ async def run_episode_rti(client: Client, message: Message, status_msg: Message,
 async def send_batch_summary_post(client: Client, channel_id: int, season_num: int,
                                    batch_links: dict, language: str = "Hindi") -> int | None:
     """
-    Posts 'Season XX Full Batch Hindi' with quality buttons (360p/480p, 720p, 1080p)
-    pointing to the batch links, to the channel. Returns the sent message id.
+    Posts 'Season XX Full Batch Hindi' with custom emoji quality buttons.
+    Pyrogram (MTProto) se send hoga — emoji buttons mein dikhenge.
     """
     s = f"{season_num:02d}"
-    caption_text, caption_entities = _make_caption_with_entity(f"Season {s} Full Batch {language}")
+    caption_html = _make_caption_with_entity(f"Season {s} Full Batch {language}")
 
     row = []
     low_q = "360p" if "360p" in batch_links else ("480p" if "480p" in batch_links else None)
     if low_q:
-        row.append(_quality_button_dict(low_q, batch_links[low_q], "low"))
+        row.append(_quality_button(low_q, batch_links[low_q], "low"))
     for q in ["720p", "1080p"]:
         if q in batch_links:
-            row.append(_quality_button_dict(q, batch_links[q], q))
+            row.append(_quality_button(q, batch_links[q], q))
 
-    keyboard = {"inline_keyboard": [row]} if row else {"inline_keyboard": []}
+    keyboard = InlineKeyboardMarkup([row]) if row else None
 
-    # Bot API se send karo — styled buttons + premium emoji
-    # Response mein seedha message_id milta hai
-    msg_id = await _bot_api_send_message(channel_id, caption_text, caption_entities, keyboard)
-    if msg_id:
-        return msg_id
-
-    # Pyrogram fallback
     try:
-        pyrogram_kb = None
-        if row:
-            pyrogram_row = [InlineKeyboardButton(text=b["text"], url=b["url"]) for b in row]
-            pyrogram_kb = InlineKeyboardMarkup([pyrogram_row])
         sent = await client.send_message(
             chat_id=channel_id,
-            text=f"<b>➲ Season {s} Full Batch {language}</b>",
-            reply_markup=pyrogram_kb,
-            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            text=caption_html,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
         )
         return sent.id
     except Exception as e:
