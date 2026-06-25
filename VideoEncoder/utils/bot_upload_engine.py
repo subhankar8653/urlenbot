@@ -65,20 +65,23 @@ def _make_caption_with_entity(text_without_prefix: str) -> str:
 
 def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
     """
-    InlineKeyboardButton with custom_emoji_id + style — Pyrofork support.
+    InlineKeyboardButton with Bot API 9.4 style + icon_custom_emoji_id.
+    Pyrofork mein api_kwargs se pass hote hain (MTProto layer inhe Bot API params mein map karta hai).
     style="primary" (blue), "success" (green), "danger" (red)
-    custom_emoji_id aur style dono Pyrofork mein seedha InlineKeyboardButton mein pass hota hai.
+    icon_custom_emoji_id = string (Bot API 9.4 convention)
     """
     emoji_id_str, fallback_emoji, style = _BUTTON_EMOJI.get(slot, _BUTTON_EMOJI["low"])
     try:
         return InlineKeyboardButton(
             text=f"{fallback_emoji} {text}",
             url=url,
-            custom_emoji_id=int(emoji_id_str),
-            style=style,
+            api_kwargs={
+                "icon_custom_emoji_id": emoji_id_str,
+                "style": style,
+            },
         )
-    except TypeError:
-        # Fallback agar old library ho
+    except Exception:
+        # Fallback agar api_kwargs bhi na chale
         return InlineKeyboardButton(text=f"{fallback_emoji} {text}", url=url)
 
 
