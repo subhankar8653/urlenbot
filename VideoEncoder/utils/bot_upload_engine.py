@@ -29,14 +29,16 @@ from ..plugins.rti_downloader import get_watchmult_link, get_argon_link, argon_t
 
 
 # ─────────────────────────────────────────────────────────────────────────
-#  Colour buttons — quality -> (custom_emoji_id, fallback_emoji)
-#  Pyrofork InlineKeyboardButton mein custom_emoji_id seedha pass hota hai
+#  Colour buttons — quality -> (custom_emoji_id, fallback_emoji, style)
+#  Pyrofork InlineKeyboardButton mein custom_emoji_id + style parameter hai
 #  MTProto se send hoga — colored buttons + custom emoji dikhega
+#
+#  style options: "primary" (blue), "success" (green), "danger" (red)
 # ─────────────────────────────────────────────────────────────────────────
 _BUTTON_EMOJI = {
-    "low":   ("6246969377288098637", "🔗"),   # Custom emoji (chain/link)
-    "720p":  ("6246841619190912436", "🍀"),   # Custom emoji (clover)
-    "1080p": ("6244729981339964487", "☄️"),   # Custom emoji (comet)
+    "low":   ("6246969377288098637", "🔗", "primary"),   # Blue — 360p/480p
+    "720p":  ("6246841619190912436", "🍀", "success"),   # Green — 720p
+    "1080p": ("6244729981339964487", "☄️", "danger"),    # Red — 1080p
 }
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -63,19 +65,20 @@ def _make_caption_with_entity(text_without_prefix: str) -> str:
 
 def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
     """
-    InlineKeyboardButton with custom_emoji_id — kurigram support karta hai.
-    kurigram pyrogram namespace mein hi install hota hai, custom_emoji_id
-    InlineKeyboardButton mein directly kaam karta hai.
+    InlineKeyboardButton with custom_emoji_id + style — Pyrofork support.
+    style="primary" (blue), "success" (green), "danger" (red)
+    custom_emoji_id aur style dono Pyrofork mein seedha InlineKeyboardButton mein pass hota hai.
     """
-    emoji_id_str, fallback_emoji = _BUTTON_EMOJI.get(slot, _BUTTON_EMOJI["low"])
+    emoji_id_str, fallback_emoji, style = _BUTTON_EMOJI.get(slot, _BUTTON_EMOJI["low"])
     try:
         return InlineKeyboardButton(
             text=f"{fallback_emoji} {text}",
             url=url,
             custom_emoji_id=int(emoji_id_str),
+            style=style,
         )
     except TypeError:
-        # Fallback agar library custom_emoji_id support na kare
+        # Fallback agar old library ho
         return InlineKeyboardButton(text=f"{fallback_emoji} {text}", url=url)
 
 
