@@ -18,6 +18,10 @@ import httpx
 from pyrogram import Client
 from pyrogram.enums import ParseMode
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+try:
+    from pyrogram.enums import ButtonStyle as _ButtonStyle
+except ImportError:
+    _ButtonStyle = None
 
 from .. import LOGGER, log as LOG_CHANNEL
 from .uploads.telegram import upload_video, get_thumbnail, _make_uploader_client
@@ -39,9 +43,9 @@ _BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 #  Bot API bypass — MTProto se send hoga, emoji buttons mein dikhega
 # ─────────────────────────────────────────────────────────────────────────
 _BUTTON_STYLE = {
-    "low":   (6178956770564645948, "🔵"),  # Blue
-    "720p":  (6179433490459665818, "🟢"),  # Green
-    "1080p": (6179270925947510542, "🔴"),  # Red
+    "low":   (6178956770564645948, "🔵", "PRIMARY"),   # Blue
+    "720p":  (6179433490459665818, "🟢", "SUCCESS"),   # Green
+    "1080p": (6179270925947510542, "🔴", "DANGER"),    # Red
 }
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -68,22 +72,35 @@ def _make_caption_with_entity(text_without_prefix: str) -> str:
 
 def _quality_button_dict(text: str, url: str, slot: str) -> dict:
     """Legacy dict — sirf reference ke liye."""
-    _, fallback_emoji = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
+    _, fallback_emoji, _ = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
     return {"text": f"{fallback_emoji} {text}", "url": url}
 
 
 def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
     """
-    Pyrofork InlineKeyboardButton with custom_emoji_id.
-    MTProto se send hoga — emoji button mein dikhega.
+    Pyrofork/kurigram InlineKeyboardButton with color style + custom emoji icon.
+    ButtonStyle (PRIMARY/SUCCESS/DANGER) + icon_custom_emoji_id dono saath kaam karte hain.
     """
-    emoji_id, fallback_emoji = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
+    emoji_id, fallback_emoji, style_name = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
+    kwargs = {
+        "text": f"{fallback_emoji} {text}",
+        "url": url,
+    }
+    # ButtonStyle (colored buttons) — kurigram/pyrofork extended feature
+    if _ButtonStyle is not None:
+        try:
+            kwargs["style"] = getattr(_ButtonStyle, style_name, None)
+        except Exception:
+            pass
+    # icon_custom_emoji_id — premium emoji icon on button
     try:
-        return InlineKeyboardButton(
-            text=f"{fallback_emoji} {text}",
-            url=url,
-            custom_emoji_id=emoji_id,
-        )
+        btn = InlineKeyboardButton(**kwargs, icon_custom_emoji_id=emoji_id)
+        return btn
+    except TypeError:
+        pass
+    # fallback: style without icon
+    try:
+        return InlineKeyboardButton(**kwargs)
     except TypeError:
         return InlineKeyboardButton(text=f"{fallback_emoji} {text}", url=url)
 
