@@ -63,14 +63,13 @@ def _make_caption_with_entity(text_without_prefix: str) -> str:
 
 def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
     """
-    Pyrofork InlineKeyboardButton with custom_emoji_id — MTProto se colored/emoji button.
-    custom_emoji_id seedha pass hota hai pyrofork mein, Telegram render karega.
+    Simple InlineKeyboardButton with emoji text.
+    pyrogram 2.3.69 custom_emoji_id support nahi karta — sirf emoji prefix use karo.
     """
-    emoji_id_str, fallback_emoji = _BUTTON_EMOJI.get(slot, _BUTTON_EMOJI["low"])
+    _, fallback_emoji = _BUTTON_EMOJI.get(slot, _BUTTON_EMOJI["low"])
     return InlineKeyboardButton(
         text=f"{fallback_emoji} {text}",
         url=url,
-        custom_emoji_id=int(emoji_id_str),
     )
 
 
