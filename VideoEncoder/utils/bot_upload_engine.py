@@ -63,14 +63,20 @@ def _make_caption_with_entity(text_without_prefix: str) -> str:
 
 def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
     """
-    Simple InlineKeyboardButton with emoji text.
-    pyrogram 2.3.69 custom_emoji_id support nahi karta — sirf emoji prefix use karo.
+    InlineKeyboardButton with custom_emoji_id — kurigram support karta hai.
+    kurigram pyrogram namespace mein hi install hota hai, custom_emoji_id
+    InlineKeyboardButton mein directly kaam karta hai.
     """
-    _, fallback_emoji = _BUTTON_EMOJI.get(slot, _BUTTON_EMOJI["low"])
-    return InlineKeyboardButton(
-        text=f"{fallback_emoji} {text}",
-        url=url,
-    )
+    emoji_id_str, fallback_emoji = _BUTTON_EMOJI.get(slot, _BUTTON_EMOJI["low"])
+    try:
+        return InlineKeyboardButton(
+            text=f"{fallback_emoji} {text}",
+            url=url,
+            custom_emoji_id=int(emoji_id_str),
+        )
+    except TypeError:
+        # Fallback agar library custom_emoji_id support na kare
+        return InlineKeyboardButton(text=f"{fallback_emoji} {text}", url=url)
 
 
 
