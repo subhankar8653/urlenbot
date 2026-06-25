@@ -67,61 +67,49 @@ def _make_caption_with_entity(text_without_prefix: str) -> str:
 
 
 def _quality_button_dict(text: str, url: str, slot: str) -> dict:
-    """Legacy dict — sirf reference ke liye."""
-    _, fallback_emoji, _ = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
-    return {"text": f"{fallback_emoji} {text}", "url": url}
+    """Bot API JSON ke liye button dict — style + icon_custom_emoji_id ke saath."""
+    emoji_id_str, fallback_emoji, style_str = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
+    return {
+        "text": f"{fallback_emoji} {text}",
+        "url": url,
+        "style": style_str,
+        "icon_custom_emoji_id": emoji_id_str,
+    }
 
 
 def _quality_button(text: str, url: str, slot: str) -> InlineKeyboardButton:
-    """
-    InlineKeyboardButton with style (color) + icon_custom_emoji_id.
-    style = "primary"/"success"/"danger" (plain string, Bot API 9.4+)
-    icon_custom_emoji_id = string (not int!)
-    """
-    emoji_id_str, fallback_emoji, style_str = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
-    try:
-        return InlineKeyboardButton(
-            text=f"{fallback_emoji} {text}",
-            url=url,
-            style=style_str,                    # "primary" / "success" / "danger"
-            icon_custom_emoji_id=emoji_id_str,  # string, not int
-        )
-    except TypeError:
-        # Agar pyrofork version in params support nahi karta
-        try:
-            return InlineKeyboardButton(
-                text=f"{fallback_emoji} {text}",
-                url=url,
-                style=style_str,
-            )
-        except TypeError:
-            return InlineKeyboardButton(text=f"{fallback_emoji} {text}", url=url)
+    """Pyrogram fallback button (no color/emoji) — sirf tab use hoga jab Bot API call fail ho."""
+    _, fallback_emoji, _ = _BUTTON_STYLE.get(slot, _BUTTON_STYLE["low"])
+    return InlineKeyboardButton(text=f"{fallback_emoji} {text}", url=url)
 
 
 async def _bot_api_send_message(chat_id: int, text: str, entities: list,
                                  reply_markup: dict) -> int | None:
     """
-    httpx se Bot API call — styled buttons + custom emoji.
+    httpx se Bot API sendMessage — styled buttons + custom emoji.
     Returns message_id (int) agar success, None agar fail.
     """
     if not _BOT_TOKEN:
         return None
     try:
         async with httpx.AsyncClient(timeout=30) as client:
+            payload = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": reply_markup,
+                "disable_web_page_preview": True,
+            }
+            if entities:
+                payload["entities"] = entities
             resp = await client.post(
                 f"https://api.telegram.org/bot{_BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": text,
-                    "entities": entities,
-                    "reply_markup": reply_markup,
-                }
+                json=payload,
             )
             data = resp.json()
             if not data.get("ok"):
                 LOGGER.warning(f"[BotUpload] Bot API sendMessage failed: {data.get('description')}")
                 return None
-            # Response mein directly message_id milta hai
             return data["result"]["message_id"]
     except Exception as e:
         LOGGER.warning(f"[BotUpload] Bot API call failed: {e}")
@@ -135,15 +123,19 @@ async def _bot_api_edit_message(chat_id: int, message_id: int, text: str,
         return False
     try:
         async with httpx.AsyncClient(timeout=30) as client:
+            payload = {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": reply_markup,
+                "disable_web_page_preview": True,
+            }
+            if entities:
+                payload["entities"] = entities
             resp = await client.post(
                 f"https://api.telegram.org/bot{_BOT_TOKEN}/editMessageText",
-                json={
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "text": text,
-                    "entities": entities,
-                    "reply_markup": reply_markup,
-                }
+                json=payload,
             )
             data = resp.json()
             if not data.get("ok"):
@@ -262,6 +254,26 @@ class EpisodePostManager:
         except Exception as e:
             LOGGER.warning(f"[EpisodePost] DB save failed: {e}")
 
+    def _keyboard_dict(self) -> dict | None:
+        """
+        Bot API JSON format mein reply_markup — style + icon_custom_emoji_id ke saath.
+        HTTP Bot API call ke liye use hoga (pyrogram MTProto ye support nahi karta).
+        """
+        row = []
+        low_q = None
+        if "360p" in self._buttons:
+            low_q = "360p"
+        elif "480p" in self._buttons:
+            low_q = "480p"
+        if low_q:
+            row.append(_quality_button_dict(low_q, self._buttons[low_q], "low"))
+        for q in ["720p", "1080p"]:
+            if q in self._buttons:
+                row.append(_quality_button_dict(q, self._buttons[q], q))
+        if not row:
+            return None
+        return {"inline_keyboard": [row]}
+
     async def add_quality(self, quality: str, deep_link_url: str):
         if quality == "2160p":
             return  # never displayed
@@ -270,37 +282,56 @@ class EpisodePostManager:
             await self._load_from_db()
 
             self._buttons[quality] = deep_link_url
-            caption_html = self._caption()   # HTML string with tg-emoji
-            keyboard = self._keyboard()       # InlineKeyboardMarkup with custom_emoji_id
+            caption_html = self._caption()
+            keyboard_dict = self._keyboard_dict()  # Bot API JSON (colored buttons)
+            markup_json = keyboard_dict or {"inline_keyboard": []}
 
             if self.post_msg_id is None:
-                # Naya post — seedha pyrogram se (MTProto — custom emoji buttons dikhenge)
-                try:
-                    sent = await self.client.send_message(
-                        chat_id=self.channel_id,
-                        text=caption_html,
-                        reply_markup=keyboard,
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                    )
-                    self.post_msg_id = sent.id
-                except Exception as e:
-                    LOGGER.error(f"[BotUpload] Post create error: {e}")
-                await self._save_to_db()
+                # Naya post — Bot API HTTP se (colored buttons + custom emoji)
+                msg_id = await _bot_api_send_message(
+                    chat_id=self.channel_id,
+                    text=caption_html,
+                    entities=[],
+                    reply_markup=markup_json,
+                )
+                if msg_id:
+                    self.post_msg_id = msg_id
+                else:
+                    # Bot API fail — pyrogram fallback (plain buttons)
+                    LOGGER.warning("[BotUpload] Bot API send failed, pyrogram fallback")
+                    try:
+                        sent = await self.client.send_message(
+                            chat_id=self.channel_id,
+                            text=caption_html,
+                            reply_markup=self._keyboard(),
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+                        self.post_msg_id = sent.id
+                    except Exception as e:
+                        LOGGER.error(f"[BotUpload] Post create error: {e}")
             else:
-                # Edit existing post — pyrogram se
-                try:
-                    await self.client.edit_message_text(
-                        chat_id=self.channel_id,
-                        message_id=self.post_msg_id,
-                        text=caption_html,
-                        reply_markup=keyboard,
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                    )
-                except Exception as e:
-                    LOGGER.error(f"[BotUpload] Post edit error: {e}")
-                await self._save_to_db()
+                # Edit existing — Bot API HTTP se
+                ok = await _bot_api_edit_message(
+                    chat_id=self.channel_id,
+                    message_id=self.post_msg_id,
+                    text=caption_html,
+                    entities=[],
+                    reply_markup=markup_json,
+                )
+                if not ok:
+                    try:
+                        await self.client.edit_message_text(
+                            chat_id=self.channel_id,
+                            message_id=self.post_msg_id,
+                            text=caption_html,
+                            reply_markup=self._keyboard(),
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as e:
+                        LOGGER.error(f"[BotUpload] Post edit error: {e}")
+            await self._save_to_db()
 
 
 # ─────────────────────────────────────────────────────────────────────────
