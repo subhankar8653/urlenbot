@@ -23,7 +23,7 @@ import re
 import string
 
 import aiohttp
-from pyrogram import Client, filters
+from pyrogram import Client, filters, ContinuePropagation
 from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 
@@ -197,6 +197,13 @@ async def border_or_season_photo_handler(bot: Client, message: Message):
             f"ya <code>/done</code> karo agar khatam.",
         )
         return
+
+    # Koi border/season session match nahi hua — is photo se humein kuch
+    # nahi karna. Pyrogram same group mein sirf EK handler chalata hai jab
+    # tak ContinuePropagation na ho, isliye yahan explicitly continue karo
+    # taaki dusre plugins (jaise update_channel.py ka image-upload step)
+    # is photo ko process kar sakein.
+    raise ContinuePropagation
 
 
 # ─────────────────────────────────────────────────────────────────────────
