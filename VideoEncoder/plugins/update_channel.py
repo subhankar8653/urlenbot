@@ -35,7 +35,7 @@ Auto-trigger:
     ◈ Quality: 360p, 720p, 1080p
     ◈ Genres: Action, Comedy, Romance
     ╰┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
-    ◈ Episode: 10 Added!
+    ➲ Episode: 10 Added!
 
     Row 1: [ ⎙ ᴡᴀᴛᴄʜ & ᴅᴏᴡɴʟᴏᴀᴅ ⎙ ]   (green, url = per-anime invite_link)
     Row 2: [• ᴋᴀɪꜱᴇ ᴅᴇᴋʜᴇɪɴ •] [• ᴊᴏɪɴ ʙᴀᴄᴋᴜᴘ •]   (blue, red — global default urls)
@@ -242,8 +242,8 @@ async def send_update_post(
          (exact/fuzzy match) AUR jiska 5-step entry COMPLETE ho (image required).
          Incomplete entry (image missing) → post skip.
 
-    Single episode:  episode=6        → ◈ Episode: 06 Added!
-    Episode range:   episode_start=34, episode_end=36  → ◈ Episode: 34-36 Added!
+    Single episode:  episode=6        → ➲ Episode: 06 Added!
+    Episode range:   episode_start=34, episode_end=36  → ➲ Episode: 34-36 Added!
     """
     # ── Toggle check ──
     enabled = await _get_update_toggle()
@@ -306,6 +306,7 @@ async def send_update_post(
     # ── Caption (box layout) ──
     box_top = "╭┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
     box_bottom = "╰┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+    ep_line = f"➲ Episode: {ep_str} Added!"
     lines = [
         title,
         box_top,
@@ -313,21 +314,25 @@ async def send_update_post(
         "◈ Quality: 360p, 720p, 1080p",
         f"◈ Genres: {genres}",
         box_bottom,
-        f"◈ Episode: {ep_str} Added!",
+        ep_line,
     ]
     caption = "\n".join(lines)
 
-    # Blockquote on title line and episode line (matches the rounded-chip look
-    # in the reference screenshot); box content stays plain text.
-    # NOTE: blockquote can't overlap with text_link on the same range, so the
-    # clickable link lives on the "Watch & Download" button instead.
+    # Whole caption bold. Title line also gets blockquote (chip-look, matches
+    # reference screenshot). Episode line gets a clickable text_link instead of
+    # blockquote — blockquote + text_link can't safely overlap on the same range,
+    # so the episode line trades the chip-look for being tap-to-open.
     title_len = len(title)
-    ep_line = lines[-1]
     ep_offset = len(caption) - len(ep_line)
     caption_entities = [
+        {"type": "bold", "offset": 0, "length": len(caption)},
         {"type": "blockquote", "offset": 0, "length": title_len},
-        {"type": "blockquote", "offset": ep_offset, "length": len(ep_line)},
     ]
+    if invite_link:
+        caption_entities.append({
+            "type": "text_link", "offset": ep_offset, "length": len(ep_line),
+            "url": invite_link,
+        })
 
     # ── Buttons ──
     button_defaults = await _get_button_defaults()
