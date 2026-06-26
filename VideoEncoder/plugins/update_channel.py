@@ -7,9 +7,12 @@ Flow:
   - /update_channel [channel_id]          → Update channel add karo
   - /update_channel_list                  → Saare update channels dekho (with IDs)
   - /delete_update_channel [channel_id]   → Update channel remove karo
-  - /update_post                          → Anime + invite link ka pair save karo
-                                            (2-step: anime name → invite link)
-  - /update_post_list                     → Saare saved anime → invite link pairs dekho
+  - /update_post                          → Anime ka pura update-post entry save karo
+                                            (5-step: anime name → invite link → audio →
+                                             genres → image)
+  - /update_post_button                   → Default "Kaise Dekhein" / "Join Backup"
+                                            button links set karo (sab posts pe lagte hain)
+  - /update_post_list                     → Saare saved anime entries dekho
   - /delete_update_post [anime_name]      → Kisi anime ka saved post entry remove karo
   - /updatechannel on|off                 → Update channel posting toggle karo
   - /latest_post_delete                   → Last sent update channel post delete karo
@@ -17,57 +20,88 @@ Flow:
 Auto-trigger:
   Jab bhi 360p file upload hoti hai kisi anime channel pe (auto_monitor se),
   toh SIRF wohi update channels pe post jaata hai jinka anime name
-  update_post_map mein saved hai (exact ya fuzzy match).
+  update_post_map mein saved hai (exact ya fuzzy match) AUR jiska image+audio+genres
+  bhi saved ho (5-step flow complete hua ho).
 
-  Agar anime ka koi entry update_post_map mein nahi → post NAHI jaayega.
+  Agar anime ka entry incomplete ho (image missing) → post NAHI jaayega.
   Agar /updatechannel off hai → post NAHI jaayega.
 
-    🔰 Witch Hat Atelier (S01)
-    ──────────────────────────
-    ⚡EP - 06 | Added
-    [❇️ Start the Bot Get Link Here ❇️]   ← button (agar invite link saved hai)
-    Start the Bot Get Link Here           ← plain text link (agar invite link saved hai)
+  Naya post format (image + caption + 3 colour buttons):
+
+    [photo]
+    ➲ Marriagetoxin (S - 01)
+    ╭┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+    ◈ Audio: Hindi ORG
+    ◈ Quality: 360p, 720p, 1080p
+    ◈ Genres: Action, Comedy, Romance
+    ╰┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+    ◈ Episode: 10 Added!
+
+    Row 1: [ ⎙ ᴡᴀᴛᴄʜ & ᴅᴏᴡɴʟᴏᴀᴅ ⎙ ]   (green, url = per-anime invite_link)
+    Row 2: [• ᴋᴀɪꜱᴇ ᴅᴇᴋʜᴇɪɴ •] [• ᴊᴏɪɴ ʙᴀᴄᴋᴜᴘ •]   (blue, red — global default urls)
 
 DB storage:
-  - update_channels  → col2, id='update_channels', data: list of {channel_id, channel_title}
-  - update_post_map  → col2, id='update_post_map', data: dict {anime_name_lower: invite_link}
-  - update_toggle    → col2, id='update_toggle', data: {enabled: True/False}
-  - latest_post_ids  → col2, id='latest_post_ids', data: list of {channel_id, message_id}
-  Both stored in bot-level col2 (status collection) — user-specific nahi.
+  - update_channels             → col2, id='update_channels', list of {channel_id, channel_title}
+  - update_post_map             → col2, id='update_post_map',
+                                  dict {anime_name_lower: {display_name, invite_link,
+                                                             audio, genres, image}}
+  - update_post_button_defaults → col2, id='update_post_button_defaults',
+                                  dict {kaise_dekhein: url, join_backup: url}
+  - update_toggle               → col2, id='update_toggle', data: {enabled: True/False}
+  - latest_post_ids             → col2, id='latest_post_ids', list of {channel_id, message_id}
+  All stored in bot-level col2 (status collection) — user-specific nahi.
 
 Commands registered here (conflict check):
   /update_channel          — unique
   /update_channel_list     — unique
   /delete_update_channel   — unique
-  /update_post             — unique (2-step session, group=15 text handler)
+  /update_post             — unique (5-step session: anime → link → audio → genres → image)
   /cancel_update_post      — unique (session cancel)
+  /update_post_button      — unique (1-step session: kaise_dekhein url → join_backup url)
   /update_post_list        — unique
   /delete_update_post      — unique
   /updatechannel           — unique (on/off toggle)
   /latest_post_delete      — unique
 
-  NOTE: text handler (group=0) sirf tab fire karta hai jab
-  _update_post_sessions mein us user ka session ho.
-  Isliye dusre plugins ke saath koi conflict nahi.
+  NOTE: text/photo handler (group=0) sirf tab fire karta hai jab
+  _update_post_sessions ya _update_post_button_sessions mein us user ka
+  session ho. Isliye dusre plugins ke saath koi conflict nahi.
 """
 
 import logging
 import re
 
-from pyrogram import Client, filters, enums, StopPropagation, ContinuePropagation
+from pyrogram import Client, filters, StopPropagation, ContinuePropagation
 from pyrogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup, Message
 )
 
 from .. import app, owner, sudo_users
 from ..utils.database.access_db import db
+from ..utils.bot_upload_engine import _bot_api_send_photo
 
 LOGGER = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-#  In-memory session for /update_post 2-step flow
+#  Colour styles for the 3 update-post buttons
+#  (same Bot API 9.4+ "style" mechanism /bot_upload uses)
 # ─────────────────────────────────────────────
-_update_post_sessions: dict = {}   # { user_id: {'step': 'anime'|'link', 'anime': str} }
+_WATCH_DL_STYLE = ("success", "🟢")   # green
+_KAISE_STYLE    = ("primary", "🔵")   # blue
+_BACKUP_STYLE   = ("danger",  "🔴")   # red
+
+
+# ─────────────────────────────────────────────
+#  In-memory session for /update_post 5-step flow
+#  step: 'anime' -> 'link' -> 'audio' -> 'genres' -> 'image'
+# ─────────────────────────────────────────────
+_update_post_sessions: dict = {}
+
+# ─────────────────────────────────────────────
+#  In-memory session for /update_post_button (set default button links)
+#  step: 'kaise_dekhein' -> 'join_backup'
+# ─────────────────────────────────────────────
+_update_post_button_sessions: dict = {}
 
 
 # ─────────────────────────────────────────────
@@ -104,17 +138,52 @@ async def _save_update_channels(channels: list):
 
 
 async def _get_post_map() -> dict:
-    """anime_name (lowercase) → invite_link map lo."""
+    """
+    anime_name (lowercase) → entry dict lo.
+    Entry shape: {
+        "display_name": str,
+        "invite_link": str,
+        "audio": str,
+        "genres": str,
+        "image": str,   # local file_id ya path jo Telegram pe already upload hai
+    }
+    Purane (string-only) entries bhi backward-compat ke liye support karte hain —
+    agar value plain string hai toh usko {"invite_link": value} treat karo.
+    """
     doc = await db.col2.find_one({'id': 'update_post_map'})
     if not doc:
         return {}
-    return doc.get('map', {})
+    raw = doc.get('map', {})
+    fixed = {}
+    for k, v in raw.items():
+        if isinstance(v, dict):
+            fixed[k] = v
+        else:
+            fixed[k] = {"display_name": k, "invite_link": v or ""}
+    return fixed
 
 
 async def _save_post_map(data: dict):
     await db.col2.update_one(
         {'id': 'update_post_map'},
         {'$set': {'map': data}},
+        upsert=True,
+    )
+
+
+# ── Global default button links (◈ kaise dekhein / join backup) ──
+async def _get_button_defaults() -> dict:
+    """{"kaise_dekhein": url, "join_backup": url} lo."""
+    doc = await db.col2.find_one({'id': 'update_post_button_defaults'})
+    if not doc:
+        return {}
+    return doc.get('buttons', {})
+
+
+async def _save_button_defaults(data: dict):
+    await db.col2.update_one(
+        {'id': 'update_post_button_defaults'},
+        {'$set': {'buttons': data}},
         upsert=True,
     )
 
@@ -165,15 +234,16 @@ async def send_update_post(
     episode_end: int | None = None,
 ):
     """
-    Update channels pe stylish format post bhejta hai.
+    Update channels pe naya image-based stylish post bhejta hai.
 
     RULES:
       1. /updatechannel off hai toh kuch nahi hoga.
       2. Sirf wohi anime ka post jaayega jiska entry update_post_map mein hai
-         (exact/fuzzy match). Agar entry nahi → post skip.
+         (exact/fuzzy match) AUR jiska 5-step entry COMPLETE ho (image required).
+         Incomplete entry (image missing) → post skip.
 
-    Single episode:  episode=6        → ⚡EP - 06 | Added
-    Episode range:   episode_start=34, episode_end=36  → ⚡EP 34-36 | Added
+    Single episode:  episode=6        → ◈ Episode: 06 Added!
+    Episode range:   episode_start=34, episode_end=36  → ◈ Episode: 34-36 Added!
     """
     # ── Toggle check ──
     enabled = await _get_update_toggle()
@@ -186,60 +256,116 @@ async def send_update_post(
         LOGGER.warning("[UpdateChannel] send_update_post called but no update channels saved.")
         return
 
+    if not anime_name.strip():
+        LOGGER.warning("[UpdateChannel] anime_name empty, post skip kiya.")
+        return
+
     post_map = await _get_post_map()
 
     # ── Anime match check — REQUIRED ──
-    # Sirf tab post hoga jab anime update_post_map mein registered ho
     query_norm = _norm(anime_name)
-    invite_link = None
-    matched = False
-    for key, link in post_map.items():
+    entry = None
+    for key, val in post_map.items():
         if _norm(key) == query_norm:
-            invite_link = link
-            matched = True
+            entry = val
             break
 
-    if not matched:
+    if not entry:
         LOGGER.info(
             f"[UpdateChannel] '{anime_name}' update_post_map mein nahi hai — post skip kiya."
         )
         return
 
-    # ── Title line ──
-    season_str = f"(S{season:02d})" if season else ""
-    title_line = f"🔰 **{anime_name} {season_str}**".strip() if season_str else f"🔰 **{anime_name}**"
-
-    # ── Episode line ──
-    ep_str = ""
-    if episode_start and episode_end and episode_start != episode_end:
-        ep_str = f">⚡**EP {episode_start}-{episode_end} | Added**"
-    elif episode_start:
-        ep_num = f"{episode_start:02d}" if episode_start < 100 else str(episode_start)
-        ep_str = f">⚡**EP - {ep_num} | Added**"
-    elif episode:
-        ep_num = f"{episode:02d}" if episode < 100 else str(episode)
-        ep_str = f">⚡**EP - {ep_num} | Added**"
-
-    divider = "──────────────────────────"
-
-    # ── Build text ──
-    lines = [title_line, divider]
-    if ep_str:
-        lines.append(ep_str)
-    if invite_link:
-        lines.append(f"[Start the Bot Get Link Here]({invite_link})")
-    text = "\n".join(lines)
-
-    if not anime_name.strip():
-        LOGGER.warning("[UpdateChannel] anime_name empty, post skip kiya.")
+    # ── Entry completeness check — image REQUIRED ──
+    image = entry.get("image")
+    if not image:
+        LOGGER.info(
+            f"[UpdateChannel] '{anime_name}' ka entry incomplete hai (image missing) — post skip kiya."
+        )
         return
 
-    # ── Button ──
-    markup = None
+    display_name = entry.get("display_name") or anime_name
+    invite_link = entry.get("invite_link") or ""
+    audio = entry.get("audio") or "—"
+    genres = entry.get("genres") or "—"
+
+    # ── Episode line ──
+    if episode_start and episode_end and episode_start != episode_end:
+        ep_str = f"{episode_start}-{episode_end}"
+    elif episode_start:
+        ep_str = f"{episode_start:02d}" if episode_start < 100 else str(episode_start)
+    elif episode:
+        ep_str = f"{episode:02d}" if episode < 100 else str(episode)
+    else:
+        ep_str = "—"
+
+    # ── Title line: ➲ Anime Name (S - 01) ──
+    season_str = f"(S - {season:02d})" if season else ""
+    title = f"➲ {display_name} {season_str}".strip() if season_str else f"➲ {display_name}"
+
+    # ── Caption (box layout) ──
+    box_top = "╭┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+    box_bottom = "╰┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+    lines = [
+        title,
+        box_top,
+        f"◈ Audio: {audio}",
+        "◈ Quality: 360p, 720p, 1080p",
+        f"◈ Genres: {genres}",
+        box_bottom,
+        f"◈ Episode: {ep_str} Added!",
+    ]
+    caption = "\n".join(lines)
+
+    # Blockquote on title line and episode line (matches the rounded-chip look
+    # in the reference screenshot); box content stays plain text.
+    # NOTE: blockquote can't overlap with text_link on the same range, so the
+    # clickable link lives on the "Watch & Download" button instead.
+    title_len = len(title)
+    ep_line = lines[-1]
+    ep_offset = len(caption) - len(ep_line)
+    caption_entities = [
+        {"type": "blockquote", "offset": 0, "length": title_len},
+        {"type": "blockquote", "offset": ep_offset, "length": len(ep_line)},
+    ]
+
+    # ── Buttons ──
+    button_defaults = await _get_button_defaults()
+    kaise_url = button_defaults.get("kaise_dekhein")
+    backup_url = button_defaults.get("join_backup")
+
+    row1 = []
     if invite_link:
-        markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("❇️ Start the Bot Get Link Here ❇️", url=invite_link)]
-        ])
+        row1.append({
+            "text": "⎙ ᴡᴀᴛᴄʜ & ᴅᴏᴡɴʟᴏᴀᴅ ⎙",
+            "url": invite_link,
+            "style": _WATCH_DL_STYLE[0],
+        })
+
+    row2 = []
+    if kaise_url:
+        row2.append({
+            "text": "• ᴋᴀɪꜱᴇ ᴅᴇᴋʜᴇɪɴ •",
+            "url": kaise_url,
+            "style": _KAISE_STYLE[0],
+        })
+    if backup_url:
+        row2.append({
+            "text": "• ᴊᴏɪɴ ʙᴀᴄᴋᴜᴘ •",
+            "url": backup_url,
+            "style": _BACKUP_STYLE[0],
+        })
+
+    keyboard_rows = [r for r in [row1, row2] if r]
+    reply_markup = {"inline_keyboard": keyboard_rows} if keyboard_rows else {"inline_keyboard": []}
+
+    # Pyrogram fallback markup (plain, no colour — used only if Bot API call fails)
+    pyrogram_rows = []
+    if row1:
+        pyrogram_rows.append([InlineKeyboardButton(b["text"], url=b["url"]) for b in row1])
+    if row2:
+        pyrogram_rows.append([InlineKeyboardButton(b["text"], url=b["url"]) for b in row2])
+    pyrogram_markup = InlineKeyboardMarkup(pyrogram_rows) if pyrogram_rows else None
 
     # ── Send and store latest post IDs ──
     new_latest = []
@@ -247,20 +373,30 @@ async def send_update_post(
         ch_id = ch.get("channel_id")
         if not ch_id:
             continue
+        msg_id = None
         try:
-            sent = await client.send_message(
-                chat_id=ch_id,
-                text=text,
-                reply_markup=markup,
-                parse_mode=enums.ParseMode.MARKDOWN,
-                disable_web_page_preview=True,
-            )
-            new_latest.append({"channel_id": ch_id, "message_id": sent.id})
-            LOGGER.info(
-                f"[UpdateChannel] Post sent to {ch_id} for '{anime_name}' Ep {episode or episode_start} (msg_id={sent.id})"
-            )
+            msg_id = await _bot_api_send_photo(ch_id, image, caption, caption_entities, reply_markup)
         except Exception as e:
-            LOGGER.error(f"[UpdateChannel] Failed to send to {ch_id}: {e}")
+            LOGGER.warning(f"[UpdateChannel] Bot API sendPhoto error for {ch_id}: {e}")
+
+        if not msg_id:
+            # Pyrogram fallback — no custom colours, but post still goes out
+            try:
+                sent = await client.send_photo(
+                    chat_id=ch_id,
+                    photo=image,
+                    caption=caption,
+                    reply_markup=pyrogram_markup,
+                )
+                msg_id = sent.id
+            except Exception as e:
+                LOGGER.error(f"[UpdateChannel] Failed to send to {ch_id}: {e}")
+                continue
+
+        new_latest.append({"channel_id": ch_id, "message_id": msg_id})
+        LOGGER.info(
+            f"[UpdateChannel] Post sent to {ch_id} for '{display_name}' Ep {ep_str} (msg_id={msg_id})"
+        )
 
     # Save latest post IDs (overwrite with fresh batch)
     if new_latest:
@@ -487,7 +623,7 @@ async def cmd_delete_update_channel(client: Client, message: Message):
 # ─────────────────────────────────────────────
 @Client.on_message(filters.command("update_post") & filters.private)
 async def cmd_update_post(client: Client, message: Message):
-    """Anime ka invite link save karo."""
+    """Anime ka pura update-post entry save karo (5-step)."""
     if not _is_auth(message.from_user.id):
         return
 
@@ -495,7 +631,7 @@ async def cmd_update_post(client: Client, message: Message):
     _update_post_sessions[user_id] = {"step": "anime"}
 
     await message.reply(
-        "**Step 1/2 — Anime ka naam do:**\n\n"
+        "**Step 1/5 — Anime ka naam do:**\n\n"
         "**Example:** `Witch Hat Atelier`\n\n"
         "_Cancel karna ho toh `/cancel_update_post` bhejo._"
     )
@@ -505,7 +641,29 @@ async def cmd_update_post(client: Client, message: Message):
 async def cmd_cancel_update_post(client: Client, message: Message):
     user_id = message.from_user.id
     _update_post_sessions.pop(user_id, None)
+    _update_post_button_sessions.pop(user_id, None)
     await message.reply("❌ Cancelled.")
+
+
+# ─────────────────────────────────────────────
+#  /update_post_button — default Kaise Dekhein / Join Backup links set karo
+#  Ye ek baar set karo, sab future update posts pe automatically lagega.
+#  Dobara is command se reset/change kiya ja sakta hai.
+# ─────────────────────────────────────────────
+@Client.on_message(filters.command("update_post_button") & filters.private)
+async def cmd_update_post_button(client: Client, message: Message):
+    """Kaise Dekhein + Join Backup ke default button links set karo."""
+    if not _is_auth(message.from_user.id):
+        return
+
+    user_id = message.from_user.id
+    _update_post_button_sessions[user_id] = {"step": "kaise_dekhein"}
+
+    await message.reply(
+        "**Step 1/2 — • ᴋᴀɪꜱᴇ ᴅᴇᴋʜᴇɪɴ • ka link do:**\n\n"
+        "**Example:** `https://t.me/+xxxxxxxxxx`\n\n"
+        "_Cancel karna ho toh `/cancel_update_post` bhejo._"
+    )
 
 
 # ─────────────────────────────────────────────
@@ -513,7 +671,7 @@ async def cmd_cancel_update_post(client: Client, message: Message):
 # ─────────────────────────────────────────────
 @Client.on_message(filters.command("update_post_list") & filters.private)
 async def cmd_update_post_list(client: Client, message: Message):
-    """Saare saved anime → invite link pairs dikho."""
+    """Saare saved anime entries dikho."""
     if not _is_auth(message.from_user.id):
         return
 
@@ -527,10 +685,20 @@ async def cmd_update_post_list(client: Client, message: Message):
         return
 
     text = f"📋 **Saved Anime Posts ({len(post_map)})**\n"
-    text += "_Sirf inhi anime ka post update channel pe jaayega_\n\n"
-    for i, (anime, link) in enumerate(post_map.items(), 1):
+    text += "_Sirf complete entries (image saved) ka hi post update channel pe jaayega_\n\n"
+    for i, (key, entry) in enumerate(post_map.items(), 1):
+        name = entry.get("display_name") or key
+        link = entry.get("invite_link") or ""
         link_display = f"[link]({link})" if link else "_(no link)_"
-        text += f"`{i}.` **{anime}**\n    🔗 {link_display}\n\n"
+        audio = entry.get("audio") or "_(not set)_"
+        genres = entry.get("genres") or "_(not set)_"
+        complete = "✅" if entry.get("image") else "⚠️ incomplete (no image)"
+        text += (
+            f"`{i}.` **{name}** — {complete}\n"
+            f"    🔗 {link_display}\n"
+            f"    🎙 {audio}\n"
+            f"    🎭 {genres}\n\n"
+        )
 
     text += "🗑️ Remove: `/delete_update_post [anime name]`"
     await message.reply(text, disable_web_page_preview=True)
@@ -593,28 +761,75 @@ async def cmd_delete_update_post(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────
-#  Text input handler for /update_post 2-step flow
-#  group=0 — sabse pehle fire hoga, kisi se conflict nahi
+#  Text input handler for /update_post 5-step flow +
+#  /update_post_button 2-step flow.
+#  group=0 — sabse pehle fire hoga, kisi se conflict nahi.
 #  Agar session nahi → ContinuePropagation (agle handlers ko jaane do)
 #  Agar session hai → process karo, StopPropagation (koi aur na pakde)
 # ─────────────────────────────────────────────
 @Client.on_message(filters.text & filters.private, group=0)
 async def update_post_text_input(client: Client, message: Message):
-    """update_post ke 2-step input ko handle karo."""
+    """update_post ke 5-step aur update_post_button ke 2-step input ko handle karo."""
     user_id = message.from_user.id
 
     # Auth check — authorized nahi toh agle handlers ko jaane do
     if not _is_auth(user_id):
         raise ContinuePropagation
 
-    # Session nahi → hamara kaam nahi, agle handler ko jaane do
+    text = message.text.strip()
+
+    # ── /update_post_button session ──
+    btn_session = _update_post_button_sessions.get(user_id)
+    if btn_session:
+        if text.lower() in ["/cancel_update_post", "cancel"]:
+            _update_post_button_sessions.pop(user_id, None)
+            await message.reply("❌ Cancelled.")
+            raise StopPropagation
+
+        if text.startswith("/"):
+            _update_post_button_sessions.pop(user_id, None)
+            raise ContinuePropagation
+
+        if btn_session.get("step") == "kaise_dekhein":
+            if not text.startswith("http"):
+                await message.reply("⚠️ Valid link do (`https://...`).")
+                raise StopPropagation
+            _update_post_button_sessions[user_id] = {
+                "step": "join_backup", "kaise_dekhein": text
+            }
+            await message.reply(
+                f"✅ • ᴋᴀɪꜱᴇ ᴅᴇᴋʜᴇɪɴ •: `{text}`\n\n"
+                f"**Step 2/2 — • ᴊᴏɪɴ ʙᴀᴄᴋᴜᴘ • ka link do:**\n\n"
+                f"**Example:** `https://t.me/+xxxxxxxxxx`"
+            )
+            raise StopPropagation
+
+        if btn_session.get("step") == "join_backup":
+            if not text.startswith("http"):
+                await message.reply("⚠️ Valid link do (`https://...`).")
+                raise StopPropagation
+            kaise_url = btn_session["kaise_dekhein"]
+            _update_post_button_sessions.pop(user_id, None)
+
+            await _save_button_defaults({
+                "kaise_dekhein": kaise_url,
+                "join_backup": text,
+            })
+            await message.reply(
+                "✅ **Saved!**\n\n"
+                f"• ᴋᴀɪꜱᴇ ᴅᴇᴋʜᴇɪɴ •: `{kaise_url}`\n"
+                f"• ᴊᴏɪɴ ʙᴀᴄᴋᴜᴘ •: `{text}`\n\n"
+                "Ab se yeh dono buttons sabhi update posts pe automatically lagenge.\n"
+                "Change karna ho toh dobara `/update_post_button` karo."
+            )
+            raise StopPropagation
+
+    # ── /update_post session ──
     session = _update_post_sessions.get(user_id)
     if not session:
         raise ContinuePropagation
 
     # Session hai — ab sirf hum handle karenge, koi aur nahi
-    text = message.text.strip()
-
     if text.lower() in ["/cancel_update_post", "cancel"]:
         _update_post_sessions.pop(user_id, None)
         await message.reply("❌ Cancelled.")
@@ -629,7 +844,7 @@ async def update_post_text_input(client: Client, message: Message):
         _update_post_sessions[user_id] = {"step": "link", "anime": text}
         await message.reply(
             f"✅ Anime: **{text}**\n\n"
-            f"**Step 2/2 — Invite link do:**\n\n"
+            f"**Step 2/5 — Invite link do:**\n\n"
             f"**Example:** `https://t.me/+xxxxxxxxxx`\n\n"
             f"_Link nahi dena toh `skip` likho — post button ke bina aayega._"
         )
@@ -637,37 +852,108 @@ async def update_post_text_input(client: Client, message: Message):
 
     # ── Step 2: Invite link ──
     if session.get("step") == "link":
-        anime_name = session["anime"]
-        _update_post_sessions.pop(user_id, None)
-
         if text.lower() == "skip":
             invite_link = ""
         elif not text.startswith("http"):
             await message.reply(
                 "⚠️ Valid invite link do (`https://t.me/...`) ya `skip` likho."
             )
-            _update_post_sessions[user_id] = session
             raise StopPropagation
         else:
             invite_link = text
 
-        post_map = await _get_post_map()
-        post_map[anime_name.lower().strip()] = invite_link
-        await _save_post_map(post_map)
+        session["invite_link"] = invite_link
+        session["step"] = "audio"
+        _update_post_sessions[user_id] = session
 
-        if invite_link:
-            await message.reply(
-                f"✅ **Saved!**\n\n"
-                f"📺 Anime: **{anime_name}**\n"
-                f"🔗 Link: `{invite_link}`\n\n"
-                f"Ab jab bhi `{anime_name}` ka 360p upload hoga, "
-                f"update channel pe link ke saath post aayega."
-            )
-        else:
-            await message.reply(
-                f"✅ **Saved!** (link ke bina)\n\n"
-                f"📺 Anime: **{anime_name}**\n\n"
-                f"Post aayega par button nahi hoga.\n"
-                f"Link add karna ho toh dobara `/update_post` karo."
-            )
+        await message.reply(
+            f"✅ Link: {'`' + invite_link + '`' if invite_link else '_(skip kiya)_'}\n\n"
+            f"**Step 3/5 — Audio kya hai?**\n\n"
+            f"**Example:** `Hindi ORG`"
+        )
         raise StopPropagation
+
+    # ── Step 3: Audio ──
+    if session.get("step") == "audio":
+        session["audio"] = text
+        session["step"] = "genres"
+        _update_post_sessions[user_id] = session
+
+        await message.reply(
+            f"✅ Audio: **{text}**\n\n"
+            f"**Step 4/5 — Genres do:**\n\n"
+            f"**Example:** `Action, Comedy, Romance`"
+        )
+        raise StopPropagation
+
+    # ── Step 4: Genres ──
+    if session.get("step") == "genres":
+        session["genres"] = text
+        session["step"] = "image"
+        _update_post_sessions[user_id] = session
+
+        await message.reply(
+            f"✅ Genres: **{text}**\n\n"
+            f"**Step 5/5 — Ab image bhejo** (poster/banner jo update post pe lagegi):\n\n"
+            f"_Photo bhejo (caption ki zaroorat nahi)._"
+        )
+        raise StopPropagation
+
+    # ── Step 5 (image) is handled by the dedicated photo handler below.
+    #     Agar yahan text aaya iska matlab user ne image ke jagah text bheja.
+    if session.get("step") == "image":
+        await message.reply(
+            "⚠️ Image bhejo (photo), text nahi.\n\n"
+            "_Cancel karna ho toh `/cancel_update_post` bhejo._"
+        )
+        raise StopPropagation
+
+    raise ContinuePropagation
+
+
+# ─────────────────────────────────────────────
+#  Photo handler for /update_post Step 5/5 — final image save
+#  group=0 — sirf tab fire karta hai jab session step == 'image'
+# ─────────────────────────────────────────────
+@Client.on_message(filters.photo & filters.private, group=0)
+async def update_post_photo_input(client: Client, message: Message):
+    """update_post ke Step 5/5 (image) ko handle karo."""
+    user_id = message.from_user.id
+
+    if not _is_auth(user_id):
+        raise ContinuePropagation
+
+    session = _update_post_sessions.get(user_id)
+    if not session or session.get("step") != "image":
+        raise ContinuePropagation
+
+    anime_name = session["anime"]
+    invite_link = session.get("invite_link", "")
+    audio = session.get("audio", "")
+    genres = session.get("genres", "")
+    file_id = message.photo.file_id
+
+    _update_post_sessions.pop(user_id, None)
+
+    post_map = await _get_post_map()
+    post_map[anime_name.lower().strip()] = {
+        "display_name": anime_name,
+        "invite_link": invite_link,
+        "audio": audio,
+        "genres": genres,
+        "image": file_id,
+    }
+    await _save_post_map(post_map)
+
+    link_line = f"🔗 Link: `{invite_link}`\n" if invite_link else "🔗 Link: _(none)_\n"
+    await message.reply(
+        f"✅ **Saved!**\n\n"
+        f"📺 Anime: **{anime_name}**\n"
+        f"{link_line}"
+        f"🎙 Audio: **{audio}**\n"
+        f"🎭 Genres: **{genres}**\n"
+        f"🖼 Image: ✅ saved\n\n"
+        f"Ab jab bhi `{anime_name}` ka 360p upload hoga, "
+        f"update channel pe full styled post aayega."
+    )
+    raise StopPropagation
