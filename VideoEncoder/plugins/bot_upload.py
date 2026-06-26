@@ -14,6 +14,22 @@ Commands:
                              episode upload (RTI/url -e) → batch links →
                              border → batch summary → /set_end → next season sticker →
                              default auto-upload end messages.
+
+  /bot_upload <post_link> | rti <rti_url> <ep_num>
+                           — EXISTING POST mode (single). post_link ek already-bani
+                             hui channel post ka link hai (https://t.me/c/<id>/<msgid>).
+                             Episode ep_num upload karke, sirf usi post ke quality
+                             button-row mein same-slot-replace karega:
+                               360p/480p ek slot share karte hain (jo bhi naya aaye
+                               wahi dikhega), 720p/1080p apne alag slots mein replace
+                               hote hain. Baaki (non-quality) buttons untouched.
+
+  /bot_upload <start_post_link> <end_msg_id> | url <link> -e <ep_start> <ep_end> <quality>
+                           — EXISTING POST mode (batch). start_post_link se end_msg_id
+                             tak SEQUENTIAL message_ids ko episodes ep_start..ep_end
+                             se map kiya jaata hai (msg_id N = episode ep_start + (N - start)).
+                             Har episode ki file upload hoke uski matching post pe
+                             diye gaye <quality> ka button same-slot-replace hota hai.
 """
 
 import asyncio
@@ -292,6 +308,232 @@ def _build_imdb_caption(info: dict, anime_name: str) -> str:
     )
 
 
+def _parse_tme_link(link: str) -> tuple[int, int] | None:
+    """
+    https://t.me/c/<internal_id>/<msg_id>  →  (chat_id, msg_id)
+    chat_id = int("-100" + internal_id). Public links (t.me/username/id) supported
+    bhi parse honge but channel_id wahi rahega jo username se resolve hota hai —
+    is feature ke liye hum sirf private (/c/) links expect karte hain.
+    """
+    m = re.search(r"t\.me/c/(\d+)/(\d+)", link)
+    if m:
+        return int("-100" + m.group(1)), int(m.group(2))
+    m = re.search(r"t\.me/([A-Za-z0-9_]+)/(\d+)", link)
+    if m:
+        # Public channel username — chat_id ko hum yahan resolve nahi kar sakte
+        # bina ek extra API call ke; caller ko username pass karna hoga.
+        return None
+    return None
+
+
+async def _bot_upload_existing_post_mode(bot: Client, message: Message, rest: str):
+    """
+    Existing-post mode — naye post nahi banaye jaate, balki kisi already-existing
+    channel post ke quality buttons same-slot-replace logic se update kiye jaate hain.
+
+    Single:  <post_link> | rti <rti_url> <ep_num>
+    Batch:   <start_post_link> <end_msg_id> | url <link> -e <ep_start> <ep_end> <quality>
+    """
+    parts = rest.split("|")
+    if len(parts) < 2:
+        await message.reply(
+            "❌ Format galat hai.\n\n"
+            "<b>Single:</b> <code>/bot_upload &lt;post_link&gt; | rti &lt;url&gt; &lt;ep_num&gt;</code>\n"
+            "<b>Batch:</b> <code>/bot_upload &lt;start_link&gt; &lt;end_msg_id&gt; | url &lt;link&gt; -e &lt;ep_start&gt; &lt;ep_end&gt; &lt;quality&gt;</code>"
+        )
+        return
+
+    link_part = parts[0].strip()
+    source_part = parts[1].strip()
+    link_tokens = link_part.split()
+
+    parsed = _parse_tme_link(link_tokens[0])
+    if not parsed:
+        await message.reply(
+            "❌ Invalid post link. Private channel link chahiye: "
+            "<code>https://t.me/c/&lt;id&gt;/&lt;msg_id&gt;</code>"
+        )
+        return
+    chat_id, start_msg_id = parsed
+
+    user_id = message.from_user.id
+
+    # ── SINGLE mode: source starts with "rti" (with or without leading /) ──
+    source_lower = source_part.lower()
+    if source_lower.startswith("rti") or source_lower.startswith("/rti"):
+        m = re.match(r"^/?rti\s+(\S+)\s+(\d+)", source_part, re.IGNORECASE)
+        if not m:
+            await message.reply("❌ <code>rti &lt;url&gt; &lt;ep_num&gt;</code> format galat hai.")
+            return
+        page_url, ep_num = m.group(1), int(m.group(2))
+
+        if len(link_tokens) > 1:
+            await message.reply(
+                "ℹ️ Single mode mein sirf ek post_link chahiye "
+                "(end_msg_id mat do — wo batch mode ke liye hai)."
+            )
+            return
+
+        status = await message.reply(
+            f"<b>🚀 Existing-post upload started</b>\n"
+            f"Post: <code>{link_tokens[0]}</code>\nEpisode: {ep_num}"
+        )
+
+        from ..utils.bot_upload_engine import run_episode_rti, update_existing_post_button
+        from ..plugins.auto_monitor import _get_suhani_bot_link
+
+        uploaded = await run_episode_rti(app, message, status, page_url, ep_num, ep_num)
+        if not uploaded:
+            await status.edit(f"❌ Episode {ep_num} — koi quality upload nahi hui.")
+            return
+
+        done = []
+        for quality, sent_msg in uploaded.items():
+            link = await _get_suhani_bot_link(sent_msg)
+            if not link:
+                continue
+            ok = await update_existing_post_button(app, chat_id, start_msg_id, quality, link)
+            if ok:
+                done.append(quality)
+
+        if done:
+            await status.edit(
+                f"✅ <b>Done!</b> Episode {ep_num}\n"
+                f"Updated qualities on post: {', '.join(done)}"
+            )
+        else:
+            await status.edit(f"❌ Episode {ep_num} — button update fail ho gaya.")
+        return
+
+    # ── BATCH mode: source starts with "url" (with or without leading /) ──
+    if source_lower.startswith("url") or source_lower.startswith("/url"):
+        if len(link_tokens) < 2:
+            await message.reply(
+                "❌ Batch mode ke liye end_msg_id bhi chahiye:\n"
+                "<code>/bot_upload &lt;start_link&gt; &lt;end_msg_id&gt; | url &lt;link&gt; -e &lt;ep_start&gt; &lt;ep_end&gt; &lt;quality&gt;</code>"
+            )
+            return
+        try:
+            end_msg_id = int(link_tokens[1])
+        except ValueError:
+            await message.reply("❌ <code>end_msg_id</code> ek number hona chahiye.")
+            return
+
+        m = re.match(
+            r"^/?url\s+(\S+)\s+-e\s+(\d+)\s+(\d+)\s+(\d+p)",
+            source_part, re.IGNORECASE,
+        )
+        if not m:
+            await message.reply(
+                "❌ Format galat hai:\n"
+                "<code>url &lt;link&gt; -e &lt;ep_start&gt; &lt;ep_end&gt; &lt;quality&gt;</code>"
+            )
+            return
+        url, ep_start, ep_end, quality = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4).lower()
+
+        if end_msg_id < start_msg_id:
+            await message.reply("❌ <code>end_msg_id</code> start se chota nahi ho sakta.")
+            return
+
+        post_count = end_msg_id - start_msg_id + 1
+        ep_count = ep_end - ep_start + 1
+        if post_count != ep_count:
+            suggested_end_msg_id = start_msg_id + (ep_count - 1)
+            await message.reply(
+                f"⚠️ <b>Count match nahi ho raha!</b>\n\n"
+                f"📨 Post range: <code>{start_msg_id}</code> → <code>{end_msg_id}</code> = <b>{post_count} posts</b>\n"
+                f"🎬 Episode range: <code>{ep_start}</code> → <code>{ep_end}</code> = <b>{ep_count} episodes</b>\n\n"
+                f"Dono ka count barabar hona chahiye (1 post = 1 episode, sequential).\n\n"
+                f"💡 Agar episodes {ep_start}-{ep_end} hi sahi hain, toh end_msg_id "
+                f"<code>{suggested_end_msg_id}</code> hona chahiye.\n\n"
+                f"Sahi count ke saath dobara bhejo."
+            )
+            return
+
+        status = await message.reply(
+            f"<b>🚀 Existing-post BATCH upload started</b>\n"
+            f"Posts: <code>{start_msg_id}</code> → <code>{end_msg_id}</code>\n"
+            f"Episodes: {ep_start} → {ep_end} | Quality: <b>{quality}</b>"
+        )
+
+        from ..utils.bot_upload_engine import (
+            episode_from_filename, upload_file_to_log, update_existing_post_button,
+        )
+        from ..plugins.swift_downloader import _quality_from
+        from ..plugins.auto_monitor import _get_suhani_bot_link
+        from ..plugins.url_upload import _download_url, _extract_archive_all, _safe_filename, apply_urlpreset_to_file
+        from ..utils.direct_link_generator import direct_link_generator
+        from .. import download_dir as DL_DIR
+
+        direct = direct_link_generator(url)
+        if direct:
+            url = direct
+
+        await status.edit("<b>💠 Archive download ho raha hai...</b>")
+        fname = _safe_filename(os.path.basename(url.split("?")[0]) or "download.zip")
+        filepath = await _download_url(url, fname, status, message)
+        if not filepath or not os.path.isfile(filepath):
+            await status.edit("❌ Download fail ho gaya.")
+            return
+
+        all_files = await _extract_archive_all(filepath, status)
+        if not all_files:
+            return
+
+        # Sirf requested quality ki files chahiye, episode range ke andar
+        ep_files: dict = {}
+        for fp in all_files:
+            ep = episode_from_filename(os.path.basename(fp))
+            q = _quality_from(os.path.basename(fp))
+            if ep is None or q != quality:
+                continue
+            if not (ep_start <= ep <= ep_end):
+                continue
+            ep_files[ep] = fp
+
+        done_eps = []
+        failed_eps = []
+        for ep_num in range(ep_start, ep_end + 1):
+            fp = ep_files.get(ep_num)
+            if not fp or not os.path.isfile(fp):
+                failed_eps.append(ep_num)
+                continue
+
+            msg_id_for_ep = start_msg_id + (ep_num - ep_start)
+
+            await status.edit(f"<b>📤 Ep {ep_num} — {quality}</b> uploading...")
+            fp, _has_eng_sub = await apply_urlpreset_to_file(fp, user_id, status)
+            success, sent_msg, _q = await upload_file_to_log(app, message, status, fp, DL_DIR)
+            if not success or not sent_msg:
+                failed_eps.append(ep_num)
+                continue
+
+            link = await _get_suhani_bot_link(sent_msg)
+            if not link:
+                failed_eps.append(ep_num)
+                continue
+
+            ok = await update_existing_post_button(app, chat_id, msg_id_for_ep, quality, link)
+            if ok:
+                done_eps.append(ep_num)
+            else:
+                failed_eps.append(ep_num)
+
+        summary = f"✅ <b>Batch complete!</b>\nQuality: <b>{quality}</b>\n"
+        summary += f"Updated: {len(done_eps)} episode(s)"
+        if done_eps:
+            summary += f" ({', '.join(map(str, done_eps))})"
+        if failed_eps:
+            summary += f"\n⚠️ Failed/missing: {', '.join(map(str, failed_eps))}"
+        await status.edit(summary)
+        return
+
+    await message.reply(
+        "❌ Source samajh nahi aaya. <code>rti &lt;url&gt; &lt;ep_num&gt;</code> ya "
+        "<code>url &lt;link&gt; -e &lt;ep_start&gt; &lt;ep_end&gt; &lt;quality&gt;</code> use karo."
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────
 #  /bot_upload — Phase 1 skeleton
 #  /bot_upload <channel_id> <anime_name> | <season_no>
@@ -313,11 +555,24 @@ async def bot_upload_cmd(bot: Client, message: Message):
             "<code>/rti &lt;rti_page_url&gt; 1-12</code>\n"
             "<code>/url &lt;link&gt; -e</code>\n\n"
             "<b>Example:</b>\n"
-            "<code>/bot_upload -1001234567890 Naruto | 1 | /rti https://rti.site/naruto 1-12</code>"
+            "<code>/bot_upload -1001234567890 Naruto | 1 | /rti https://rti.site/naruto 1-12</code>\n\n"
+            "──────────\n"
+            "<b>Existing-post mode (single):</b>\n"
+            "<code>/bot_upload &lt;post_link&gt; | rti &lt;rti_url&gt; &lt;ep_num&gt;</code>\n\n"
+            "<b>Existing-post mode (batch):</b>\n"
+            "<code>/bot_upload &lt;start_post_link&gt; &lt;end_msg_id&gt; | url &lt;link&gt; -e &lt;ep_start&gt; &lt;ep_end&gt; &lt;quality&gt;</code>"
         )
         return
 
     rest = args[1].strip()
+    parts_check = rest.split("|", 1)
+    first_part = parts_check[0].strip()
+
+    # ── Existing-post mode detection: first part starts with a t.me link ──
+    if re.match(r"^https?://t\.me/", first_part, re.IGNORECASE):
+        await _bot_upload_existing_post_mode(bot, message, rest)
+        return
+
     # Split into: "<channel_id> <anime_name>" | "<season_no>" | "<source spec>"
     parts = rest.split("|")
     if len(parts) < 2:
