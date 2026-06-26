@@ -196,6 +196,33 @@ async def _bot_api_edit_message(chat_id: int, message_id: int, text: str,
         LOGGER.warning(f"[BotUpload] Bot API edit failed: {e}")
         return False
 
+async def _bot_api_edit_reply_markup(chat_id: int, message_id: int, reply_markup: dict) -> bool:
+    """
+    httpx se Bot API editMessageReplyMarkup — sirf buttons change karo, caption/text
+    bilkul untouched rehta hai. Existing posts (jo /bot_upload se nahi bani) ke
+    quality buttons update karne ke liye use hota hai.
+    """
+    if not _BOT_TOKEN:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{_BOT_TOKEN}/editMessageReplyMarkup",
+                json={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "reply_markup": reply_markup,
+                }
+            )
+            data = resp.json()
+            if not data.get("ok"):
+                LOGGER.warning(f"[BotUpload] Bot API editReplyMarkup failed: {data.get('description')}")
+                return False
+            return True
+    except Exception as e:
+        LOGGER.warning(f"[BotUpload] Bot API editReplyMarkup error: {e}")
+        return False
+
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -365,6 +392,127 @@ class EpisodePostManager:
                     except Exception as e:
                         LOGGER.error(f"[BotUpload] Post edit error: {e}")
                 await self._save_to_db()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Existing-post quality-button editor (for /bot_upload <post_link> mode)
+#  Kisi bhi existing channel post ke quality buttons ko same-slot-replace
+#  logic se update karta hai — 360p/480p ek slot (sirf ek dikhega),
+#  720p alag slot, 1080p alag slot. Baaki buttons (non-quality) untouched.
+# ─────────────────────────────────────────────────────────────────────────
+_QUALITY_RE = re.compile(r"\b(360p|480p|720p|1080p|2160p)\b", re.IGNORECASE)
+
+
+def _quality_slot_for(quality: str) -> str:
+    """360p/480p => 'low' slot; 720p/1080p => apna hi slot."""
+    q = quality.lower()
+    if q in ("360p", "480p"):
+        return "low"
+    return q
+
+
+def _button_quality_slot(button: dict) -> str | None:
+    """Button ke text se quality nikal ke uska slot batao (None agar quality button nahi hai)."""
+    text = button.get("text", "")
+    m = _QUALITY_RE.search(text)
+    if not m:
+        return None
+    return _quality_slot_for(m.group(1).lower())
+
+
+async def _fetch_message_buttons(client: Client, chat_id: int, msg_id: int) -> list:
+    """
+    Existing message ka current inline_keyboard nikalo (list of rows, har row list of
+    {"text", "url"} dicts). Bot API se direct fetch ka koi method nahi hai isliye
+    Pyrogram ke get_messages se reply_markup parse karte hain.
+    """
+    try:
+        msg = await client.get_messages(chat_id, msg_id)
+    except Exception as e:
+        LOGGER.warning(f"[BotUpload] get_messages failed for {chat_id}/{msg_id}: {e}")
+        return []
+
+    if not msg or not msg.reply_markup or not getattr(msg.reply_markup, "inline_keyboard", None):
+        return []
+
+    rows = []
+    for row in msg.reply_markup.inline_keyboard:
+        new_row = []
+        for btn in row:
+            new_row.append({"text": btn.text or "", "url": btn.url or ""})
+        rows.append(new_row)
+    return rows
+
+
+async def update_existing_post_button(client: Client, chat_id: int, msg_id: int,
+                                       quality: str, deep_link_url: str) -> bool:
+    """
+    Kisi existing channel post (jo /bot_upload se nahi bani thi, jaise koi
+    pehle se mojood post) ke quality buttons ko same-slot-replace logic se
+    update karta hai:
+      - 360p/480p ek slot share karte hain — naya jo bhi ho (360p ya 480p),
+        purana 360p/480p button (jo bhi tha) hat jaayega, naya add hoga.
+      - 720p apna alag slot, 1080p apna alag slot — same tarah replace.
+      - Quality se related na ho wo koi bhi button (e.g. "Join Channel")
+        bilkul untouched rehta hai.
+    Returns True agar edit successful hua.
+    """
+    if quality == "2160p":
+        return False
+
+    new_slot = _quality_slot_for(quality)
+    rows = await _fetch_message_buttons(client, chat_id, msg_id)
+
+    # Quality row dhoondo — jis row mein koi bhi quality-button ho, wahi
+    # quality-row treat karenge (typically ek hi row hota hai). Agar kahin
+    # quality button nahi mila, naya row banake end mein add karenge.
+    quality_row_idx = None
+    other_rows = []
+    quality_row = []
+
+    for idx, row in enumerate(rows):
+        if any(_button_quality_slot(b) is not None for b in row):
+            quality_row_idx = idx
+            quality_row = row
+        else:
+            other_rows.append((idx, row))
+
+    # Quality row se: same slot wala purana button hatao, baaki rakho
+    kept = [b for b in quality_row if _button_quality_slot(b) != new_slot]
+    new_button = _quality_button_dict(quality, deep_link_url, new_slot)
+    kept.append(new_button)
+
+    # Order maintain karo: low -> 720p -> 1080p
+    order = {"low": 0, "720p": 1, "1080p": 2}
+    kept.sort(key=lambda b: order.get(_button_quality_slot(b), 99))
+
+    # Final rows rebuild — quality row ko apni original position pe rakho
+    final_rows = [r for _, r in other_rows]
+    if quality_row_idx is not None:
+        final_rows.insert(min(quality_row_idx, len(final_rows)), kept)
+    else:
+        final_rows.append(kept)
+
+    keyboard = {"inline_keyboard": final_rows}
+
+    success = await _bot_api_edit_reply_markup(chat_id, msg_id, keyboard)
+    if success:
+        return True
+
+    # Pyrogram fallback — koi style/emoji nahi, sirf text+url
+    try:
+        pyrogram_rows = [
+            [InlineKeyboardButton(text=b["text"], url=b["url"]) for b in row]
+            for row in final_rows
+        ]
+        await client.edit_message_reply_markup(
+            chat_id=chat_id, message_id=msg_id,
+            reply_markup=InlineKeyboardMarkup(pyrogram_rows) if pyrogram_rows else None,
+        )
+        return True
+    except Exception as e:
+        LOGGER.error(f"[BotUpload] update_existing_post_button fallback failed: {e}")
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────
