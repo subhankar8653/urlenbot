@@ -12,7 +12,9 @@ Flow:
                                              genres → image)
   - /update_post_button                   → Default "Kaise Dekhein" / "Join Backup"
                                             button links set karo (sab posts pe lagte hain)
-  - /update_post_list                     → Saare saved anime entries dekho
+  - /update_post_list                     → Saare saved anime entries — interactive
+                                            paginated panel (10/page), tap karke
+                                            link/audio/genres/image edit karo
   - /delete_update_post [anime_name]      → Kisi anime ka saved post entry remove karo
   - /updatechannel on|off                 → Update channel posting toggle karo
   - /latest_post_delete                   → Last sent update channel post delete karo
@@ -73,7 +75,7 @@ import re
 
 from pyrogram import Client, filters, StopPropagation, ContinuePropagation
 from pyrogram.types import (
-    InlineKeyboardButton, InlineKeyboardMarkup, Message
+    InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
 )
 
 from .. import app, owner, sudo_users
@@ -102,6 +104,14 @@ _update_post_sessions: dict = {}
 #  step: 'kaise_dekhein' -> 'join_backup'
 # ─────────────────────────────────────────────
 _update_post_button_sessions: dict = {}
+
+# ─────────────────────────────────────────────
+#  In-memory session for /update_post_list inline-edit flow
+#  { user_id: {'key': anime_key, 'field': 'invite_link'|'audio'|'genres'|'image', 'page': int} }
+# ─────────────────────────────────────────────
+_update_post_edit_sessions: dict = {}
+
+_UPE_PAGE_SIZE = 10
 
 
 # ─────────────────────────────────────────────
@@ -676,7 +686,7 @@ async def cmd_update_post_button(client: Client, message: Message):
 # ─────────────────────────────────────────────
 @Client.on_message(filters.command("update_post_list") & filters.private)
 async def cmd_update_post_list(client: Client, message: Message):
-    """Saare saved anime entries dikho."""
+    """Saare saved anime entries — interactive paginated panel."""
     if not _is_auth(message.from_user.id):
         return
 
@@ -689,24 +699,272 @@ async def cmd_update_post_list(client: Client, message: Message):
         )
         return
 
-    text = f"📋 **Saved Anime Posts ({len(post_map)})**\n"
-    text += "_Sirf complete entries (image saved) ka hi post update channel pe jaayega_\n\n"
-    for i, (key, entry) in enumerate(post_map.items(), 1):
-        name = entry.get("display_name") or key
-        link = entry.get("invite_link") or ""
-        link_display = f"[link]({link})" if link else "_(no link)_"
-        audio = entry.get("audio") or "_(not set)_"
-        genres = entry.get("genres") or "_(not set)_"
-        complete = "✅" if entry.get("image") else "⚠️ incomplete (no image)"
-        text += (
-            f"`{i}.` **{name}** — {complete}\n"
-            f"    🔗 {link_display}\n"
-            f"    🎙 {audio}\n"
-            f"    🎭 {genres}\n\n"
-        )
+    await _show_update_post_list_panel(message, message.from_user.id, page=0, is_new=True)
 
-    text += "🗑️ Remove: `/delete_update_post [anime name]`"
-    await message.reply(text, disable_web_page_preview=True)
+
+async def _show_update_post_list_panel(event, user_id: int, page: int, is_new: bool):
+    """
+    Page wise anime list dikhao — har anime ek button (numbered), 10 per page,
+    aur Prev/Next navigation niche.
+    """
+    post_map = await _get_post_map()
+    keys = list(post_map.keys())
+
+    if not keys:
+        text = "📭 Koi anime post entry save nahi hai.\n\nAdd karne ke liye: `/update_post`"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="closeMeh")]])
+        if is_new:
+            await event.reply(text, reply_markup=kb)
+        else:
+            try:
+                await event.edit(text, reply_markup=kb)
+            except Exception:
+                pass
+        return
+
+    total = len(keys)
+    total_pages = (total + _UPE_PAGE_SIZE - 1) // _UPE_PAGE_SIZE
+    page = max(0, min(page, total_pages - 1))
+    start = page * _UPE_PAGE_SIZE
+    end = min(start + _UPE_PAGE_SIZE, total)
+
+    rows = []
+    for idx in range(start, end):
+        key = keys[idx]
+        entry = post_map[key]
+        name = entry.get("display_name") or key
+        status = "✅" if entry.get("image") else "⚠️"
+        label = f"{idx + 1}. {name} {status}"
+        if len(label) > 50:
+            label = label[:47] + "…"
+        rows.append([InlineKeyboardButton(label, callback_data=f"upe_open_{idx}_{user_id}_{page}")])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"upe_page_{page - 1}_{user_id}"))
+    nav_row.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data=f"upe_noop_{user_id}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"upe_page_{page + 1}_{user_id}"))
+    rows.append(nav_row)
+    rows.append([InlineKeyboardButton("❌ Close", callback_data="closeMeh")])
+
+    kb = InlineKeyboardMarkup(rows)
+
+    text = (
+        f"📋 **Saved Anime Posts ({total})**\n"
+        f"_Kisi bhi anime pe tap karke edit karo (link / audio / genres / image)._\n"
+        f"_✅ = complete (image saved), ⚠️ = incomplete (no image)_"
+    )
+
+    if is_new:
+        await event.reply(text, reply_markup=kb)
+    else:
+        try:
+            await event.edit(text, reply_markup=kb)
+        except Exception:
+            pass
+
+
+def _field_display(entry: dict, field: str) -> str:
+    val = entry.get(field)
+    if field == "image":
+        return "✅ saved" if val else "_(not set)_"
+    return f"`{val}`" if val else "_(not set)_"
+
+
+async def _show_update_post_edit_menu(event, user_id: int, idx: int, page: int, is_new: bool = False):
+    """Single anime ka edit menu — Link / Audio / Genres / Image fields + Back."""
+    post_map = await _get_post_map()
+    keys = list(post_map.keys())
+
+    if idx < 0 or idx >= len(keys):
+        await _show_update_post_list_panel(event, user_id, page, is_new=False)
+        return
+
+    key = keys[idx]
+    entry = post_map[key]
+    name = entry.get("display_name") or key
+
+    text = (
+        f"✏️ **Editing: {name}**\n\n"
+        f"🔗 Link: {_field_display(entry, 'invite_link')}\n"
+        f"🎙 Audio: {_field_display(entry, 'audio')}\n"
+        f"🎭 Genres: {_field_display(entry, 'genres')}\n"
+        f"🖼 Image: {_field_display(entry, 'image')}\n\n"
+        f"_Konsa field change karna hai?_"
+    )
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Link", callback_data=f"upe_field_{idx}_link_{user_id}_{page}")],
+        [InlineKeyboardButton("🎙 Audio", callback_data=f"upe_field_{idx}_audio_{user_id}_{page}")],
+        [InlineKeyboardButton("🎭 Genres", callback_data=f"upe_field_{idx}_genres_{user_id}_{page}")],
+        [InlineKeyboardButton("🖼 Image", callback_data=f"upe_field_{idx}_image_{user_id}_{page}")],
+        [
+            InlineKeyboardButton("🗑️ Delete Entry", callback_data=f"upe_delentry_{idx}_{user_id}_{page}"),
+        ],
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"upe_listback_{page}_{user_id}")],
+    ])
+
+    if is_new:
+        await event.reply(text, reply_markup=kb)
+    else:
+        try:
+            await event.edit(text, reply_markup=kb)
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────
+#  Callback handlers for /update_post_list panel
+# ─────────────────────────────────────────────
+@Client.on_callback_query(filters.regex(r"^upe_"))
+async def update_post_edit_callbacks(bot: Client, cb: CallbackQuery):
+    """Saare update_post_list panel callbacks."""
+    data = cb.data
+    user_id = cb.from_user.id
+
+    if not _is_auth(user_id):
+        await cb.answer("❌ Authorized nahi ho!", show_alert=True)
+        return
+
+    # ── upe_noop_<uid> — page indicator button, sirf display ──
+    if data.startswith("upe_noop_"):
+        await cb.answer()
+        return
+
+    # ── upe_page_<page>_<uid> ──
+    if data.startswith("upe_page_"):
+        parts = data.split("_")
+        try:
+            page = int(parts[2])
+            owner_id = int(parts[3])
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+        if user_id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+        await cb.answer()
+        await _show_update_post_list_panel(cb.message, owner_id, page, is_new=False)
+        return
+
+    # ── upe_open_<idx>_<uid>_<page> ──
+    if data.startswith("upe_open_"):
+        parts = data.split("_")
+        try:
+            idx = int(parts[2])
+            owner_id = int(parts[3])
+            page = int(parts[4]) if len(parts) > 4 else 0
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+        if user_id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+        await cb.answer()
+        await _show_update_post_edit_menu(cb.message, owner_id, idx, page, is_new=False)
+        return
+
+    # ── upe_listback_<page>_<uid> ──
+    if data.startswith("upe_listback_"):
+        parts = data.split("_")
+        try:
+            page = int(parts[2])
+            owner_id = int(parts[3])
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+        if user_id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+        _update_post_edit_sessions.pop(owner_id, None)
+        await cb.answer()
+        await _show_update_post_list_panel(cb.message, owner_id, page, is_new=False)
+        return
+
+    # ── upe_field_<idx>_<field>_<uid>_<page> ──
+    if data.startswith("upe_field_"):
+        parts = data.split("_")
+        try:
+            idx = int(parts[2])
+            field = parts[3]
+            owner_id = int(parts[4])
+            page = int(parts[5])
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+        if user_id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+
+        post_map = await _get_post_map()
+        keys = list(post_map.keys())
+        if idx < 0 or idx >= len(keys):
+            await cb.answer("❌ Entry nahi mila!", show_alert=True)
+            await _show_update_post_list_panel(cb.message, owner_id, page, is_new=False)
+            return
+
+        key = keys[idx]
+        name = post_map[key].get("display_name") or key
+        _update_post_edit_sessions[owner_id] = {
+            "key": key, "field": field, "idx": idx, "page": page,
+        }
+        await cb.answer()
+
+        field_labels = {
+            "link": ("🔗 Invite Link", "`https://t.me/+xxxxxxxxxx`\n\n_Skip karne ke liye `skip` likho._"),
+            "audio": ("🎙 Audio", "`Hindi ORG`"),
+            "genres": ("🎭 Genres", "`Action, Comedy, Romance`"),
+            "image": ("🖼 Image", "_Photo bhejo (poster/banner)._"),
+        }
+        label, example = field_labels.get(field, (field, ""))
+
+        back_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Cancel", callback_data=f"upe_open_{idx}_{owner_id}_{page}")
+        ]])
+
+        if field == "image":
+            await cb.message.edit(
+                f"✏️ **{name} — {label}**\n\n{example}",
+                reply_markup=back_kb,
+            )
+        else:
+            await cb.message.edit(
+                f"✏️ **{name} — {label}**\n\n**Naya value bhejo:**\n{example}",
+                reply_markup=back_kb,
+            )
+        return
+
+    # ── upe_delentry_<idx>_<uid>_<page> ──
+    if data.startswith("upe_delentry_"):
+        parts = data.split("_")
+        try:
+            idx = int(parts[2])
+            owner_id = int(parts[3])
+            page = int(parts[4])
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+        if user_id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+
+        post_map = await _get_post_map()
+        keys = list(post_map.keys())
+        if idx < 0 or idx >= len(keys):
+            await cb.answer("❌ Entry nahi mila!", show_alert=True)
+            await _show_update_post_list_panel(cb.message, owner_id, page, is_new=False)
+            return
+
+        key = keys[idx]
+        del post_map[key]
+        await _save_post_map(post_map)
+        _update_post_edit_sessions.pop(owner_id, None)
+        await cb.answer("✅ Entry deleted!")
+        await _show_update_post_list_panel(cb.message, owner_id, page, is_new=False)
+        return
+
+    await cb.answer()
 
 
 # ─────────────────────────────────────────────
@@ -782,6 +1040,49 @@ async def update_post_text_input(client: Client, message: Message):
         raise ContinuePropagation
 
     text = message.text.strip()
+
+    # ── /update_post_list inline-edit session (link / audio / genres) ──
+    edit_session = _update_post_edit_sessions.get(user_id)
+    if edit_session and edit_session.get("field") in ("link", "audio", "genres"):
+        field = edit_session["field"]
+        key = edit_session["key"]
+        idx = edit_session["idx"]
+        page = edit_session["page"]
+
+        if text.lower() in ["/cancel_update_post", "cancel"]:
+            _update_post_edit_sessions.pop(user_id, None)
+            await message.reply("❌ Cancelled.")
+            raise StopPropagation
+
+        if text.startswith("/"):
+            _update_post_edit_sessions.pop(user_id, None)
+            raise ContinuePropagation
+
+        post_map = await _get_post_map()
+        if key not in post_map:
+            _update_post_edit_sessions.pop(user_id, None)
+            await message.reply("❌ Ye entry ab exist nahi karta.")
+            raise StopPropagation
+
+        if field == "link":
+            if text.lower() == "skip":
+                post_map[key]["invite_link"] = ""
+            elif not text.startswith("http"):
+                await message.reply("⚠️ Valid link do (`https://t.me/...`) ya `skip` likho.")
+                raise StopPropagation
+            else:
+                post_map[key]["invite_link"] = text
+        elif field == "audio":
+            post_map[key]["audio"] = text
+        elif field == "genres":
+            post_map[key]["genres"] = text
+
+        await _save_post_map(post_map)
+        _update_post_edit_sessions.pop(user_id, None)
+
+        confirm = await message.reply(f"✅ **{field.capitalize()} updated!**")
+        await _show_update_post_edit_menu(confirm, user_id, idx, page, is_new=True)
+        raise StopPropagation
 
     # ── /update_post_button session ──
     btn_session = _update_post_button_sessions.get(user_id)
@@ -927,6 +1228,27 @@ async def update_post_photo_input(client: Client, message: Message):
 
     if not _is_auth(user_id):
         raise ContinuePropagation
+
+    # ── /update_post_list inline-edit session (image field) ──
+    edit_session = _update_post_edit_sessions.get(user_id)
+    if edit_session and edit_session.get("field") == "image":
+        key = edit_session["key"]
+        idx = edit_session["idx"]
+        page = edit_session["page"]
+
+        post_map = await _get_post_map()
+        if key not in post_map:
+            _update_post_edit_sessions.pop(user_id, None)
+            await message.reply("❌ Ye entry ab exist nahi karta.")
+            raise StopPropagation
+
+        post_map[key]["image"] = message.photo.file_id
+        await _save_post_map(post_map)
+        _update_post_edit_sessions.pop(user_id, None)
+
+        confirm = await message.reply("✅ **Image updated!**")
+        await _show_update_post_edit_menu(confirm, user_id, idx, page, is_new=True)
+        raise StopPropagation
 
     session = _update_post_sessions.get(user_id)
     if not session or session.get("step") != "image":
