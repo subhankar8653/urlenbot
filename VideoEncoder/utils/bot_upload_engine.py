@@ -123,6 +123,53 @@ async def _bot_api_send_message(chat_id: int, text: str, entities: list,
         return None
 
 
+async def _bot_api_send_photo(chat_id: int, photo: str, caption: str,
+                               caption_entities: list, reply_markup: dict) -> int | None:
+    """
+    httpx se Bot API sendPhoto — image + caption + styled buttons.
+    `photo` ek file_id, URL, ya local file path ho sakta hai. Local path hone par
+    multipart upload karte hain, warna seedha JSON mein bhej dete hain (file_id/URL).
+    Returns message_id agar success, None agar fail.
+    """
+    if not _BOT_TOKEN:
+        return None
+    import json as _json
+    import os as _os
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            if photo and _os.path.isfile(photo):
+                with open(photo, "rb") as fh:
+                    resp = await client.post(
+                        f"https://api.telegram.org/bot{_BOT_TOKEN}/sendPhoto",
+                        data={
+                            "chat_id": str(chat_id),
+                            "caption": caption,
+                            "caption_entities": _json.dumps(caption_entities or []),
+                            "reply_markup": _json.dumps(reply_markup or {}),
+                        },
+                        files={"photo": fh},
+                    )
+            else:
+                resp = await client.post(
+                    f"https://api.telegram.org/bot{_BOT_TOKEN}/sendPhoto",
+                    json={
+                        "chat_id": chat_id,
+                        "photo": photo,
+                        "caption": caption,
+                        "caption_entities": caption_entities or [],
+                        "reply_markup": reply_markup,
+                    }
+                )
+            data = resp.json()
+            if not data.get("ok"):
+                LOGGER.warning(f"[UpdatePost] Bot API sendPhoto failed: {data.get('description')}")
+                return None
+            return data["result"]["message_id"]
+    except Exception as e:
+        LOGGER.warning(f"[UpdatePost] Bot API sendPhoto error: {e}")
+        return None
+
+
 async def _bot_api_edit_message(chat_id: int, message_id: int, text: str,
                                  entities: list, reply_markup: dict) -> bool:
     """httpx se Bot API editMessageText — styled buttons update ke liye."""
