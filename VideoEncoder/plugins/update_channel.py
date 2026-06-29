@@ -10,6 +10,10 @@ Flow:
   - /update_post                          → Anime ka pura update-post entry save karo
                                             (5-step: anime name → invite link → audio →
                                              genres → image)
+  - /manual_update_post [anime] [season]  → Saved anime ka post MANUALLY abhi bhejo
+    [episode/range]                         (auto-trigger ka wait nahi karna, sirf
+                                            tab kaam karega jab /update_post se entry
+                                            saved hoga)
   - /update_post_button                   → Default "Kaise Dekhein" / "Join Backup"
                                             button links set karo (sab posts pe lagte hain)
   - /update_post_list                     → Saare saved anime entries — interactive
@@ -58,6 +62,7 @@ Commands registered here (conflict check):
   /update_channel_list     — unique
   /delete_update_channel   — unique
   /update_post             — unique (5-step session: anime → link → audio → genres → image)
+  /manual_update_post      — unique (instant send, no session, reuses send_update_post)
   /cancel_update_post      — unique (session cancel)
   /update_post_button      — unique (1-step session: kaise_dekhein url → join_backup url)
   /update_post_list        — unique
@@ -630,6 +635,145 @@ async def cmd_delete_update_channel(client: Client, message: Message):
     await _save_update_channels(new_channels)
     await message.reply(
         f"🗑️ **Removed!** Channel `{channel_id}` update list se hata diya."
+    )
+
+
+# ─────────────────────────────────────────────
+#  /manual_update_post [anime name] [season] [episode(s)]
+#  Manually update-channel post bhejne ke liye — auto-trigger ka wait nahi
+#  karna padta, isi waqt post chala jaata hai.
+#
+#  Sirf tab kaam karega jab us anime ka entry /update_post se already
+#  saved ho (display_name + image waghera) — same check jo auto-trigger
+#  karta hai (send_update_post ke andar).
+#
+#  Usage:
+#    /manual_update_post <anime name> S<season> <episode|range>
+#
+#  Examples:
+#    /manual_update_post Blue Box S01 episode 01-25
+#    /manual_update_post Blue Box S01 episode 01
+#    /manual_update_post Blue Box S01 01-25
+#    /manual_update_post Blue Box 01            (season optional)
+# ─────────────────────────────────────────────
+_MUP_SEASON_RE = re.compile(r'^s(?:eason)?\s*0*(\d+)$', re.IGNORECASE)
+_MUP_EP_RANGE_RE = re.compile(r'^(?:episode\s*)?0*(\d+)\s*-\s*0*(\d+)$', re.IGNORECASE)
+_MUP_EP_SINGLE_RE = re.compile(r'^(?:episode\s*)?0*(\d+)$', re.IGNORECASE)
+
+
+@Client.on_message(filters.command("manual_update_post") & filters.private)
+async def cmd_manual_update_post(client: Client, message: Message):
+    """Manually kisi saved anime ka update-post sabhi update channels pe bhejo."""
+    if not _is_auth(message.from_user.id):
+        return
+
+    raw = message.text.split(None, 1)
+    if len(raw) < 2 or not raw[1].strip():
+        await message.reply(
+            "**Usage:**\n"
+            "`/manual_update_post <anime name> S<season> <episode|range>`\n\n"
+            "**Examples:**\n"
+            "`/manual_update_post Blue Box S01 episode 01-25`\n"
+            "`/manual_update_post Blue Box S01 episode 01`\n"
+            "`/manual_update_post Blue Box S01 01-25`\n\n"
+            "⚠️ Ye sirf un anime ke liye kaam karega jinka entry "
+            "`/update_post` se already saved hai (image waghera ke saath)."
+        )
+        return
+
+    args = raw[1].strip().split()
+
+    # ── Tail se parse karo: episode (last token, ya last 2 tokens range ke liye) ──
+    season = None
+    episode = None
+    episode_start = None
+    episode_end = None
+
+    tokens = args[:]
+
+    if not tokens:
+        await message.reply("⚠️ Episode number ya range do.")
+        return
+
+    # "episode" / "ep" filler word hata do agar last token se pehle aaya
+    if len(tokens) >= 2 and tokens[-2].lower() in ("episode", "ep"):
+        ep_token = tokens[-1]
+        tokens = tokens[:-2]
+    else:
+        ep_token = tokens[-1]
+        tokens = tokens[:-1]
+
+    range_match = _MUP_EP_RANGE_RE.match(ep_token)
+    single_match = _MUP_EP_SINGLE_RE.match(ep_token)
+
+    if range_match:
+        episode_start = int(range_match.group(1))
+        episode_end = int(range_match.group(2))
+    elif single_match:
+        episode = int(single_match.group(1))
+        episode_start = episode
+    else:
+        await message.reply(
+            "⚠️ Episode number samajh nahi aaya.\n\n"
+            "**Example:** `episode 01-25` ya sirf `01`"
+        )
+        return
+
+    # ── Agar last remaining token season hai (S01, Season 1, etc) toh nikal lo ──
+    if tokens and _MUP_SEASON_RE.match(tokens[-1]):
+        season = int(_MUP_SEASON_RE.match(tokens[-1]).group(1))
+        tokens = tokens[:-1]
+    elif len(tokens) >= 2 and tokens[-2].lower() == "season" and tokens[-1].isdigit():
+        season = int(tokens[-1])
+        tokens = tokens[:-2]
+
+    anime_name = " ".join(tokens).strip()
+    if not anime_name:
+        await message.reply("⚠️ Anime ka naam do.")
+        return
+
+    # ── Pehle check karo entry exist karta hai aur complete hai ──
+    post_map = await _get_post_map()
+    query_norm = _norm(anime_name)
+    entry = None
+    for key, val in post_map.items():
+        if _norm(key) == query_norm:
+            entry = val
+            break
+
+    if not entry:
+        await message.reply(
+            f"❌ **'{anime_name}'** ka koi entry saved nahi hai.\n\n"
+            f"Pehle `/update_post` se iska entry save karo, fir manual post bhejo."
+        )
+        return
+
+    if not entry.get("image"):
+        await message.reply(
+            f"❌ **'{anime_name}'** ka entry incomplete hai (image missing).\n\n"
+            f"`/update_post_list` se entry kholo aur image add karo, fir try karo."
+        )
+        return
+
+    await send_update_post(
+        client,
+        anime_name=anime_name,
+        season=season,
+        episode=episode,
+        episode_start=episode_start,
+        episode_end=episode_end,
+    )
+
+    ep_str = (
+        f"{episode_start}-{episode_end}" if episode_start and episode_end and episode_start != episode_end
+        else str(episode_start or episode)
+    )
+    season_str = f"S{season:02d} " if season else ""
+    await message.reply(
+        f"✅ **Post bhej diya!**\n\n"
+        f"📺 {entry.get('display_name') or anime_name} {season_str}\n"
+        f"➲ Episode: {ep_str}\n\n"
+        f"Sabhi update channels pe chala gaya."
     )
 
 
