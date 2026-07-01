@@ -27,6 +27,7 @@ Commands:
 
 import asyncio
 import glob
+import html
 import logging
 import os
 import re
@@ -1030,43 +1031,30 @@ async def cmd_add_anime(client: Client, message: Message):
 ANIME_PAGE_SIZE = 10
 
 
-def _md_escape(value) -> str:
+def _esc(value) -> str:
     """
-    Anime_name/channel_title/hashtag jaise dynamic fields mein agar
-    *, _, `, [ jaisa raw Markdown character aa jaaye toh Telegram entity
-    parsing todh deta hai (ENTITY_BOUNDS_INVALID). Har dynamic field yahan
-    se hokar hi message mein jaana chahiye.
+    Saare dynamic fields (anime_name/channel_title/hashtag/link/monitor
+    channel title) yahan se hokar jaana chahiye.
+
+    PEHLE do escaping attempts Markdown (parse_mode default) ke saath kiye
+    gaye the — pehle raw *, _, `, [ ko backslash-escape kiya, phir backtick
+    ko alag se handle kiya. Dono baar crash wapas aaya (/list_anime AUR
+    /del_anime dono mein), kyunki Pyrofork ka Markdown tokenizer bahut saari
+    edge cases mein (nested delimiters, fixed-width spans, wgera) predictable
+    tarike se escape hone hi nahi deta — chahe kitna bhi escape karo, koi na
+    koi character combination bach jaata hai jo entity offsets todh deta hai.
+
+    FIX: ab is poore anime-list/monitor section ke har message mein
+    parse_mode=ParseMode.HTML use ho raha hai. HTML mode mein escaping rules
+    fixed aur simple hain — sirf `<`, `>`, `&` ko escape karna hota hai
+    (html.escape() yahi karta hai), baaki KOI bhi character (*, _, `, [, ~,
+    |, kuch bhi) literal reh jaata hai, kabhi entity nahi bantа. Isliye ab
+    yeh channel title/anime name mein chahe kuch bhi ho, crash structurally
+    hi possible nahi hai.
     """
     if not value:
         return "—"
-    text = str(value)
-    for ch in ("\\", "*", "_", "`", "["):
-        text = text.replace(ch, "\\" + ch)
-    return text
-
-
-def _md_escape_code(value) -> str:
-    """
-    _md_escape() sirf PLAIN markdown text ke liye safe hai (bold/italic ke
-    beech). Jab wahi escaped string backtick code-span `` `...` `` ke ANDAR
-    daala jaata hai (jaisa _monitor_channel_text aur _show_anime_detail mein
-    hota hai) toh backslash-escaping ULTA nuksaan karti hai — code-span ke
-    andar Telegram/Pyrofork ka parser sirf agla LITERAL backtick dhoondta
-    hai, backslash ko escape character nahi maanta. Toh agar channel title
-    ya anime name mein ek bhi backtick ho, "escaped" backslash+backtick khud
-    ek backtick reh jaata hai aur span waqt se pehle band ho jaata hai —
-    baaki poore message ke entities offset se hat jaate hain ->
-    ENTITY_BOUNDS_INVALID. Yehi asli wajah thi /list_anime crash ki.
-
-    Fix: code-span ke andar sirf backtick khud dangerous hai (baaki *, _, [
-    already inert/literal hote hain code-span ke andar) — usko escape karne
-    ki koshish mat karo, bas ek lookalike character se replace kar do.
-    """
-    if not value:
-        return "—"
-    text = str(value).replace("`", "'")
-    text = text.replace("\n", " ").replace("\r", "")
-    return text
+    return html.escape(str(value), quote=False)
 
 
 def _render_anime_list_page(anime_list: list, page: int, mc_text: str, mode: str):
@@ -1076,6 +1064,9 @@ def _render_anime_list_page(anime_list: list, page: int, mc_text: str, mode: str
     bina number ke, compact). Return (text, InlineKeyboardMarkup | None).
     Numbering hamesha FULL list ke absolute index pe based hai, taaki
     `/del_anime <number>` kisi bhi page se sahi kaam kare.
+
+    NOTE: text ab HTML entities use karta hai (<b>, <code>) — is function ka
+    output hamesha parse_mode=ParseMode.HTML ke saath hi bhejo/edit karo.
     """
     total = len(anime_list)
     total_pages = max(1, (total + ANIME_PAGE_SIZE - 1) // ANIME_PAGE_SIZE)
@@ -1084,28 +1075,28 @@ def _render_anime_list_page(anime_list: list, page: int, mc_text: str, mode: str
     start = page * ANIME_PAGE_SIZE
     chunk = anime_list[start:start + ANIME_PAGE_SIZE]
 
-    header = "📋 **Registered Anime**" if mode == "list" else "🗑️ **Konsa remove karna hai?**"
-    text = f"📡 **Monitor:** {mc_text}\n\n{header}\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    header = "📋 <b>Registered Anime</b>" if mode == "list" else "🗑️ <b>Konsa remove karna hai?</b>"
+    text = f"📡 <b>Monitor:</b> {mc_text}\n\n{header}\n━━━━━━━━━━━━━━━━━━━━\n\n"
 
     for i, entry in enumerate(chunk, start + 1):
-        name = _md_escape(entry.get('anime_name', 'Unknown'))
-        ch_title = _md_escape(entry.get('channel_title', 'Unknown'))
+        name = _esc(entry.get('anime_name', 'Unknown'))
+        ch_title = _esc(entry.get('channel_title', 'Unknown'))
         if mode == "list":
             ch_id = entry.get('channel_id', 'N/A')
-            hashtag = _md_escape(entry.get('hashtag', ''))
-            link = _md_escape(entry.get('channel_link', ''))
+            hashtag = _esc(entry.get('hashtag', ''))
+            link = _esc(entry.get('channel_link', ''))
             text += (
-                f"**{i}.** 📺 {name}\n"
-                f"   📢 {ch_title} (`{ch_id}`)\n"
+                f"<b>{i}.</b> 📺 {name}\n"
+                f"   📢 {ch_title} (<code>{ch_id}</code>)\n"
                 f"   🏷️ {hashtag} | 🔗 {link}\n\n"
             )
         else:
-            text += f"**{i}.** {name} → {ch_title}\n"
+            text += f"<b>{i}.</b> {name} → {ch_title}\n"
 
     text += (
         f"\n━━━━━━━━━━━━━━━━━━━━\n"
-        f"Page **{page + 1}/{total_pages}** | Total: **{total}**\n\n"
-        f"🗑️ Remove: `/del_anime <number>`"
+        f"Page <b>{page + 1}/{total_pages}</b> | Total: <b>{total}</b>\n\n"
+        f"🗑️ Remove: <code>/del_anime &lt;number&gt;</code>"
     )
 
     nav_row = []
@@ -1121,20 +1112,20 @@ def _render_anime_list_page(anime_list: list, page: int, mc_text: str, mode: str
 
 async def _monitor_channel_text(client: Client) -> str:
     """
-    Monitor channel ka display text banao — list/del dono handlers use karte hain.
-    FIX: mc.title pehle bina escape kiye jaata tha — agar channel title mein
-    *, _, ` jaisa raw Markdown character hota (bahut common hota hai
-    channel names mein) toh ENTITY_BOUNDS_INVALID crash hota tha. Ab
-    _md_escape() se hokar backtick span mein jaata hai.
+    Monitor channel ka display text banao — list/del dono handlers use karte
+    hain. HTML mode ke liye title ko html.escape() se hokar <code> span mein
+    daala jaata hai — is baar backtick, asterisk, underscore, kuch bhi ho
+    title mein, entity kabhi nahi tootega (HTML escaping position-independent
+    hai, Markdown code-span jaisi koi ambiguity nahi).
     """
     monitor_ch = await _get_monitor_channel()
     if not monitor_ch:
-        return "❌ Set nahi — use `/set_monitor`"
+        return "❌ Set nahi — use <code>/set_monitor</code>"
     try:
         mc = await client.get_chat(monitor_ch)
-        return f"✅ `{_md_escape_code(mc.title)}` (`{monitor_ch}`)"
+        return f"✅ <code>{_esc(mc.title)}</code> (<code>{monitor_ch}</code>)"
     except Exception:
-        return f"⚠️ ID: `{monitor_ch}` (access error)"
+        return f"⚠️ ID: <code>{monitor_ch}</code> (access error)"
 
 
 # ─────────────────────────────────────────────
@@ -1144,10 +1135,13 @@ async def _monitor_channel_text(client: Client) -> str:
 #  tha. Woh MESSAGE_TOO_LONG toh fix ho gaya tha, lekin _monitor_channel_text
 #  ka channel title kabhi escape nahi hua — ek stray *, _ ya ` waale title
 #  ne poore message ke Markdown entities todh diye (ENTITY_BOUNDS_INVALID).
-#  AB: /update_post_list ki tarah har anime ek BUTTON label hai. Button
-#  labels Telegram kabhi Markdown-parse nahi karta — isliye ye crash ka
-#  scope structurally hi khatam ho jaata hai, chahe naam mein kuch bhi ho.
-#  Tap karke full detail dikhta hai, Back se list pe wapas.
+#  Do escaping attempts ke baad bhi Markdown mode mein crash wapas aata raha
+#  (/list_anime AUR /del_anime dono mein) — Pyrofork ka Markdown tokenizer
+#  bahut edge cases mein predictable escaping allow hi nahi karta.
+#  AB: is poore panel mein parse_mode=ParseMode.HTML use hota hai (fixed,
+#  simple escaping rules — sirf <, >, & — koi ambiguity nahi), aur har
+#  anime ek BUTTON label hai jo kabhi parse hi nahi hota. Dono wajah se ab
+#  crash structurally hi possible nahi hai, naam mein kuch bhi ho.
 # ─────────────────────────────────────────────
 async def _show_list_anime_panel(client: Client, event, user_id: int, page: int, is_new: bool):
     anime_list = await _get_anime_list()
@@ -1155,16 +1149,16 @@ async def _show_list_anime_panel(client: Client, event, user_id: int, page: int,
 
     if not anime_list:
         text = (
-            f"📡 **Monitor Channel:** {mc_text}\n\n"
+            f"📡 <b>Monitor Channel:</b> {mc_text}\n\n"
             f"📋 Koi anime registered nahi hai!\n\n"
-            f"Add karo: `/add_anime [channel_id] [Anime Name]`"
+            f"Add karo: <code>/add_anime [channel_id] [Anime Name]</code>"
         )
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="closeMeh")]])
         if is_new:
-            await event.reply(text, reply_markup=kb)
+            await event.reply(text, reply_markup=kb, parse_mode=ParseMode.HTML)
         else:
             try:
-                await event.edit(text, reply_markup=kb)
+                await event.edit(text, reply_markup=kb, parse_mode=ParseMode.HTML)
             except Exception:
                 pass
         return
@@ -1196,26 +1190,26 @@ async def _show_list_anime_panel(client: Client, event, user_id: int, page: int,
 
     kb = InlineKeyboardMarkup(rows)
     text = (
-        f"📡 **Monitor:** {mc_text}\n\n"
-        f"📋 **Registered Anime ({total})**\n"
-        f"_Kisi bhi anime pe tap karke full detail dekho._\n\n"
-        f"🗑️ Remove: `/del_anime <number>`"
+        f"📡 <b>Monitor:</b> {mc_text}\n\n"
+        f"📋 <b>Registered Anime ({total})</b>\n"
+        f"<i>Kisi bhi anime pe tap karke full detail dekho.</i>\n\n"
+        f"🗑️ Remove: <code>/del_anime &lt;number&gt;</code>"
     )
 
     if is_new:
-        await event.reply(text, reply_markup=kb)
+        await event.reply(text, reply_markup=kb, parse_mode=ParseMode.HTML)
     else:
         try:
-            await event.edit(text, reply_markup=kb)
+            await event.edit(text, reply_markup=kb, parse_mode=ParseMode.HTML)
         except Exception:
             pass
 
 
 async def _show_anime_detail(client: Client, event, user_id: int, idx: int, page: int):
     """
-    Single anime ka detail view. Dynamic fields (name/channel/hashtag/link)
-    sirf backtick code-span ke andar jaate hain — kabhi **bold** ke andar
-    nahi — isliye stray Markdown character se entity crash nahi ho sakta.
+    Single anime ka detail view. HTML mode + html.escape() — chahe
+    name/channel/hashtag/link mein kuch bhi character ho, entity crash
+    structurally possible nahi hai.
     """
     anime_list = await _get_anime_list()
 
@@ -1224,26 +1218,26 @@ async def _show_anime_detail(client: Client, event, user_id: int, idx: int, page
         return
 
     entry = anime_list[idx]
-    name = _md_escape_code(entry.get('anime_name', 'Unknown'))
-    ch_title = _md_escape_code(entry.get('channel_title', 'Unknown'))
+    name = _esc(entry.get('anime_name', 'Unknown'))
+    ch_title = _esc(entry.get('channel_title', 'Unknown'))
     ch_id = entry.get('channel_id', 'N/A')
-    hashtag = _md_escape_code(entry.get('hashtag', ''))
-    link = _md_escape_code(entry.get('channel_link', ''))
+    hashtag = _esc(entry.get('hashtag', ''))
+    link = _esc(entry.get('channel_link', ''))
 
     text = (
-        f"📺 **Anime Detail**\n\n"
-        f"**Name:** `{name}`\n"
-        f"**Channel:** `{ch_title}` (`{ch_id}`)\n"
-        f"**Hashtag:** `{hashtag}`\n"
-        f"**Link:** `{link}`\n\n"
-        f"🗑️ Remove: `/del_anime {idx + 1}`"
+        f"📺 <b>Anime Detail</b>\n\n"
+        f"<b>Name:</b> <code>{name}</code>\n"
+        f"<b>Channel:</b> <code>{ch_title}</code> (<code>{ch_id}</code>)\n"
+        f"<b>Hashtag:</b> <code>{hashtag}</code>\n"
+        f"<b>Link:</b> <code>{link}</code>\n\n"
+        f"🗑️ Remove: <code>/del_anime {idx + 1}</code>"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⬅️ Back", callback_data=f"alist_back_{page}_{user_id}")],
     ])
 
     try:
-        await event.edit(text, reply_markup=kb)
+        await event.edit(text, reply_markup=kb, parse_mode=ParseMode.HTML)
     except Exception as e:
         LOGGER.warning(f"[AutoMonitor] _show_anime_detail edit error: {e}")
 
@@ -1253,16 +1247,10 @@ async def cmd_list_anime(client: Client, message: Message):
     if not _is_authorized(message.from_user.id):
         return
 
-    anime_list = await _get_anime_list()
-    if not anime_list:
-        mc_text = await _monitor_channel_text(client)
-        await message.reply(
-            f"📡 **Monitor Channel:** {mc_text}\n\n"
-            f"📋 Koi anime registered nahi hai!\n\n"
-            f"Add karo: `/add_anime [channel_id] [Anime Name]`"
-        )
-        return
-
+    # NOTE: pehle yahan empty-list ke liye ek ALAG duplicate Markdown text
+    # tha (bina html.escape() / mc_text ke) — usi class ka crash risk tha.
+    # Ab _show_list_anime_panel() ko hi call karo, wo empty aur non-empty
+    # dono cases HTML-safe tarike se already handle karta hai.
     await _show_list_anime_panel(client, message, message.from_user.id, page=0, is_new=True)
 
 
@@ -1358,7 +1346,7 @@ async def anime_del_page_callback(client: Client, cb: CallbackQuery):
     mc_text = await _monitor_channel_text(client)
     text, markup = _render_anime_list_page(anime_list, page, mc_text, "del")
     try:
-        await cb.message.edit(text, reply_markup=markup)
+        await cb.message.edit(text, reply_markup=markup, parse_mode=ParseMode.HTML)
     except Exception as e:
         LOGGER.warning(f"[AutoMonitor] anime_del_page_callback edit error: {e}")
     await cb.answer()
@@ -1385,13 +1373,13 @@ async def cmd_del_anime(client: Client, message: Message):
     if len(message.command) < 2:
         mc_text = await _monitor_channel_text(client)
         text, markup = _render_anime_list_page(anime_list, 0, mc_text, "del")
-        await message.reply(text, reply_markup=markup)
+        await message.reply(text, reply_markup=markup, parse_mode=ParseMode.HTML)
         return
 
     try:
         num = int(message.command[1])
     except ValueError:
-        await message.reply("❌ Sahi number dalo! Example: `/del_anime 1`")
+        await message.reply("❌ Sahi number dalo! Example: <code>/del_anime 1</code>", parse_mode=ParseMode.HTML)
         return
 
     if num < 1 or num > len(anime_list):
@@ -1402,9 +1390,10 @@ async def cmd_del_anime(client: Client, message: Message):
     await _save_anime_list(anime_list)
 
     await message.reply(
-        f"✅ **Removed!**\n\n"
-        f"📺 {_md_escape(removed.get('anime_name'))}\n"
-        f"📢 {_md_escape(removed.get('channel_title'))}"
+        f"✅ <b>Removed!</b>\n\n"
+        f"📺 {_esc(removed.get('anime_name'))}\n"
+        f"📢 {_esc(removed.get('channel_title'))}",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -1422,24 +1411,25 @@ async def cmd_monitor_status(client: Client, message: Message):
     if monitor_ch:
         try:
             mc = await client.get_chat(monitor_ch)
-            mc_text = f"✅ {_md_escape(mc.title)} (`{monitor_ch}`)"
+            mc_text = f"✅ {_esc(mc.title)} (<code>{monitor_ch}</code>)"
         except Exception:
-            mc_text = f"⚠️ ID set (`{monitor_ch}`) but access error"
+            mc_text = f"⚠️ ID set (<code>{monitor_ch}</code>) but access error"
     else:
-        mc_text = "❌ Set nahi — use `/set_monitor`"
+        mc_text = "❌ Set nahi — use <code>/set_monitor</code>"
 
     await message.reply(
-        f"📊 **AutoMonitor Status**\n\n"
+        f"📊 <b>AutoMonitor Status</b>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📡 Monitor Channel: {mc_text}\n"
-        f"📺 Anime Count: **{len(anime_list)}**\n"
-        f"🎯 Target Qualities: `{' | '.join(TARGET_QUALITIES)}`\n"
-        f"⚡ Fast Poll: **{POLL_FAST_ATTEMPTS} × {POLL_INTERVAL_FAST}s** (first 5 min)\n"
-        f"🐢 Slow Poll: **{POLL_SLOW_ATTEMPTS} × {POLL_INTERVAL_SLOW}s** (next 20 min)\n"
-        f"⏰ Max Attempts: **{POLL_FAST_ATTEMPTS + POLL_SLOW_ATTEMPTS}** (~25 min total)\n"
+        f"📺 Anime Count: <b>{len(anime_list)}</b>\n"
+        f"🎯 Target Qualities: <code>{' | '.join(TARGET_QUALITIES)}</code>\n"
+        f"⚡ Fast Poll: <b>{POLL_FAST_ATTEMPTS} × {POLL_INTERVAL_FAST}s</b> (first 5 min)\n"
+        f"🐢 Slow Poll: <b>{POLL_SLOW_ATTEMPTS} × {POLL_INTERVAL_SLOW}s</b> (next 20 min)\n"
+        f"⏰ Max Attempts: <b>{POLL_FAST_ATTEMPTS + POLL_SLOW_ATTEMPTS}</b> (~25 min total)\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📋 /list_anime\n"
-        f"➕ /add_anime"
+        f"➕ /add_anime",
+        parse_mode=ParseMode.HTML,
     )
 
 
