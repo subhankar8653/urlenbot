@@ -245,6 +245,15 @@ async def season_sticker_cmd(bot: Client, message: Message):
 
 @Client.on_message(filters.command("done"))
 async def done_cmd(bot: Client, message: Message):
+    """
+    /done — merged handler.
+    Pyrogram ek hi command name do jagah register nahi kar sakta (jo pehle
+    load ho wahi jeetta hai, doosra dead code ban jaata hai) — isliye /done
+    ke saare possible use-cases (border/season sticker setup + schedule_notify
+    ka /end_message recording) yahin ek jagah check hote hain, priority order
+    mein. Naya /done use-case add karna ho toh yahin ek aur check jodo, alag
+    se @Client.on_message(filters.command("done")) kahin aur mat banao.
+    """
     user_id = message.from_user.id
     did_something = False
 
@@ -265,6 +274,14 @@ async def done_cmd(bot: Client, message: Message):
             f"Total seasons: <b>{len(stickers)}</b>",
         )
         did_something = True
+
+    if not did_something:
+        # /end_message recording flow ka /done bhi yahin se route hota hai —
+        # dekho schedule_notify.py mein NOTE (dono ek command pe register
+        # nahi ho sakte). Lazy import taaki plugin-load-order pe koi circular
+        # import issue na aaye.
+        from .schedule_notify import handle_done_for_recording
+        did_something = await handle_done_for_recording(bot, message)
 
     if not did_something:
         await message.reply("ℹ️ Koi active setup nahi chal raha.")

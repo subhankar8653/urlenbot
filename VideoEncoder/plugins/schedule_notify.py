@@ -502,16 +502,27 @@ async def capture_any_state(client: Client, message: Message):
 
 # ─────────────────────────────────────────────
 #  /done — save karo
+#
+#  NOTE: `/done` bot_upload.py mein bhi register hai (border/season sticker
+#  setup finish karne ke liye). Pyrogram ek hi command do jagah register nahi
+#  kar sakta — jo pehle load hota hai (bot_upload.py) wahi hamesha jeetta hai
+#  aur yeh wala poora dead code ban jaata tha, jisse /end_message → /done
+#  flow silently broken rehta tha. Isliye yeh ab standalone @Client.on_message
+#  handler nahi hai — bot_upload.py ka merged done_cmd() ise call karta hai.
 # ─────────────────────────────────────────────
-@Client.on_message(filters.command("done") & filters.private)
-async def cmd_done(client: Client, message: Message):
+async def handle_done_for_recording(client: Client, message: Message) -> bool:
+    """
+    /end_message recording flow ke /done ko handle karo.
+    Return True agar humne handle kar diya (caller apna fallback message
+    skip kar dega), False agar yeh hamara kaam nahi tha (koi recording
+    active nahi thi) — is case mein koi reply nahi bheja jaata yahan se.
+    """
     user_id = message.from_user.id
     if not _is_authorized(user_id):
-        return
+        return False
 
     if user_id not in _recording_state:
-        await message.reply("⚠️ Koi recording chal nahi rahi. Pehle `/end_message` ya `/end_message ChannelName` karo.")
-        return
+        return False
 
     state = _recording_state.pop(user_id)
     channel_key = state['channel_key']
@@ -519,7 +530,7 @@ async def cmd_done(client: Client, message: Message):
 
     if not messages:
         await message.reply("⚠️ Koi message save nahi hua! Recording cancel ho gaya.")
-        return
+        return True
 
     await _save_end_messages(channel_key, messages)
 
@@ -534,6 +545,7 @@ async def cmd_done(client: Client, message: Message):
         f"💾 Total: **{len(messages)}** messages saved\n\n"
         f"Har episode upload ke baad yeh messages automatically post honge."
     )
+    return True
 
 
 # ─────────────────────────────────────────────
