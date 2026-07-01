@@ -1045,6 +1045,30 @@ def _md_escape(value) -> str:
     return text
 
 
+def _md_escape_code(value) -> str:
+    """
+    _md_escape() sirf PLAIN markdown text ke liye safe hai (bold/italic ke
+    beech). Jab wahi escaped string backtick code-span `` `...` `` ke ANDAR
+    daala jaata hai (jaisa _monitor_channel_text aur _show_anime_detail mein
+    hota hai) toh backslash-escaping ULTA nuksaan karti hai — code-span ke
+    andar Telegram/Pyrofork ka parser sirf agla LITERAL backtick dhoondta
+    hai, backslash ko escape character nahi maanta. Toh agar channel title
+    ya anime name mein ek bhi backtick ho, "escaped" backslash+backtick khud
+    ek backtick reh jaata hai aur span waqt se pehle band ho jaata hai —
+    baaki poore message ke entities offset se hat jaate hain ->
+    ENTITY_BOUNDS_INVALID. Yehi asli wajah thi /list_anime crash ki.
+
+    Fix: code-span ke andar sirf backtick khud dangerous hai (baaki *, _, [
+    already inert/literal hote hain code-span ke andar) — usko escape karne
+    ki koshish mat karo, bas ek lookalike character se replace kar do.
+    """
+    if not value:
+        return "—"
+    text = str(value).replace("`", "'")
+    text = text.replace("\n", " ").replace("\r", "")
+    return text
+
+
 def _render_anime_list_page(anime_list: list, page: int, mc_text: str, mode: str):
     """
     anime_list ka ek page (ANIME_PAGE_SIZE items) + pagination buttons
@@ -1108,7 +1132,7 @@ async def _monitor_channel_text(client: Client) -> str:
         return "❌ Set nahi — use `/set_monitor`"
     try:
         mc = await client.get_chat(monitor_ch)
-        return f"✅ `{_md_escape(mc.title)}` (`{monitor_ch}`)"
+        return f"✅ `{_md_escape_code(mc.title)}` (`{monitor_ch}`)"
     except Exception:
         return f"⚠️ ID: `{monitor_ch}` (access error)"
 
@@ -1200,11 +1224,11 @@ async def _show_anime_detail(client: Client, event, user_id: int, idx: int, page
         return
 
     entry = anime_list[idx]
-    name = _md_escape(entry.get('anime_name', 'Unknown'))
-    ch_title = _md_escape(entry.get('channel_title', 'Unknown'))
+    name = _md_escape_code(entry.get('anime_name', 'Unknown'))
+    ch_title = _md_escape_code(entry.get('channel_title', 'Unknown'))
     ch_id = entry.get('channel_id', 'N/A')
-    hashtag = _md_escape(entry.get('hashtag', ''))
-    link = _md_escape(entry.get('channel_link', ''))
+    hashtag = _md_escape_code(entry.get('hashtag', ''))
+    link = _md_escape_code(entry.get('channel_link', ''))
 
     text = (
         f"📺 **Anime Detail**\n\n"
@@ -1398,7 +1422,7 @@ async def cmd_monitor_status(client: Client, message: Message):
     if monitor_ch:
         try:
             mc = await client.get_chat(monitor_ch)
-            mc_text = f"✅ {mc.title} (`{monitor_ch}`)"
+            mc_text = f"✅ {_md_escape(mc.title)} (`{monitor_ch}`)"
         except Exception:
             mc_text = f"⚠️ ID set (`{monitor_ch}`) but access error"
     else:
