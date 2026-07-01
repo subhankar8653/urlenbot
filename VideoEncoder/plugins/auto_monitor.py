@@ -1017,6 +1017,98 @@ async def cmd_add_anime(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────
+#  Paginated anime list — /list_anime aur /del_anime dono is se render
+#  hote hain.
+#
+#  PEHLE: poori anime_list ek hi message mein bheji jaati thi. List badi ho
+#  jaane par (jaise ab) Telegram [400 MESSAGE_TOO_LONG] / [400
+#  ENTITY_BOUNDS_INVALID] de deta tha (4096 char limit + bold/code markdown
+#  entities corrupt ho jaate the) — isliye command "kaam nahi kar raha tha"
+#  (crash ho ke exception, koi reply hi nahi jaata tha).
+#  AB: hamesha max ANIME_PAGE_SIZE entries ek page mein, Prev/Next buttons
+#  se navigate karo.
+# ─────────────────────────────────────────────
+ANIME_PAGE_SIZE = 10
+
+
+def _md_escape(value) -> str:
+    """
+    Anime_name/channel_title/hashtag jaise dynamic fields mein agar
+    *, _, `, [ jaisa raw Markdown character aa jaaye toh Telegram entity
+    parsing todh deta hai (ENTITY_BOUNDS_INVALID). Har dynamic field yahan
+    se hokar hi message mein jaana chahiye.
+    """
+    if not value:
+        return "—"
+    text = str(value)
+    for ch in ("\\", "*", "_", "`", "["):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def _render_anime_list_page(anime_list: list, page: int, mc_text: str, mode: str):
+    """
+    anime_list ka ek page (ANIME_PAGE_SIZE items) + pagination buttons
+    banao. mode = "list" (/list_anime, full detail) ya "del" (/del_anime
+    bina number ke, compact). Return (text, InlineKeyboardMarkup | None).
+    Numbering hamesha FULL list ke absolute index pe based hai, taaki
+    `/del_anime <number>` kisi bhi page se sahi kaam kare.
+    """
+    total = len(anime_list)
+    total_pages = max(1, (total + ANIME_PAGE_SIZE - 1) // ANIME_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * ANIME_PAGE_SIZE
+    chunk = anime_list[start:start + ANIME_PAGE_SIZE]
+
+    header = "📋 **Registered Anime**" if mode == "list" else "🗑️ **Konsa remove karna hai?**"
+    text = f"📡 **Monitor:** {mc_text}\n\n{header}\n━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    for i, entry in enumerate(chunk, start + 1):
+        name = _md_escape(entry.get('anime_name', 'Unknown'))
+        ch_title = _md_escape(entry.get('channel_title', 'Unknown'))
+        if mode == "list":
+            ch_id = entry.get('channel_id', 'N/A')
+            hashtag = _md_escape(entry.get('hashtag', ''))
+            link = _md_escape(entry.get('channel_link', ''))
+            text += (
+                f"**{i}.** 📺 {name}\n"
+                f"   📢 {ch_title} (`{ch_id}`)\n"
+                f"   🏷️ {hashtag} | 🔗 {link}\n\n"
+            )
+        else:
+            text += f"**{i}.** {name} → {ch_title}\n"
+
+    text += (
+        f"\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"Page **{page + 1}/{total_pages}** | Total: **{total}**\n\n"
+        f"🗑️ Remove: `/del_anime <number>`"
+    )
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"anime_pg_{mode}_{page - 1}"))
+    nav_row.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="anime_pg_noop"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"anime_pg_{mode}_{page + 1}"))
+
+    markup = InlineKeyboardMarkup([nav_row]) if len(nav_row) > 1 else None
+    return text, markup
+
+
+async def _monitor_channel_text(client: Client) -> str:
+    """Monitor channel ka display text banao — list/del dono handlers use karte hain."""
+    monitor_ch = await _get_monitor_channel()
+    if not monitor_ch:
+        return "❌ Set nahi — use `/set_monitor`"
+    try:
+        mc = await client.get_chat(monitor_ch)
+        return f"✅ {mc.title} (`{monitor_ch}`)"
+    except Exception:
+        return f"⚠️ ID: `{monitor_ch}` (access error)"
+
+
+# ─────────────────────────────────────────────
 #  /list_anime
 # ─────────────────────────────────────────────
 @Client.on_message(filters.command("list_anime") & filters.private)
@@ -1025,16 +1117,7 @@ async def cmd_list_anime(client: Client, message: Message):
         return
 
     anime_list = await _get_anime_list()
-    monitor_ch = await _get_monitor_channel()
-
-    if monitor_ch:
-        try:
-            mc = await client.get_chat(monitor_ch)
-            mc_text = f"✅ {mc.title} (`{monitor_ch}`)"
-        except Exception:
-            mc_text = f"⚠️ ID: `{monitor_ch}` (access error)"
-    else:
-        mc_text = "❌ Set nahi — use `/set_monitor`"
+    mc_text = await _monitor_channel_text(client)
 
     if not anime_list:
         await message.reply(
@@ -1044,26 +1127,43 @@ async def cmd_list_anime(client: Client, message: Message):
         )
         return
 
-    text = f"📡 **Monitor:** {mc_text}\n\n📋 **Registered Anime**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    text, markup = _render_anime_list_page(anime_list, 0, mc_text, "list")
+    await message.reply(text, reply_markup=markup)
 
-    for i, entry in enumerate(anime_list, 1):
-        name = entry.get('anime_name', 'Unknown')
-        ch_title = entry.get('channel_title', 'Unknown')
-        ch_id = entry.get('channel_id', 'N/A')
-        hashtag = entry.get('hashtag', '') or '—'
-        link = entry.get('channel_link', '') or '—'
-        text += (
-            f"**{i}.** 📺 {name}\n"
-            f"   📢 {ch_title} (`{ch_id}`)\n"
-            f"   🏷️ {hashtag} | 🔗 {link}\n\n"
-        )
 
-    text += (
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Total: **{len(anime_list)}**\n\n"
-        f"🗑️ Remove: `/del_anime 1`"
-    )
-    await message.reply(text)
+# ─────────────────────────────────────────────
+#  /list_anime aur /del_anime ke Prev/Next buttons
+# ─────────────────────────────────────────────
+@Client.on_callback_query(filters.regex(r"^anime_pg_(list|del)_(\d+)$"))
+async def anime_list_page_callback(client: Client, cb: CallbackQuery):
+    if not _is_authorized(cb.from_user.id):
+        await cb.answer("⛔ Permission nahi hai.", show_alert=True)
+        return
+
+    mode = cb.matches[0].group(1)
+    page = int(cb.matches[0].group(2))
+
+    anime_list = await _get_anime_list()
+    if not anime_list:
+        await cb.answer("📋 List ab khaali hai.", show_alert=True)
+        try:
+            await cb.message.edit("📋 Koi anime registered nahi hai!")
+        except Exception:
+            pass
+        return
+
+    mc_text = await _monitor_channel_text(client)
+    text, markup = _render_anime_list_page(anime_list, page, mc_text, mode)
+    try:
+        await cb.message.edit(text, reply_markup=markup)
+    except Exception as e:
+        LOGGER.warning(f"[AutoMonitor] anime_list_page_callback edit error: {e}")
+    await cb.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^anime_pg_noop$"))
+async def anime_list_page_noop(client: Client, cb: CallbackQuery):
+    await cb.answer()
 
 
 # ─────────────────────────────────────────────
@@ -1080,11 +1180,9 @@ async def cmd_del_anime(client: Client, message: Message):
         return
 
     if len(message.command) < 2:
-        text = "🗑️ **Konsa remove karna hai?**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        for i, entry in enumerate(anime_list, 1):
-            text += f"**{i}.** {entry.get('anime_name')} → {entry.get('channel_title')}\n"
-        text += "\n━━━━━━━━━━━━━━━━━━━━\nUse: `/del_anime <number>`"
-        await message.reply(text)
+        mc_text = await _monitor_channel_text(client)
+        text, markup = _render_anime_list_page(anime_list, 0, mc_text, "del")
+        await message.reply(text, reply_markup=markup)
         return
 
     try:
@@ -1102,8 +1200,8 @@ async def cmd_del_anime(client: Client, message: Message):
 
     await message.reply(
         f"✅ **Removed!**\n\n"
-        f"📺 {removed.get('anime_name')}\n"
-        f"📢 {removed.get('channel_title')}"
+        f"📺 {_md_escape(removed.get('anime_name'))}\n"
+        f"📢 {_md_escape(removed.get('channel_title'))}"
     )
 
 
