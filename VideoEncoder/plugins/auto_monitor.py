@@ -1017,14 +1017,13 @@ async def cmd_add_anime(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────
-#  Paginated anime list — /list_anime aur /del_anime dono is se render
-#  hote hain.
+#  Paginated anime list — ab sirf /del_anime is se render hota hai.
+#  (/list_anime niche button-panel style use karta hai, _show_list_anime_panel)
 #
 #  PEHLE: poori anime_list ek hi message mein bheji jaati thi. List badi ho
-#  jaane par (jaise ab) Telegram [400 MESSAGE_TOO_LONG] / [400
-#  ENTITY_BOUNDS_INVALID] de deta tha (4096 char limit + bold/code markdown
-#  entities corrupt ho jaate the) — isliye command "kaam nahi kar raha tha"
-#  (crash ho ke exception, koi reply hi nahi jaata tha).
+#  jaane par Telegram [400 MESSAGE_TOO_LONG] / [400 ENTITY_BOUNDS_INVALID]
+#  de deta tha (4096 char limit + bold/code markdown entities corrupt ho
+#  jaate the) — isliye command "kaam nahi kar raha tha".
 #  AB: hamesha max ANIME_PAGE_SIZE entries ek page mein, Prev/Next buttons
 #  se navigate karo.
 # ─────────────────────────────────────────────
@@ -1097,29 +1096,142 @@ def _render_anime_list_page(anime_list: list, page: int, mc_text: str, mode: str
 
 
 async def _monitor_channel_text(client: Client) -> str:
-    """Monitor channel ka display text banao — list/del dono handlers use karte hain."""
+    """
+    Monitor channel ka display text banao — list/del dono handlers use karte hain.
+    FIX: mc.title pehle bina escape kiye jaata tha — agar channel title mein
+    *, _, ` jaisa raw Markdown character hota (bahut common hota hai
+    channel names mein) toh ENTITY_BOUNDS_INVALID crash hota tha. Ab
+    _md_escape() se hokar backtick span mein jaata hai.
+    """
     monitor_ch = await _get_monitor_channel()
     if not monitor_ch:
         return "❌ Set nahi — use `/set_monitor`"
     try:
         mc = await client.get_chat(monitor_ch)
-        return f"✅ {mc.title} (`{monitor_ch}`)"
+        return f"✅ `{_md_escape(mc.title)}` (`{monitor_ch}`)"
     except Exception:
         return f"⚠️ ID: `{monitor_ch}` (access error)"
 
 
 # ─────────────────────────────────────────────
-#  /list_anime
+#  /list_anime — button-style panel (/update_post_list jaisa)
+#
+#  PEHLE: har anime raw message TEXT mein **bold** ke saath likha jaata
+#  tha. Woh MESSAGE_TOO_LONG toh fix ho gaya tha, lekin _monitor_channel_text
+#  ka channel title kabhi escape nahi hua — ek stray *, _ ya ` waale title
+#  ne poore message ke Markdown entities todh diye (ENTITY_BOUNDS_INVALID).
+#  AB: /update_post_list ki tarah har anime ek BUTTON label hai. Button
+#  labels Telegram kabhi Markdown-parse nahi karta — isliye ye crash ka
+#  scope structurally hi khatam ho jaata hai, chahe naam mein kuch bhi ho.
+#  Tap karke full detail dikhta hai, Back se list pe wapas.
 # ─────────────────────────────────────────────
+async def _show_list_anime_panel(client: Client, event, user_id: int, page: int, is_new: bool):
+    anime_list = await _get_anime_list()
+    mc_text = await _monitor_channel_text(client)
+
+    if not anime_list:
+        text = (
+            f"📡 **Monitor Channel:** {mc_text}\n\n"
+            f"📋 Koi anime registered nahi hai!\n\n"
+            f"Add karo: `/add_anime [channel_id] [Anime Name]`"
+        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="closeMeh")]])
+        if is_new:
+            await event.reply(text, reply_markup=kb)
+        else:
+            try:
+                await event.edit(text, reply_markup=kb)
+            except Exception:
+                pass
+        return
+
+    total = len(anime_list)
+    total_pages = max(1, (total + ANIME_PAGE_SIZE - 1) // ANIME_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * ANIME_PAGE_SIZE
+    end = min(start + ANIME_PAGE_SIZE, total)
+
+    rows = []
+    for idx in range(start, end):
+        entry = anime_list[idx]
+        name = entry.get('anime_name', 'Unknown')
+        ch_title = entry.get('channel_title', 'Unknown')
+        label = f"{idx + 1}. 📺 {name} → {ch_title}"
+        if len(label) > 50:
+            label = label[:47] + "…"
+        rows.append([InlineKeyboardButton(label, callback_data=f"alist_open_{idx}_{user_id}_{page}")])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"alist_page_{page - 1}_{user_id}"))
+    nav_row.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data=f"alist_noop_{user_id}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"alist_page_{page + 1}_{user_id}"))
+    rows.append(nav_row)
+    rows.append([InlineKeyboardButton("❌ Close", callback_data="closeMeh")])
+
+    kb = InlineKeyboardMarkup(rows)
+    text = (
+        f"📡 **Monitor:** {mc_text}\n\n"
+        f"📋 **Registered Anime ({total})**\n"
+        f"_Kisi bhi anime pe tap karke full detail dekho._\n\n"
+        f"🗑️ Remove: `/del_anime <number>`"
+    )
+
+    if is_new:
+        await event.reply(text, reply_markup=kb)
+    else:
+        try:
+            await event.edit(text, reply_markup=kb)
+        except Exception:
+            pass
+
+
+async def _show_anime_detail(client: Client, event, user_id: int, idx: int, page: int):
+    """
+    Single anime ka detail view. Dynamic fields (name/channel/hashtag/link)
+    sirf backtick code-span ke andar jaate hain — kabhi **bold** ke andar
+    nahi — isliye stray Markdown character se entity crash nahi ho sakta.
+    """
+    anime_list = await _get_anime_list()
+
+    if idx < 0 or idx >= len(anime_list):
+        await _show_list_anime_panel(client, event, user_id, page, is_new=False)
+        return
+
+    entry = anime_list[idx]
+    name = _md_escape(entry.get('anime_name', 'Unknown'))
+    ch_title = _md_escape(entry.get('channel_title', 'Unknown'))
+    ch_id = entry.get('channel_id', 'N/A')
+    hashtag = _md_escape(entry.get('hashtag', ''))
+    link = _md_escape(entry.get('channel_link', ''))
+
+    text = (
+        f"📺 **Anime Detail**\n\n"
+        f"**Name:** `{name}`\n"
+        f"**Channel:** `{ch_title}` (`{ch_id}`)\n"
+        f"**Hashtag:** `{hashtag}`\n"
+        f"**Link:** `{link}`\n\n"
+        f"🗑️ Remove: `/del_anime {idx + 1}`"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"alist_back_{page}_{user_id}")],
+    ])
+
+    try:
+        await event.edit(text, reply_markup=kb)
+    except Exception as e:
+        LOGGER.warning(f"[AutoMonitor] _show_anime_detail edit error: {e}")
+
+
 @Client.on_message(filters.command("list_anime") & filters.private)
 async def cmd_list_anime(client: Client, message: Message):
     if not _is_authorized(message.from_user.id):
         return
 
     anime_list = await _get_anime_list()
-    mc_text = await _monitor_channel_text(client)
-
     if not anime_list:
+        mc_text = await _monitor_channel_text(client)
         await message.reply(
             f"📡 **Monitor Channel:** {mc_text}\n\n"
             f"📋 Koi anime registered nahi hai!\n\n"
@@ -1127,21 +1239,88 @@ async def cmd_list_anime(client: Client, message: Message):
         )
         return
 
-    text, markup = _render_anime_list_page(anime_list, 0, mc_text, "list")
-    await message.reply(text, reply_markup=markup)
+    await _show_list_anime_panel(client, message, message.from_user.id, page=0, is_new=True)
 
 
 # ─────────────────────────────────────────────
-#  /list_anime aur /del_anime ke Prev/Next buttons
+#  /list_anime panel ke callbacks (alist_*) — /update_post_list (upe_*) jaisa
 # ─────────────────────────────────────────────
-@Client.on_callback_query(filters.regex(r"^anime_pg_(list|del)_(\d+)$"))
-async def anime_list_page_callback(client: Client, cb: CallbackQuery):
+@Client.on_callback_query(filters.regex(r"^alist_"))
+async def anime_list_panel_callbacks(client: Client, cb: CallbackQuery):
+    data = cb.data
+    user_id = cb.from_user.id
+
+    if not _is_authorized(user_id):
+        await cb.answer("⛔ Permission nahi hai.", show_alert=True)
+        return
+
+    # ── alist_noop_<uid> — page indicator, sirf display ──
+    if data.startswith("alist_noop_"):
+        await cb.answer()
+        return
+
+    # ── alist_page_<page>_<uid> ──
+    if data.startswith("alist_page_"):
+        parts = data.split("_")
+        try:
+            page = int(parts[2])
+            owner_id = int(parts[3])
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+        if user_id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+        await cb.answer()
+        await _show_list_anime_panel(client, cb.message, owner_id, page, is_new=False)
+        return
+
+    # ── alist_open_<idx>_<uid>_<page> ──
+    if data.startswith("alist_open_"):
+        parts = data.split("_")
+        try:
+            idx = int(parts[2])
+            owner_id = int(parts[3])
+            page = int(parts[4]) if len(parts) > 4 else 0
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+        if user_id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+        await cb.answer()
+        await _show_anime_detail(client, cb.message, owner_id, idx, page)
+        return
+
+    # ── alist_back_<page>_<uid> ──
+    if data.startswith("alist_back_"):
+        parts = data.split("_")
+        try:
+            page = int(parts[2])
+            owner_id = int(parts[3])
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+        if user_id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+        await cb.answer()
+        await _show_list_anime_panel(client, cb.message, owner_id, page, is_new=False)
+        return
+
+    await cb.answer()
+
+
+# ─────────────────────────────────────────────
+#  /del_anime ke Prev/Next buttons (compact text-list style, unchanged)
+# ─────────────────────────────────────────────
+@Client.on_callback_query(filters.regex(r"^anime_pg_del_(\d+)$"))
+async def anime_del_page_callback(client: Client, cb: CallbackQuery):
     if not _is_authorized(cb.from_user.id):
         await cb.answer("⛔ Permission nahi hai.", show_alert=True)
         return
 
-    mode = cb.matches[0].group(1)
-    page = int(cb.matches[0].group(2))
+    page = int(cb.matches[0].group(1))
 
     anime_list = await _get_anime_list()
     if not anime_list:
@@ -1153,11 +1332,11 @@ async def anime_list_page_callback(client: Client, cb: CallbackQuery):
         return
 
     mc_text = await _monitor_channel_text(client)
-    text, markup = _render_anime_list_page(anime_list, page, mc_text, mode)
+    text, markup = _render_anime_list_page(anime_list, page, mc_text, "del")
     try:
         await cb.message.edit(text, reply_markup=markup)
     except Exception as e:
-        LOGGER.warning(f"[AutoMonitor] anime_list_page_callback edit error: {e}")
+        LOGGER.warning(f"[AutoMonitor] anime_del_page_callback edit error: {e}")
     await cb.answer()
 
 
