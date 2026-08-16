@@ -433,6 +433,38 @@ def _collect_visible_links(driver) -> list:
     return download_links
 
 
+def _fast_download_link(href: str, dl_dir: str, quality: str, referer: str, cookie_header: str):
+    """
+    Multi-connection direct download (pySmartDL, 8 threads) — bypasses
+    Chrome's slow single-connection download manager entirely. Cookies from
+    the live Selenium session are forwarded so token-gated CDN links still
+    authenticate. Returns a non-blocking SmartDL object, or None if it
+    couldn't even start (caller falls back to the old browser-download path).
+    """
+    try:
+        from pySmartDL import SmartDL
+        from urllib.parse import urlparse, unquote
+        name = unquote(os.path.basename(urlparse(href).path))
+        if not name or "." not in name:
+            name = f"{quality}.mp4"
+        dest = os.path.join(dl_dir, name)
+        headers = {
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/120.0.0.0 Safari/537.36"),
+            "Referer": referer,
+        }
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+        dl = SmartDL(href, dest, progress_bar=False, threads=8,
+                     request_args={"headers": headers}, timeout=30)
+        dl.start(blocking=False)
+        return dl
+    except Exception as e:
+        LOGGER.warning(f"[Swift] Fast-download setup failed for {quality}: {e}")
+        return None
+
+
 def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_filter: str = None) -> dict:
     """
     Same Selenium session mein:
@@ -521,6 +553,8 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
                 return result
 
         # ── STEP 4: Sirf page pe present qualities click karo ──
+        fast_downloaded_files = []  # multi-connection downloads jo already confirm done hain
+
         if not download_links:
             # Fallback: XPATH button click try karo
             LOGGER.warning("[Swift] No hrefs found after 360p gate — trying XPATH button click...")
@@ -555,44 +589,87 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
 
         else:
             qualities_clicked = []
+            fallback_links = []
+
+            # Selenium session ke cookies le lo — token-gated CDN links direct
+            # fetch karne pe bhi authenticate ho jaayenge browser ke bina.
+            try:
+                cookies = driver.get_cookies()
+                cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+            except Exception:
+                cookie_header = ""
+
+            # Sabhi qualities ke fast (multi-connection) downloads ek saath
+            # start karo — max 4 qualities x 8 threads = up to 32 connections
+            # parallel, Chrome ke single-connection download se kaafi tez.
+            active_dls = {}
             for lnk in download_links[:4]:  # max 4 qualities
-                q = lnk["quality"]
-                href = lnk["href"]
+                q, href = lnk["quality"], lnk["href"]
+                dl = _fast_download_link(href, dl_dir, q, swift_url, cookie_header)
+                if dl:
+                    active_dls[q] = (dl, href)
+                else:
+                    fallback_links.append(lnk)
+
+            for q, (dl, href) in active_dls.items():
+                try:
+                    dl.wait()
+                    if dl.isSuccessful():
+                        fpath = dl.get_dest()
+                        if fpath and os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
+                            fast_downloaded_files.append(fpath)
+                            qualities_clicked.append(q)
+                            LOGGER.info(f"[Swift] Fast-downloaded ({q}): {fpath}")
+                            continue
+                    LOGGER.warning(f"[Swift] Fast-download unsuccessful for {q}, falling back to browser")
+                except Exception as e:
+                    LOGGER.warning(f"[Swift] Fast-download error for {q}: {e}, falling back to browser")
+                fallback_links.append({"quality": q, "href": href})
+
+            # Jo bhi fast-path mein fail hua, uske liye purana reliable
+            # browser-download fallback (slower, but never breaks the feature).
+            for lnk in fallback_links:
+                q, href = lnk["quality"], lnk["href"]
                 try:
                     driver.execute_script(f"window.open('{href}', '_blank');")
-                    time.sleep(0.3)   # was 1s — popup close ke liye kafi hai
+                    time.sleep(0.3)   # popup close ke liye kafi hai
                     _close_popups(driver, main)
                     qualities_clicked.append(q)
-                    LOGGER.info(f"[Swift] JS opened: {q} | {href[:60]}")
-                    # 2s sleep remove kiya — next link ke liye zaroorat nahi
+                    LOGGER.info(f"[Swift] JS opened (fallback): {q} | {href[:60]}")
                 except Exception as e:
                     LOGGER.warning(f"[Swift] JS open failed for {q}: {e}")
 
             result["qualities"] = qualities_clicked
 
         # ── STEP 5: Downloads complete hone ka wait ──
+        # (fast-downloaded files upar hi confirm ho chuke hain — sirf browser
+        #  se trigger hui fallback downloads ke liye polling chahiye)
         LOGGER.info("[Swift] Waiting for downloads to complete...")
         start = time.time()
-        expected = max(len(result["qualities"]), 1)
+        expected = max(len(result["qualities"]) - len(fast_downloaded_files), 0)
 
-        while True:
-            done = _get_done_files(dl_dir)
-            in_prog = _in_progress(dl_dir)
-            elapsed = int(time.time() - start)
+        if expected == 0 and fast_downloaded_files:
+            LOGGER.info("[Swift] All qualities finished via fast multi-connection path — skipping poll.")
+            result["files"] = fast_downloaded_files
+        else:
+            while True:
+                done = _get_done_files(dl_dir)
+                in_prog = _in_progress(dl_dir)
+                elapsed = int(time.time() - start)
 
-            LOGGER.info(f"[Swift] Done={len(done)}, InProg={len(in_prog)}, Elapsed={elapsed}s")
+                LOGGER.info(f"[Swift] Done={len(done)}, InProg={len(in_prog)}, Elapsed={elapsed}s")
 
-            if len(done) >= expected and not in_prog:
-                break
-            if elapsed > 5 and len(done) >= 1 and not in_prog:
-                break
-            if elapsed > 1200:
-                LOGGER.warning("[Swift] Download timeout (1200s)!")
-                break
+                if len(done) >= expected and not in_prog:
+                    break
+                if elapsed > 5 and len(done) >= 1 and not in_prog:
+                    break
+                if elapsed > 1200:
+                    LOGGER.warning("[Swift] Download timeout (1200s)!")
+                    break
 
-            time.sleep(2)  # was 5s — faster polling, less idle wait
+                time.sleep(2)  # was 5s — faster polling, less idle wait
 
-        result["files"] = _get_done_files(dl_dir)
+            result["files"] = list(dict.fromkeys(fast_downloaded_files + _get_done_files(dl_dir)))
 
     except Exception as e:
         result["error"] = str(e)
