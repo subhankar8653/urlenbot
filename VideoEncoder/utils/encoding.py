@@ -97,20 +97,26 @@ async def _should_parallel_encode(filepath, message, audio_map):
     # Multi-audio-track selection and hardsub burn-in both need frame-accurate
     # timing across the whole file — keep those on the safe single-pass path.
     if audio_map:
+        LOGGER.info("Parallel encode skipped: custom audio_map in use.")
         return False
     if not await db.get_parallel(uid):
+        LOGGER.info("Parallel encode skipped: toggle is OFF in user settings.")
         return False
     if await db.get_hardsub(uid):
+        LOGGER.info("Parallel encode skipped: hardsub is ON.")
         return False
     cpu_count = os.cpu_count() or 1
     if cpu_count < 2:
+        LOGGER.info("Parallel encode skipped: only 1 CPU core available.")
         return False
     video_i = get_codec(filepath, channel='v:0')
     if video_i == []:
+        LOGGER.info("Parallel encode skipped: could not detect a video stream.")
         return False
     duration = get_duration(filepath)
     # Not worth the split/merge overhead on short clips
     if duration < 240:
+        LOGGER.info(f"Parallel encode skipped: duration {duration}s < 240s threshold.")
         return False
     return True
 
@@ -225,6 +231,16 @@ async def parallel_encode(filepath, message, msg, audio_map=None):
         seg_cmds.append(cmd)
 
     LOGGER.info(f"Parallel encode: {n_segments} segments x {threads_per_seg} threads each")
+
+    # Confirmation line so it's obvious in chat that parallel mode kicked in
+    # (this fires immediately, before the first 5s progress tick)
+    try:
+        await msg.edit(
+            f"⚡ <b>Parallel Encode:</b> splitting into {n_segments} segments "
+            f"({threads_per_seg} threads each)...\nAudio/Subtitles: full-length, single pass."
+        )
+    except Exception:
+        pass
 
     procs = []
     for cmd in seg_cmds:
