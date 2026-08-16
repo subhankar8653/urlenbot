@@ -122,21 +122,23 @@ def _find_matching_anime(text: str, anime_list: list) -> dict | None:
 
 
 def _extract_episodes(text: str) -> tuple[int, int] | None:
-    # "EPISODE 4-13 + ZIP PACK ADDED!" / "Episode 34-36" / "Ep 34 - 36"
-    m = re.search(r'(?i)episodes?\s*(\d+)\s*[-\u2013]\s*(\d+)', text)
+    # "EPISODE 4-13 + ZIP PACK ADDED!" / "Episode 34-36" / "Ep 34 - 36" / "EP 34-36"
+    m = re.search(r'episodes?\s*(\d+)\s*[-\u2013]\s*(\d+)', text, re.IGNORECASE)
     if m:
         return int(m.group(1)), int(m.group(2))
-    # Ep/Episode + to range
-    m = re.search(r'[Ee]p(?:isode)?\s*(\d+)\s*[-\u2013to]+\s*(\d+)', text)
+    # Ep/Episode + to range (case-insensitive — handles all-caps "EP" / "EPISODE" too)
+    m = re.search(r'ep(?:isode)?\s*(\d+)\s*[-\u2013to]+\s*(\d+)', text, re.IGNORECASE)
     if m:
         return int(m.group(1)), int(m.group(2))
-    # Single "Episode 5"
-    m = re.search(r'[Ee]p(?:isode)?\s*(\d+)', text)
+    # Single "Episode 5" / "EP 2" / "ep 2" — grabs the FIRST ep mentioned
+    # (matches your convention of always listing Hindi ep first, e.g.
+    #  "EP 2 HINDI DUB + EP 4 HINDI SUB ADDED!" -> picks Ep 2)
+    m = re.search(r'ep(?:isode)?\s*(\d+)', text, re.IGNORECASE)
     if m:
         ep = int(m.group(1))
         return ep, ep
     # "34-36 Added" / "34-36 + ZIP PACK ADDED"
-    m = re.search(r'(\d+)\s*[-\u2013]\s*(\d+)[^\n]*[Aa]dded', text)
+    m = re.search(r'(\d+)\s*[-\u2013]\s*(\d+)[^\n]*added', text, re.IGNORECASE)
     if m:
         return int(m.group(1)), int(m.group(2))
     return None
