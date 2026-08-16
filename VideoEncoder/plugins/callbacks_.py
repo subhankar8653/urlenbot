@@ -255,11 +255,9 @@ async def callback_handlers(bot: Client, cb: CallbackQuery):
             else:
                 await db.set_parallel(cb.from_user.id, parallel=True)
                 await cb.answer(
-                    "Long videos ke liye video ko chunks mein split karke "
-                    "sabhi CPU cores pe parallel encode karega, phir merge "
-                    "karega. Audio/Subtitles hamesha poori file se, ek hi "
-                    "baar process hote hain — desync nahi hoga. Hardsub / "
-                    "multi-audio-select ke sath ye off rehta hai (safety).",
+                    "Long videos: chunks mein split -> sab cores pe parallel "
+                    "encode -> merge. Audio/Subs poori file se, ek hi baar "
+                    "(no desync). Hardsub/multi-audio ke sath auto-OFF.",
                     show_alert=True
                 )
             await VideoSettings(cb.message, user_id=cb.from_user.id)
