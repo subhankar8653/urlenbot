@@ -138,7 +138,10 @@ async def parallel_encode(filepath, message, msg, audio_map=None):
 
     duration = get_duration(filepath)
     cpu_count = os.cpu_count() or 2
-    n_segments = min(cpu_count, 4)
+    # Segments run all-at-once, in parallel — so segment count is bounded by
+    # available CPU cores, not by video length. Capped at 16 so a huge-core
+    # host doesn't split into pointlessly tiny chunks (split/merge overhead).
+    n_segments = min(cpu_count, 16)
     if n_segments < 2 or duration < 1:
         return None
 
