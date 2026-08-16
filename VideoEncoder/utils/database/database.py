@@ -260,6 +260,15 @@ class Database:
         user = await self._get_user(id)
         return user.get('drive', False)
 
+    # Parallel (segmented) encoding — splits video into chunks encoded
+    # simultaneously across all cores, then merges. Off by default.
+    async def set_parallel(self, id, parallel):
+        await self.col.update_one({'id': id}, {'$set': {'parallel': parallel}}, upsert=True)
+
+    async def get_parallel(self, id):
+        user = await self._get_user(id)
+        return user.get('parallel', False)
+
     # CRF
     async def get_crf(self, id):
         user = await self._get_user(id)
