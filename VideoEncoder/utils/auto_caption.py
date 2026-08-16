@@ -38,6 +38,18 @@ QUALITY_MAP = {
     '854': '480p', '848': '480p', '640': '360p',
 }
 
+# Matches an already-baked-in "in Japanese" / "in Hindi + English" phrase
+# that a PREVIOUS auto-caption pass added to the filename. Without this,
+# re-processing an already-captioned file duplicates the language tag
+# (".. in Japanese in Japanese 720p ..") because the plain-text phrase
+# isn't in brackets and survives into anime_name, then gets appended again.
+_LANG_ALTS = sorted(set(LANG_WORDS.values()), key=len, reverse=True)
+_IN_LANG_RE = re.compile(
+    r'\bin\s+(?:' + '|'.join(re.escape(l) for l in _LANG_ALTS) + r')'
+    r'(?:\s*\+\s*(?:' + '|'.join(re.escape(l) for l in _LANG_ALTS) + r'))*\b',
+    re.IGNORECASE
+)
+
 
 def get_media_metadata(filepath):
     """FFprobe se file ka metadata nikalo"""
@@ -178,6 +190,12 @@ def extract_anime_info(filename, metadata):
     Metadata title IGNORE - woh group ka promo text ho sakta hai.
     """
     name = os.path.splitext(os.path.basename(filename))[0]
+
+    # Step 0: Agar naam mein pehle se hi "in Japanese" jaisa plain-text
+    # language phrase baked-in hai (previous auto-caption run se), usse
+    # yahin hata do — warna niche language dobara detect hoke duplicate
+    # ho jaayega ("in Japanese in Japanese").
+    name = _IN_LANG_RE.sub('', name).strip()
 
     # Step 1: Starting group tag remove [SubsPlease], [Erai-raws] etc
     name = re.sub(r'^\[[^\]]+\]', '', name).strip()

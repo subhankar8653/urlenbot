@@ -114,8 +114,22 @@ async def encode(filepath, message, msg, audio_map=None):
             if result:
                 return result
             LOGGER.warning("Parallel encode did not complete cleanly — falling back to single-pass encode.")
+            try:
+                await msg.edit(
+                    "⚠️ <b>Parallel Encode failed</b> (segment crashed/likely low RAM) — "
+                    "switching to normal single-pass encoding...\nCheck bot logs for "
+                    "'Segment ffmpeg failed' to see the exact ffmpeg error."
+                )
+            except Exception:
+                pass
     except Exception as e:
         LOGGER.error(f"Parallel encode crashed, falling back to single-pass: {e}")
+        try:
+            await msg.edit(
+                f"⚠️ <b>Parallel Encode crashed</b> ({e}) — switching to normal single-pass encoding..."
+            )
+        except Exception:
+            pass
 
     return await _encode_single(filepath, message, msg, audio_map=audio_map)
 
