@@ -15,6 +15,34 @@ from .database.access_db import db
 from .display_progress import TimeFormatter
 
 
+def get_available_cpus():
+    """os.cpu_count() Docker/Railway jaise containers mein poore HOST machine
+    ke cores dikhata hai — jo container ko actually cgroup se allot hue hain
+    unse kahin zyada ho sakta hai. Isliye cgroup quota seedhe padhte hain
+    (v2 pehle, phir v1 fallback); agar dono na milein tabhi os.cpu_count()
+    pe fallback karte hain. Isse hum utne hi parallel segments banate hain
+    jitne container sach mein handle kar sakta hai — warna oversubscription
+    se ek ya zyada segment crash/OOM ho jaate hain aur poora single-pass
+    fallback trigger ho jaata hai."""
+    try:
+        with open('/sys/fs/cgroup/cpu.max', 'r') as f:
+            quota, period = f.read().split()
+            if quota != 'max':
+                return max(1, int(int(quota) / int(period)))
+    except Exception:
+        pass
+    try:
+        with open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', 'r') as f:
+            quota = int(f.read().strip())
+        with open('/sys/fs/cgroup/cpu/cpu.cfs_period_us', 'r') as f:
+            period = int(f.read().strip())
+        if quota > 0:
+            return max(1, quota // period)
+    except Exception:
+        pass
+    return os.cpu_count() or 2
+
+
 def get_codec(filepath, channel='v:0'):
     try:
         output = subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', channel,
@@ -105,7 +133,7 @@ async def _should_parallel_encode(filepath, message, audio_map):
     if await db.get_hardsub(uid):
         LOGGER.info("Parallel encode skipped: hardsub is ON.")
         return False
-    cpu_count = os.cpu_count() or 1
+    cpu_count = get_available_cpus()
     if cpu_count < 2:
         LOGGER.info("Parallel encode skipped: only 1 CPU core available.")
         return False
@@ -137,11 +165,12 @@ async def parallel_encode(filepath, message, msg, audio_map=None):
     assert(output_filepath != filepath)
 
     duration = get_duration(filepath)
-    cpu_count = os.cpu_count() or 2
+    cpu_count = get_available_cpus()
     # Segments run all-at-once, in parallel — so segment count is bounded by
-    # available CPU cores, not by video length. Capped at 8 so the host
-    # doesn't split into pointlessly tiny chunks (split/merge overhead).
-    n_segments = min(cpu_count, 8)
+    # available CPU cores, not by video length. Capped at 6 so the host
+    # doesn't split into pointlessly tiny chunks or run out of RAM running
+    # too many encoders at once.
+    n_segments = min(cpu_count, 6)
     if n_segments < 2 or duration < 1:
         return None
 
@@ -294,7 +323,7 @@ async def parallel_encode(filepath, message, msg, audio_map=None):
     else:
         use_copy_audio = False  # nothing to map
 
-    ok = await _monitor_parallel_progress(procs, progress_paths, lengths, msg, message)
+    ok = await _monitor_parallel_progress(procs, progress_paths, lengths, msg, message, seg_cmds=seg_cmds)
     if not ok:
         if audio_proc:
             try:
@@ -413,7 +442,7 @@ async def parallel_encode(filepath, message, msg, audio_map=None):
     return output_filepath
 
 
-async def _monitor_parallel_progress(procs, progress_paths, lengths, msg, message):
+async def _monitor_parallel_progress(procs, progress_paths, lengths, msg, message, seg_cmds=None):
     status = download_dir + "status.json"
     with open(status, 'w') as f:
         json.dump({'running': True, 'message': msg.id, 'user': message.from_user.id,
@@ -481,15 +510,45 @@ async def _monitor_parallel_progress(procs, progress_paths, lengths, msg, messag
             pass
 
     returncodes = [t.result() for t in wait_tasks]
-    fail = any(rc != 0 for rc in returncodes)
-    if fail:
-        for i, p in enumerate(procs):
-            if returncodes[i] != 0:
+    fail_indices = [i for i, rc in enumerate(returncodes) if rc != 0]
+    for i in fail_indices:
+        try:
+            _, err = await procs[i].communicate()
+            LOGGER.error(f"Segment {i} ffmpeg failed (code {returncodes[i]}): {err.decode(errors='ignore')[:500]}")
+        except Exception:
+            pass
+
+    # ── One retry pass for failed segments only — most failures here are
+    #    transient resource-contention (too many ffmpeg procs competing for
+    #    CPU/RAM at once), not a real encoding problem. Retrying just the
+    #    failed segment(s) is far cheaper than falling all the way back to
+    #    a full single-pass re-encode of the whole file ("double encoding").
+    if fail_indices and seg_cmds:
+        LOGGER.info(f"Retrying {len(fail_indices)} failed segment(s) before giving up on parallel mode.")
+        try:
+            await msg.edit(f"⚠️ {len(fail_indices)} segment(s) hit a snag — retrying before falling back...")
+        except Exception:
+            pass
+        retry_procs = {}
+        for i in fail_indices:
+            with open(progress_paths[i], 'w'):
+                pass
+            retry_procs[i] = await asyncio.create_subprocess_exec(
+                *seg_cmds[i], stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+            )
+        retry_results = await asyncio.gather(*[p.wait() for p in retry_procs.values()])
+        still_failed = [i for i, rc in zip(retry_procs.keys(), retry_results) if rc != 0]
+        if still_failed:
+            for i in still_failed:
                 try:
-                    _, err = await p.communicate()
-                    LOGGER.error(f"Segment {i} ffmpeg failed (code {returncodes[i]}): {err.decode(errors='ignore')[:500]}")
+                    _, err = await retry_procs[i].communicate()
+                    LOGGER.error(f"Segment {i} retry also failed (code): {err.decode(errors='ignore')[:500]}")
                 except Exception:
                     pass
+            return False
+        return True
+
+    fail = bool(fail_indices)
     return not fail
 
 
