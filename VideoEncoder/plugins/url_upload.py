@@ -11,6 +11,7 @@ Features:
 """
 
 import asyncio
+import json
 import os
 import re
 import subprocess
@@ -1375,26 +1376,111 @@ def _default_stream_headers(url: str, cookie_header: str = "") -> dict:
     return headers
 
 
+def _make_stealth_driver(dl_dir: str):
+    """
+    Swift downloader jaisa hi headless Chrome, but extra "stealth" flags
+    ke saath. Kai CDNs/Cloudflare wagera headless-automation ko
+    fingerprint karke khud hi block kar dete hain (navigator.webdriver
+    flag headless Selenium mein True hota hai — yeh #1 giveaway hai),
+    isliye cookies bhejne ke baad bhi 403 aata rehta hai. Yeh flags us
+    detection ko bypass karte hain.
+    Performance/network logging bhi ON karte hain taaki hum verify kar
+    sakein ki headless Chrome khud is URL pe 200 laata hai ya 403
+    (asli root-cause pata chalega — cookies ka issue hai ya detection ka).
+    """
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service as ChromeService
+
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--mute-audio")
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument(f"user-agent={_BROWSER_UA}")
+    options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+    options.add_experimental_option("useAutomationExtension", False)
+    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+
+    prefs = {
+        "download.default_directory": dl_dir,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": False,
+        "profile.managed_default_content_settings.images": 2,
+    }
+    options.add_experimental_option("prefs", prefs)
+
+    for binary in [
+        "/usr/bin/chromium", "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
+    ]:
+        if os.path.exists(binary):
+            options.binary_location = binary
+            break
+
+    service = None
+    for cd_path in [
+        "/usr/bin/chromedriver", "/usr/lib/chromium/chromedriver",
+        "/usr/lib/chromium-browser/chromedriver",
+    ]:
+        if os.path.exists(cd_path):
+            service = ChromeService(executable_path=cd_path)
+            break
+
+    driver = webdriver.Chrome(service=service, options=options) if service else webdriver.Chrome(options=options)
+    driver.set_page_load_timeout(30)
+    driver.set_script_timeout(20)
+
+    # navigator.webdriver ko hide karo — bot-detectors ka sabse common check
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
+        )
+    except Exception:
+        pass
+
+    try:
+        driver.execute_cdp_cmd(
+            "Page.setDownloadBehavior",
+            {"behavior": "allow", "downloadPath": dl_dir},
+        )
+    except Exception:
+        pass
+
+    return driver
+
+
 def _capture_browser_session(url: str) -> dict:
     """
-    BLOCKING (run via executor). Real Chrome (Selenium, headless) mein URL
-    ko waise hi khol te hain jaise user manually khol ke video play karta
-    hai — phir uss live session ke cookies "borrow" kar lete hain.
+    BLOCKING (run via executor). Real Chrome (Selenium, headless, stealth
+    flags ke saath) mein URL ko waise hi khol te hain jaise user manually
+    khol ke video play karta hai — phir uss live session se cookies aur
+    (agar redirect hua ho to) resolved final URL "borrow" kar lete hain.
 
     Kyun zaruri hai: kai CDNs sirf real browser (JS challenge pass karke,
     cookies set karke) ko hi content serve karte hain — plain script
-    request (aiohttp/ffmpeg/ye sab) pe 403 de dete hain, chahe headers
-    kitne bhi browser-jaise ho. Note: native "3-dot > Download" context
-    menu OS/browser level UI hai, DOM ka part nahi — isliye use directly
-    click nahi karwa sakte. Lekin same result milta hai: hum wahi
-    authenticated session use karke download karte hain jo Chrome ne
-    khud establish kiya.
+    request (aiohttp/ffmpeg) pe 403 de dete hain, chahe headers kitne
+    bhi browser-jaise ho. Note: native "3-dot > Download" context menu
+    OS/browser-level UI hai, DOM ka part nahi — isliye use directly click
+    nahi karwa sakte. Lekin same result milta hai: hum wahi authenticated
+    session use karke download karte hain jo Chrome ne khud establish kiya.
 
-    Returns: {"cookie_header": str, "final_url": str, "error": str|None}
+    Returns: {
+        "cookie_header": str, "final_url": str, "video_loaded": bool,
+        "network_status": int|None, "error": str|None
+    }
     """
-    result = {"cookie_header": "", "final_url": url, "error": None}
+    result = {
+        "cookie_header": "", "final_url": url, "video_loaded": False,
+        "network_status": None, "error": None,
+    }
     try:
-        from .swift_downloader import _make_driver, SELENIUM_OK
+        from .swift_downloader import SELENIUM_OK
     except Exception as e:
         result["error"] = f"Swift downloader module load nahi hua: {e}"
         return result
@@ -1405,8 +1491,7 @@ def _capture_browser_session(url: str) -> dict:
 
     driver = None
     try:
-        driver = _make_driver(download_dir)
-        driver.set_page_load_timeout(30)
+        driver = _make_stealth_driver(download_dir)
         try:
             driver.get(url)
         except Exception:
@@ -1415,13 +1500,49 @@ def _capture_browser_session(url: str) -> dict:
             # chuke hote hain isliye ignore karke aage badho.
             pass
 
-        # JS challenge / redirect / cookie-set hone ka thoda wait
-        time.sleep(4)
+        # Fixed sleep pe bharosa nahi — actual <video> element ka
+        # readyState check karo (2+ = HAVE_CURRENT_DATA, matlab stream
+        # successfully fetch ho rahi hai). Max 12s wait.
+        loaded = False
+        for _ in range(12):
+            try:
+                ready_state = driver.execute_script(
+                    "var v = document.querySelector('video'); "
+                    "return v ? v.readyState : -1;"
+                )
+                if isinstance(ready_state, (int, float)) and ready_state >= 2:
+                    loaded = True
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        result["video_loaded"] = loaded
+        if not loaded:
+            time.sleep(2)  # thoda aur wait — kuch pages/CDNs slow hote hain
 
         try:
             result["final_url"] = driver.current_url or url
         except Exception:
             pass
+
+        # Network logs se actual response status nikaalo — ye confirm karta
+        # hai ki headless Chrome khud is CDN pe block hua ya nahi (asli
+        # root-cause: cookies missing hain, ya headless-detection hi ban
+        # kar raha hai).
+        try:
+            logs = driver.get_log("performance")
+            url_tail = url.split("?")[0][-40:]
+            for entry in logs:
+                try:
+                    msg = json.loads(entry["message"]).get("message", {})
+                    if msg.get("method") == "Network.responseReceived":
+                        resp = msg["params"]["response"]
+                        if url_tail in resp.get("url", ""):
+                            result["network_status"] = resp.get("status")
+                except Exception:
+                    continue
+        except Exception as e:
+            LOGGER.warning(f"[URL] Performance log read failed: {e}")
 
         try:
             cookies = driver.get_cookies()
@@ -1439,6 +1560,11 @@ def _capture_browser_session(url: str) -> dict:
             except Exception:
                 pass
 
+    LOGGER.info(
+        f"[URL] Browser session result: video_loaded={result['video_loaded']} "
+        f"network_status={result['network_status']} "
+        f"cookies={len(result['cookie_header'])}b final_url={result['final_url'][:100]}"
+    )
     return result
 
 
@@ -1681,11 +1807,35 @@ async def _download_m3u8(url: str, filepath: str, msg: Message, cookie_header: s
                 pass
             loop = asyncio.get_event_loop()
             session = await loop.run_in_executor(None, _capture_browser_session, url)
+
+            diag = (
+                f"video_loaded={session.get('video_loaded')} "
+                f"net_status={session.get('network_status')} "
+                f"cookies={len(session.get('cookie_header') or '')}b"
+            )
+            LOGGER.info(f"[URL] Browser session diag: {diag}")
+
             if session.get("cookie_header"):
-                LOGGER.info("[URL] Browser session captured, retrying M3U8 download with cookies...")
-                return await _download_m3u8(url, filepath, msg, cookie_header=session["cookie_header"])
+                retry_url = session.get("final_url") or url
+                try:
+                    await msg.edit(
+                        "<b>✅ Browser session mil gaya, retry kar rahe hain...</b>\n"
+                        f"<code>{diag}</code>"
+                    )
+                except Exception:
+                    pass
+                LOGGER.info(f"[URL] Retrying M3U8 download with browser cookies, url={retry_url[:100]}")
+                return await _download_m3u8(retry_url, filepath, msg, cookie_header=session["cookie_header"])
             else:
-                LOGGER.warning(f"[URL] Browser session capture gave no cookies: {session.get('error')}")
+                LOGGER.warning(f"[URL] Browser session capture gave no cookies: {session.get('error')} | {diag}")
+                if session.get("network_status") == 403:
+                    # Headless browser bhi khud 403 khaa raha hai — matlab
+                    # yeh cookies ka issue nahi, CDN headless/bot-detection
+                    # se hi block kar raha hai.
+                    raise RuntimeError(
+                        "M3U8 download fail — CDN headless browser ko bhi 403 de raha hai "
+                        "(bot-detection). Cookies ka fix isse nahi hoga."
+                    )
 
         raise RuntimeError(
             "M3U8 (HLS) download fail hua — ffmpeg error ya invalid/expired stream URL."
@@ -1764,13 +1914,33 @@ async def _download_url(url: str, filename: str, msg: Message, orig_message: Mes
                 pass
             loop = asyncio.get_event_loop()
             session_info = await loop.run_in_executor(None, _capture_browser_session, url)
+
+            diag = (
+                f"video_loaded={session_info.get('video_loaded')} "
+                f"net_status={session_info.get('network_status')} "
+                f"cookies={len(session_info.get('cookie_header') or '')}b"
+            )
+            LOGGER.info(f"[URL] Browser session diag: {diag}")
+
             if session_info.get("cookie_header"):
-                LOGGER.info("[URL] Browser session captured, retrying direct download with cookies...")
+                retry_url = session_info.get("final_url") or url
+                try:
+                    await msg.edit(
+                        "<b>✅ Browser session mil gaya, retry kar rahe hain...</b>\n"
+                        f"<code>{diag}</code>"
+                    )
+                except Exception:
+                    pass
                 return await _download_url(
-                    url, filename, msg, orig_message,
+                    retry_url, filename, msg, orig_message,
                     cookie_header=session_info["cookie_header"],
                 )
-            LOGGER.warning(f"[URL] Browser session capture gave no cookies: {session_info.get('error')}")
+            LOGGER.warning(f"[URL] Browser session capture gave no cookies: {session_info.get('error')} | {diag}")
+            if session_info.get("network_status") == 403:
+                raise RuntimeError(
+                    "Download fail — CDN headless browser ko bhi 403 de raha hai "
+                    "(bot-detection). Cookies ka fix isse nahi hoga."
+                ) from e
         raise
 
 
