@@ -83,9 +83,19 @@ async def _new_media_session(client: Client, dc_id: int) -> Session:
     return session
 
 
-async def _download_chunks(session: Session, location, fd, chunk_indices,
+async def _download_worker(session: Session, location, fd, queue: asyncio.Queue,
                            progress_state: dict, lock: asyncio.Lock):
-    for idx in chunk_indices:
+    """Pulls chunk indices from a SHARED queue (work-stealing) instead of a
+    static pre-assigned list. This way, if one session hits a FloodWait or
+    a slow patch, the other sessions simply pick up more chunks from the
+    queue instead of finishing early and sitting idle — keeps all N
+    connections busy right up to the last chunk, so speed doesn't taper
+    off near the end of the file."""
+    while True:
+        try:
+            idx = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
         offset = idx * CHUNK_SIZE
         attempt = 0
         while True:
@@ -99,8 +109,11 @@ async def _download_chunks(session: Session, location, fd, chunk_indices,
             except Exception:
                 attempt += 1
                 if attempt >= MAX_RETRIES_PER_CHUNK:
+                    # Put it back so another (possibly healthier) session
+                    # can retry it, rather than killing the whole download.
+                    await queue.put(idx)
                     raise
-                await asyncio.sleep(1)
+                await asyncio.sleep(min(0.5 * (2 ** attempt), 4))
 
         if isinstance(r, raw.types.upload.File) and r.bytes:
             os.pwrite(fd, r.bytes, offset)
@@ -146,13 +159,13 @@ async def _parallel_download(client: Client, media, file_name: str,
 
             reporter_task = asyncio.create_task(_reporter())
 
-            buckets = [[] for _ in range(n_conn)]
+            queue = asyncio.Queue()
             for i in range(total_chunks):
-                buckets[i % n_conn].append(i)
+                queue.put_nowait(i)
 
             try:
                 await asyncio.gather(*[
-                    _download_chunks(sessions[i], location, fd, buckets[i], progress_state, lock)
+                    _download_worker(sessions[i], location, fd, queue, progress_state, lock)
                     for i in range(n_conn)
                 ])
             finally:
