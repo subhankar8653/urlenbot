@@ -142,9 +142,13 @@ async def _should_parallel_encode(filepath, message, audio_map):
         LOGGER.info("Parallel encode skipped: could not detect a video stream.")
         return False
     duration = get_duration(filepath)
-    # Not worth the split/merge overhead on short clips
-    if duration < 240:
-        LOGGER.info(f"Parallel encode skipped: duration {duration}s < 240s threshold.")
+    # Fast Encode mode uses a much lower bar (30s) since it's meant for
+    # low-resource, quick-turnaround encoding; normal mode keeps 240s so
+    # the split/merge overhead is only worth it on longer videos.
+    fast = await db.get_fast_encode(uid)
+    threshold = 30 if fast else 240
+    if duration < threshold:
+        LOGGER.info(f"Parallel encode skipped: duration {duration}s < {threshold}s threshold.")
         return False
     return True
 
@@ -166,11 +170,18 @@ async def parallel_encode(filepath, message, msg, audio_map=None):
 
     duration = get_duration(filepath)
     cpu_count = get_available_cpus()
-    # Segments run all-at-once, in parallel — so segment count is bounded by
-    # available CPU cores, not by video length. Capped at 6 so the host
-    # doesn't split into pointlessly tiny chunks or run out of RAM running
-    # too many encoders at once.
-    n_segments = min(cpu_count, 6)
+    fast = await db.get_fast_encode(uid)
+    if fast:
+        # Fast Encode mode: always exactly 2 segments (>=30s videos), no
+        # matter how many cores are actually free — keeps behavior fixed
+        # and predictable on low-resource hosts.
+        n_segments = min(cpu_count, 2)
+    else:
+        # Segments run all-at-once, in parallel — so segment count is bounded
+        # by available CPU cores, not by video length. Capped at 6 so the
+        # host doesn't split into pointlessly tiny chunks or run out of RAM
+        # running too many encoders at once.
+        n_segments = min(cpu_count, 6)
     if n_segments < 2 or duration < 1:
         return None
 

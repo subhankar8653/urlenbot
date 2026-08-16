@@ -149,6 +149,7 @@ async def VideoSettings(event: Message, user_id: int):
                     [InlineKeyboardButton(f"CABAC {'☑️' if ((await db.get_cabac(user_id)) is True) else ''}", callback_data="triggercabac"),
                      InlineKeyboardButton(f"Reframe: {reframe}", callback_data="triggerreframe")],
                     [InlineKeyboardButton(f"⚡ Parallel Encode {'☑️' if ((await db.get_parallel(user_id)) is True) else ''}", callback_data="triggerParallel")],
+                    [InlineKeyboardButton(f"🚀 Fast Encode {'☑️' if ((await db.get_fast_encode(user_id)) is True) else ''}", callback_data="triggerFastEncode")],
                     [InlineKeyboardButton(
                         f"Back", callback_data="OpenSettings")]
                 ]
