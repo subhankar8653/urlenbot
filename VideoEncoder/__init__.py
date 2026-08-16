@@ -112,6 +112,13 @@ app = Client(
     api_hash=api_hash,
     plugins={'root': os.path.join(__package__, 'plugins')},
     sleep_threshold=60,
-    max_concurrent_transmissions=4,  # FIX: 20 → 4 (20 se deadlock hota tha pyrogram_patch mein)
+    # Parallel MTProto connections PER FILE for download/upload (pyrofork
+    # native feature — splits one file's transfer across multiple sessions).
+    # The old deadlock at 20 was caused by a custom save_file() patch
+    # (pyrogram_patch.py) that is now disabled — this value only feeds
+    # kurigram's own built-in, version-matched transfer code, so it's safe
+    # to raise. Bumped 4 → 8 for faster downloads; push higher only if the
+    # box stays stable (more RAM gets used per extra connection).
+    max_concurrent_transmissions=8,
     workers=32,
     ipv6=False)
