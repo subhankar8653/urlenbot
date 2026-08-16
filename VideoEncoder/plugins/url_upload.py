@@ -1360,16 +1360,86 @@ _BROWSER_UA = (
 )
 
 
-def _default_stream_headers(url: str) -> dict:
+def _default_stream_headers(url: str, cookie_header: str = "") -> dict:
     """Common headers jo HLS/CDN links ke liye 403 se bachne mein madad karte hain."""
     parsed = urlparse(url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
-    return {
+    headers = {
         "User-Agent": _BROWSER_UA,
         "Referer": origin + "/",
         "Origin": origin,
         "Accept": "*/*",
     }
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    return headers
+
+
+def _capture_browser_session(url: str) -> dict:
+    """
+    BLOCKING (run via executor). Real Chrome (Selenium, headless) mein URL
+    ko waise hi khol te hain jaise user manually khol ke video play karta
+    hai — phir uss live session ke cookies "borrow" kar lete hain.
+
+    Kyun zaruri hai: kai CDNs sirf real browser (JS challenge pass karke,
+    cookies set karke) ko hi content serve karte hain — plain script
+    request (aiohttp/ffmpeg/ye sab) pe 403 de dete hain, chahe headers
+    kitne bhi browser-jaise ho. Note: native "3-dot > Download" context
+    menu OS/browser level UI hai, DOM ka part nahi — isliye use directly
+    click nahi karwa sakte. Lekin same result milta hai: hum wahi
+    authenticated session use karke download karte hain jo Chrome ne
+    khud establish kiya.
+
+    Returns: {"cookie_header": str, "final_url": str, "error": str|None}
+    """
+    result = {"cookie_header": "", "final_url": url, "error": None}
+    try:
+        from .swift_downloader import _make_driver, SELENIUM_OK
+    except Exception as e:
+        result["error"] = f"Swift downloader module load nahi hua: {e}"
+        return result
+
+    if not SELENIUM_OK:
+        result["error"] = "Selenium install nahi hai (pip install selenium)"
+        return result
+
+    driver = None
+    try:
+        driver = _make_driver(download_dir)
+        driver.set_page_load_timeout(30)
+        try:
+            driver.get(url)
+        except Exception:
+            # Video/stream URLs kabhi kabhi "page load" timeout dete hain
+            # (player buffer karta rehta hai) — cookies phir bhi set ho
+            # chuke hote hain isliye ignore karke aage badho.
+            pass
+
+        # JS challenge / redirect / cookie-set hone ka thoda wait
+        time.sleep(4)
+
+        try:
+            result["final_url"] = driver.current_url or url
+        except Exception:
+            pass
+
+        try:
+            cookies = driver.get_cookies()
+            result["cookie_header"] = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+        except Exception as e:
+            LOGGER.warning(f"[URL] Cookie extraction failed: {e}")
+
+    except Exception as e:
+        result["error"] = str(e)
+        LOGGER.warning(f"[URL] Browser session capture failed for {url}: {e}")
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    return result
 
 
 async def _is_m3u8_url(url: str) -> bool:
@@ -1507,25 +1577,25 @@ def _format_hms(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
-def _ffmpeg_stream_header_args(url: str) -> list[str]:
+def _ffmpeg_stream_header_args(url: str, cookie_header: str = "") -> list[str]:
     """
     ffmpeg/ffprobe ke liye '-user_agent' aur '-headers' args banao taaki
     CDN 403 Forbidden na de (server browser jaisa User-Agent/Referer
     expect karta hai, jo ffmpeg ka default 'Lavf/...' UA nahi deta).
     Yeh -i se PEHLE lagne chahiye.
     """
-    headers = _default_stream_headers(url)
+    headers = _default_stream_headers(url, cookie_header=cookie_header)
     ua = headers.pop("User-Agent")
     header_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
     return ["-user_agent", ua, "-headers", header_str]
 
 
-async def _get_m3u8_duration(url: str) -> float:
+async def _get_m3u8_duration(url: str, cookie_header: str = "") -> float:
     """ffprobe se stream ki total duration (seconds) nikalo — progress % ke liye."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "error",
-            *_ffmpeg_stream_header_args(url),
+            *_ffmpeg_stream_header_args(url, cookie_header=cookie_header),
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             url,
@@ -1538,21 +1608,26 @@ async def _get_m3u8_duration(url: str) -> float:
         return 0.0
 
 
-async def _download_m3u8(url: str, filepath: str, msg: Message) -> str:
+async def _download_m3u8(url: str, filepath: str, msg: Message, cookie_header: str = "") -> str:
     """
     M3U8 (HLS) stream download karo — ffmpeg segments ko fetch karke
     ek single .mp4 file mein merge kar deta hai (re-encode nahi, sirf remux).
     Works with links like:
       https://.../480p/index.m3u8
+
+    Agar CDN 403 Forbidden de (bot-jaisa request block ho), to real Chrome
+    (Selenium) mein URL khol ke uska session cookie "borrow" karke ek
+    dobara try karta hai — jaise koi manually browser mein khol ke
+    download karta.
     """
     if not filepath.lower().endswith(".mp4"):
         filepath = os.path.splitext(filepath)[0] + ".mp4"
 
-    duration = await _get_m3u8_duration(url)
+    duration = await _get_m3u8_duration(url, cookie_header=cookie_header)
 
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        *_ffmpeg_stream_header_args(url),
+        *_ffmpeg_stream_header_args(url, cookie_header=cookie_header),
         "-i", url,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
@@ -1564,7 +1639,7 @@ async def _download_m3u8(url: str, filepath: str, msg: Message) -> str:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
 
     last_edit = time.time()
@@ -1589,17 +1664,38 @@ async def _download_m3u8(url: str, filepath: str, msg: Message) -> str:
                 pass
             last_edit = time.time()
 
+    stderr_bytes = await proc.stderr.read()
     await proc.wait()
+    stderr_text = stderr_bytes.decode(errors="ignore")
 
     if proc.returncode != 0 or not os.path.isfile(filepath) or os.path.getsize(filepath) == 0:
+        # 403 mila aur abhi tak browser session try nahi kiya → ab try karo
+        if not cookie_header and ("403" in stderr_text or "Forbidden" in stderr_text):
+            LOGGER.info("[URL] M3U8 got 403 — trying browser-session cookie fallback...")
+            try:
+                await msg.edit(
+                    "<b>⚠️ Direct download blocked (403)</b>\n"
+                    "<b>🌐 Chrome mein link khol ke session le rahe hain...</b>"
+                )
+            except Exception:
+                pass
+            loop = asyncio.get_event_loop()
+            session = await loop.run_in_executor(None, _capture_browser_session, url)
+            if session.get("cookie_header"):
+                LOGGER.info("[URL] Browser session captured, retrying M3U8 download with cookies...")
+                return await _download_m3u8(url, filepath, msg, cookie_header=session["cookie_header"])
+            else:
+                LOGGER.warning(f"[URL] Browser session capture gave no cookies: {session.get('error')}")
+
         raise RuntimeError(
             "M3U8 (HLS) download fail hua — ffmpeg error ya invalid/expired stream URL."
+            + (" (403 Forbidden — browser session se bhi fail hua)" if cookie_header else "")
         )
 
     return filepath
 
 
-async def _download_url(url: str, filename: str, msg: Message, orig_message: Message) -> str:
+async def _download_url(url: str, filename: str, msg: Message, orig_message: Message, cookie_header: str = "") -> str:
     """Download from URL with progress."""
     filename = _safe_filename(filename)  # Double safety — koi bhi caller se aaye
     filepath = os.path.join(download_dir, filename)
@@ -1610,14 +1706,16 @@ async def _download_url(url: str, filename: str, msg: Message, orig_message: Mes
             await msg.edit("<b>💠 M3U8 stream detected — merging segments...</b>")
         except Exception:
             pass
-        return await _download_m3u8(url, filepath, msg)
+        return await _download_m3u8(url, filepath, msg, cookie_header=cookie_header)
+
+    headers = _default_stream_headers(url, cookie_header=cookie_header)
 
     try:
         from pySmartDL import SmartDL
         from ..utils.display_progress import progress_for_url
         downloader = SmartDL(
             url, filepath, progress_bar=False, threads=10,
-            request_args={"headers": _default_stream_headers(url)},
+            request_args={"headers": headers},
         )
         downloader.start(blocking=False)
         while not downloader.isFinished():
@@ -1630,28 +1728,50 @@ async def _download_url(url: str, filename: str, msg: Message, orig_message: Mes
 
     # Fallback: aiohttp streaming download
     import aiohttp
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("content-length", 0))
-            downloaded = 0
-            last_edit = time.time()
-            with open(filepath, "wb") as f:
-                async for chunk in resp.content.iter_chunked(1024 * 512):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if time.time() - last_edit > 3:
-                        pct = int(downloaded * 100 / total) if total else 0
-                        bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-                        try:
-                            await msg.edit(
-                                f"<b>💠 Downloading...</b>\n{bar} {pct}%\n"
-                                f"<code>{downloaded // 1024 // 1024} MB</code>"
-                            )
-                        except Exception:
-                            pass
-                        last_edit = time.time()
-    return filepath
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                resp.raise_for_status()
+                total = int(resp.headers.get("content-length", 0))
+                downloaded = 0
+                last_edit = time.time()
+                with open(filepath, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(1024 * 512):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if time.time() - last_edit > 3:
+                            pct = int(downloaded * 100 / total) if total else 0
+                            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+                            try:
+                                await msg.edit(
+                                    f"<b>💠 Downloading...</b>\n{bar} {pct}%\n"
+                                    f"<code>{downloaded // 1024 // 1024} MB</code>"
+                                )
+                            except Exception:
+                                pass
+                            last_edit = time.time()
+        return filepath
+    except aiohttp.ClientResponseError as e:
+        # 403 mila aur abhi tak browser session try nahi kiya → ab try karo
+        if e.status == 403 and not cookie_header:
+            LOGGER.info("[URL] Direct download got 403 — trying browser-session cookie fallback...")
+            try:
+                await msg.edit(
+                    "<b>⚠️ Direct download blocked (403)</b>\n"
+                    "<b>🌐 Chrome mein link khol ke session le rahe hain...</b>"
+                )
+            except Exception:
+                pass
+            loop = asyncio.get_event_loop()
+            session_info = await loop.run_in_executor(None, _capture_browser_session, url)
+            if session_info.get("cookie_header"):
+                LOGGER.info("[URL] Browser session captured, retrying direct download with cookies...")
+                return await _download_url(
+                    url, filename, msg, orig_message,
+                    cookie_header=session_info["cookie_header"],
+                )
+            LOGGER.warning(f"[URL] Browser session capture gave no cookies: {session_info.get('error')}")
+        raise
 
 
 async def _ffmpeg_process(input_path: str, output_path: str, extra_args: list, msg: Message) -> str | None:
