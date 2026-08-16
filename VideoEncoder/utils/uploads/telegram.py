@@ -74,7 +74,12 @@ async def _make_uploader_client(user_id: int):
             api_id=api_id,
             api_hash=api_hash,
             in_memory=True,
-            max_concurrent_transmissions=4,  # FIX: 20 → 4 (app client mein yeh already fix tha, yahan reh gaya tha — isi se deadlock + pyrogram_patch.py ki zaroorat padi thi)
+            # Was 4 (deadlock-safety fix from an old 20 value). App's main
+            # client runs stable at 8 (see VideoEncoder/__init__.py), so 6
+            # here is a moderate boost for upload speed while staying below
+            # that proven-stable number — safer on a 1GB/2-core box where
+            # this per-file client is created fresh for every upload.
+            max_concurrent_transmissions=6,
             workers=32,
             sleep_threshold=60,
         )
