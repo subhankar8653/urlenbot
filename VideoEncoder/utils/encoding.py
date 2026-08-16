@@ -170,7 +170,9 @@ async def parallel_encode(filepath, message, msg, audio_map=None):
     # available CPU cores, not by video length. Capped at 6 so the host
     # doesn't split into pointlessly tiny chunks or run out of RAM running
     # too many encoders at once.
-    n_segments = min(cpu_count, 6)
+    # TEMP TEST: forced to 4 regardless of detected cores (2) to compare
+    # against the auto-detected count — revert to `min(cpu_count, 6)` after.
+    n_segments = 4
     if n_segments < 2 or duration < 1:
         return None
 
