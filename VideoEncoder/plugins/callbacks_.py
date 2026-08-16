@@ -248,6 +248,22 @@ async def callback_handlers(bot: Client, cb: CallbackQuery):
                 await cb.answer("H265 need more time for encoding video", show_alert=True)
             await VideoSettings(cb.message, user_id=cb.from_user.id)
 
+        # Parallel (segmented) encoding
+        elif cb.data == "triggerParallel":
+            if await db.get_parallel(cb.from_user.id):
+                await db.set_parallel(cb.from_user.id, parallel=False)
+            else:
+                await db.set_parallel(cb.from_user.id, parallel=True)
+                await cb.answer(
+                    "Long videos ke liye video ko chunks mein split karke "
+                    "sabhi CPU cores pe parallel encode karega, phir merge "
+                    "karega. Audio/Subtitles hamesha poori file se, ek hi "
+                    "baar process hote hain — desync nahi hoga. Hardsub / "
+                    "multi-audio-select ke sath ye off rehta hai (safety).",
+                    show_alert=True
+                )
+            await VideoSettings(cb.message, user_id=cb.from_user.id)
+
         # Tune
         elif cb.data == "triggertune":
             if await db.get_tune(cb.from_user.id):
