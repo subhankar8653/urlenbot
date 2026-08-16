@@ -1349,6 +1349,29 @@ async def apply_urlpreset_to_file(filepath: str, user_id: int, msg: Message) -> 
 
 # ─── Helper functions ─────────────────────────────────────────────────────────
 
+# Kai CDNs (jaise is user ka publicfile.com) requests ko 403 Forbidden kar
+# dete hain agar request mein browser jaisa User-Agent na ho — bots/scripts
+# ka default User-Agent (aiohttp/ffmpeg ka apna) block ho jata hai. Isliye
+# saari URL requests (sniff, ffprobe, ffmpeg download) mein yeh same
+# browser-like header bhejte hain taaki server "asli browser" samjhe.
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def _default_stream_headers(url: str) -> dict:
+    """Common headers jo HLS/CDN links ke liye 403 se bachne mein madad karte hain."""
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    return {
+        "User-Agent": _BROWSER_UA,
+        "Referer": origin + "/",
+        "Origin": origin,
+        "Accept": "*/*",
+    }
+
+
 async def _is_m3u8_url(url: str) -> bool:
     """
     Check karo ki URL ek HLS (.m3u8) playlist hai ya nahi.
@@ -1373,7 +1396,8 @@ async def _is_m3u8_url(url: str) -> bool:
         try:
             import aiohttp
             async with aiohttp.ClientSession() as sess:
-                headers = {"Range": "bytes=0-1024"}
+                headers = _default_stream_headers(url)
+                headers["Range"] = "bytes=0-1024"
                 async with sess.get(
                     url, headers=headers, allow_redirects=True,
                     timeout=aiohttp.ClientTimeout(total=10)
@@ -1483,11 +1507,25 @@ def _format_hms(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
+def _ffmpeg_stream_header_args(url: str) -> list[str]:
+    """
+    ffmpeg/ffprobe ke liye '-user_agent' aur '-headers' args banao taaki
+    CDN 403 Forbidden na de (server browser jaisa User-Agent/Referer
+    expect karta hai, jo ffmpeg ka default 'Lavf/...' UA nahi deta).
+    Yeh -i se PEHLE lagne chahiye.
+    """
+    headers = _default_stream_headers(url)
+    ua = headers.pop("User-Agent")
+    header_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+    return ["-user_agent", ua, "-headers", header_str]
+
+
 async def _get_m3u8_duration(url: str) -> float:
     """ffprobe se stream ki total duration (seconds) nikalo — progress % ke liye."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "error",
+            *_ffmpeg_stream_header_args(url),
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             url,
@@ -1514,6 +1552,7 @@ async def _download_m3u8(url: str, filepath: str, msg: Message) -> str:
 
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        *_ffmpeg_stream_header_args(url),
         "-i", url,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
@@ -1576,7 +1615,10 @@ async def _download_url(url: str, filename: str, msg: Message, orig_message: Mes
     try:
         from pySmartDL import SmartDL
         from ..utils.display_progress import progress_for_url
-        downloader = SmartDL(url, filepath, progress_bar=False, threads=10)
+        downloader = SmartDL(
+            url, filepath, progress_bar=False, threads=10,
+            request_args={"headers": _default_stream_headers(url)},
+        )
         downloader.start(blocking=False)
         while not downloader.isFinished():
             await progress_for_url(downloader, msg)
