@@ -148,6 +148,7 @@ async def VideoSettings(event: Message, user_id: int):
                      InlineKeyboardButton(f"Aspect: {'16:9' if ((await db.get_aspect(user_id)) is True) else 'Source'}", callback_data="triggeraspect")],
                     [InlineKeyboardButton(f"CABAC {'☑️' if ((await db.get_cabac(user_id)) is True) else ''}", callback_data="triggercabac"),
                      InlineKeyboardButton(f"Reframe: {reframe}", callback_data="triggerreframe")],
+                    [InlineKeyboardButton(f"⚡ Parallel Encode {'☑️' if ((await db.get_parallel(user_id)) is True) else ''}", callback_data="triggerParallel")],
                     [InlineKeyboardButton(
                         f"Back", callback_data="OpenSettings")]
                 ]
