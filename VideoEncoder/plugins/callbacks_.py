@@ -262,6 +262,43 @@ async def callback_handlers(bot: Client, cb: CallbackQuery):
                 )
             await VideoSettings(cb.message, user_id=cb.from_user.id)
 
+        # Fast Encode — one-tap preset. ON pe video+audio dono ka pura set
+        # exactly wahi ban jaata hai jo low-resource (1GB/2-core) machine ke
+        # liye best hai. OFF pe sirf flag hatta hai, pichli settings waisi
+        # hi rehti hain (revert nahi hoti).
+        elif cb.data == "triggerFastEncode":
+            if await db.get_fast_encode(cb.from_user.id):
+                await db.set_fast_encode(cb.from_user.id, fast_encode=False)
+                await cb.answer("🚀 Fast Encode OFF", show_alert=False)
+            else:
+                await db.set_fast_encode(cb.from_user.id, fast_encode=True)
+                uid = cb.from_user.id
+                # ── Video ──
+                await db.set_extensions(uid, extensions='MP4')
+                await db.set_bits(uid, bits=False)
+                await db.set_hevc(uid, hevc=False)
+                await db.set_crf(uid, crf=28)
+                await db.set_resolution(uid, resolution='480')
+                await db.set_tune(uid, tune=True)
+                await db.set_preset(uid, preset='vf')
+                await db.set_frame(uid, frame='23.976')
+                await db.set_aspect(uid, aspect=False)
+                await db.set_cabac(uid, cabac=False)
+                await db.set_reframe(uid, reframe='pass')
+                await db.set_parallel(uid, parallel=True)
+                # ── Audio: sab Source (pure copy, no re-encode) ──
+                await db.set_audio(uid, audio='copy')
+                await db.set_channels(uid, channels='source')
+                await db.set_samplerate(uid, sample='source')
+                await db.set_bitrate(uid, bitrate='source')
+                await cb.answer(
+                    "🚀 Fast Encode ON!\nVideo: H264 480p VeryFast CRF28, Animation tune.\n"
+                    "Audio: Source (copy).\nParallel: ≥30s videos -> 2 segments, "
+                    "<30s -> normal single-pass.",
+                    show_alert=True
+                )
+            await VideoSettings(cb.message, user_id=cb.from_user.id)
+
         # Tune
         elif cb.data == "triggertune":
             if await db.get_tune(cb.from_user.id):
