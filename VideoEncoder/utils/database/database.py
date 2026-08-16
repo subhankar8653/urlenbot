@@ -269,6 +269,19 @@ class Database:
         user = await self._get_user(id)
         return user.get('parallel', False)
 
+    # Fast Encode — one-tap preset button. When ON, forces:
+    # Video: H264, CRF 28, 480p, Tune Animation, Preset VeryFast, FPS 23.976,
+    #        Aspect Source, CABAC OFF, Reframe Pass, Parallel Encode ON.
+    # Audio: Codec/Channels/Sample Rate/Bitrate all Source (pure copy).
+    # Also changes the parallel-encode duration threshold (30s instead of
+    # 240s) and forces a fixed 2-segment split — see encoding.py.
+    async def set_fast_encode(self, id, fast_encode):
+        await self.col.update_one({'id': id}, {'$set': {'fast_encode': fast_encode}}, upsert=True)
+
+    async def get_fast_encode(self, id):
+        user = await self._get_user(id)
+        return user.get('fast_encode', False)
+
     # CRF
     async def get_crf(self, id):
         user = await self._get_user(id)
