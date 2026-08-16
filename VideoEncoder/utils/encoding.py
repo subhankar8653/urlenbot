@@ -161,8 +161,22 @@ async def _should_parallel_encode(filepath, message, audio_map):
     # the split/merge overhead is only worth it on longer videos.
     fast = await db.get_fast_encode(uid)
     threshold = 30 if fast else 240
-    if duration < threshold:
-        LOGGER.info(f"Parallel encode skipped: duration {duration}s < {threshold}s threshold.")
+
+    # File-size safety net: some containers/forwarded files report a bad or
+    # zero duration from ffprobe. A reasonably large file is almost always
+    # worth splitting even if duration-detection failed, so size alone can
+    # also trigger parallel mode (Fast Encode: >=10MB, Normal: >=100MB).
+    try:
+        size_mb = os.path.getsize(filepath) / (1024 * 1024)
+    except Exception:
+        size_mb = 0
+    size_threshold_mb = 10 if fast else 100
+
+    if duration < threshold and size_mb < size_threshold_mb:
+        LOGGER.info(
+            f"Parallel encode skipped: duration {duration}s < {threshold}s "
+            f"AND size {size_mb:.1f}MB < {size_threshold_mb}MB threshold."
+        )
         return False
     return True
 
