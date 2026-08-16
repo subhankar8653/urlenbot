@@ -1349,10 +1349,45 @@ async def apply_urlpreset_to_file(filepath: str, user_id: int, msg: Message) -> 
 
 # ─── Helper functions ─────────────────────────────────────────────────────────
 
-def _is_m3u8_url(url: str) -> bool:
-    """Check karo ki URL ek HLS (.m3u8) playlist hai ya nahi."""
+async def _is_m3u8_url(url: str) -> bool:
+    """
+    Check karo ki URL ek HLS (.m3u8) playlist hai ya nahi.
+
+    Pehle fast string check karta hai (".m3u8" URL mein ho).
+    Lekin kai CDN/providers (jaise publicfile.com/hls/... type links)
+    extension ko URL mein show hi nahi karte — path sirf
+    '/hls/<id>/<token>' jaisa hota hai, koi ".m3u8" ya koi bhi
+    extension nahi hota. Aise cases mein hum actual content sniff
+    karte hain: URL ka Content-Type ya pehle bytes check karke
+    dekhte hain ki wo ek M3U8 playlist (#EXTM3U) hai ya nahi.
+    """
     path = urlparse(url).path.lower()
-    return path.endswith(".m3u8") or ".m3u8" in url.lower()
+    if path.endswith(".m3u8") or ".m3u8" in url.lower():
+        return True
+
+    # Extension hidden/obfuscated ho sakta hai — content sniff karo
+    # jab path mein 'hls' ho ya URL ka koi file extension na ho.
+    has_ext = bool(os.path.splitext(path)[1])
+    looks_like_hls_path = "/hls/" in path or "hls" in path.split("/")
+    if looks_like_hls_path or not has_ext:
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as sess:
+                headers = {"Range": "bytes=0-1024"}
+                async with sess.get(
+                    url, headers=headers, allow_redirects=True,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    ctype = resp.headers.get("Content-Type", "").lower()
+                    if "mpegurl" in ctype or "x-mpegurl" in ctype or "m3u8" in ctype:
+                        return True
+                    chunk = await resp.content.read(1024)
+                    if b"#EXTM3U" in chunk:
+                        return True
+        except Exception as e:
+            LOGGER.warning(f"[URL] HLS content sniff failed for {url}: {e}")
+
+    return False
 
 
 async def _get_filename_from_url(url: str) -> str:
@@ -1375,7 +1410,7 @@ async def _get_filename_from_url(url: str) -> str:
 
     # Step 0: M3U8 stream — ye ek playlist hoti hai, actual video nahi.
     # Isse merge karke hamesha .mp4 banega, isliye naam bhi waise hi banao.
-    if _is_m3u8_url(url):
+    if await _is_m3u8_url(url):
         try:
             segs = [p for p in urlparse(url).path.split("/") if p and p.lower() != "index.m3u8"]
             base = segs[-1] if segs else "m3u8_video"
@@ -1531,7 +1566,7 @@ async def _download_url(url: str, filename: str, msg: Message, orig_message: Mes
     filepath = os.path.join(download_dir, filename)
 
     # ── M3U8 (HLS) stream — ffmpeg se segments merge karke download karo ──
-    if _is_m3u8_url(url):
+    if await _is_m3u8_url(url):
         try:
             await msg.edit("<b>💠 M3U8 stream detected — merging segments...</b>")
         except Exception:
