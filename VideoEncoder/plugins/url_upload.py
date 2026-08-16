@@ -18,7 +18,7 @@ import time
 import zipfile
 import tarfile
 import shutil
-from urllib.parse import unquote_plus
+from urllib.parse import unquote_plus, urlparse
 
 from pyrogram import Client, filters
 from pyrogram.types import (
@@ -1349,10 +1349,17 @@ async def apply_urlpreset_to_file(filepath: str, user_id: int, msg: Message) -> 
 
 # ─── Helper functions ─────────────────────────────────────────────────────────
 
+def _is_m3u8_url(url: str) -> bool:
+    """Check karo ki URL ek HLS (.m3u8) playlist hai ya nahi."""
+    path = urlparse(url).path.lower()
+    return path.endswith(".m3u8") or ".m3u8" in url.lower()
+
+
 async def _get_filename_from_url(url: str) -> str:
     """
     URL se real filename nikalo.
     Priority:
+    0. M3U8 (HLS) URL ho toh path segments se naam banao + .mp4 extension
     1. HTTP HEAD request ka Content-Disposition header (real filename hota hai)
     2. URL ke basename mein valid extension ho toh use karo
     3. Fallback: 'downloaded_file'
@@ -1365,6 +1372,18 @@ async def _get_filename_from_url(url: str) -> str:
     import re as _re
 
     VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".ts", ".m4v", ".wmv", ".webm"}
+
+    # Step 0: M3U8 stream — ye ek playlist hoti hai, actual video nahi.
+    # Isse merge karke hamesha .mp4 banega, isliye naam bhi waise hi banao.
+    if _is_m3u8_url(url):
+        try:
+            segs = [p for p in urlparse(url).path.split("/") if p and p.lower() != "index.m3u8"]
+            base = segs[-1] if segs else "m3u8_video"
+            base = _re.sub(r'[^A-Za-z0-9_\-]+', '_', base).strip('_')[:60] or "m3u8_video"
+        except Exception:
+            base = "m3u8_video"
+        LOGGER.info(f"[URL] M3U8 detected, filename: {base}.mp4")
+        return f"{base}.mp4"
 
     # Step 1: HEAD request se Content-Disposition check karo
     try:
@@ -1422,10 +1441,102 @@ def _safe_filename(name: str, max_len: int = 180) -> str:
     return safe
 
 
+def _format_hms(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+async def _get_m3u8_duration(url: str) -> float:
+    """ffprobe se stream ki total duration (seconds) nikalo — progress % ke liye."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        return float(out.decode().strip())
+    except Exception:
+        return 0.0
+
+
+async def _download_m3u8(url: str, filepath: str, msg: Message) -> str:
+    """
+    M3U8 (HLS) stream download karo — ffmpeg segments ko fetch karke
+    ek single .mp4 file mein merge kar deta hai (re-encode nahi, sirf remux).
+    Works with links like:
+      https://.../480p/index.m3u8
+    """
+    if not filepath.lower().endswith(".mp4"):
+        filepath = os.path.splitext(filepath)[0] + ".mp4"
+
+    duration = await _get_m3u8_duration(url)
+
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", url,
+        "-c", "copy",
+        "-bsf:a", "aac_adtstoasc",
+        "-progress", "pipe:1",
+        filepath,
+    ]
+    LOGGER.info(f"[URL] M3U8 download cmd: {' '.join(cmd)}")
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+    last_edit = time.time()
+
+    while True:
+        line = await proc.stdout.readline()
+        if not line:
+            break
+        line = line.decode(errors="ignore").strip()
+        if line.startswith("out_time_ms=") and time.time() - last_edit > 3:
+            try:
+                done_sec = int(line.split("=")[1]) / 1_000_000
+                if duration > 0:
+                    pct = min(99, int(done_sec * 100 / duration))
+                    bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+                    txt = (f"<b>💠 Downloading (HLS)...</b>\n{bar} {pct}%\n"
+                           f"<code>{_format_hms(done_sec)} / {_format_hms(duration)}</code>")
+                else:
+                    txt = f"<b>💠 Downloading (HLS)...</b>\n<code>{_format_hms(done_sec)} elapsed</code>"
+                await msg.edit(txt)
+            except Exception:
+                pass
+            last_edit = time.time()
+
+    await proc.wait()
+
+    if proc.returncode != 0 or not os.path.isfile(filepath) or os.path.getsize(filepath) == 0:
+        raise RuntimeError(
+            "M3U8 (HLS) download fail hua — ffmpeg error ya invalid/expired stream URL."
+        )
+
+    return filepath
+
+
 async def _download_url(url: str, filename: str, msg: Message, orig_message: Message) -> str:
     """Download from URL with progress."""
     filename = _safe_filename(filename)  # Double safety — koi bhi caller se aaye
     filepath = os.path.join(download_dir, filename)
+
+    # ── M3U8 (HLS) stream — ffmpeg se segments merge karke download karo ──
+    if _is_m3u8_url(url):
+        try:
+            await msg.edit("<b>💠 M3U8 stream detected — merging segments...</b>")
+        except Exception:
+            pass
+        return await _download_m3u8(url, filepath, msg)
 
     try:
         from pySmartDL import SmartDL
