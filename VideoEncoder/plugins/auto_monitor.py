@@ -728,6 +728,90 @@ async def _get_swift_url_for_episode(page_url: str, episode_num: int, status_msg
 
 
 # ─────────────────────────────────────────────
+#  NEW Format Detection — Title/Genre/Audio/Dub template
+#  ─────────────────────────────────────────────
+#  RTI ne recently ek naya post template shuru kiya hai jahan
+#  plain URL text mein nahi hota — balki pehle row ke inline
+#  button (Download & Watch) mein hota hai. Structure kuch aisi:
+#
+#     🔥 Episode 3 Added!
+#     ━━━━━━━━━━━━━━━━━━━━━━
+#     🎬 Title: Mob Psycho 100 – Season 3
+#     🗣 Genre: Action, Comedy, ...
+#     🔊 Audio: Hindi | Tamil | Telugu
+#     🎙 Dub By: Muse India
+#     ━━━━━━━━━━━━━━━━━━━━━━
+#
+#  Ya tree-style:
+#     ├ 📌 Episode 19-21 Added!
+#     ├ 🎬 Title: Captain Tsubasa – Season 2
+#     ├ 🗣 Genre: Sports, Drama, School, Shounen
+#     ├ 🔊 Audio: Hindi
+#     ├ 🎙 Dub By: Anime Times
+#
+#  Purana format (plain "Episode X-Y Added! <url>") bilkul
+#  waisa hi chalta rahega — yeh sirf ek NAYA extra detection
+#  path hai, purane wale ko kuch nahi hua.
+#
+#  Sirf HINDI audio wale posts process karne hain — agar
+#  "Audio:" line mein Hindi nahi hai (sirf Tamil/Telugu/etc)
+#  toh us post ko skip kar do.
+# ─────────────────────────────────────────────
+_NEW_FMT_EP_RE    = re.compile(r'episode\s*(\d+)(?:\s*[-\u2013]\s*(\d+))?\s*added', re.IGNORECASE)
+_NEW_FMT_TITLE_RE = re.compile(r'title\s*:\s*(.+)', re.IGNORECASE)
+_NEW_FMT_AUDIO_RE = re.compile(r'audio\s*:\s*(.+)', re.IGNORECASE)
+
+
+def _extract_new_format_url(message: Message) -> str | None:
+    """Post ke inline keyboard se pehla valid URL button nikalo
+    (usually pehli row ka 'Download & Watch' button)."""
+    markup = message.reply_markup
+    if not markup or not getattr(markup, 'inline_keyboard', None):
+        return None
+    for row in markup.inline_keyboard:
+        for btn in row:
+            btn_url = getattr(btn, 'url', None)
+            if btn_url and btn_url.startswith('http'):
+                return btn_url
+    return None
+
+
+def _extract_new_format_info(message: Message, text: str) -> tuple[str, tuple[int, int], str] | None:
+    """
+    Naya Title/Genre/Audio/Dub template detect + parse karo.
+    Returns (url, (start_ep, end_ep), match_text) ya None agar
+    format match nahi hua / Hindi audio nahi hai / button nahi mila.
+    """
+    title_m = _NEW_FMT_TITLE_RE.search(text)
+    audio_m = _NEW_FMT_AUDIO_RE.search(text)
+    ep_m    = _NEW_FMT_EP_RE.search(text)
+
+    if not (title_m and audio_m and ep_m):
+        return None
+
+    # ── Sirf Hindi audio wale posts ──
+    audio_line = audio_m.group(1)
+    if 'hindi' not in audio_line.lower():
+        LOGGER.info(f"[AutoMonitor] NEW-format post skip (no Hindi audio): {audio_line.strip()[:60]}")
+        return None
+
+    # ── URL button se nikalo (text mein URL nahi hota is format mein) ──
+    url = _extract_new_format_url(message)
+    if not url:
+        LOGGER.info("[AutoMonitor] NEW-format post skip (no URL button found)")
+        return None
+
+    start_ep = int(ep_m.group(1))
+    end_ep   = int(ep_m.group(2)) if ep_m.group(2) else start_ep
+
+    # Matching ke liye sirf Title line use karo — Genre/Dub By text
+    # mein galti se koi dusra registered anime name match na ho jaaye
+    match_text = title_m.group(1).strip()
+
+    return url, (start_ep, end_ep), match_text
+
+
+# ─────────────────────────────────────────────
 #  Monitor Channel Message Handler
 # ─────────────────────────────────────────────
 @Client.on_message(
@@ -737,6 +821,11 @@ async def auto_monitor_handler(client: Client, message: Message):
     """
     Monitor channel pe message aaya → check karo.
     RTI URL + episode info mila → process karo.
+
+    Do formats support karta hai:
+      1. OLD — "Episode X-Y Added! <url>" (url plain text mein)
+      2. NEW — Title/Genre/Audio/Dub template (url inline button mein,
+         sirf Hindi audio wale posts process hote hain)
     """
     monitor_ch = await _get_monitor_channel()
     if not monitor_ch:
@@ -751,29 +840,35 @@ async def auto_monitor_handler(client: Client, message: Message):
 
     LOGGER.info(f"[AutoMonitor] Message in monitor channel: {text[:100]}")
 
+    # ── Format 1: OLD — plain "Episode X-Y Added! <url>" ──
     url = _extract_url(text)
-    if not url:
-        return
+    ep_info = _extract_episodes(text) if url else None
+    match_text = text
+    fmt_label = "OLD"
 
-    ep_info = _extract_episodes(text)
-    if not ep_info:
-        return
+    if not (url and ep_info):
+        # ── Format 2: NEW — Title/Genre/Audio/Dub template ──
+        new_fmt = _extract_new_format_info(message, text)
+        if not new_fmt:
+            return
+        url, ep_info, match_text = new_fmt
+        fmt_label = "NEW"
 
     start_ep, end_ep = ep_info
     anime_list = await _get_anime_list()
     if not anime_list:
         return
 
-    matched = _find_matching_anime(text + " " + url, anime_list)
+    matched = _find_matching_anime(match_text + " " + url, anime_list)
     if not matched:
-        LOGGER.info(f"[AutoMonitor] No anime match for: {text[:80]}")
+        LOGGER.info(f"[AutoMonitor] No anime match ({fmt_label} format) for: {match_text[:80]}")
         return
 
     anime_name = matched['anime_name']
     channel_id = matched['channel_id']
     oid = await _owner_id()
 
-    LOGGER.info(f"[AutoMonitor] ✅ Match: {anime_name} | Ep {start_ep}–{end_ep}")
+    LOGGER.info(f"[AutoMonitor] ✅ Match ({fmt_label}): {anime_name} | Ep {start_ep}–{end_ep}")
 
     total = end_ep - start_ep + 1
 
