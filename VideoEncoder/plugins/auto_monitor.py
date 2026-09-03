@@ -757,9 +757,21 @@ async def _get_swift_url_for_episode(page_url: str, episode_num: int, status_msg
 #  "Audio:" line mein Hindi nahi hai (sirf Tamil/Telugu/etc)
 #  toh us post ko skip kar do.
 # ─────────────────────────────────────────────
-_NEW_FMT_EP_RE    = re.compile(r'episode\s*(\d+)(?:\s*[-\u2013]\s*(\d+))?\s*added', re.IGNORECASE)
+#  FIX (Sept 3): Pehle yeh regex episode number ke turant baad literal
+#  "added" maangta tha — isliye "Episode 9 Added!" wale posts detect ho
+#  jaate the, lekin "Episode 9 Hindi DUB Fixed + ZIP Repacked!" jaise
+#  posts (jahan "added" word hi nahi hota, ya kahin aur hota hai) miss ho
+#  jaate the. Ab sirf "Episode <num>[-<num>]" match karta hai, chaahe
+#  uske baad "Added!" ho, "Fixed + ZIP Repacked!" ho, ya kuch bhi.
+_NEW_FMT_EP_RE    = re.compile(r'episode\s*(\d+)(?:\s*[-\u2013]\s*(\d+))?', re.IGNORECASE)
 _NEW_FMT_TITLE_RE = re.compile(r'title\s*:\s*(.+)', re.IGNORECASE)
 _NEW_FMT_AUDIO_RE = re.compile(r'audio\s*:\s*(.+)', re.IGNORECASE)
+#  Dub vs Sub detection — RTI ke posts mein "🎙 Dub By: ..." line hoti
+#  hai dubbed releases ke liye, aur "Sub By: ..." (ya similar) subbed
+#  releases ke liye. Hindi SUB/subbed posts skip karne hain, sirf Hindi
+#  DUB wale process karne hain.
+_NEW_FMT_DUBBY_RE = re.compile(r'\bdub\s*by\s*:', re.IGNORECASE)
+_NEW_FMT_SUBBY_RE = re.compile(r'\bsub\s*by\s*:', re.IGNORECASE)
 
 
 def _extract_new_format_url(message: Message) -> str | None:
@@ -793,6 +805,15 @@ def _extract_new_format_info(message: Message, text: str) -> tuple[str, tuple[in
     audio_line = audio_m.group(1)
     if 'hindi' not in audio_line.lower():
         LOGGER.info(f"[AutoMonitor] NEW-format post skip (no Hindi audio): {audio_line.strip()[:60]}")
+        return None
+
+    # ── Sirf Hindi DUB wale posts — Sub/Subbed skip karo ──
+    # "Sub By:" line mile aur "Dub By:" na mile → yeh ek subbed release
+    # hai, isse process nahi karna. Agar "Dub By:" line mil jaaye (jyada
+    # reliable signal) toh dub hi maano, chahe kahin "sub" word bhi ho
+    # (e.g. "subscribe", "ZIP Repacked" mein nahi hota but future-proofing).
+    if _NEW_FMT_SUBBY_RE.search(text) and not _NEW_FMT_DUBBY_RE.search(text):
+        LOGGER.info(f"[AutoMonitor] NEW-format post skip (Sub, not Dub): {text[:80]}")
         return None
 
     # ── URL button se nikalo (text mein URL nahi hota is format mein) ──
