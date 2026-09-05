@@ -345,6 +345,30 @@ class Database:
     async def clear_swap(self, id):
         await self.col.update_one({'id': id}, {'$set': {'swap_rules': {}}}, upsert=True)
 
+    # Caption Blacklist (words/tags to strip from auto-generated captions/filenames)
+    async def get_blacklist(self, id) -> list:
+        user = await self._get_user(id)
+        return user.get('caption_blacklist', [])
+
+    async def set_blacklist(self, id, words: list):
+        await self.col.update_one({'id': id}, {'$set': {'caption_blacklist': words}}, upsert=True)
+
+    async def add_blacklist_word(self, id, word: str):
+        words = await self.get_blacklist(id)
+        if word.lower() not in [w.lower() for w in words]:
+            words.append(word)
+            await self.set_blacklist(id, words)
+        return words
+
+    async def remove_blacklist_word(self, id, word: str):
+        words = await self.get_blacklist(id)
+        words = [w for w in words if w.lower() != word.lower()]
+        await self.set_blacklist(id, words)
+        return words
+
+    async def clear_blacklist(self, id):
+        await self.col.update_one({'id': id}, {'$set': {'caption_blacklist': []}}, upsert=True)
+
     # Cover Pic
     async def set_coverpic(self, id, file_id):
         await self.col.update_one({'id': id}, {'$set': {'coverpic': file_id}}, upsert=True)
