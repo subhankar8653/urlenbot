@@ -9,6 +9,11 @@ import json
 import os
 
 
+# Hardcoded default blacklist — words/tags that get stripped from anime name
+# no matter what, regardless of where they appear in the filename (start,
+# middle, brackets, or bare). Users can add more via /blacklist.
+DEFAULT_BLACKLIST = ["RareToonsIndia"]
+
 LANG_MAP = {
     'hin': 'Hindi', 'jpn': 'Japanese', 'eng': 'English',
     'tel': 'Telugu', 'tam': 'Tamil', 'ben': 'Bengali',
@@ -49,6 +54,34 @@ _IN_LANG_RE = re.compile(
     r'(?:\s*\+\s*(?:' + '|'.join(re.escape(l) for l in _LANG_ALTS) + r'))*\b',
     re.IGNORECASE
 )
+
+
+def strip_blacklist(text, blacklist=None):
+    """
+    Blacklist ke words filename/caption se hata do — chahe woh kahin bhi ho
+    (start, middle, end, brackets ke andar ya bina brackets ke bare text).
+    Case-insensitive. Bracket wrapper bhi saath mein hata di jaati hai
+    agar blacklist word akela hi bracket ke andar ho, e.g. "[RareToonsIndia]".
+    """
+    words = list(DEFAULT_BLACKLIST)
+    if blacklist:
+        for w in blacklist:
+            if w and w.lower() not in [x.lower() for x in words]:
+                words.append(w)
+
+    for word in words:
+        if not word:
+            continue
+        esc = re.escape(word.strip())
+        if not esc:
+            continue
+        # 1. Bracket-wrapped occurrence: [RareToonsIndia] / (RareToonsIndia)
+        text = re.sub(r'[\[\(]\s*' + esc + r'\s*[\]\)]', '', text, flags=re.IGNORECASE)
+        # 2. Bare occurrence anywhere (word boundary-ish, works with spaces/dots/dashes/underscores)
+        text = re.sub(esc, '', text, flags=re.IGNORECASE)
+
+    text = re.sub(r'\s+', ' ', text).strip(' .-_')
+    return text
 
 
 def get_media_metadata(filepath):
@@ -184,12 +217,25 @@ def detect_quality(metadata, current_resolution=None):
     return detect_quality_from_metadata(metadata)
 
 
-def extract_anime_info(filename, metadata):
+def extract_anime_info(filename, metadata, blacklist=None):
     """
     Anime name HAMESHA filename se lo.
     Metadata title IGNORE - woh group ka promo text ho sakta hai.
+
+    blacklist: extra words (site names, uploader tags) jo user ne
+    /blacklist se add kiye hain — inhe bhi hata denge, kahin bhi hon.
     """
     name = os.path.splitext(os.path.basename(filename))[0]
+
+    # Step -2: Underscores ko space treat karo (anime filenames mein '_'
+    # usually space ka substitute hota hai — "AnimeName_360P_SD" jaisa).
+    # Isse aage quality/word-boundary regexes sahi se match karte hain.
+    name = name.replace('_', ' ')
+    name = re.sub(r'\s+', ' ', name).strip()
+
+    # Step -1: Blacklisted words/tags hata do (RareToonsIndia jaise site
+    # names) — chahe woh kahin bhi hon, bracket ke andar ya bare text.
+    name = strip_blacklist(name, blacklist)
 
     # Step 0: Agar naam mein pehle se hi "in Japanese" jaisa plain-text
     # language phrase baked-in hai (previous auto-caption run se), usse
@@ -219,6 +265,15 @@ def extract_anime_info(filename, metadata):
 
     name = remove_lang_brackets(name)
 
+    # Step 3b: Koi bhi baaki bacha hua [...] square-bracket group — yeh
+    # almost hamesha ek uploader/site/group tag hota hai (e.g.
+    # "[RareToonsIndia]", "[ToonWorld4All]"), chahe woh naam ke beech
+    # mein hi kyun na ho (sirf start/end tak limited nahi). Round
+    # brackets ()  ko chhedte nahi — woh usually year "(2025)" jaisi
+    # useful info rakhte hain.
+    name = re.sub(r'\[[^\]]*\]', '', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+
     # Step 4: Season/Episode detect
     season = None
     episode = None
@@ -241,9 +296,20 @@ def extract_anime_info(filename, metadata):
     anime_name = re.sub(r'\[[^\]]+\]\s*$', '', anime_name).strip()
     anime_name = re.sub(r'\([^\)]+\)\s*$', '', anime_name).strip()
 
-    # Step 6: Quality tags naam se remove
+    # Step 6: Quality/source tags naam se remove.
+    # 360p/240p/144p bhi cover karo (word-boundary safe hai kyunki
+    # underscores upar hi space mein convert ho chuke).
     anime_name = re.sub(
-        r'(2160p|1080p|720p|480p|4K|HEVC|x264|x265|WEB-DL|BluRay|HDRip)',
+        r'\b(2160p|1080p|720p|480p|360p|240p|144p|4K|8K|FHD|UHD|HDRip|'
+        r'BluRay|BDRip|BRRip|DVDRip|WEB-?DL|WEBRip|HEVC|x264|x265|'
+        r'H\.?264|H\.?265)\b',
+        '', anime_name, flags=re.IGNORECASE
+    )
+    # Bare "HD"/"SD" quality tags — sirf tab remove karo jab woh title ke
+    # SHURU mein na hon (kuch anime titles literally "SD Gundam..." se
+    # shuru hote hain — waha "SD" naam ka hissa hai, quality tag nahi).
+    anime_name = re.sub(
+        r'(?<!^)\b(HD|SD)\b',
         '', anime_name, flags=re.IGNORECASE
     )
     anime_name = re.sub(r'\s+', ' ', anime_name).strip(' .-_')
@@ -251,7 +317,8 @@ def extract_anime_info(filename, metadata):
     return anime_name, season, episode
 
 
-def build_auto_caption(filepath, resolution=None, channel='@SBANIME', override_filename=None, has_eng_sub=False):
+def build_auto_caption(filepath, resolution=None, channel='@SBANIME', override_filename=None,
+                        has_eng_sub=False, blacklist=None):
     """
     Format: AnimeName S02E06 in Hindi 1080p [@SBANIME].mp4
             AnimeName S02E06 in Hindi 1080p [@SBANIME] Esub.mp4  (has_eng_sub=True)
@@ -266,6 +333,10 @@ def build_auto_caption(filepath, resolution=None, channel='@SBANIME', override_f
 
     has_eng_sub:
       - True ho toh caption ke end mein 'Esub' add hoga (extension se pehle)
+
+    blacklist:
+      - Extra words (list[str]) jo user ke /blacklist se aaye hain — inhe
+        DEFAULT_BLACKLIST ke saath merge karke anime name se hata denge.
     """
     metadata = get_media_metadata(filepath)
     # override_filename diya toh usse parse karo, warna actual file ka naam
@@ -273,7 +344,7 @@ def build_auto_caption(filepath, resolution=None, channel='@SBANIME', override_f
     # Extension strip karo pehle (double .mp4 problem fix)
     base_filename = os.path.splitext(filename)[0]
 
-    anime_name, season, episode = extract_anime_info(filename, metadata)
+    anime_name, season, episode = extract_anime_info(filename, metadata, blacklist=blacklist)
     quality = detect_quality(metadata, resolution)
     # Language detect: pehle override_filename se, phir actual filepath se
     langs = detect_language(filename, metadata)
@@ -374,7 +445,8 @@ def clean_caption(caption):
     return text
 
 
-def smart_caption(original_caption, filepath, resolution=None, channel='@SBANIME', has_eng_sub=False):
+def smart_caption(original_caption, filepath, resolution=None, channel='@SBANIME', has_eng_sub=False,
+                   blacklist=None):
     """
     Har case mein clean auto-caption banao.
 
@@ -386,6 +458,8 @@ def smart_caption(original_caption, filepath, resolution=None, channel='@SBANIME
        AnimeName S02E01 in Hindi 480p [@SBANIME] Esub.mp4  (has_eng_sub=True)
 
     has_eng_sub: True ho toh caption ke end mein 'Esub' add hoga
+    blacklist: extra words jo user ke /blacklist se aaye hain (DEFAULT_BLACKLIST
+               ke upar merge honge) — build_auto_caption() ko pass ho jaayenge.
     """
     # Source: original caption hai toh use karo, warna actual filename
     raw = (original_caption or '').strip()
@@ -415,4 +489,5 @@ def smart_caption(original_caption, filepath, resolution=None, channel='@SBANIME
         channel=channel,
         override_filename=temp_filename,   # cleaned naam pass karo
         has_eng_sub=has_eng_sub,
+        blacklist=blacklist,
     )
