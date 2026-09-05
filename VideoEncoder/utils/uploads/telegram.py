@@ -246,7 +246,8 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
     else:
         original_caption = raw_text or os.path.splitext(filename)[0]
 
-    caption = smart_caption(original_caption, new_file, resolution)
+    user_blacklist = await db.get_blacklist(message.from_user.id)
+    caption = smart_caption(original_caption, new_file, resolution, blacklist=user_blacklist)
     caption = await apply_swap(caption, message.from_user.id)
     bold_caption = f'<b>{caption}</b>'
 
