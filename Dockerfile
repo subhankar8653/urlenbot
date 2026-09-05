@@ -1,4 +1,4 @@
-FROM python:3.10-slim-bullseye
+FROM python:3.10-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ="Asia/Kolkata"
@@ -6,11 +6,19 @@ ENV TZ="Asia/Kolkata"
 WORKDIR /app
 
 # System packages — chromium + chromedriver for Swift downloader
-RUN apt-get update && apt-get install -y \
+# --fix-missing + retry: guards against transient 404s from the Debian
+# security-repo CDN (stale index vs pool mismatch) without needing a rebuild
+RUN apt-get update && \
+    (apt-get install -y --fix-missing \
     ffmpeg git wget pv jq python3-dev megatools \
     mediainfo gcc libsm6 libxext6 \
     libfontconfig1 libxrender1 libgl1-mesa-glx \
     chromium chromium-driver \
+    || (apt-get update && apt-get install -y \
+    ffmpeg git wget pv jq python3-dev megatools \
+    mediainfo gcc libsm6 libxext6 \
+    libfontconfig1 libxrender1 libgl1-mesa-glx \
+    chromium chromium-driver)) \
  && rm -rf /var/lib/apt/lists/*
 
 # Selenium ko bata do ke system chromium use karo (selenium-manager mat chalao)
