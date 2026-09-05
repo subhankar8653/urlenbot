@@ -79,6 +79,25 @@ def memory_file(name=None, contents=None, *, bytes=True):
 # Check Folder
 if not os.path.isdir(download_dir):
     os.makedirs(download_dir)
+else:
+    # Purani crashed/leftover session folders saaf karo — agar bot beech
+    # process (download/chrome session) mein crash ya redeploy hua tha,
+    # unke temp folders (swift_*, monitor_ep*, chrome ke disposable
+    # profile _chrome_tmp) disk pe reh gaye ho sakte hain. Fresh start pe
+    # hamesha inhe wipe karo, warna yeh gradually storage bharte rehte
+    # hain jab tak redeploy na ho (jo purane symptom ki wajah thi).
+    import glob as _glob
+    for _leftover in (
+        _glob.glob(os.path.join(download_dir, "swift_*"))
+        + _glob.glob(os.path.join(download_dir, "monitor_ep*"))
+        + [os.path.join(download_dir, "_chrome_tmp")]
+    ):
+        try:
+            if os.path.isdir(_leftover):
+                import shutil as _shutil
+                _shutil.rmtree(_leftover, ignore_errors=True)
+        except Exception:
+            pass
 if not os.path.isdir(encode_dir):
     os.makedirs(encode_dir)
 
