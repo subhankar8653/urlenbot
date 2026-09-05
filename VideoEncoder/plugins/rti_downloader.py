@@ -5,6 +5,9 @@ Commands:
   /rti <url>                -> Latest episode auto-detect + download
   /rti <url> <start> <end>  -> Episode range download
   /rti <url> 5 5            -> Sirf episode 5
+  /rti <url> 0 0            -> MOVIE mode — episode number dhundhta hi
+                                nahi, seedha page pe jo WatchMultQuality
+                                link mile use utha leta hai
 """
 
 import asyncio
@@ -154,6 +157,21 @@ def get_watchmult_link(page_url: str, episode_num: int):
 
         title_tag = soup.find("h1", class_="entry-title")
         anime_title = title_tag.text.strip() if title_tag else "Unknown Anime"
+
+        # ── MOVIE MODE (episode_num == 0) ──
+        # Movies ke page pe "Episode N" jaisa koi text hota hi nahi
+        # (seedha "Hindi – Download" ke baad "WatchMultiQuality" heading
+        # aa jaati hai). Aise pages ke liye episode number dhundhne ki
+        # koshish karna hi galat hai — /rti <url> 0 0 use karo, tab
+        # seedha poore page pe jo bhi WatchMultQuality link mile
+        # (audio-priority ke hisaab se best) utha lo, episode text
+        # match kiye bina.
+        if episode_num == 0:
+            all_links = _find_wmq_links(soup)
+            best = _best_link(all_links)
+            if best:
+                return best["href"], anime_title
+            return None, None
 
         for p in soup.find_all("p"):
             text = p.get_text(" ", strip=True)
@@ -376,6 +394,10 @@ async def _process_episode(client, message, page_url, episode_num, total_episode
     """
     loop = asyncio.get_event_loop()
 
+    # Movie mode (episode_num == 0) mein status messages "Ep 0" ki jagah
+    # "Movie" dikhayenge — zyada readable hai
+    ep_label = "Movie" if episode_num == 0 else f"Ep {episode_num}"
+
     # ── Swift URL nikalne ke liye retry constants ──
     SWIFT_MAX_ATTEMPTS   = 5    # 5 baar try karo
     SWIFT_RETRY_INTERVAL = 60   # har attempt ke beech 60s wait
@@ -386,7 +408,7 @@ async def _process_episode(client, message, page_url, episode_num, total_episode
         # Step 1: WatchMultQuality link
         try:
             await status_msg.edit(
-                f"🔍 **Ep {episode_num}/{total_episodes}**\n"
+                f"🔍 **{ep_label}/{total_episodes}**\n"
                 f"Attempt `{attempt}/{SWIFT_MAX_ATTEMPTS}` — WatchMultQuality link dhundh raha hoon..."
             )
         except Exception:
@@ -398,7 +420,7 @@ async def _process_episode(client, message, page_url, episode_num, total_episode
             # Step 2: Argon link
             try:
                 await status_msg.edit(
-                    f"🔍 **Ep {episode_num}/{total_episodes}**\n"
+                    f"🔍 **{ep_label}/{total_episodes}**\n"
                     f"Attempt `{attempt}/{SWIFT_MAX_ATTEMPTS}` — Argon link extract ho raha hai..."
                 )
             except Exception:
@@ -417,7 +439,7 @@ async def _process_episode(client, message, page_url, episode_num, total_episode
             # Sabhi attempts khatam — HARD STOP signal bhejo
             try:
                 await status_msg.edit(
-                    f"🛑 **Ep {episode_num} — Complete Fail**\n\n"
+                    f"🛑 **{ep_label} — Complete Fail**\n\n"
                     f"❌ `{SWIFT_MAX_ATTEMPTS}` attempts ke baad bhi Swift URL nahi mila.\n"
                     f"⛔ Agle episodes **band** kar diye gaye.\n"
                     f"RTI pe manually check karo."
@@ -430,7 +452,7 @@ async def _process_episode(client, message, page_url, episode_num, total_episode
         remaining = SWIFT_MAX_ATTEMPTS - attempt
         try:
             await status_msg.edit(
-                f"⏳ **Ep {episode_num}/{total_episodes}**\n\n"
+                f"⏳ **{ep_label}/{total_episodes}**\n\n"
                 f"🔄 Attempt `{attempt}/{SWIFT_MAX_ATTEMPTS}` fail — link nahi mila\n"
                 f"⏰ `{SWIFT_RETRY_INTERVAL}s` baad retry... (`{remaining}` attempts baki)"
             )
@@ -442,17 +464,17 @@ async def _process_episode(client, message, page_url, episode_num, total_episode
     # ── Swift URL mil gaya — download + upload ──
     try:
         await message.reply(
-            f"🔗 **Ep {episode_num} — Swift Link**\n\n"
+            f"🔗 **{ep_label} — Swift Link**\n\n"
             f"`{swift_url}`\n\n"
             f"⬇️ Ab download shuru ho raha hai..."
         )
         await _run_rti_swift(client, message, swift_url, status_msg, ep_num=episode_num, total_eps=total_episodes)
         return "ok"
     except Exception as e:
-        LOGGER.error(f"[RTI] Ep {episode_num} download/upload error: {e}")
+        LOGGER.error(f"[RTI] {ep_label} download/upload error: {e}")
         try:
             await status_msg.edit(
-                f"🛑 **Ep {episode_num} — Upload Error**\n\n"
+                f"🛑 **{ep_label} — Upload Error**\n\n"
                 f"❌ `{str(e)[:120]}`\n"
                 f"⛔ Agle episodes **band** kar diye gaye."
             )
@@ -486,11 +508,13 @@ async def rti_command(client: Client, message: Message):
         await message.reply(
             "**Usage:**\n"
             "`/rti <url>` — Latest episode auto-download\n"
-            "`/rti <url> <start> <end>` — Episode range\n\n"
+            "`/rti <url> <start> <end>` — Episode range\n"
+            "`/rti <url> 0 0` — Movie mode (no episode number on page)\n\n"
             "**Examples:**\n"
             "`/rti https://rareanimes.buzz/wistoria/` — Latest\n"
             "`/rti https://rareanimes.buzz/wistoria/ 01 10` — Ep 1 to 10\n"
-            "`/rti https://rareanimes.buzz/wistoria/ 5 5` — Sirf Ep 5"
+            "`/rti https://rareanimes.buzz/wistoria/ 5 5` — Sirf Ep 5\n"
+            "`/rti https://rareanimes.mov/a-magnificent-life/ 0 0` — Movie"
         )
         return
 
