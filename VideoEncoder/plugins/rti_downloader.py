@@ -8,8 +8,11 @@ Commands:
 """
 
 import asyncio
+import os
 import re
+import shutil
 import time
+import uuid
 
 import requests
 from bs4 import BeautifulSoup
@@ -180,6 +183,21 @@ def get_watchmult_link(page_url: str, episode_num: int):
 #  Step 2: WatchMultQuality -> Argon embed link
 # ─────────────────────────────────────────────
 def _make_selenium_driver():
+    # ── Har session ka apna disposable profile dir ──
+    # Chrome ko --user-data-dir diye bina chalane pe woh khud /tmp mein
+    # ek random profile folder banata hai. Normal case mein quit() pe
+    # khud clean kar deta hai, lekin agar Railway ke constrained container
+    # mein renderer crash ho jaaye ya OOM aa jaaye, profile folder /tmp
+    # mein hi reh jaata hai. get_argon_link 1 episode ke 30 retry attempts
+    # tak baar-baar call hota hai — thodi si bhi leak rate ke saath yeh
+    # kuch hi episodes mein /tmp/storage bhar deta hai aur bot stuck ho
+    # jaata hai jab tak redeploy na ho.
+    # Fix: apna hi disposable dir do (download_dir ke andar) taaki humein
+    # pata ho iska exact path — aur cleanup (_kill_driver_tree) mein
+    # explicitly delete kar dein, Chrome ke bharose na rahe.
+    profile_dir = os.path.join(download_dir, "_chrome_tmp", f"rti_{uuid.uuid4().hex}")
+    os.makedirs(profile_dir, exist_ok=True)
+
     options = webdriver.ChromeOptions()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -187,13 +205,62 @@ def _make_selenium_driver():
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     options.add_argument(f"user-agent={HEADERS['User-Agent']}")
+    options.add_argument(f"--user-data-dir={profile_dir}")
+    options.add_argument("--disable-crash-reporter")
     options.add_experimental_option("prefs", {
         "profile.managed_default_content_settings.images": 2
     })
     options.page_load_strategy = "eager"
     driver = webdriver.Chrome(options=options)
     driver.set_page_load_timeout(40)
+    # Cleanup ke liye profile_dir ko driver pe hi attach kar do
+    driver._suhani_profile_dir = profile_dir
     return driver
+
+
+def _kill_driver_tree(driver):
+    """
+    driver.quit() bhaunsa/fail ho jaaye (renderer crash, hung tab, etc.)
+    to bhi chromedriver + chrome + unke saare child processes ko
+    forcefully kill karo, aur uska disposable profile dir bhi delete
+    karo. Warna zombie chrome processes RAM/fd jama karte rehte hain
+    aur kuch episodes ke baad bot response dena band kar deta hai —
+    sirf redeploy (fresh process) se hi theek hota hai.
+    """
+    if not driver:
+        return
+
+    pid = None
+    try:
+        pid = driver.service.process.pid
+    except Exception:
+        pid = None
+
+    try:
+        driver.quit()
+    except Exception:
+        pass
+
+    if pid:
+        try:
+            import psutil
+            if psutil.pid_exists(pid):
+                proc = psutil.Process(pid)
+                for child in proc.children(recursive=True):
+                    try:
+                        child.kill()
+                    except Exception:
+                        pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    profile_dir = getattr(driver, "_suhani_profile_dir", None)
+    if profile_dir:
+        shutil.rmtree(profile_dir, ignore_errors=True)
 
 
 def _extract_argon_from_iframes(driver):
@@ -271,11 +338,7 @@ def get_argon_link(watchmult_url: str):
         LOGGER.error(f"[RTI] get_argon_link error: {e}")
         return None
     finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+        _kill_driver_tree(driver)
 
 
 # ─────────────────────────────────────────────

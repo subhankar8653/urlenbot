@@ -21,6 +21,7 @@ import glob
 import os
 import re
 import time
+import uuid
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -81,6 +82,7 @@ def _make_driver(dl_dir: str):
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--enable-javascript")
     options.add_argument("--allow-running-insecure-content")
+    options.add_argument("--disable-crash-reporter")
     # Shared memory limit increase — renderer timeout fix
     options.add_argument("--shm-size=2gb")
     options.add_argument(
@@ -88,6 +90,23 @@ def _make_driver(dl_dir: str):
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     )
+
+    # ── Disposable profile dir — dl_dir ke ANDAR ──
+    # Chrome ko --user-data-dir diye bina chalane pe woh khud /tmp mein
+    # random profile folder banata hai, jo normally quit() pe khud saaf
+    # ho jaata hai — LEKIN agar Railway ke constrained container mein
+    # renderer crash/hang ho jaaye (kaafi common jab ek session pe
+    # baar-baar poll attempts chalte hain), woh /tmp mein hi reh jaata
+    # hai. Auto-monitor 1 episode ke liye 30 poll attempts tak yeh
+    # function baar-baar call karta hai — thodi si bhi leak rate ke
+    # saath 6-7 episodes mein hi storage bhar jaata hai aur bot stuck
+    # ho jaata hai jab tak redeploy na ho.
+    # Fix: profile ko dl_dir ke andar hi rakho — dl_dir already har
+    # attempt/episode ke baad shutil.rmtree ho raha hai, isliye Chrome
+    # ke bharose rahe bina bhi guaranteed cleanup mil jaata hai.
+    profile_dir = os.path.join(dl_dir, f"_chrome_profile_{uuid.uuid4().hex}")
+    os.makedirs(profile_dir, exist_ok=True)
+    options.add_argument(f"--user-data-dir={profile_dir}")
 
     prefs = {
         "download.default_directory": dl_dir,
@@ -143,6 +162,49 @@ def _make_driver(dl_dir: str):
         pass
 
     return driver
+
+
+def _kill_driver_tree(driver):
+    """
+    driver.quit() fail/hang ho jaaye (renderer crash, hung tab, etc.)
+    to bhi chromedriver + chrome + unke saare child processes ko
+    forcefully kill karo. Warna zombie chrome processes RAM/fd jama
+    karte rehte hain aur kuch episodes ke baad bot response dena band
+    kar deta hai — sirf redeploy (fresh process) se hi theek hota hai.
+    (Profile dir khud dl_dir ke andar hai isliye uski cleanup outer
+    shutil.rmtree(dl_dir) se already ho jaati hai — yahan alag se
+    dobara delete karne ki zaroorat nahi.)
+    """
+    if not driver:
+        return
+
+    pid = None
+    try:
+        pid = driver.service.process.pid
+    except Exception:
+        pid = None
+
+    try:
+        driver.quit()
+    except Exception:
+        pass
+
+    if pid:
+        try:
+            import psutil
+            if psutil.pid_exists(pid):
+                proc = psutil.Process(pid)
+                for child in proc.children(recursive=True):
+                    try:
+                        child.kill()
+                    except Exception:
+                        pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────
@@ -675,11 +737,7 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
         result["error"] = str(e)
         LOGGER.error(f"[Swift] Error: {e}")
     finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+        _kill_driver_tree(driver)
 
     return result
 

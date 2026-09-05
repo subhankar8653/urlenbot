@@ -150,6 +150,67 @@ def _extract_url(text: str) -> str | None:
 
 
 # ─────────────────────────────────────────────
+#  OLD Format — Language + Alt-Dub Guard
+#  ─────────────────────────────────────────────
+#  Yeh channel SIRF Hindi ke liye hai. Do cases mein OLD-format post
+#  ko SKIP karna hai — chahe URL + episode number match ho jaaye:
+#
+#  1. Title mein koi specific non-Hindi language ka naam explicitly
+#     likha ho (Tamil, Telugu, English, Malayalam, Kannada, Bengali,
+#     Marathi, Punjabi, Gujarati, Urdu) AUR "Hindi" word kahin bhi
+#     na ho.
+#       "Episode 4 Tamil-Telugu Added!"          -> SKIP (Hindi nahi hai)
+#       "Episode 4 Hindi-Tamil-Telugu Added!"    -> ALLOW (Hindi hai)
+#       "Episode 4 Added!"                       -> ALLOW (koi language
+#                                                    naam hi nahi, default
+#                                                    Hindi maana jaata hai)
+#
+#  2. "Added!" ke turant baad ek "(...)" bracket ho jisme kuch likha ho
+#     — yeh ek ALTERNATE/SECOND dub source ko batata hai
+#     (e.g. "Episode 2 Added! (AnimeTimes DUB)"), jo already handle ho
+#     chuke episode ka duplicate/alt release hota hai. Aise posts skip.
+#
+#  IMPORTANT: dono check sirf URL SE PEHLE wale "title" segment pe
+#  lagte hain, poore text pe nahi — kyunki RTI ke URLs mein hamesha
+#  "/hindi/...-hindi-dubbed-..." jaisa path hota hai (site ka apna
+#  naming convention), jo warna har baar false-positive "Hindi mila"
+#  de deta chahe title mein Hindi ka naam-o-nishaan na ho.
+_NON_HINDI_LANG_RE = re.compile(
+    r'\b(tamil|telugu|malayalam|kannada|bengali|marathi|punjabi|gujarati|urdu|english)\b',
+    re.IGNORECASE
+)
+_HINDI_WORD_RE     = re.compile(r'\bhindi\b', re.IGNORECASE)
+_ADDED_BRACKET_RE  = re.compile(r'added\s*!?\s*\(([^)]+)\)', re.IGNORECASE)
+
+
+def _old_format_title_segment(text: str, url: str | None) -> str:
+    """URL se pehle wala hissa nikaalo — language/bracket checks isi
+    pe lagane hain, URL ke andar ke words (jaise '/hindi/') pe nahi."""
+    if url:
+        idx = text.find(url)
+        if idx != -1:
+            return text[:idx]
+    return text
+
+
+def _old_format_should_skip(text: str, url: str | None) -> str | None:
+    """OLD-format post ko skip karne ki wajah return karta hai (logging
+    ke liye), ya None agar post process karna theek hai."""
+    title_seg = _old_format_title_segment(text, url)
+
+    # ── Sirf non-Hindi language(s) named, Hindi kahin nahi ──
+    if _NON_HINDI_LANG_RE.search(title_seg) and not _HINDI_WORD_RE.search(title_seg):
+        return f"non-Hindi language post (no 'Hindi' in title): {title_seg.strip()[:80]}"
+
+    # ── "Added! (kuch bhi)" — alt/second dub source ──
+    m = _ADDED_BRACKET_RE.search(title_seg)
+    if m:
+        return f"alt-dub bracket detected ({m.group(1).strip()}): {title_seg.strip()[:80]}"
+
+    return None
+
+
+# ─────────────────────────────────────────────
 #  Core: AutoMonitor Swift Runner
 #
 #  Swift URL milne ke baad — bilkul /swift ki
@@ -246,11 +307,6 @@ async def _episode_quality_poller(
         proxy_msg = _ProxyMsg(log_message, owner_id, _LOG_CH)
     else:
         proxy_msg = _ProxyMsg(log_message, owner_id, channel_id)
-
-    # ── DL folder ──
-    session_id = f"monitor_ep{episode_num}_{int(time.time())}"
-    dl_dir = os.path.join(download_dir, session_id)
-    os.makedirs(dl_dir, exist_ok=True)
 
     status_msg = await log_message.reply(
         f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
@@ -866,6 +922,12 @@ async def auto_monitor_handler(client: Client, message: Message):
     ep_info = _extract_episodes(text) if url else None
     match_text = text
     fmt_label = "OLD"
+
+    if url and ep_info:
+        skip_reason = _old_format_should_skip(text, url)
+        if skip_reason:
+            LOGGER.info(f"[AutoMonitor] OLD-format post skip ({skip_reason})")
+            url, ep_info = None, None
 
     if not (url and ep_info):
         # ── Format 2: NEW — Title/Genre/Audio/Dub template ──
