@@ -78,6 +78,13 @@ async def _show_preset_panel(event, user_id: int, is_new: bool = False):
                 callback_data=f"urlp_toggle_metadata_{user_id}"
             ),
         ],
+        [
+            InlineKeyboardButton("🔄 Name Swap Rules", callback_data=f"urlp_open_swap_{user_id}"),
+            InlineKeyboardButton("🏷️ Metadata Fields", callback_data=f"urlp_open_meta_{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("🚫 Blacklist Words", callback_data=f"urlp_open_blacklist_{user_id}"),
+        ],
         [InlineKeyboardButton("❌ Close", callback_data="closeMeh")],
     ])
 
@@ -95,9 +102,11 @@ async def _show_preset_panel(event, user_id: int, is_new: bool = False):
         f"• Convert to AAC: <b>{'ON' if auto.get('to_aac') else 'OFF'}</b>\n"
         f"  ↳ (E-AC3/DTS/TrueHD → AAC 192k, Remove Audio ON ho toh ignore hogi)\n"
         f"• Name Swap: <b>{'ON' if auto.get('name_swap') else 'OFF'}</b>\n"
-        f"  ↳ (Rules set karo: /addswap)\n"
+        f"  ↳ (Rules niche button se set karo)\n"
         f"• Apply Metadata: <b>{'ON' if auto.get('apply_metadata') else 'OFF'}</b>\n"
-        f"  ↳ (Metadata set karo: /setmeta)\n"
+        f"  ↳ (Fields niche button se set karo)\n\n"
+        "↓ Niche buttons se Swap Rules, Metadata Fields aur Blacklist Words "
+        "seedha yahin se manage karo:"
     )
 
     if is_new:
@@ -126,6 +135,19 @@ async def url_preset_callbacks(bot: Client, cb: CallbackQuery):
 
     if cb.from_user.id != owner_id:
         await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+        return
+
+    # ── "Open other panel" buttons (Swap / Metadata / Blacklist) ──────────────
+    if action == "open":
+        await cb.answer()
+        if key_raw == "swap":
+            from .url_upload import _show_addswap_panel
+            await _show_addswap_panel(cb.message, owner_id, is_new=False)
+        elif key_raw == "meta":
+            await _show_setmeta_panel(cb.message, owner_id, is_new=False)
+        elif key_raw == "blacklist":
+            from .url_upload import _show_blacklist_panel
+            await _show_blacklist_panel(cb.message, owner_id, is_new=False)
         return
 
     key_map = {
@@ -210,6 +232,7 @@ async def url_settings_cmd(bot: Client, message: Message):
         "• <code>/setmeta</code> – Interactive metadata panel\n"
         "• <code>/urlpreset</code> – Auto-processing toggle\n"
         "• <code>/addswap &lt;from&gt; &lt;to&gt;</code> – Add swap rule\n"
+        "• <code>/blacklist</code> – Caption se hatane wale words manage karo\n"
         "• <code>/clearmeta</code> – Reset metadata"
     )
     kb = InlineKeyboardMarkup([

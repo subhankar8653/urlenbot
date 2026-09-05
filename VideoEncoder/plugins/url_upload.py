@@ -1265,6 +1265,210 @@ async def clear_swap_rules(bot: Client, message: Message):
     await message.reply("✅ All swap rules cleared.")
 
 
+# ─── /blacklist — Interactive button panel (like /addswap) ───────────────────
+# Caption/filename se hamesha hata diye jaane wale words (site names,
+# uploader tags jaise "RareToonsIndia") — user apne khud ke words add
+# kar sakta hai. "RareToonsIndia" hamesha hardcoded blacklist mein hai,
+# ye list ke alawa hai (auto_caption.DEFAULT_BLACKLIST).
+# { user_id: True }  — session marker: agla text message = naya blacklist word
+_blacklist_sessions: dict = {}
+
+
+@Client.on_message(filters.command("blacklist"))
+async def blacklist_cmd(bot: Client, message: Message):
+    """
+    /blacklist                 → Interactive button panel
+    /blacklist word1|word2     → Seedha add karo (backwards compat)
+    """
+    c = await check_chat(message, chat="Both")
+    if not c:
+        return
+
+    args = message.text.split(None, 1)
+    if len(args) >= 2 and args[1].strip():
+        raw = args[1].strip()
+        added = []
+        for w in raw.split("|"):
+            w = w.strip()
+            if w:
+                await db.add_blacklist_word(message.from_user.id, w)
+                added.append(w)
+        if not added:
+            await message.reply("Format: /blacklist word1|word2")
+            return
+        lines = "\n".join(f"• <code>{w}</code>" for w in added)
+        await message.reply(f"✅ <b>Blacklisted:</b>\n{lines}", reply_markup=output)
+        return
+
+    await _show_blacklist_panel(message, message.from_user.id, is_new=True)
+
+
+async def _show_blacklist_panel(event, user_id: int, is_new: bool = False):
+    """Interactive blacklist panel — existing words dikhao + add/delete buttons."""
+    from ..utils.auto_caption import DEFAULT_BLACKLIST
+    words = await db.get_blacklist(user_id)
+
+    word_rows = []
+    for w in words:
+        label = f"🚫 {w}"
+        if len(label) > 48:
+            label = label[:45] + "…"
+        word_rows.append([
+            InlineKeyboardButton(label, callback_data=f"bl_noop_{user_id}"),
+            InlineKeyboardButton("🗑️", callback_data=f"bl_del_{w}_{user_id}"),
+        ])
+
+    bottom_row = [InlineKeyboardButton("➕ Add Word", callback_data=f"bl_add_{user_id}")]
+    if words:
+        bottom_row.append(InlineKeyboardButton("🗑️ Clear All", callback_data=f"bl_clearall_{user_id}"))
+    bottom_row.append(InlineKeyboardButton("❌ Close", callback_data="closeMeh"))
+
+    kb = InlineKeyboardMarkup(word_rows + [bottom_row])
+
+    if words:
+        words_text = "\n".join(f"• <code>{w}</code>" for w in words)
+    else:
+        words_text = "  <i>Koi custom word nahi hai</i>"
+
+    default_text = ", ".join(f"<code>{w}</code>" for w in DEFAULT_BLACKLIST)
+
+    text = (
+        "<b>🚫 Caption Blacklist</b>\n\n"
+        f"<i>Hamesha blocked (built-in):</i> {default_text}\n\n"
+        "<b>Tumhare custom words:</b>\n"
+        f"{words_text}\n\n"
+        f"Total custom: <b>{len(words)}</b>\n\n"
+        "<i>Blacklist mein jo bhi word ho, woh caption/filename se auto-hat "
+        "jaayega — chahe woh kahin bhi ho (brackets ke andar ya bina).</i>\n"
+        "<i>➕ Add Word pe tap karo → word type karke bhejo → done!</i>"
+    )
+
+    if is_new:
+        await event.reply(text, reply_markup=kb)
+    else:
+        try:
+            await event.edit(text, reply_markup=kb)
+        except Exception:
+            pass
+
+
+@Client.on_callback_query(filters.regex(r"^bl_"))
+async def blacklist_callbacks(bot: Client, cb: CallbackQuery):
+    """Blacklist panel ke saare callbacks."""
+    data = cb.data  # e.g. bl_add_123 | bl_del_RareToonsIndia_123 | bl_clearall_123
+
+    if data.startswith("bl_noop_"):
+        await cb.answer("Ye blacklist word hai. Delete karne ke liye 🗑️ dabao.", show_alert=False)
+        return
+
+    if data.startswith("bl_add_"):
+        try:
+            owner_id = int(data.split("_")[-1])
+        except ValueError:
+            await cb.answer()
+            return
+        if cb.from_user.id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+        _blacklist_sessions[owner_id] = True
+        await cb.answer()
+        await cb.message.edit(
+            "<b>➕ New Blacklist Word</b>\n\n"
+            "Wo <b>text/word</b> bhejo jo caption/filename se hamesha "
+            "hata dena hai (e.g. site ya uploader ka naam).\n\n"
+            "<b>Example:</b> <code>HindiAnimeZone</code>\n\n"
+            "<i>Send <code>-</code> (dash) to cancel.</i>",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Back", callback_data=f"bl_back_{owner_id}")
+            ]])
+        )
+        return
+
+    if data.startswith("bl_del_"):
+        parts = data.split("_")
+        try:
+            owner_id = int(parts[-1])
+        except ValueError:
+            await cb.answer()
+            return
+        if cb.from_user.id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+        word = "_".join(parts[2:-1])
+        await db.remove_blacklist_word(owner_id, word)
+        await cb.answer(f"✅ Removed: {word}")
+        await _show_blacklist_panel(cb.message, owner_id, is_new=False)
+        return
+
+    if data.startswith("bl_clearall_"):
+        try:
+            owner_id = int(data.split("_")[-1])
+        except ValueError:
+            await cb.answer()
+            return
+        if cb.from_user.id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+        await db.clear_blacklist(owner_id)
+        await cb.answer("✅ Custom blacklist cleared!")
+        await _show_blacklist_panel(cb.message, owner_id, is_new=False)
+        return
+
+    if data.startswith("bl_back_"):
+        try:
+            owner_id = int(data.split("_")[-1])
+        except ValueError:
+            await cb.answer()
+            return
+        _blacklist_sessions.pop(owner_id, None)
+        await cb.answer()
+        await _show_blacklist_panel(cb.message, owner_id, is_new=False)
+        return
+
+    await cb.answer()
+
+
+# ─── Text handler: blacklist word input ───────────────────────────────────────
+@Client.on_message(filters.text & filters.private, group=4)
+async def blacklist_text_input(bot: Client, message: Message):
+    """Blacklist panel ka text input — ek word add karo."""
+    user_id = message.from_user.id
+    if user_id not in _blacklist_sessions:
+        return  # Hamara kaam nahi
+
+    text = message.text.strip()
+    _blacklist_sessions.pop(user_id, None)
+
+    if text == "-":
+        confirm = await message.reply("❌ Cancelled.")
+        await asyncio.sleep(1)
+        await _show_blacklist_panel(confirm, user_id, is_new=True)
+        return
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    words = await db.add_blacklist_word(user_id, text)
+
+    confirm = await message.reply(
+        f"✅ <b>Blacklisted!</b>\n<code>{text}</code>\n\n"
+        f"Total custom words: <b>{len(words)}</b>"
+    )
+    await asyncio.sleep(2)
+    await _show_blacklist_panel(confirm, user_id, is_new=True)
+
+
+@Client.on_message(filters.command("blacklistclear"))
+async def blacklist_clear_cmd(bot: Client, message: Message):
+    c = await check_chat(message, chat="Both")
+    if not c:
+        return
+    await db.clear_blacklist(message.from_user.id)
+    await message.reply("✅ All custom blacklist words cleared.")
+
+
 # ─── Public: urlpreset apply (bot_upload.py bhi use karta hai) ───────────────
 
 async def apply_urlpreset_to_file(filepath: str, user_id: int, msg: Message) -> tuple[str, bool]:
@@ -2157,11 +2361,13 @@ async def _do_upload(bot: Client, filepath: str, message: Message, msg: Message,
         # DB mein saved encode resolution URL uploads pe apply NAHI hona chahiye.
         # Warna agar user ne /setres 480 set kiya hua hai toh 1080p video bhi
         # "480p" caption ke saath upload hogi — jo GALAT hai.
+        user_blacklist = await db.get_blacklist(message.from_user.id)
         caption = smart_caption(
             original_caption=os.path.basename(filepath),
             filepath=filepath,
             resolution=None,   # FIX: metadata se actual quality detect karo
             has_eng_sub=has_eng_sub,
+            blacklist=user_blacklist,
         )
         # File ko caption ke naam se rename karo taaki upload_worker sahi naam use kare
         # Filesystem-unsafe characters remove karo
