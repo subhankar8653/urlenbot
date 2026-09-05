@@ -464,6 +464,8 @@ async def cmd_end_message(client: Client, message: Message):
         "swap", "swapclear", "addswap", "swaplist", "clearswap",
         # blacklist
         "blacklist", "blacklistclear",
+        # rename
+        "rename",
         # auto_monitor
         "set_monitor", "add_anime", "list_anime", "del_anime", "monitor_status",
         # update_channel
