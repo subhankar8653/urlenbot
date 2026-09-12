@@ -2,8 +2,11 @@
 thumb_style.py
 ================
 Auto-generated thumbnails ke bottom-band ("@SBANIME" wala red box) ke
-liye 10 professional style presets + ek "disable" option + custom color
-override — sab GLOBAL (bot-wide), community branding ki tarah.
+liye 10 STRUCTURALLY ALAG professional layouts + ek "disable" option +
+custom color override — sab GLOBAL (bot-wide), community branding ki
+tarah. Har style ka SHAPE/POSITION alag hai (sirf color badal ke naya
+style nahi banaya gaya) — full band, corner tag, floating pill, bracket
+frame, angled cut, side tab, ribbon, cinematic fade, glass pill, outline.
 
 /setpic_style command (plugins/setpic_style.py) se style select/preview/
 apply/disable hota hai. Yeh module sirf engine hai:
@@ -27,70 +30,80 @@ DEFAULT_THUMB_BAND_TEXT = "@SBANIME"
 # ─────────────────────────────────────────────
 #  10 Style Presets + "none" (disable)
 # ─────────────────────────────────────────────
-# kind:
-#   "band"      -> solid-color full-width bottom band
-#   "gradient"  -> top->bottom gradient full-width bottom band
-#   "bordered"  -> solid band + thin accent border line on top edge
-#   "glass"     -> semi-transparent (alpha-blended) band
-#   "ribbon"    -> small diagonal corner ribbon (top-right), not full-width
-#   "outline"   -> no box at all, sirf outlined/shadowed text
+# kind (har ek ka layout/shape/position alag hai):
+#   "band"       -> classic full-width solid bottom band
+#   "fade"       -> koi box nahi, bottom pe smooth dark-to-transparent
+#                   cinematic gradient fade, text seedha uspe (Netflix/
+#                   movie-poster style)
+#   "pill"       -> chhota floating rounded "badge" bottom-center mein,
+#                   edges ko touch nahi karta
+#   "corner_tag" -> chhota rounded box TOP-LEFT corner mein (channel-bug
+#                   jaisa, bottom band nahi)
+#   "bracket"    -> 4 corners pe viewfinder-style L brackets + chhota
+#                   text-pill niche center mein — minimal cinematic
+#   "glass_pill" -> translucent (glass) rounded pill BOTTOM-RIGHT corner
+#   "angled"     -> bottom band, lekin seedhi rectangle nahi — slanted/
+#                   diagonal-cut top edge (parallelogram silhouette)
+#   "side_tab"   -> LEFT edge pe vertical strip, text rotated (top se
+#                   bottom padhte hue)
+#   "ribbon"     -> diagonal corner ribbon (top-right), full-width nahi
+#   "outline"    -> koi box nahi, sirf outlined/shadowed text
 #
 # color override (custom color pick) primary target:
-#   band/gradient/bordered/glass/ribbon -> bg_color badalta hai
-#   outline                              -> text_color badalta hai
+#   sabhi filled shapes (band/pill/corner_tag/bracket/glass_pill/
+#   angled/side_tab/ribbon)  -> bg_color/accent badalta hai
+#   fade                     -> gradient tint color badalta hai
+#   outline                  -> text_color badalta hai
 
 STYLES = {
-    "classic_red": {
-        "name": "🔴 Classic Red",
+    "classic_band": {
+        "name": "🔴 Classic Band",
         "kind": "band",
         "bg_color": (220, 20, 20),
         "text_color": (255, 255, 255),
     },
-    "midnight_black": {
-        "name": "⚫ Midnight Black",
-        "kind": "band",
-        "bg_color": (18, 18, 18),
-        "text_color": (255, 215, 0),
+    "cinematic_fade": {
+        "name": "🌆 Cinematic Fade",
+        "kind": "fade",
+        "bg_color": (0, 0, 0),
+        "text_color": (255, 255, 255),
     },
-    "royal_blue": {
-        "name": "🔵 Royal Blue",
-        "kind": "band",
+    "center_pill": {
+        "name": "💊 Center Pill Badge",
+        "kind": "pill",
         "bg_color": (25, 55, 180),
         "text_color": (255, 255, 255),
     },
-    "emerald_green": {
-        "name": "🟢 Emerald Green",
-        "kind": "band",
+    "corner_tag": {
+        "name": "🏷️ Corner Tag",
+        "kind": "corner_tag",
         "bg_color": (14, 120, 70),
         "text_color": (255, 255, 255),
     },
-    "sunset_gradient": {
-        "name": "🌅 Sunset Gradient",
-        "kind": "gradient",
-        "bg_color": (255, 140, 0),
-        "bg_color2": (200, 20, 20),
-        "text_color": (255, 255, 255),
+    "bracket_frame": {
+        "name": "📐 Bracket Frame",
+        "kind": "bracket",
+        "bg_color": (255, 205, 60),
+        "text_color": (20, 20, 20),
     },
-    "neon_purple": {
-        "name": "🟣 Neon Purple",
-        "kind": "bordered",
-        "bg_color": (110, 25, 170),
-        "text_color": (255, 255, 255),
-        "border_color": (0, 230, 255),
-    },
-    "golden_luxury": {
-        "name": "✨ Golden Luxury",
-        "kind": "bordered",
-        "bg_color": (15, 15, 15),
-        "text_color": (255, 205, 60),
-        "border_color": (255, 205, 60),
-    },
-    "dark_glass": {
-        "name": "🖤 Dark Glass",
-        "kind": "glass",
+    "glass_pill": {
+        "name": "🪟 Glass Pill",
+        "kind": "glass_pill",
         "bg_color": (10, 10, 10),
         "text_color": (255, 255, 255),
-        "alpha": 175,
+        "alpha": 180,
+    },
+    "angled_band": {
+        "name": "🔻 Angled Cut Band",
+        "kind": "angled",
+        "bg_color": (110, 25, 170),
+        "text_color": (255, 255, 255),
+    },
+    "side_tab": {
+        "name": "📎 Side Tab",
+        "kind": "side_tab",
+        "bg_color": (200, 20, 20),
+        "text_color": (255, 255, 255),
     },
     "corner_ribbon": {
         "name": "🎗️ Corner Ribbon",
@@ -107,12 +120,12 @@ STYLES = {
 }
 
 STYLE_ORDER = [
-    "classic_red", "midnight_black", "royal_blue", "emerald_green",
-    "sunset_gradient", "neon_purple", "golden_luxury", "dark_glass",
+    "classic_band", "cinematic_fade", "center_pill", "corner_tag",
+    "bracket_frame", "glass_pill", "angled_band", "side_tab",
     "corner_ribbon", "minimal_outline",
 ]
 
-DEFAULT_STYLE_ID = "classic_red"
+DEFAULT_STYLE_ID = "classic_band"
 
 # Color-picker preset swatches (color override) — (label, hex)
 COLOR_PRESETS = [
@@ -203,9 +216,6 @@ def resolve_style(style_id: str, color_hex=None) -> dict:
             style["text_color"] = rgb
         else:
             style["bg_color"] = rgb
-            # gradient ka 2nd stop bhi thoda dark shift kar do taaki gradient banaa rahe
-            if style["kind"] == "gradient":
-                style["bg_color2"] = tuple(max(0, c - 70) for c in rgb)
     return style
 
 
@@ -226,6 +236,11 @@ def _get_font(size: int):
         return ImageFont.load_default()
 
 
+def _text_size(draw, text, font):
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1], bbox
+
+
 def render_band(img, text: str, style: dict):
     """
     PIL Image (RGB) pe diya gaya style draw karta hai — in-place modify
@@ -235,64 +250,232 @@ def render_band(img, text: str, style: dict):
     if style is None:
         return img
 
-    from PIL import Image, ImageDraw
-
-    w, h = img.size
     kind = style["kind"]
+    dispatch = {
+        "band": _render_band,
+        "fade": _render_fade,
+        "pill": _render_pill,
+        "corner_tag": _render_corner_tag,
+        "bracket": _render_bracket,
+        "glass_pill": _render_glass_pill,
+        "angled": _render_angled_band,
+        "side_tab": _render_side_tab,
+        "ribbon": _render_ribbon,
+        "outline": _render_outline,
+    }
+    fn = dispatch.get(kind, _render_band)
+    return fn(img, text, style)
 
-    if kind == "ribbon":
-        return _render_ribbon(img, text, style)
 
-    if kind == "outline":
-        draw = ImageDraw.Draw(img)
-        font = _get_font(max(int(h * 0.05), 22))
-        bbox = draw.textbbox((0, 0), text, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        tx = (w - tw) / 2 - bbox[0]
-        ty = h - th - int(h * 0.05) - bbox[1]
-        draw.text(
-            (tx, ty), text, font=font, fill=style["text_color"],
-            stroke_width=max(2, int(h * 0.006)), stroke_fill=style["outline_color"],
-        )
-        return img
-
+def _render_band(img, text, style):
+    from PIL import ImageDraw
+    w, h = img.size
     band_h = max(int(h * 0.09), 34)
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([0, h - band_h, w, h], fill=style["bg_color"])
     font = _get_font(int(band_h * 0.55))
-
-    if kind == "gradient":
-        band = Image.new("RGB", (w, band_h))
-        c1, c2 = style["bg_color"], style["bg_color2"]
-        for row in range(band_h):
-            t = row / max(band_h - 1, 1)
-            color = tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
-            for x in range(w):
-                band.putpixel((x, row), color)
-        img.paste(band, (0, h - band_h))
-        draw = ImageDraw.Draw(img)
-    elif kind == "glass":
-        overlay = Image.new("RGBA", (w, band_h), (*style["bg_color"], style.get("alpha", 175)))
-        base = img.convert("RGBA")
-        base.paste(Image.alpha_composite(
-            base.crop((0, h - band_h, w, h)).convert("RGBA"), overlay
-        ), (0, h - band_h))
-        img.paste(base.convert("RGB"))
-        draw = ImageDraw.Draw(img)
-    else:
-        draw = ImageDraw.Draw(img)
-        draw.rectangle([0, h - band_h, w, h], fill=style["bg_color"])
-        if kind == "bordered":
-            border_h = max(int(band_h * 0.08), 3)
-            draw.rectangle([0, h - band_h, w, h - band_h + border_h], fill=style["border_color"])
-
-    bbox = draw.textbbox((0, 0), text, font=font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    tw, th, bbox = _text_size(draw, text, font)
     tx = (w - tw) / 2 - bbox[0]
     ty = h - band_h + (band_h - th) / 2 - bbox[1]
     draw.text((tx, ty), text, font=font, fill=style["text_color"])
     return img
 
 
-def _render_ribbon(img, text: str, style: dict):
+def _render_fade(img, text, style):
+    """Bottom se upar ki taraf transparent->tint-color gradient (cinematic poster look), text bina box ke."""
+    from PIL import Image, ImageDraw
+    w, h = img.size
+    fade_h = max(int(h * 0.32), 90)
+    tint = style["bg_color"]
+
+    overlay = Image.new("RGBA", (w, fade_h), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    for row in range(fade_h):
+        t = row / max(fade_h - 1, 1)  # 0 top -> 1 bottom
+        alpha = int(200 * (t ** 1.4))
+        od.line([(0, row), (w, row)], fill=(*tint, alpha))
+
+    base = img.convert("RGBA")
+    base.alpha_composite(overlay, (0, h - fade_h))
+    img.paste(base.convert("RGB"))
+
+    draw = ImageDraw.Draw(img)
+    font = _get_font(max(int(h * 0.05), 24))
+    tw, th, bbox = _text_size(draw, text, font)
+    tx = (w - tw) / 2 - bbox[0]
+    ty = h - th - int(h * 0.045) - bbox[1]
+    # soft shadow for readability on top of fade
+    draw.text((tx + 2, ty + 2), text, font=font, fill=(0, 0, 0))
+    draw.text((tx, ty), text, font=font, fill=style["text_color"])
+    return img
+
+
+def _render_pill(img, text, style):
+    """Floating rounded badge, bottom-center, edges ko touch nahi karta."""
+    from PIL import ImageDraw
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+    font = _get_font(max(int(h * 0.045), 20))
+    tw, th, bbox = _text_size(draw, text, font)
+
+    pad_x, pad_y = int(th * 0.9), int(th * 0.55)
+    pill_w, pill_h = tw + pad_x * 2, th + pad_y * 2
+    cx = w / 2
+    bottom_margin = int(h * 0.06)
+    y1 = h - bottom_margin - pill_h
+    x1 = cx - pill_w / 2
+
+    draw.rounded_rectangle(
+        [x1, y1, x1 + pill_w, y1 + pill_h], radius=pill_h / 2, fill=style["bg_color"]
+    )
+    tx = x1 + pad_x - bbox[0]
+    ty = y1 + pad_y - bbox[1]
+    draw.text((tx, ty), text, font=font, fill=style["text_color"])
+    return img
+
+
+def _render_corner_tag(img, text, style):
+    """Chhota rounded tag TOP-LEFT corner mein (bottom band nahi)."""
+    from PIL import ImageDraw
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+    font = _get_font(max(int(h * 0.04), 18))
+    tw, th, bbox = _text_size(draw, text, font)
+
+    pad_x, pad_y = int(th * 0.7), int(th * 0.45)
+    tag_w, tag_h = tw + pad_x * 2, th + pad_y * 2
+    margin = int(min(w, h) * 0.035)
+
+    draw.rounded_rectangle(
+        [margin, margin, margin + tag_w, margin + tag_h],
+        radius=int(tag_h * 0.28), fill=style["bg_color"],
+    )
+    tx = margin + pad_x - bbox[0]
+    ty = margin + pad_y - bbox[1]
+    draw.text((tx, ty), text, font=font, fill=style["text_color"])
+    return img
+
+
+def _render_bracket(img, text, style):
+    """4 corners pe viewfinder-style L brackets + chhota text-pill bottom-center."""
+    from PIL import ImageDraw
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+    accent = style["bg_color"]
+
+    arm = int(min(w, h) * 0.07)
+    thick = max(int(min(w, h) * 0.008), 3)
+    m = int(min(w, h) * 0.035)
+
+    corners = [
+        ((m, m), (1, 1)),            # top-left
+        ((w - m, m), (-1, 1)),       # top-right
+        ((m, h - m), (1, -1)),       # bottom-left
+        ((w - m, h - m), (-1, -1)),  # bottom-right
+    ]
+    for (cx, cy), (dx, dy) in corners:
+        draw.line([(cx, cy), (cx + dx * arm, cy)], fill=accent, width=thick)
+        draw.line([(cx, cy), (cx, cy + dy * arm)], fill=accent, width=thick)
+
+    font = _get_font(max(int(h * 0.04), 18))
+    tw, th, bbox = _text_size(draw, text, font)
+    pad_x, pad_y = int(th * 0.7), int(th * 0.4)
+    pill_w, pill_h = tw + pad_x * 2, th + pad_y * 2
+    x1 = (w - pill_w) / 2
+    y1 = h - m - pill_h
+    draw.rounded_rectangle([x1, y1, x1 + pill_w, y1 + pill_h], radius=pill_h / 2, fill=accent)
+    draw.text((x1 + pad_x - bbox[0], y1 + pad_y - bbox[1]), text, font=font, fill=style["text_color"])
+    return img
+
+
+def _render_glass_pill(img, text, style):
+    """Translucent rounded pill, BOTTOM-RIGHT corner."""
+    from PIL import Image, ImageDraw
+    w, h = img.size
+    tmp_draw = ImageDraw.Draw(img)
+    font = _get_font(max(int(h * 0.042), 18))
+    tw, th, bbox = _text_size(tmp_draw, text, font)
+
+    pad_x, pad_y = int(th * 0.85), int(th * 0.5)
+    pill_w, pill_h = tw + pad_x * 2, th + pad_y * 2
+    margin = int(min(w, h) * 0.04)
+    x1 = w - margin - pill_w
+    y1 = h - margin - pill_h
+
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    od.rounded_rectangle(
+        [x1, y1, x1 + pill_w, y1 + pill_h], radius=pill_h / 2,
+        fill=(*style["bg_color"], style.get("alpha", 180)),
+    )
+    od.text((x1 + pad_x - bbox[0], y1 + pad_y - bbox[1]), text, font=font, fill=style["text_color"])
+
+    base = img.convert("RGBA")
+    base.alpha_composite(overlay)
+    img.paste(base.convert("RGB"))
+    return img
+
+
+def _render_angled_band(img, text, style):
+    """Bottom band, lekin slanted/diagonal-cut top edge (parallelogram)."""
+    from PIL import ImageDraw
+    w, h = img.size
+    band_h = max(int(h * 0.11), 40)
+    slant = int(band_h * 0.7)
+    draw = ImageDraw.Draw(img)
+    draw.polygon(
+        [(0, h - band_h + slant), (w, h - band_h), (w, h), (0, h)],
+        fill=style["bg_color"],
+    )
+    font = _get_font(int(band_h * 0.5))
+    tw, th, bbox = _text_size(draw, text, font)
+    tx = (w - tw) / 2 - bbox[0]
+    ty = h - band_h + slant / 2 + (band_h - slant / 2 - th) / 2 - bbox[1]
+    draw.text((tx, ty), text, font=font, fill=style["text_color"])
+    return img
+
+
+def _render_side_tab(img, text, style):
+    """LEFT edge pe vertical strip, text rotated (top-se-bottom padhte hue)."""
+    from PIL import Image, ImageDraw
+    w, h = img.size
+    tab_w = max(int(w * 0.09), 44)
+    tab_h = int(h * 0.46)
+    y0 = int((h - tab_h) / 2)
+
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([0, y0, tab_w, y0 + tab_h], fill=style["bg_color"])
+
+    # Font ko shrink karte jao jab tak text (rotate se pehle horizontal
+    # width) tab_h ke andar fit na ho jaaye (padding ke saath) — warna
+    # lamba text tab se upar-neeche overflow ho jaata hai.
+    max_text_len = tab_h - int(tab_h * 0.12)
+    size = max(int(tab_w * 0.55), 20)
+    tmp = Image.new("RGBA", (10, 10))
+    td = ImageDraw.Draw(tmp)
+    font = _get_font(size)
+    tbbox = td.textbbox((0, 0), text, font=font)
+    tw = tbbox[2] - tbbox[0]
+    while tw > max_text_len and size > 10:
+        size -= 2
+        font = _get_font(size)
+        tbbox = td.textbbox((0, 0), text, font=font)
+        tw = tbbox[2] - tbbox[0]
+    th = tbbox[3] - tbbox[1]
+
+    txt_img = Image.new("RGBA", (tab_h, tab_w), (0, 0, 0, 0))
+    td = ImageDraw.Draw(txt_img)
+    td.text(((tab_h - tw) / 2 - tbbox[0], (tab_w - th) / 2 - tbbox[1]),
+            text, font=font, fill=style["text_color"])
+    rotated = txt_img.rotate(90, expand=True)
+
+    rx = int((tab_w - rotated.width) / 2)
+    ry = y0 + int((tab_h - rotated.height) / 2)
+    img.paste(rotated, (rx, ry), rotated)
+    return img
+
+
+def _render_ribbon(img, text, style):
     from PIL import Image, ImageDraw
 
     w, h = img.size
@@ -303,8 +486,7 @@ def _render_ribbon(img, text: str, style: dict):
     d = ImageDraw.Draw(strip)
     d.rectangle([0, 0, strip_w, strip_h], fill=(*style["bg_color"], 255))
     font = _get_font(int(strip_h * 0.55))
-    bbox = d.textbbox((0, 0), text, font=font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    tw, th, bbox = _text_size(d, text, font)
     d.text(
         ((strip_w - tw) / 2 - bbox[0], (strip_h - th) / 2 - bbox[1]),
         text, font=font, fill=style["text_color"],
@@ -313,6 +495,21 @@ def _render_ribbon(img, text: str, style: dict):
     rotated = strip.rotate(-32, expand=True, resample=Image.BICUBIC)
     px, py = w - rotated.width + int(rotated.width * 0.18), -int(rotated.height * 0.18)
     img.paste(rotated, (px, py), rotated)
+    return img
+
+
+def _render_outline(img, text, style):
+    from PIL import ImageDraw
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+    font = _get_font(max(int(h * 0.05), 22))
+    tw, th, bbox = _text_size(draw, text, font)
+    tx = (w - tw) / 2 - bbox[0]
+    ty = h - th - int(h * 0.05) - bbox[1]
+    draw.text(
+        (tx, ty), text, font=font, fill=style["text_color"],
+        stroke_width=max(2, int(h * 0.006)), stroke_fill=style["outline_color"],
+    )
     return img
 
 
