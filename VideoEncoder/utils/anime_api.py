@@ -8,8 +8,10 @@ episode count, status. Requires a free API key (TMDB_API_KEY in config.env).
 Anime zyaadatar TMDB par "TV" ke tarah listed hote hain, kuch (movies) "Movie"
 ke tarah — dono search kiye jaate hain.
 
-Fallback: AniList (free, no key) — jab TMDB key set na ho, ya TMDB par match
-na mile, tab AniList try hota hai taaki hit-rate zyaada rahe.
+AniList fallback REMOVED — sirf TMDB use hota hai ab (TMDB_API_KEY zaroori
+hai config.env mein). AniList helper functions neeche abhi bhi maujood
+hain (future use ke liye), bas fetch_anime_details() unhe ab call nahi
+karta.
 """
 
 import logging
@@ -58,8 +60,8 @@ _client: Optional[httpx.AsyncClient] = None
 
 
 def is_configured() -> bool:
-    # TMDB key ho ya na ho, AniList fallback ki wajah se hamesha "available".
-    return True
+    # AniList fallback removed — ab sirf TMDB, isliye key hona zaroori hai.
+    return bool(TMDB_API_KEY)
 
 
 async def _get_client() -> httpx.AsyncClient:
@@ -316,41 +318,34 @@ async def _fetch_from_anilist(anime_name: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 async def search_anime(query: str) -> list:
-    """TMDB (ya AniList) pe title search karo, matched media (dict, agar mila) wapas do."""
+    """TMDB pe title search karo, matched media (dict, agar mila) wapas do."""
     result = await _fetch_from_tmdb(query)
     if result:
         return [result]
-    media = await _anilist_search(query)
-    if not media:
-        return []
-    return [media]
+    return []
 
 
 async def fetch_anime_details(anime_name: str):
     """
-    TMDB se (fallback: AniList/AniZip) anime ki details nikalo, /add_anime ke
+    TMDB se anime ki details nikalo, /add_anime aur auto-thumbnail ke
     liye zaroori fields ek dict mein:
 
       {
         "matched_name": str,
-        "image":        str,   # poster URL ("" agar nahi mila)
+        "image":        str,   # poster/backdrop URL ("" agar nahi mila)
         "genres":       str,   # "Action, Comedy"
         "audio":        str,   # default "Hindi ORG" (baad mein
                                 # /update_post_list se manually change karo)
         "season":       None,
         "total_eps":    int,   # total episode count
         "status":       str,   # "Ongoing" / "Finished" / ""
-        "source":       str,   # "TMDB" / "AniList" — konsi API se aaya
+        "source":       str,   # "TMDB"
       }
 
-    Kahin se bhi match na mile toh None.
+    TMDB pe match na mile toh None (AniList fallback jaan-boojh kar
+    hata diya gaya hai — sirf TMDB use hota hai).
     """
-    result = await _fetch_from_tmdb(anime_name)
-    if result:
-        return result
-
-    LOGGER.info(f"[AnimeAPI] Falling back to AniList for '{anime_name}'")
-    return await _fetch_from_anilist(anime_name)
+    return await _fetch_from_tmdb(anime_name)
 
 
 async def download_image(url: str, dest_path: str) -> bool:

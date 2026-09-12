@@ -6,15 +6,14 @@ set NAHI hai.
 
 Priority (sabhi upload paths mein — URL upload, mega, auto-channel-upload,
 rename, save-restrict, waghera):
-  1. User ka custom thumbnail (/setpic /thumb)          — already existing,
-                                                            sabse pehle priority
-                                                            (is module tak
-                                                            aata hi nahi agar
-                                                            set hai)
-  2. TMDB (fallback AniList) se related poster/backdrop  — NAYA
-  3. Video se ffmpeg se nikala hua frame                 — purana fallback,
-                                                            agar TMDB pe kuch
-                                                            match na mile
+  1. User ka custom thumbnail (/setpic /thumb)  — already existing,
+                                                   sabse pehle priority
+                                                   (is module tak aata
+                                                   hi nahi agar set hai)
+  2. TMDB se related poster/backdrop            — NAYA (AniList fallback
+                                                   hata diya gaya, sirf TMDB)
+  3. Video se ffmpeg se nikala hua frame         — purana fallback, agar
+                                                   TMDB pe kuch match na mile
 
 Har case mein community band (@SBANIME, ya /community se set kiya naam)
 consistent lagta hai — TMDB se aaya poster ho ya ffmpeg-frame, dono pe
@@ -34,8 +33,8 @@ LOGGER = logging.getLogger(__name__)
 
 async def get_tmdb_thumbnail(filepath: str, dl_dir: str, band_text: str = None):
     """
-    Filename se anime/movie ka naam nikal ke TMDB (fallback AniList) se
-    poster/backdrop dhundo, download karke community band lagao.
+    Filename se anime/movie ka naam nikal ke TMDB se poster/backdrop
+    dhundo, download karke community band lagao.
 
     Kuch na mile ya koi bhi step fail ho toh None wapas — caller phir
     purane tarike se ffmpeg-frame pe fallback kare.

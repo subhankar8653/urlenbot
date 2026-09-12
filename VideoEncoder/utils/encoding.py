@@ -819,54 +819,32 @@ async def _encode_single(filepath, message, msg, audio_map=None):
     return output_filepath
 
 
-# Default channel-username band jo har auto-generated thumbnail ke bottom
-# pe lagta hai. Abhi ke liye hardcoded — future mein isko DB se editable
-# banayenge (per-user/per-channel).
-DEFAULT_THUMB_BAND_TEXT = "@SBANIME"
+# Channel-username band jo har auto-generated thumbnail ke bottom pe
+# lagta hai. Style (color/shape) ab /setpic_style se GLOBAL (bot-wide)
+# configurable hai — dekho utils/thumb_style.py. DEFAULT_THUMB_BAND_TEXT
+# yahaan backward-compat ke liye re-exported hai (purane imports ke liye).
+from .thumb_style import DEFAULT_THUMB_BAND_TEXT, get_current_style, render_band
 
 
 def _add_thumb_username_band(image_path, text=DEFAULT_THUMB_BAND_TEXT):
     """
-    Thumbnail ke ekdam niche ki taraf ek red-color lamba box add karta hai
-    jiske andar channel ka username (white bold text) hota hai — jaisa
-    reference screenshot mein dikhaya gaya tha.
+    Thumbnail ke bottom (ya, style ke hisaab se corner) pe channel ka
+    username-band add karta hai — current /setpic_style selection ke
+    mutabik (color, shape, ya "off" agar style disable hai).
 
     Sirf ffmpeg se auto-nikale hue frame (get_thumbnail) pe lagta hai —
     agar user/anime ka apna custom thumbnail already set hai, woh is
     function ke through nahi guzarta, isliye untouched rehta hai.
     """
     try:
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image
+
+        style = get_current_style()
+        if style is None:
+            return  # style disabled hai — thumbnail untouched
 
         img = Image.open(image_path).convert("RGB")
-        w, h = img.size
-        band_h = max(int(h * 0.09), 34)
-
-        draw = ImageDraw.Draw(img)
-        draw.rectangle([0, h - band_h, w, h], fill=(220, 20, 20))
-
-        font_size = int(band_h * 0.55)
-        font = None
-        for fp in (
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        ):
-            if os.path.isfile(fp):
-                font = ImageFont.truetype(fp, font_size)
-                break
-        if font is None:
-            try:
-                font = ImageFont.load_default(size=font_size)
-            except TypeError:
-                # Purane Pillow versions mein load_default() size accept nahi karta
-                font = ImageFont.load_default()
-
-        bbox = draw.textbbox((0, 0), text, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        tx = (w - tw) / 2 - bbox[0]
-        ty = h - band_h + (band_h - th) / 2 - bbox[1]
-        draw.text((tx, ty), text, font=font, fill=(255, 255, 255))
-
+        render_band(img, text, style)
         img.save(image_path, "JPEG", quality=90)
     except Exception as e:
         LOGGER.warning(f"Thumbnail username band failed: {e}")
