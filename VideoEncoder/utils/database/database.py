@@ -350,6 +350,28 @@ class Database:
             return None
         return doc.get('name') or None
 
+    # Thumbnail Band Style — /setpic_style command se set hota hai.
+    # GLOBAL (bot-wide) setting hai, community branding ki tarah — jo bhi
+    # style/color select kiya jaaye, woh HAR auto-generated thumbnail
+    # (manual + auto-monitor) pe consistent lagta hai.
+    async def set_thumb_style(self, style_id):
+        await self.col2.update_one({'id': 'thumb_style'}, {'$set': {'style_id': style_id}}, upsert=True)
+
+    async def get_thumb_style(self):
+        doc = await self.col2.find_one({'id': 'thumb_style'})
+        if not doc:
+            return None
+        return doc.get('style_id') or None
+
+    async def set_thumb_color(self, hex_color):
+        await self.col2.update_one({'id': 'thumb_style'}, {'$set': {'color': hex_color}}, upsert=True)
+
+    async def get_thumb_color(self):
+        doc = await self.col2.find_one({'id': 'thumb_style'})
+        if not doc:
+            return None
+        return doc.get('color') or None
+
     # Swap Rules
     async def set_swap(self, id, rules: dict):
         await self.col.update_one({'id': id}, {'$set': {'swap_rules': rules}}, upsert=True)
