@@ -1340,7 +1340,9 @@ async def cmd_set_monitor(client: Client, message: Message):
 
 # { user_id: {
 #     'step': 'await_start'|'channel'|'name_choice'|'name_manual'|
-#             'image_choice'|'image_custom'|'dub_choice'|'interval'|'link',
+#             'image_choice'|'image_custom'|'dub_choice'|
+#             'interval_choice'|'interval_custom'|
+#             'link_choice'|'link_manual',
 #     'channel_id', 'channel_title',
 #     'anime_name', 'audio', 'genres', 'image', 'season', 'total_eps',
 #     'season_breakdown', 'interval_days', 'channel_link',
@@ -1447,6 +1449,45 @@ async def _show_dub_choice(event, user_id: int):
         "🎙 **ORG** — Official Hindi dub\n"
         "🎙 **FanDub** — Fan-made Hindi dub\n\n"
         "_Select karte hi baaki quick setup khud maang liya jaayega._",
+        reply_markup=kb,
+    )
+
+
+async def _show_interval_choice(event, user_id: int):
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📅 7 Din", callback_data=f"aa_int_7_{user_id}"),
+            InlineKeyboardButton("⚡ 1 Din", callback_data=f"aa_int_1_{user_id}"),
+        ],
+        [InlineKeyboardButton("✏️ Custom", callback_data=f"aa_int_custom_{user_id}")],
+        [InlineKeyboardButton("❓ Unknown", callback_data=f"aa_int_unknown_{user_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"aa_cancel_{user_id}")],
+    ])
+    await event.reply(
+        "**🗓️ Almost Done — Bas Ek Aakhri Cheez! 🚀**\n\n"
+        "Next episode kitne din baad aata hai? _(schedule reminder ke liye)_\n\n"
+        "📅 **7 Din** — weekly release\n"
+        "⚡ **1 Din** — daily release\n"
+        "✏️ **Custom** — khud number set karo\n"
+        "❓ **Unknown** — pata nahi; episode post hone ke baad channel pe "
+        "*\"More episodes comming soon...\"* dikhega\n\n"
+        "_Cancel karna ho toh `/cancel_add_anime` bhejo._",
+        reply_markup=kb,
+    )
+
+
+async def _show_link_choice(event, user_id: int):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Set Link", callback_data=f"aa_link_set_{user_id}")],
+        [InlineKeyboardButton("⏭️ Skip", callback_data=f"aa_link_skip_{user_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"aa_cancel_{user_id}")],
+    ])
+    await event.reply(
+        "**🔗 Channel Invite Link**\n\n"
+        "Ye link *\"Watch & Download\"* button ke liye use hoga.\n\n"
+        "🔗 **Set Link** — invite link bhejo\n"
+        "⏭️ **Skip** — link ke bina aage badho\n\n"
+        "_Cancel karna ho toh `/cancel_add_anime` bhejo._",
         reply_markup=kb,
     )
 
@@ -1569,39 +1610,32 @@ async def _add_anime_step_name_manual(client: Client, message: Message, session:
 
 
 async def _add_anime_step_interval(client: Client, message: Message, session: dict, user_id: int):
+    """Sirf 'interval_custom' step ke liye — user ne ✏️ Custom choose kiya hai."""
     text = (message.text or "").strip()
-    if text.lower() == "skip":
-        interval_days = 7
-    else:
-        try:
-            interval_days = int(text)
-        except ValueError:
-            await message.reply("⚠️ Sirf number do, jaise `7`, ya `skip` likho (default 7 din).")
-            return
+    try:
+        interval_days = int(text)
+        if interval_days <= 0:
+            raise ValueError
+    except ValueError:
+        await message.reply("⚠️ Sirf ek positive number do, jaise `10`.")
+        return
 
     session["interval_days"] = interval_days
-    session["step"] = "link"
+    session["step"] = "link_choice"
     _add_anime_sessions[user_id] = session
 
-    await message.reply(
-        f"✅ Interval: **{interval_days} din**\n\n"
-        f"Channel ka invite link do (\"Watch & Download\" button ke liye):\n\n"
-        f"**Example:** `https://t.me/+xxxxxxxxxx`\n\n"
-        f"_Nahi dena toh `skip` likho._"
-    )
+    await message.reply(f"✅ **Interval:** {interval_days} din")
+    await _show_link_choice(message, user_id)
 
 
 async def _add_anime_step_link(client: Client, message: Message, session: dict, user_id: int):
+    """Sirf 'link_manual' step ke liye — user ne 🔗 Set Link choose kiya hai."""
     text = (message.text or "").strip()
-    if text.lower() == "skip":
-        channel_link = ""
-    elif not text.startswith("http"):
-        await message.reply("⚠️ Valid link do (`https://t.me/...`) ya `skip` likho.")
+    if not text.startswith("http"):
+        await message.reply("⚠️ Valid link do, jaise `https://t.me/+xxxxxxxxxx`.")
         return
-    else:
-        channel_link = text
 
-    session["channel_link"] = channel_link
+    session["channel_link"] = text
     _add_anime_sessions.pop(user_id, None)
     await _finalize_add_anime(client, message, session)
 
@@ -1684,6 +1718,7 @@ async def _finalize_add_anime(client: Client, message: Message, session: dict):
         "📌 **Auto-Thumbnail:** ✅ `/setpic` mein bhi save ho gaya\n" if setpic_saved
         else ("📌 **Auto-Thumbnail:** ⚠️ save nahi ho paaya — `/setpic " + anime_name + "` manually karo\n" if image else "")
     )
+    interval_str = "❓ Unknown" if interval_days == "unknown" else f"{interval_days} din"
     await message.reply(
         f"✅ **Anime Fully Added!** 🎉\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1695,7 +1730,7 @@ async def _finalize_add_anime(client: Client, message: Message, session: dict):
         f"🎭 **Genres:** {genres or '—'}\n"
         f"{image_line}"
         f"{setpic_line}"
-        f"📅 **Next Episode In:** {interval_days} din\n"
+        f"📅 **Next Episode In:** {interval_str}\n"
         f"🔗 **Link:** {channel_link or '—'}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Monitor + Update Post + Schedule — teeno set ho gaye! Ab uploads automatic honge 🚀"
@@ -1861,19 +1896,96 @@ async def add_anime_callbacks(client: Client, cb: CallbackQuery):
             return
         mode = parts[2]
         session["audio"] = "Hindi ORG" if mode == "org" else "Hindi FanDub"
-        session["step"] = "interval"
+        session["step"] = "interval_choice"
         _add_anime_sessions[owner_id] = session
         await cb.answer(f"✅ {session['audio']}")
         try:
             await cb.message.edit(f"✅ **Audio:** {session['audio']}")
         except Exception:
             pass
-        await cb.message.reply(
-            "**Almost done — bas ek aakhri cheez! 🚀**\n\n"
-            "Kitne din baad next episode aata hai? (schedule reminder ke liye)\n\n"
-            "**Example:** `7`\n\n"
-            "_Nahi pata toh `skip` likho (default 7 din)._"
-        )
+        await _show_interval_choice(cb.message, owner_id)
+        return
+
+    # ── aa_int_7_<uid> / aa_int_1_<uid> / aa_int_custom_<uid> / aa_int_unknown_<uid> ──
+    if data.startswith("aa_int_"):
+        if session.get("step") != "interval_choice":
+            await cb.answer("⚠️ Ye step ab active nahi hai.", show_alert=True)
+            return
+        mode = parts[2]
+
+        if mode == "custom":
+            session["step"] = "interval_custom"
+            _add_anime_sessions[owner_id] = session
+            await cb.answer()
+            try:
+                await cb.message.edit(
+                    "**✏️ Custom Interval**\n\n"
+                    "Kitne din baad next episode aata hai? Number bhejo (jaise `10`).\n\n"
+                    "_Cancel karna ho toh `/cancel_add_anime` bhejo._"
+                )
+            except Exception:
+                pass
+            return
+
+        if mode == "unknown":
+            session["interval_days"] = "unknown"
+            session["step"] = "link_choice"
+            _add_anime_sessions[owner_id] = session
+            await cb.answer("✅ Unknown")
+            try:
+                await cb.message.edit(
+                    "✅ **Interval:** Unknown\n\n"
+                    "_Episode post hone ke baad channel pe \"More episodes comming "
+                    "soon...\" dikhega._"
+                )
+            except Exception:
+                pass
+            await _show_link_choice(cb.message, owner_id)
+            return
+
+        # mode == "7" ya "1"
+        interval_days = int(mode)
+        session["interval_days"] = interval_days
+        session["step"] = "link_choice"
+        _add_anime_sessions[owner_id] = session
+        await cb.answer(f"✅ {interval_days} din")
+        try:
+            await cb.message.edit(f"✅ **Interval:** {interval_days} din")
+        except Exception:
+            pass
+        await _show_link_choice(cb.message, owner_id)
+        return
+
+    # ── aa_link_set_<uid> / aa_link_skip_<uid> ──
+    if data.startswith("aa_link_"):
+        if session.get("step") != "link_choice":
+            await cb.answer("⚠️ Ye step ab active nahi hai.", show_alert=True)
+            return
+        mode = parts[2]
+
+        if mode == "skip":
+            session["channel_link"] = ""
+            _add_anime_sessions.pop(owner_id, None)
+            await cb.answer("✅ Skipped")
+            try:
+                await cb.message.edit("✅ **Link:** Skipped")
+            except Exception:
+                pass
+            await _finalize_add_anime(client, cb.message, session)
+            return
+
+        # mode == "set"
+        session["step"] = "link_manual"
+        _add_anime_sessions[owner_id] = session
+        await cb.answer()
+        try:
+            await cb.message.edit(
+                "**🔗 Channel ka invite link bhejo:**\n\n"
+                "**Example:** `https://t.me/+xxxxxxxxxx`\n\n"
+                "_Cancel karna ho toh `/cancel_add_anime` bhejo._"
+            )
+        except Exception:
+            pass
         return
 
     await cb.answer()
@@ -1932,10 +2044,10 @@ async def add_anime_flow_router(client: Client, message: Message):
     if step == "name_manual":
         await _add_anime_step_name_manual(client, message, session, user_id)
         raise StopPropagation
-    if step == "interval":
+    if step == "interval_custom":
         await _add_anime_step_interval(client, message, session, user_id)
         raise StopPropagation
-    if step == "link":
+    if step == "link_manual":
         await _add_anime_step_link(client, message, session, user_id)
         raise StopPropagation
     if step == "image_custom":
@@ -1948,7 +2060,8 @@ async def add_anime_flow_router(client: Client, message: Message):
             )
             raise StopPropagation
         raise ContinuePropagation
-    if step in ("await_start", "name_choice", "image_choice", "dub_choice"):
+    if step in ("await_start", "name_choice", "image_choice", "dub_choice",
+                "interval_choice", "link_choice"):
         if message.text:
             await message.reply("⬆️ Upar diye gaye buttons mein se ek option choose karo.")
         raise StopPropagation

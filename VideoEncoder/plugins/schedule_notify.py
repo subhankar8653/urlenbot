@@ -367,6 +367,11 @@ async def send_schedule_notification(
                 if sent:
                     posted_ids.append(sent.id)
                 LOGGER.info(f"[Schedule] Last ep {episode_num} → posted END for '{anime_name}'")
+            elif interval_days == "unknown":
+                sent = await app.send_message(channel_id, "More episodes comming soon...")
+                if sent:
+                    posted_ids.append(sent.id)
+                LOGGER.info(f"[Schedule] Ep {episode_num} → interval unknown for '{anime_name}'")
             else:
                 next_date = _next_episode_date(interval_days)
                 sent = await app.send_message(channel_id, f"**Next episode upload on {next_date}**")
@@ -665,11 +670,12 @@ async def cmd_schedule_list(client: Client, message: Message):
     for i, entry in enumerate(slist, 1):
         name = entry.get('anime_name', 'Unknown')
         days = entry.get('interval_days', 7)
+        days_str = "❓ Unknown" if days == "unknown" else f"Every {days} days"
         total = entry.get('total_eps', 0)
         total_str = str(total) if total > 0 else '∞'
         text += (
             f"**{i}.** 📺 {name}\n"
-            f"    📅 Every {days} days | 🔢 {total_str} eps\n\n"
+            f"    📅 {days_str} | 🔢 {total_str} eps\n\n"
         )
 
     text += f"Total: **{len(slist)}** schedules"
