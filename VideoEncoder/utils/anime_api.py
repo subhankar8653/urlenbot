@@ -153,7 +153,41 @@ async def _tmdb_search(query: str):
 
 
 async def _tmdb_details(media_type: str, tmdb_id: int) -> Optional[dict]:
-    return await _tmdb_get(f"/{media_type}/{tmdb_id}", {})
+    # `append_to_response=images` ek hi call mein saare backdrops/posters
+    # bhi de deta hai (alag /images call nahi karni padti). English/no-
+    # language wale images maangte hain — kai backdrops pe kisi aur
+    # language ka logo/text overlay hota hai jo thumbnail mein ganda lagta.
+    return await _tmdb_get(f"/{media_type}/{tmdb_id}", {
+        "append_to_response": "images",
+        "include_image_language": "en,null",
+    })
+
+
+# ── "YouTube size" (16:9) backdrop selection ──
+# Bug: pehle `details.get("backdrop_path")` seedha use hota tha — yeh TMDB
+# ka DEFAULT-pick backdrop hota hai, jo kabhi 16:9 nahi hota (ultra-wide
+# banner / episode-still jaisa ajeeb ratio) aur dekhne mein bura lagta tha.
+# Fix: TMDB `images.backdrops` list mein se sirf un images ko consider karo
+# jinka aspect ratio *clean 16:9* (YouTube thumbnail jaisa) ho aur jo
+# kam se kam HD resolution (1280px+) ke hon, phir un mein se best-rated
+# (vote_average/vote_count) wala choose karo.
+_YOUTUBE_RATIO = 16 / 9          # 1.778 — YouTube/HD thumbnail ratio
+_RATIO_TOLERANCE = 0.06          # ±0.06 — sirf true 16:9, ultra-wide/odd reject
+_MIN_BACKDROP_WIDTH = 1280       # HD se kam resolution reject
+
+
+def _pick_best_backdrop(backdrops: list) -> str:
+    candidates = [
+        b for b in (backdrops or [])
+        if b.get("width") and b.get("height")
+        and b["width"] >= _MIN_BACKDROP_WIDTH
+        and abs((b["width"] / b["height"]) - _YOUTUBE_RATIO) <= _RATIO_TOLERANCE
+        and b.get("file_path")
+    ]
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda b: (b.get("vote_average", 0), b.get("vote_count", 0)), reverse=True)
+    return f"{TMDB_IMAGE_BASE}{candidates[0]['file_path']}"
 
 
 async def _fetch_from_tmdb(anime_name: str) -> Optional[dict]:
@@ -200,15 +234,18 @@ async def _fetch_from_tmdb(anime_name: str) -> Optional[dict]:
         total_eps = 1
         status = _TMDB_STATUS_MAP.get(details.get("status") or "", "")
 
-    # ── Image: backdrop (wide/landscape banner, jaisa detail-page pe dikhta
-    #    hai) — poster (portrait) sirf backdrop na milne par fallback ──
-    backdrop_path = details.get("backdrop_path")
-    poster_path = details.get("poster_path")
-    image = ""
-    if backdrop_path:
-        image = f"{TMDB_IMAGE_BASE}{backdrop_path}"
-    elif poster_path:
-        image = f"{TMDB_IMAGE_BASE}{poster_path}"
+    # ── Image: `images.backdrops` mein se best clean-16:9 ("YouTube size")
+    #    backdrop chuno. Koi bhi match na mile (rare) toh TMDB ke default
+    #    backdrop_path pe fallback karo, aur woh bhi na ho toh poster pe. ──
+    images = details.get("images") or {}
+    image = _pick_best_backdrop(images.get("backdrops") or [])
+    if not image:
+        backdrop_path = details.get("backdrop_path")
+        poster_path = details.get("poster_path")
+        if backdrop_path:
+            image = f"{TMDB_IMAGE_BASE}{backdrop_path}"
+        elif poster_path:
+            image = f"{TMDB_IMAGE_BASE}{poster_path}"
 
     genres = ", ".join(g.get("name", "") for g in (details.get("genres") or []) if g.get("name"))
 
