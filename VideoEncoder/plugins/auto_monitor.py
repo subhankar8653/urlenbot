@@ -1392,24 +1392,25 @@ def _apply_fetched_details(session: dict, fetched: dict | None):
 def _fetch_summary_text(fetched: dict | None) -> str:
     if not fetched:
         return (
-            "⚠️ TMDB pe is naam se koi match nahi mila.\n\n"
-            "Genres/poster baad mein `/update_post_list` se manually bhar sakte ho."
+            "⚠️ **TMDB pe is naam se koi match nahi mila.**\n\n"
+            "_Genres/poster baad mein `/update_post_list` se manually bhar sakte ho._"
         )
     status_str = fetched.get("status") or "—"
     source = fetched.get("source", "TMDB")
     season_breakdown = fetched.get("season_breakdown", "")
-    season_line = f"📚 Season-wise: {season_breakdown}\n" if season_breakdown else ""
+    season_line = f"📚 Season-wise: _{season_breakdown}_\n" if season_breakdown else ""
     eps_label = (
         f"{fetched.get('total_eps', 0) or '—'} (Season {fetched.get('season')})"
         if fetched.get("season") else f"{fetched.get('total_eps', 0) or '—'}"
     )
     return (
-        f"✅ **Details mil gaye!**\n\n"
+        f"✨ **Details mil gaye!** ✨\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📺 {source} Match: **{fetched.get('matched_name')}**\n"
-        f"📡 Status: {status_str}\n"
-        f"🎬 Total Episodes: {eps_label}\n"
+        f"📡 Status: **{status_str}**\n"
+        f"🎬 Total Episodes: **{eps_label}**\n"
         f"{season_line}"
-        f"🎭 Genres: {fetched.get('genres') or '—'}\n"
+        f"🎭 Genres: _{fetched.get('genres') or '—'}_\n"
         f"🖼 Poster: {'✅ (16:9 banner)' if fetched.get('image') else '❌ nahi mila'}"
     )
 
@@ -1427,10 +1428,11 @@ async def _show_image_choice(event, session: dict, user_id: int):
     note = (
         "🤖 **Auto Add** — TMDB se mila 16:9 poster/banner use hoga\n"
         if has_image else
-        "🤖 **Auto Add** — ⚠️ TMDB pe clean poster nahi mila, Custom Add use karo\n"
+        "🤖 **Auto Add** — TMDB pe clean poster nahi mila\n> ⚠️ _Custom Add use karo_\n"
     )
     await event.reply(
-        f"**Step 3/4 — Thumbnail/Poster set karo:**\n\n"
+        f"**🖼 Step 3/4 — Thumbnail/Poster set karo**\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{note}"
         f"🖼 **Custom Add** — khud ek photo bhejo\n\n"
         f"_Cancel karna ho toh `/cancel_add_anime` bhejo._",
@@ -1445,9 +1447,10 @@ async def _show_dub_choice(event, user_id: int):
         [InlineKeyboardButton("❌ Cancel", callback_data=f"aa_cancel_{user_id}")],
     ])
     await event.reply(
-        "**Step 4/4 — Audio/Dub type select karo:**\n\n"
-        "🎙 **ORG** — Official Hindi dub\n"
-        "🎙 **FanDub** — Fan-made Hindi dub\n\n"
+        "**🎙 Step 4/4 — Audio/Dub type select karo**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🎙 **ORG** — _Official Hindi dub_\n"
+        "🎙 **FanDub** — _Fan-made Hindi dub_\n\n"
         "_Select karte hi baaki quick setup khud maang liya jaayega._",
         reply_markup=kb,
     )
@@ -1464,7 +1467,8 @@ async def _show_interval_choice(event, user_id: int):
         [InlineKeyboardButton("❌ Cancel", callback_data=f"aa_cancel_{user_id}")],
     ])
     await event.reply(
-        "**🗓️ Almost Done — Bas Ek Aakhri Cheez! 🚀**\n\n"
+        "**🗓️ Almost Done — Bas Ek Aakhri Cheez!** 🚀\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
         "Next episode kitne din baad aata hai? _(schedule reminder ke liye)_\n\n"
         "📅 **7 Din** — weekly release\n"
         "⚡ **1 Din** — daily release\n"
@@ -1483,7 +1487,8 @@ async def _show_link_choice(event, user_id: int):
         [InlineKeyboardButton("❌ Cancel", callback_data=f"aa_cancel_{user_id}")],
     ])
     await event.reply(
-        "**🔗 Channel Invite Link**\n\n"
+        "**🔗 Channel Invite Link**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
         "Ye link *\"Watch & Download\"* button ke liye use hoga.\n\n"
         "🔗 **Set Link** — invite link bhejo\n"
         "⏭️ **Skip** — link ke bina aage badho\n\n"
@@ -1505,10 +1510,11 @@ async def cmd_add_anime(client: Client, message: Message):
         [InlineKeyboardButton("📢 Set Channel", callback_data=f"aa_setchannel_{user_id}")],
     ])
     await message.reply(
-        "**➕ Add New Anime**\n\n"
-        "4 aasaan steps mein set ho jaayega — channel, naam, poster aur "
-        "audio/dub. Sab kuch button se. 🚀\n\n"
-        "⚠️ **Note:** Jo channel add karna hai, usme bot ka **admin** hona zaruri hai.\n\n"
+        "🌟 **➕ Add New Anime** 🌟\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "4 aasaan steps mein set ho jaayega — _channel, naam, poster aur "
+        "audio/dub_. Sab kuch button se. 🚀\n\n"
+        "> ⚠️ **Note:** Jo channel add karna hai, usme bot ka **admin** hona zaruri hai.\n\n"
         "_Cancel karna ho toh `/cancel_add_anime` bhejo._",
         reply_markup=kb,
     )
@@ -1572,9 +1578,10 @@ async def _add_anime_step_channel(client: Client, message: Message, session: dic
         [InlineKeyboardButton("❌ Cancel", callback_data=f"aa_cancel_{user_id}")],
     ])
     await message.reply(
-        f"✅ Channel: **{channel_title}**\n\n"
-        f"**Step 2/4 — Anime ka naam kaise set karna hai?**\n\n"
-        f"🤖 **Auto Add** — channel ke naam (\"{channel_title}\") se TMDB pe "
+        f"✅ **Channel:** {channel_title}\n\n"
+        f"**📝 Step 2/4 — Anime ka naam kaise set karna hai?**\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🤖 **Auto Add** — channel ke naam (\"_{channel_title}_\") se TMDB pe "
         f"anime dhoondega, match milte hi wahi naam save ho jaayega\n"
         f"✍️ **Manual Add** — khud se poora sahi naam type karo\n\n"
         f"_Cancel karna ho toh `/cancel_add_anime` bhejo._",
@@ -1720,7 +1727,7 @@ async def _finalize_add_anime(client: Client, message: Message, session: dict):
     )
     interval_str = "❓ Unknown" if interval_days == "unknown" else f"{interval_days} din"
     await message.reply(
-        f"✅ **Anime Fully Added!** 🎉\n\n"
+        f"🎉 **Anime Fully Added!** 🎉\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📺 **Anime:** {anime_name}\n"
         f"📢 **Channel:** {channel_title}\n"
@@ -1733,7 +1740,8 @@ async def _finalize_add_anime(client: Client, message: Message, session: dict):
         f"📅 **Next Episode In:** {interval_str}\n"
         f"🔗 **Link:** {channel_link or '—'}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Monitor + Update Post + Schedule — teeno set ho gaye! Ab uploads automatic honge 🚀"
+        f"> ✨ _Monitor + Update Post + Schedule — teeno set ho gaye! "
+        f"Ab uploads automatic honge_ 🚀"
     )
 
 
@@ -1781,10 +1789,11 @@ async def add_anime_callbacks(client: Client, cb: CallbackQuery):
         await cb.answer()
         try:
             await cb.message.edit(
-                "**Step 1/4 — Channel batao:**\n\n"
+                "**📢 Step 1/4 — Channel batao**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
                 "Channel ki ID bhejo (`-100xxxxxxxxx`) *ya* us channel ka koi bhi "
                 "message yahan forward kar do.\n\n"
-                "⚠️ _Bot us channel mein admin hona chahiye._\n\n"
+                "> ⚠️ _Bot us channel mein admin hona chahiye._\n\n"
                 "_Cancel karna ho toh `/cancel_add_anime` bhejo._"
             )
         except Exception:
@@ -1804,7 +1813,8 @@ async def add_anime_callbacks(client: Client, cb: CallbackQuery):
             await cb.answer()
             try:
                 await cb.message.edit(
-                    "**Step 2/4 — Anime ka poora aur bilkul sahi naam do:**\n\n"
+                    "**✍️ Step 2/4 — Anime ka poora aur bilkul sahi naam do**\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
                     "_Isi naam se genres aur poster TMDB se auto-fetch honge._\n\n"
                     "**Example:** `Fullmetal Alchemist: Brotherhood`\n\n"
                     "_Cancel karna ho toh `/cancel_add_anime` bhejo._"
@@ -1835,7 +1845,7 @@ async def add_anime_callbacks(client: Client, cb: CallbackQuery):
             try:
                 await cb.message.edit(
                     f"❌ **\"{channel_title}\"** naam se TMDB pe koi anime match nahi mila.\n\n"
-                    f"Manual Add try karo — anime ka poora sahi naam khud type karo.",
+                    f"> ✍️ Manual Add try karo — anime ka poora sahi naam khud type karo.",
                     reply_markup=kb,
                 )
             except Exception:
@@ -1935,8 +1945,8 @@ async def add_anime_callbacks(client: Client, cb: CallbackQuery):
             try:
                 await cb.message.edit(
                     "✅ **Interval:** Unknown\n\n"
-                    "_Episode post hone ke baad channel pe \"More episodes comming "
-                    "soon...\" dikhega._"
+                    "> ℹ️ _Episode post hone ke baad channel pe \"More episodes "
+                    "comming soon...\" dikhega._"
                 )
             except Exception:
                 pass
