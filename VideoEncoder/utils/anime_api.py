@@ -84,6 +84,48 @@ def _normalize_title(title: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+# ── Query cleaning — Telegram channel/anime naam mein aksar TMDB search ko
+#    bhatka dene waale extra words hote hain ("in Hindi Dubbed", "Season 02",
+#    "1080p", "[Multi Audio]" waghera). Search se pehle inhe strip karke
+#    asli anime title nikalte hain, taaki TMDB match sahi se mile. ──
+_NOISE_PATTERNS = [
+    r"\bin\s+hindi\s+dubbed\b",
+    r"\bhindi\s*[-\s]?\s*dubbed\b",
+    r"\bhindi\s*[-\s]?\s*dub\b",
+    r"\bhindi\s*[-\s]?\s*sub(?:bed)?\b",
+    r"\bhin[-\s]?dub\b",
+    r"\bdual\s+audio\b",
+    r"\bmulti\s+audio\b",
+    r"\bofficial\s+dub\b",
+    r"\bfan\s*dub\b",
+    r"\bin\s+hindi\b",
+    r"\bhindi\b",
+    r"\bdubbed\b",
+    r"\bsubbed\b",
+    r"\bdub\b",
+    r"\bsub\b",
+    r"\bseason\s*\d+\b",
+    r"\bs\d{1,2}\b",
+    r"\bpart\s*\d+\b",
+    r"\bcour\s*\d+\b",
+    r"\b(1080p|720p|480p|360p|hd|4k|hevc|x264|x265)\b",
+    r"\[[^\]]*\]",
+    r"\([^)]*\)",
+]
+_NOISE_RE = [re.compile(p, re.IGNORECASE) for p in _NOISE_PATTERNS]
+
+
+def _clean_anime_query(name: str) -> str:
+    """Extra noise-words hatao — sirf asli anime title bache."""
+    if not name:
+        return ""
+    q = name
+    for pat in _NOISE_RE:
+        q = pat.sub(" ", q)
+    q = re.sub(r"\s+", " ", q).strip(" -_|:")
+    return q
+
+
 def _fuzzy_ratio(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
@@ -195,9 +237,22 @@ async def _fetch_from_tmdb(anime_name: str) -> Optional[dict]:
         LOGGER.info("[AnimeAPI] TMDB_API_KEY not set, skipping TMDB")
         return None
 
-    media_type, result = await _tmdb_search(anime_name)
+    # Pehle cleaned title se search karo ("Naruto in Hindi Dubbed Season 2"
+    # → "Naruto"). Match na mile toh raw naam se bhi try karo (fallback),
+    # kyunki kabhi-kabhi cleaning zaroorat se zyada strip kar deti hai.
+    cleaned_name = _clean_anime_query(anime_name)
+    search_query = cleaned_name if cleaned_name else anime_name
+
+    media_type, result = await _tmdb_search(search_query)
+    if not result and search_query.lower() != anime_name.lower():
+        LOGGER.info(
+            f"[AnimeAPI] Cleaned query '{search_query}' se match nahi mila, "
+            f"raw naam '{anime_name}' try kar raha hoon"
+        )
+        media_type, result = await _tmdb_search(anime_name)
+
     if not result:
-        LOGGER.info(f"[AnimeAPI] No TMDB match for '{anime_name}'")
+        LOGGER.info(f"[AnimeAPI] No TMDB match for '{anime_name}' (cleaned: '{search_query}')")
         return None
 
     details = await _tmdb_details(media_type, result.get("id")) or result
