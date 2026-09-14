@@ -18,10 +18,11 @@ Flow:
   5. Custom pic (existing custompic.py se auto-apply) + auto caption
 
 Commands:
-  /add_anime            → 4-step interactive flow — channel, naam, API se
-                          auto-detail (season/episodes/poster/genres/audio),
-                          interval days, channel link. Anime + monitor +
-                          update-post + schedule sab EK saath set ho jaate hain.
+  /add_anime            → 4-step button-driven flow — channel, naam
+                          (auto/manual), poster (auto/custom), audio
+                          (ORG/FanDub) + quick interval/link. Anime +
+                          monitor + update-post + schedule sab EK saath
+                          set ho jaate hain.
   /cancel_add_anime     → Beech mein /add_anime cancel karo
   /list_anime           → Kya set hai dekho
   /del_anime [number]   → Remove karo
@@ -1312,28 +1313,37 @@ async def cmd_set_monitor(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────
-#  /add_anime — Interactive 4-step flow (v2)
+#  /add_anime — Interactive button-flow (v3)
 #
-#  Step 1 (channel) : Channel ID bhejo YA channel ka koi bhi msg forward karo
-#  Step 2 (name)     : Anime ka poora/sahi naam do
-#                       → isi step ke andar A501 API se auto-fetch hota hai:
-#                         poster/thumbnail, genres, audio, latest season +
-#                         uske total episodes (koi extra step nahi lagta)
-#  Step 3 (interval) : Kitne din baad next episode aata hai
-#  Step 4 (link)     : Channel ka invite link (ya skip)
+#  Step 1/4 (channel)  : "📢 Set Channel" button dabao → channel ID bhejo
+#                          YA us channel ka koi bhi message forward karo.
+#                          Bot us channel mein *admin* hona chahiye.
+#  Step 2/4 (name)      : 🤖 Auto Add  — channel ke naam se TMDB pe anime
+#                                        dhoondta hai, match milte hi wahi
+#                                        naam save ho jaata hai; na mile
+#                                        toh error + Manual Add ka option.
+#                          ✍️ Manual Add — khud poora sahi naam type karo.
+#                          (Dono case mein genres turant TMDB se auto-fill
+#                          ho jaate hain — koi extra step nahi lagta.)
+#  Step 3/4 (poster)    : 🤖 Auto Add  — anime-name wale TMDB match se mila
+#                                        16:9 ("YouTube size") banner lagta hai.
+#                          🖼 Custom Add — khud ek photo bhejo.
+#  Step 4/4 (audio/dub) : 🎙 ORG ya 🎙 FanDub choose karo → is step ke baad
+#                          bas schedule-interval + channel-link (quick text)
+#                          maang ke sab kuch save ho jaata hai.
 #
 #  Finalize par teeno system ek saath save ho jaate hain:
-#    - anime_monitor_list   (RTI auto-monitor — jaisa pehle /add_anime karta tha)
-#    - update_post_map      (jaisa /update_post 5-step se save hota tha, bas
-#                             audio/genres/image ab API se auto-fill hote hain)
-#    - episode_schedule_list (jaisa /schedule karta tha)
+#    - anime_monitor_list   (RTI auto-monitor)
+#    - update_post_map      (update-channel post ke liye)
+#    - episode_schedule_list (agla episode kab expect karna hai)
 # ─────────────────────────────────────────────
 
 # { user_id: {
-#     'step': 'channel'|'name'|'interval'|'link',
+#     'step': 'await_start'|'channel'|'name_choice'|'name_manual'|
+#             'image_choice'|'image_custom'|'dub_choice'|'interval'|'link',
 #     'channel_id', 'channel_title',
 #     'anime_name', 'audio', 'genres', 'image', 'season', 'total_eps',
-#     'interval_days', 'channel_link',
+#     'season_breakdown', 'interval_days', 'channel_link',
 # } }
 _add_anime_sessions: dict = {}
 
@@ -1359,20 +1369,107 @@ async def _register_setpic_from_url(user_id: int, keyword: str, image_url: str) 
         return False
 
 
+def _apply_fetched_details(session: dict, fetched: dict | None):
+    """TMDB se fetch hue details session mein bhar do (ya empty defaults)."""
+    if fetched:
+        session["audio"] = fetched.get("audio", "Hindi ORG")
+        session["genres"] = fetched.get("genres", "")
+        session["image"] = fetched.get("image", "")
+        session["season"] = fetched.get("season")
+        session["total_eps"] = fetched.get("total_eps", 0)
+        session["season_breakdown"] = fetched.get("season_breakdown", "")
+    else:
+        session["audio"] = "Hindi ORG"
+        session["genres"] = ""
+        session["image"] = ""
+        session["season"] = None
+        session["total_eps"] = 0
+        session["season_breakdown"] = ""
+
+
+def _fetch_summary_text(fetched: dict | None) -> str:
+    if not fetched:
+        return (
+            "⚠️ TMDB pe is naam se koi match nahi mila.\n\n"
+            "Genres/poster baad mein `/update_post_list` se manually bhar sakte ho."
+        )
+    status_str = fetched.get("status") or "—"
+    source = fetched.get("source", "TMDB")
+    season_breakdown = fetched.get("season_breakdown", "")
+    season_line = f"📚 Season-wise: {season_breakdown}\n" if season_breakdown else ""
+    eps_label = (
+        f"{fetched.get('total_eps', 0) or '—'} (Season {fetched.get('season')})"
+        if fetched.get("season") else f"{fetched.get('total_eps', 0) or '—'}"
+    )
+    return (
+        f"✅ **Details mil gaye!**\n\n"
+        f"📺 {source} Match: **{fetched.get('matched_name')}**\n"
+        f"📡 Status: {status_str}\n"
+        f"🎬 Total Episodes: {eps_label}\n"
+        f"{season_line}"
+        f"🎭 Genres: {fetched.get('genres') or '—'}\n"
+        f"🖼 Poster: {'✅ (16:9 banner)' if fetched.get('image') else '❌ nahi mila'}"
+    )
+
+
+async def _show_image_choice(event, session: dict, user_id: int):
+    has_image = bool(session.get("image"))
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "🤖 Auto Add" if has_image else "🤖 Auto Add (nahi mila)",
+            callback_data=f"aa_img_auto_{user_id}",
+        )],
+        [InlineKeyboardButton("🖼 Custom Add", callback_data=f"aa_img_custom_{user_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"aa_cancel_{user_id}")],
+    ])
+    note = (
+        "🤖 **Auto Add** — TMDB se mila 16:9 poster/banner use hoga\n"
+        if has_image else
+        "🤖 **Auto Add** — ⚠️ TMDB pe clean poster nahi mila, Custom Add use karo\n"
+    )
+    await event.reply(
+        f"**Step 3/4 — Thumbnail/Poster set karo:**\n\n"
+        f"{note}"
+        f"🖼 **Custom Add** — khud ek photo bhejo\n\n"
+        f"_Cancel karna ho toh `/cancel_add_anime` bhejo._",
+        reply_markup=kb,
+    )
+
+
+async def _show_dub_choice(event, user_id: int):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎙 ORG", callback_data=f"aa_dub_org_{user_id}")],
+        [InlineKeyboardButton("🎙 FanDub", callback_data=f"aa_dub_fandub_{user_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"aa_cancel_{user_id}")],
+    ])
+    await event.reply(
+        "**Step 4/4 — Audio/Dub type select karo:**\n\n"
+        "🎙 **ORG** — Official Hindi dub\n"
+        "🎙 **FanDub** — Fan-made Hindi dub\n\n"
+        "_Select karte hi baaki quick setup khud maang liya jaayega._",
+        reply_markup=kb,
+    )
+
+
 @Client.on_message(filters.command("add_anime") & filters.private)
 async def cmd_add_anime(client: Client, message: Message):
-    """/add_anime — interactive flow shuru karo (Step 1/4: channel)."""
+    """/add_anime — button-flow shuru karo (Step 1/4: channel)."""
     if not _is_authorized(message.from_user.id):
         return
 
     user_id = message.from_user.id
-    _add_anime_sessions[user_id] = {"step": "channel"}
+    _add_anime_sessions[user_id] = {"step": "await_start"}
 
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Set Channel", callback_data=f"aa_setchannel_{user_id}")],
+    ])
     await message.reply(
-        "**Step 1/4 — Channel batao:**\n\n"
-        "Channel ki ID bhejo (`-100xxxxxxxxx`) *ya* us channel ka koi bhi "
-        "message yahan forward kar do.\n\n"
-        "_Cancel karna ho toh `/cancel_add_anime` bhejo._"
+        "**➕ Add New Anime**\n\n"
+        "4 aasaan steps mein set ho jaayega — channel, naam, poster aur "
+        "audio/dub. Sab kuch button se. 🚀\n\n"
+        "⚠️ **Note:** Jo channel add karna hai, usme bot ka **admin** hona zaruri hai.\n\n"
+        "_Cancel karna ho toh `/cancel_add_anime` bhejo._",
+        reply_markup=kb,
     )
 
 
@@ -1387,7 +1484,7 @@ async def cmd_cancel_add_anime(client: Client, message: Message):
         await message.reply("Koi active `/add_anime` session nahi hai.")
 
 
-# ── Step handlers ──────────────────────────────────────────────
+# ── Step handlers (text-driven steps) ──────────────────────────
 
 async def _add_anime_step_channel(client: Client, message: Message, session: dict, user_id: int):
     channel_id = None
@@ -1425,20 +1522,26 @@ async def _add_anime_step_channel(client: Client, message: Message, session: dic
 
     session["channel_id"] = channel_id
     session["channel_title"] = channel_title
-    session["step"] = "name"
+    session["step"] = "name_choice"
     _add_anime_sessions[user_id] = session
 
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤖 Auto Add", callback_data=f"aa_name_auto_{user_id}")],
+        [InlineKeyboardButton("✍️ Manual Add", callback_data=f"aa_name_manual_{user_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"aa_cancel_{user_id}")],
+    ])
     await message.reply(
         f"✅ Channel: **{channel_title}**\n\n"
-        f"**Step 2/4 — Anime ka poora aur bilkul sahi naam do:**\n\n"
-        f"_Isi naam se API se saari details (season, episodes, poster, "
-        f"genres, audio) auto-fetch hongi — isliye naam sahi likhna._\n\n"
-        f"**Example:** `Fullmetal Alchemist: Brotherhood`\n\n"
-        f"_Cancel karna ho toh `/cancel_add_anime` bhejo._"
+        f"**Step 2/4 — Anime ka naam kaise set karna hai?**\n\n"
+        f"🤖 **Auto Add** — channel ke naam (\"{channel_title}\") se TMDB pe "
+        f"anime dhoondega, match milte hi wahi naam save ho jaayega\n"
+        f"✍️ **Manual Add** — khud se poora sahi naam type karo\n\n"
+        f"_Cancel karna ho toh `/cancel_add_anime` bhejo._",
+        reply_markup=kb,
     )
 
 
-async def _add_anime_step_name(client: Client, message: Message, session: dict, user_id: int):
+async def _add_anime_step_name_manual(client: Client, message: Message, session: dict, user_id: int):
     anime_name = (message.text or "").strip()
     if not anime_name:
         await message.reply("⚠️ Anime ka naam do.")
@@ -1447,74 +1550,34 @@ async def _add_anime_step_name(client: Client, message: Message, session: dict, 
     session["anime_name"] = anime_name
 
     status_msg = await message.reply("🔎 TMDB se anime ki details dhoondh raha hoon...")
+    fetched = None
     try:
         fetched = await fetch_anime_details(anime_name)
     except Exception as e:
         LOGGER.warning(f"[AddAnime] fetch_anime_details error: {e}")
-        fetched = None
 
-    if fetched:
-        session["audio"] = fetched.get("audio", "Hindi ORG")
-        session["genres"] = fetched.get("genres", "")
-        session["image"] = fetched.get("image", "")
-        session["season"] = fetched.get("season")
-        session["total_eps"] = fetched.get("total_eps", 0)
-        session["season_breakdown"] = fetched.get("season_breakdown", "")
-
-        status_str = fetched.get("status") or "—"
-        source = fetched.get("source", "TMDB")
-        season_breakdown = fetched.get("season_breakdown", "")
-        season_line = f"📚 Season-wise: {season_breakdown}\n" if season_breakdown else ""
-        eps_label = (
-            f"{fetched.get('total_eps', 0) or '—'} (Season {fetched.get('season')})"
-            if fetched.get("season") else f"{fetched.get('total_eps', 0) or '—'}"
-        )
-        summary = (
-            f"✅ **Details mil gaye!**\n\n"
-            f"📺 {source} Match: **{fetched.get('matched_name')}**\n"
-            f"📡 Status: {status_str}\n"
-            f"🎬 Total Episodes: {eps_label}\n"
-            f"{season_line}"
-            f"🎙 Audio: {fetched.get('audio')} _(default)_\n"
-            f"🎭 Genres: {fetched.get('genres') or '—'}\n"
-            f"🖼 Poster: {'✅ (banner)' if fetched.get('image') else '❌ nahi mila'}\n\n"
-            f"_Audio default \"Hindi ORG\" set hai — badalna ho toh `/update_post_list` se karo._"
-        )
-    else:
-        session["audio"] = "Hindi ORG"
-        session["genres"] = ""
-        session["image"] = ""
-        session["season"] = None
-        session["total_eps"] = 0
-        session["season_breakdown"] = ""
-        summary = (
-            "⚠️ TMDB ya AniList pe is naam se koi match nahi mila.\n\n"
-            "Anime add ho jaayega, audio default \"Hindi ORG\" set hoga, "
-            "poster/genres baad mein `/update_post_list` se manually bhar sakte ho."
-        )
+    _apply_fetched_details(session, fetched)
 
     try:
-        await status_msg.edit(summary)
+        await status_msg.edit(_fetch_summary_text(fetched))
     except Exception:
-        await message.reply(summary)
+        pass
 
-    session["step"] = "interval"
+    session["step"] = "image_choice"
     _add_anime_sessions[user_id] = session
-
-    await message.reply(
-        f"**Step 3/4 — Kitne din baad next episode aata hai?**\n\n"
-        f"**Example:** `7`\n\n"
-        f"_Cancel karna ho toh `/cancel_add_anime` bhejo._"
-    )
+    await _show_image_choice(message, session, user_id)
 
 
 async def _add_anime_step_interval(client: Client, message: Message, session: dict, user_id: int):
     text = (message.text or "").strip()
-    try:
-        interval_days = int(text)
-    except ValueError:
-        await message.reply("⚠️ Sirf number do, jaise `7`.")
-        return
+    if text.lower() == "skip":
+        interval_days = 7
+    else:
+        try:
+            interval_days = int(text)
+        except ValueError:
+            await message.reply("⚠️ Sirf number do, jaise `7`, ya `skip` likho (default 7 din).")
+            return
 
     session["interval_days"] = interval_days
     session["step"] = "link"
@@ -1522,8 +1585,7 @@ async def _add_anime_step_interval(client: Client, message: Message, session: di
 
     await message.reply(
         f"✅ Interval: **{interval_days} din**\n\n"
-        f"**Step 4/4 — Channel ka invite link do** "
-        f"(update-post ke \"Watch & Download\" button ke liye):\n\n"
+        f"Channel ka invite link do (\"Watch & Download\" button ke liye):\n\n"
         f"**Example:** `https://t.me/+xxxxxxxxxx`\n\n"
         f"_Nahi dena toh `skip` likho._"
     )
@@ -1609,7 +1671,7 @@ async def _finalize_add_anime(client: Client, message: Message, session: dict):
     await _save_schedule_list(slist)
 
     image_line = (
-        "🖼 **Poster:** ✅ auto-fetched\n" if image
+        "🖼 **Poster:** ✅ set (16:9 banner)\n" if image
         else "🖼 **Poster:** ⚠️ nahi mila — `/update_post_list` se add karo\n"
     )
     season_breakdown = session.get("season_breakdown", "")
@@ -1623,7 +1685,7 @@ async def _finalize_add_anime(client: Client, message: Message, session: dict):
         else ("📌 **Auto-Thumbnail:** ⚠️ save nahi ho paaya — `/setpic " + anime_name + "` manually karo\n" if image else "")
     )
     await message.reply(
-        f"✅ **Anime Fully Added!**\n\n"
+        f"✅ **Anime Fully Added!** 🎉\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📺 **Anime:** {anime_name}\n"
         f"📢 **Channel:** {channel_title}\n"
@@ -1636,8 +1698,205 @@ async def _finalize_add_anime(client: Client, message: Message, session: dict):
         f"📅 **Next Episode In:** {interval_days} din\n"
         f"🔗 **Link:** {channel_link or '—'}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Monitor + Update Post + Schedule — teeno set ho gaye! \U0001f680"
+        f"Monitor + Update Post + Schedule — teeno set ho gaye! Ab uploads automatic honge 🚀"
     )
+
+
+# ── Button callbacks ──────────────────────────────────────────
+@Client.on_callback_query(filters.regex(r"^aa_"))
+async def add_anime_callbacks(client: Client, cb: CallbackQuery):
+    """/add_anime button-flow ke saare callbacks."""
+    data = cb.data
+    user_id = cb.from_user.id
+
+    if not _is_authorized(user_id):
+        await cb.answer("❌ Authorized nahi ho!", show_alert=True)
+        return
+
+    parts = data.split("_")
+    try:
+        owner_id = int(parts[-1])
+    except (ValueError, IndexError):
+        await cb.answer()
+        return
+
+    if user_id != owner_id:
+        await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+        return
+
+    # ── aa_cancel_<uid> ──
+    if data.startswith("aa_cancel_"):
+        _add_anime_sessions.pop(owner_id, None)
+        await cb.answer("❌ Cancelled")
+        try:
+            await cb.message.edit("❌ **Cancelled.**")
+        except Exception:
+            pass
+        return
+
+    session = _add_anime_sessions.get(owner_id)
+    if session is None:
+        await cb.answer("⚠️ Session expire ho gaya, /add_anime dobara chalao.", show_alert=True)
+        return
+
+    # ── aa_setchannel_<uid> ──
+    if data.startswith("aa_setchannel_"):
+        session["step"] = "channel"
+        _add_anime_sessions[owner_id] = session
+        await cb.answer()
+        try:
+            await cb.message.edit(
+                "**Step 1/4 — Channel batao:**\n\n"
+                "Channel ki ID bhejo (`-100xxxxxxxxx`) *ya* us channel ka koi bhi "
+                "message yahan forward kar do.\n\n"
+                "⚠️ _Bot us channel mein admin hona chahiye._\n\n"
+                "_Cancel karna ho toh `/cancel_add_anime` bhejo._"
+            )
+        except Exception:
+            pass
+        return
+
+    # ── aa_name_auto_<uid> / aa_name_manual_<uid> ──
+    if data.startswith("aa_name_"):
+        if session.get("step") != "name_choice":
+            await cb.answer("⚠️ Ye step ab active nahi hai.", show_alert=True)
+            return
+        mode = parts[2]
+
+        if mode == "manual":
+            session["step"] = "name_manual"
+            _add_anime_sessions[owner_id] = session
+            await cb.answer()
+            try:
+                await cb.message.edit(
+                    "**Step 2/4 — Anime ka poora aur bilkul sahi naam do:**\n\n"
+                    "_Isi naam se genres aur poster TMDB se auto-fetch honge._\n\n"
+                    "**Example:** `Fullmetal Alchemist: Brotherhood`\n\n"
+                    "_Cancel karna ho toh `/cancel_add_anime` bhejo._"
+                )
+            except Exception:
+                pass
+            return
+
+        # mode == "auto" — channel ke naam se TMDB pe search karo
+        channel_title = session.get("channel_title", "")
+        await cb.answer()
+        try:
+            await cb.message.edit(f"🔎 Channel naam **\"{channel_title}\"** se TMDB pe anime dhoondh raha hoon...")
+        except Exception:
+            pass
+
+        fetched = None
+        try:
+            fetched = await fetch_anime_details(channel_title)
+        except Exception as e:
+            LOGGER.warning(f"[AddAnime] auto-name fetch error: {e}")
+
+        if not fetched:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✍️ Manual Add", callback_data=f"aa_name_manual_{owner_id}")],
+                [InlineKeyboardButton("❌ Cancel", callback_data=f"aa_cancel_{owner_id}")],
+            ])
+            try:
+                await cb.message.edit(
+                    f"❌ **\"{channel_title}\"** naam se TMDB pe koi anime match nahi mila.\n\n"
+                    f"Manual Add try karo — anime ka poora sahi naam khud type karo.",
+                    reply_markup=kb,
+                )
+            except Exception:
+                pass
+            return
+
+        _apply_fetched_details(session, fetched)
+        session["anime_name"] = fetched["matched_name"]
+        session["step"] = "image_choice"
+        _add_anime_sessions[owner_id] = session
+
+        try:
+            await cb.message.edit(_fetch_summary_text(fetched))
+        except Exception:
+            pass
+        await _show_image_choice(cb.message, session, owner_id)
+        return
+
+    # ── aa_img_auto_<uid> / aa_img_custom_<uid> ──
+    if data.startswith("aa_img_"):
+        if session.get("step") != "image_choice":
+            await cb.answer("⚠️ Ye step ab active nahi hai.", show_alert=True)
+            return
+        mode = parts[2]
+
+        if mode == "auto":
+            if not session.get("image"):
+                await cb.answer("⚠️ TMDB se koi image nahi mila — Custom Add try karo!", show_alert=True)
+                return
+            session["step"] = "dub_choice"
+            _add_anime_sessions[owner_id] = session
+            await cb.answer("✅ TMDB poster use hoga")
+            try:
+                await cb.message.edit("✅ **Poster:** TMDB se auto set ho gaya (16:9 banner).")
+            except Exception:
+                pass
+            await _show_dub_choice(cb.message, owner_id)
+            return
+
+        # mode == "custom"
+        session["step"] = "image_custom"
+        _add_anime_sessions[owner_id] = session
+        await cb.answer()
+        try:
+            await cb.message.edit(
+                "**Step 3/4 — Poster/thumbnail image bhejo:**\n\n"
+                "_Photo bhejo, caption ki zaroorat nahi._\n\n"
+                "_Cancel karna ho toh `/cancel_add_anime` bhejo._"
+            )
+        except Exception:
+            pass
+        return
+
+    # ── aa_dub_org_<uid> / aa_dub_fandub_<uid> ──
+    if data.startswith("aa_dub_"):
+        if session.get("step") != "dub_choice":
+            await cb.answer("⚠️ Ye step ab active nahi hai.", show_alert=True)
+            return
+        mode = parts[2]
+        session["audio"] = "Hindi ORG" if mode == "org" else "Hindi FanDub"
+        session["step"] = "interval"
+        _add_anime_sessions[owner_id] = session
+        await cb.answer(f"✅ {session['audio']}")
+        try:
+            await cb.message.edit(f"✅ **Audio:** {session['audio']}")
+        except Exception:
+            pass
+        await cb.message.reply(
+            "**Almost done — bas ek aakhri cheez! 🚀**\n\n"
+            "Kitne din baad next episode aata hai? (schedule reminder ke liye)\n\n"
+            "**Example:** `7`\n\n"
+            "_Nahi pata toh `skip` likho (default 7 din)._"
+        )
+        return
+
+    await cb.answer()
+
+
+# ── Photo handler — sirf "image_custom" step ke liye ───────────
+@Client.on_message(filters.photo & filters.private, group=0)
+async def add_anime_photo_input(client: Client, message: Message):
+    if not message.from_user:
+        raise ContinuePropagation
+
+    user_id = message.from_user.id
+    session = _add_anime_sessions.get(user_id)
+    if not session or not _is_authorized(user_id) or session.get("step") != "image_custom":
+        raise ContinuePropagation
+
+    session["image"] = message.photo.file_id
+    session["step"] = "dub_choice"
+    _add_anime_sessions[user_id] = session
+
+    await message.reply("✅ **Poster:** custom image saved!")
+    await _show_dub_choice(message, user_id)
+    raise StopPropagation
 
 
 # ── Session router — sabse pehle chalta hai, apni session na ho toh
@@ -1670,14 +1929,28 @@ async def add_anime_flow_router(client: Client, message: Message):
     if step == "channel":
         await _add_anime_step_channel(client, message, session, user_id)
         raise StopPropagation
-    if step == "name":
-        await _add_anime_step_name(client, message, session, user_id)
+    if step == "name_manual":
+        await _add_anime_step_name_manual(client, message, session, user_id)
         raise StopPropagation
     if step == "interval":
         await _add_anime_step_interval(client, message, session, user_id)
         raise StopPropagation
     if step == "link":
         await _add_anime_step_link(client, message, session, user_id)
+        raise StopPropagation
+    if step == "image_custom":
+        # Photos yahan nahi — dedicated add_anime_photo_input (upar) handle
+        # karta hai. Sirf stray text ko yahan nudge karo.
+        if message.text:
+            await message.reply(
+                "⚠️ Image bhejo (photo), text nahi.\n\n"
+                "_Cancel karna ho toh `/cancel_add_anime` bhejo._"
+            )
+            raise StopPropagation
+        raise ContinuePropagation
+    if step in ("await_start", "name_choice", "image_choice", "dub_choice"):
+        if message.text:
+            await message.reply("⬆️ Upar diye gaye buttons mein se ek option choose karo.")
         raise StopPropagation
 
     raise ContinuePropagation
