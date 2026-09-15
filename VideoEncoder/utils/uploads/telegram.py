@@ -9,7 +9,8 @@ from pyrogram.enums import ParseMode
 from pyrogram.errors import ChannelInvalid, ChannelPrivate, ChatIdInvalid, PeerIdInvalid
 from ... import app, download_dir, log, api_id, api_hash, LOGGER
 from ..database.access_db import db
-from ..auto_caption import smart_caption
+from ..auto_caption import smart_caption, get_caption_data
+from .. import caption_style
 from ..community import get_community_tag
 from ..display_progress import progress_for_pyrogram
 from ..encoding import get_duration, get_thumbnail, get_width_height
@@ -252,7 +253,27 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
     caption_channel = await get_community_tag(message.from_user.id)
     caption = smart_caption(original_caption, new_file, resolution, channel=caption_channel, blacklist=user_blacklist)
     caption = await apply_swap(caption, message.from_user.id)
-    bold_caption = f'<b>{caption}</b>'
+
+    # ── GLOBAL caption style (/caption_style) ──
+    # Jo bhi style select hai (default ya koi bhi styled template), wahi
+    # yahan bhi lagta hai — /upload, /url (manual + auto), sab isi function
+    # (upload_to_tg) se guzarte hain, isliye yeh ek hi jagah fix sabhi
+    # jagah caption style consistent bana deta hai.
+    style_id = caption_style.get_current_style_id()
+    if style_id == caption_style.DEFAULT_STYLE_ID:
+        bold_caption = f'<b>{caption}</b>'
+    else:
+        try:
+            cap_data = get_caption_data(
+                original_caption, new_file, resolution,
+                channel=caption_channel, blacklist=user_blacklist,
+            )
+            cap_data["genres"] = await caption_style.lookup_genres(cap_data["anime_name"])
+            bold_caption = caption_style.render_caption_html(style_id, cap_data)
+            bold_caption = await apply_swap(bold_caption, message.from_user.id)
+        except Exception as e:
+            LOGGER.warning(f"[CaptionStyle] Styled caption build failed, falling back to default: {e}")
+            bold_caption = f'<b>{caption}</b>'
 
     new_filename = build_filename(caption)
     new_path = os.path.join(os.path.dirname(new_file), new_filename)
