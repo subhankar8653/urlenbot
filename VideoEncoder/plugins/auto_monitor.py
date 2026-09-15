@@ -47,6 +47,8 @@ from .. import LOGGER, app, owner, sudo_users, download_dir, log
 from ..utils.database.access_db import db
 from ..utils.anime_api import fetch_anime_details
 from ..utils.helper import check_chat
+from ..utils import caption_style
+from ..utils.community import get_community_tag
 
 # ─────────────────────────────────────────────
 #  Lazy imports (avoid circular on startup)
@@ -648,13 +650,52 @@ class _BotModePostManager:
         self.post_msg_id: int | None = None
         self._buttons: dict[str, str] = {}    # quality → deep_link_url (ready ones)
         self._lock       = asyncio.Lock()
+        self._genres_cache: str | None = None  # lazy, ek baar lookup karke cache
 
     # ── Caption ──────────────────────────────────────────────────────────
-    def _build_caption(self) -> str:
+    async def _lookup_genres(self) -> str:
+        if self._genres_cache is not None:
+            return self._genres_cache
+        self._genres_cache = await caption_style.lookup_genres(self.anime_name)
+        return self._genres_cache
+
+    async def _build_caption(self) -> str:
+        """GLOBAL /caption_style setting yahan bhi lagti hai — pehle yeh
+        hamesha hardcoded plain caption banata tha, isliye auto-monitor
+        (auto upload) posts pe style kabhi nahi lagta tha, chahe /caption_style
+        se koi bhi style apply ki gayi ho. Ab EpisodePostManager
+        (bot_upload_engine.py) jaisa hi engine use karta hai."""
         s = f"{self.season_num:02d}" if self.season_num else "01"
         e = f"{self.episode_num:02d}" if self.episode_num else "??"
         lang = self.language_str or "Hindi"
-        return f"<b>➲ Season {s} Episode {e} {lang}</b>"
+        default_caption = f"<b>➲ Season {s} Episode {e} {lang}</b>"
+
+        style_id = caption_style.get_current_style_id()
+        if style_id == caption_style.DEFAULT_STYLE_ID:
+            return default_caption
+
+        quality_list = [q for q in self.UPLOAD_QUALITIES if q in self._buttons]
+        quality_str = ", ".join(quality_list) if quality_list else "—"
+        genres = await self._lookup_genres()
+        try:
+            main_channel = await get_community_tag()
+        except Exception:
+            main_channel = "@SBANIME"
+
+        data = {
+            "anime_name": self.anime_name,
+            "season": self.season_num or 1,
+            "episode": self.episode_num or 0,
+            "quality": quality_str,
+            "audio": lang,
+            "genres": genres,
+            "main_channel": main_channel,
+        }
+        try:
+            return caption_style.render_caption_html(style_id, data)
+        except Exception as ex:
+            LOGGER.warning(f"[BotMode] Styled caption failed, falling back to default: {ex}")
+            return default_caption
 
     # ── Keyboard ─────────────────────────────────────────────────────────
     def _build_keyboard(self) -> InlineKeyboardMarkup | None:
@@ -696,7 +737,7 @@ class _BotModePostManager:
 
             self._buttons[quality] = deep_link_url
             keyboard = self._build_keyboard()
-            caption  = self._build_caption()
+            caption  = await self._build_caption()
 
             if self.post_msg_id is None:
                 # Pehli quality — nayi post banao

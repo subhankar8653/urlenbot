@@ -1,13 +1,14 @@
 """
 caption_style.py
 ==================
-/caption_style — /bot_upload se jab episode channel pe post hota hai,
-uske caption ke liye 10 professional style presets + "Default" (purana
-plain wala) me se ek choose karo, live preview dekho, phir apply karo.
+/caption_style — episode caption ke liye 10 professional style presets +
+"Default" (purana plain wala) me se ek choose karo, live preview dekho,
+phir apply karo.
 GLOBAL (bot-wide) setting hai — thumb_style ki tarah, sirf owner/sudo
-chala sakte hain, aur jo bhi select ho woh sabhi naye episode-posts
-(manual + auto-monitor, dono `/bot_upload` engine se hi jaate hain) mein
-consistent lagta hai — turant effective, restart ki zaroorat nahi.
+chala sakte hain, aur jo bhi select ho woh HAR upload path pe consistent
+lagta hai: `/bot_upload` (manual + auto-monitor RTI post), auto-monitor
+ka bot-mode post, aur `/upload` / `/url` (manual + auto processing) ke
+video captions — turant effective, restart ki zaroorat nahi.
 
 Flow:
   /caption_style      -> 10 styles + Default ki list dikhti hai
@@ -37,8 +38,8 @@ def _status_text() -> str:
         f"Current: **{name}**\n\n"
         "Neeche se koi bhi style tap karo — pehle uska preview dikhega, "
         "phir chaaho toh apply kar sakte ho.\n\n"
-        "> ℹ️ _Yeh style `/bot_upload` se jaane waale har naye episode "
-        "ke caption pe lagega._"
+        "> ℹ️ _Yeh style HAR jagah lagega — `/bot_upload`, `/upload`, "
+        "`/url` (manual + auto upload) sabhi naye episode captions pe._"
     )
 
 
@@ -162,8 +163,9 @@ async def caption_style_callback(client: Client, cb: CallbackQuery):
         try:
             await cb.message.edit(
                 f"✅ **Applied: {name}**\n\n"
-                f"> ✨ _Ab `/bot_upload` se jaane waale har naye episode ke "
-                f"caption pe yehi style lagega — turant effective hai._"
+                f"> ✨ _Ab har jagah se jaane waale naye episode caption pe "
+                f"yehi style lagega — `/bot_upload`, `/upload`, `/url` "
+                f"(manual + auto upload), sab jagah turant effective hai._"
             )
         except Exception:
             pass
