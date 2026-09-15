@@ -187,7 +187,7 @@ def _t_style10(d: dict) -> dict:
 
 
 STYLES = {
-    "default":  {"name": "⚪ Default (Current)", "render": _t_default},
+    "default":  {"name": "⚪ Default", "render": _t_default},
     "style1":   {"name": "1️⃣ Star Box",          "render": _t_style1},
     "style2":   {"name": "2️⃣ Dotted Frame",      "render": _t_style2},
     "style3":   {"name": "3️⃣ Bracket Card",      "render": _t_style3},
