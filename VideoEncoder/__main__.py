@@ -13,6 +13,8 @@ async def main():
     await app.start()
     from .utils.thumb_style import load_style_cache
     await load_style_cache()
+    from .utils.caption_style import load_caption_style_cache
+    await load_caption_style_cache()
     await app.send_message(chat_id=log, text=f'<b>Bot Started! @{(await app.get_me()).username}</b>')
     await idle()
     await app.stop()
