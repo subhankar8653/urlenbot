@@ -29,6 +29,12 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_STYLE_ID = "default"
 
 
+def _utf16_len(s: str) -> int:
+    """Telegram entity offsets/lengths UTF-16 code units mein hote hain
+    (emoji jaise 🎬 do units lete hain) — plain len() galat hoga."""
+    return len(s.encode("utf-16-le")) // 2
+
+
 # ─────────────────────────────────────────────
 #  Template renderers
 #  data dict fields: anime_name, season (int), episode (int),
@@ -39,134 +45,144 @@ def _t_default(d: dict) -> str:
     return f"Season {d['season']:02d} Episode {d['episode']:02d} {d['audio']}"
 
 
-def _t_style1(d: dict) -> str:
-    return (
-        f"‣ {d['anime_name']} (S - {d['season']:02d}) • ✅\n"
-        f"╭━━━━━━━━ °°★°° ━━━━━━━━\n"
-        f"├ Episode : {d['episode']:02d} (New)\n"
-        f"├ Season : {d['season']:02d}\n"
-        f"├ Quality : {d['quality']}\n"
-        f"├ Audio : {d['audio']} | #Official\n"
-        f"╰━━━━━━━━━━━━━━━━━━━━\n"
-        f"➳ᴍᴀɪɴ ᴄʜᴀɴɴᴇʟ : {d['main_channel']}"
-    )
+def _t_style1(d: dict) -> dict:
+    lines = [
+        f"‣ {d['anime_name']} (S - {d['season']:02d}) • ✅",
+        f"╭━━━━━━━━ °°★°° ━━━━━━━━",
+        f"├ Episode : {d['episode']:02d} (New)",
+        f"├ Season : {d['season']:02d}",
+        f"├ Quality : {d['quality']}",
+        f"├ Audio : {d['audio']} | #Official",
+        f"╰━━━━━━━━━━━━━━━━━━━━",
+        f"➳ᴍᴀɪɴ ᴄʜᴀɴɴᴇʟ : {d['main_channel']}",
+    ]
+    return {"lines": lines, "quote": {7}, "italic": {7}}
 
 
-def _t_style2(d: dict) -> str:
-    return (
-        f"➲ {d['anime_name']} (S - {d['season']:02d})\n"
-        f"╭┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"◈ Episode: {d['episode']:02d} (New)\n"
-        f"◈ Audio: {d['audio']} #Official\n"
-        f"◈ Quality: {d['quality']}\n"
-        f"◈ Genres: {d['genres']}\n"
-        f"╰┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"• Main Channel : 『{d['main_channel']}』"
-    )
+def _t_style2(d: dict) -> dict:
+    lines = [
+        f"➲ {d['anime_name']} (S - {d['season']:02d})",
+        f"╭┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+        f"◈ Episode: {d['episode']:02d} (New)",
+        f"◈ Audio: {d['audio']} #Official",
+        f"◈ Quality: {d['quality']}",
+        f"◈ Genres: {d['genres']}",
+        f"╰┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+        f"• Main Channel : 『{d['main_channel']}』",
+    ]
+    return {"lines": lines, "quote": {0, 7}, "italic": set()}
 
 
-def _t_style3(d: dict) -> str:
-    return (
-        f"❖ {d['anime_name']}\n"
-        f"┏────────────────────⍟\n"
-        f"│‣ Season - {d['season']:02d}\n"
-        f"│‣ Episode - {d['episode']:02d} (New)\n"
-        f"│‣ Audio - {d['audio']} #Official\n"
-        f"│‣ Quality - {d['quality']}\n"
-        f"│‣ Genres - {d['genres']}\n"
-        f"┗────────────────────⍟\n"
-        f"• Main Channel : 『{d['main_channel']}』"
-    )
+def _t_style3(d: dict) -> dict:
+    lines = [
+        f"❖ {d['anime_name']}",
+        f"┏────────────────────⍟",
+        f"│‣ Season - {d['season']:02d}",
+        f"│‣ Episode - {d['episode']:02d} (New)",
+        f"│‣ Audio - {d['audio']} #Official",
+        f"│‣ Quality - {d['quality']}",
+        f"│‣ Genres - {d['genres']}",
+        f"┗────────────────────⍟",
+        f"• Main Channel : 『{d['main_channel']}』",
+    ]
+    return {"lines": lines, "quote": {8}, "italic": set()}
 
 
-def _t_style4(d: dict) -> str:
-    return (
-        f"╭┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"◈ (S - {d['season']:02d}) Episode: {d['episode']:02d} (New)\n"
-        f"◈ Audio: {d['audio']} #Official\n"
-        f"◈ Quality: {d['quality']}\n"
-        f"◈ Genres: {d['genres']}\n"
-        f"╰┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"• Main Channel : 『{d['main_channel']}』"
-    )
+def _t_style4(d: dict) -> dict:
+    lines = [
+        f"╭┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+        f"◈ (S - {d['season']:02d}) Episode: {d['episode']:02d} (New)",
+        f"◈ Audio: {d['audio']} #Official",
+        f"◈ Quality: {d['quality']}",
+        f"◈ Genres: {d['genres']}",
+        f"╰┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+        f"• Main Channel : 『{d['main_channel']}』",
+    ]
+    return {"lines": lines, "quote": {6}, "italic": set()}
 
 
-def _t_style5(d: dict) -> str:
-    return (
-        f"🎬 {d['anime_name']} 𝗦{d['season']:02d}𝗘{d['episode']:02d}\n"
-        f"▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"
-        f"✦ Episode  : {d['episode']:02d} (New)\n"
-        f"✦ Season   : {d['season']:02d}\n"
-        f"✦ Quality  : {d['quality']}\n"
-        f"✦ Audio    : {d['audio']} #Official\n"
-        f"✦ Genres   : {d['genres']}\n"
-        f"▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"
-        f"✈ ᴍᴀɪɴ ᴄʜᴀɴɴᴇʟ ➻ {d['main_channel']}"
-    )
+def _t_style5(d: dict) -> dict:
+    lines = [
+        f"🎬 {d['anime_name']} 𝗦{d['season']:02d}𝗘{d['episode']:02d}",
+        f"▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰",
+        f"✦ Episode  : {d['episode']:02d} (New)",
+        f"✦ Season   : {d['season']:02d}",
+        f"✦ Quality  : {d['quality']}",
+        f"✦ Audio    : {d['audio']} #Official",
+        f"✦ Genres   : {d['genres']}",
+        f"▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰",
+        f"✈ ᴍᴀɪɴ ᴄʜᴀɴɴᴇʟ ➻ {d['main_channel']}",
+    ]
+    return {"lines": lines, "quote": {8}, "italic": {8}}
 
 
-def _t_style6(d: dict) -> str:
-    return (
-        f"【 {d['anime_name']} 】\n"
-        f"S{d['season']:02d} • E{d['episode']:02d} (New)\n"
-        f"▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂\n"
-        f"▸ Quality : {d['quality']}\n"
-        f"▸ Audio   : {d['audio']} #Official\n"
-        f"▸ Genres  : {d['genres']}\n"
-        f"▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂\n"
-        f"📡 Main Channel : {d['main_channel']}"
-    )
+def _t_style6(d: dict) -> dict:
+    lines = [
+        f"【 {d['anime_name']} 】",
+        f"S{d['season']:02d} • E{d['episode']:02d} (New)",
+        f"▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂",
+        f"▸ Quality : {d['quality']}",
+        f"▸ Audio   : {d['audio']} #Official",
+        f"▸ Genres  : {d['genres']}",
+        f"▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂",
+        f"📡 Main Channel : {d['main_channel']}",
+    ]
+    return {"lines": lines, "quote": {7}, "italic": set()}
 
 
-def _t_style7(d: dict) -> str:
-    return (
-        f"▌ {d['anime_name']} ▐\n"
-        f"「 Season {d['season']:02d} ⋄ Episode {d['episode']:02d} (New) 」\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"◇ Audio   : {d['audio']} #Official\n"
-        f"◇ Quality : {d['quality']}\n"
-        f"◇ Genres  : {d['genres']}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"↳ ᴍᴀɪɴ ᴄʜᴀɴɴᴇʟ : {d['main_channel']}"
-    )
+def _t_style7(d: dict) -> dict:
+    lines = [
+        f"▌ {d['anime_name']} ▐",
+        f"「 Season {d['season']:02d} ⋄ Episode {d['episode']:02d} (New) 」",
+        f"━━━━━━━━━━━━━━━━━━━",
+        f"◇ Audio   : {d['audio']} #Official",
+        f"◇ Quality : {d['quality']}",
+        f"◇ Genres  : {d['genres']}",
+        f"━━━━━━━━━━━━━━━━━━━",
+        f"↳ ᴍᴀɪɴ ᴄʜᴀɴɴᴇʟ : {d['main_channel']}",
+    ]
+    return {"lines": lines, "quote": {7}, "italic": {7}}
 
 
-def _t_style8(d: dict) -> str:
-    return (
-        f"✧･ﾟ: {d['anime_name']} :･ﾟ✧\n"
-        f"(Season {d['season']:02d} — Episode {d['episode']:02d}) 🆕\n"
-        f"┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n"
-        f"⌁ Quality : {d['quality']}\n"
-        f"⌁ Audio   : {d['audio']} #Official\n"
-        f"⌁ Genres  : {d['genres']}\n"
-        f"┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n"
-        f"🔔 Main Channel — {d['main_channel']}"
-    )
+def _t_style8(d: dict) -> dict:
+    lines = [
+        f"✧･ﾟ: {d['anime_name']} :･ﾟ✧",
+        f"(Season {d['season']:02d} — Episode {d['episode']:02d}) 🆕",
+        f"┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈",
+        f"⌁ Quality : {d['quality']}",
+        f"⌁ Audio   : {d['audio']} #Official",
+        f"⌁ Genres  : {d['genres']}",
+        f"┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈",
+        f"🔔 Main Channel — {d['main_channel']}",
+    ]
+    return {"lines": lines, "quote": {7}, "italic": set()}
 
 
-def _t_style9(d: dict) -> str:
-    return (
-        f"🎞 {d['anime_name']}\n"
-        f"Season {d['season']:02d} | Episode {d['episode']:02d} (New)\n"
-        f"╔═══════════════════╗\n"
-        f" Quality : {d['quality']}\n"
-        f" Audio   : {d['audio']} #Official\n"
-        f" Genres  : {d['genres']}\n"
-        f"╚═══════════════════╝\n"
-        f"➤ Main Channel : {d['main_channel']}"
-    )
+def _t_style9(d: dict) -> dict:
+    lines = [
+        f"🎞 {d['anime_name']}",
+        f"Season {d['season']:02d} | Episode {d['episode']:02d} (New)",
+        f"╔═══════════════════╗",
+        f" Quality : {d['quality']}",
+        f" Audio   : {d['audio']} #Official",
+        f" Genres  : {d['genres']}",
+        f"╚═══════════════════╝",
+        f"➤ Main Channel : {d['main_channel']}",
+    ]
+    return {"lines": lines, "quote": {7}, "italic": set()}
 
 
-def _t_style10(d: dict) -> str:
-    return (
-        f"▶️ {d['anime_name']} [S{d['season']:02d}-E{d['episode']:02d}] (New)\n"
-        f"────────────────────\n"
-        f"🔹 Quality : {d['quality']}\n"
-        f"🔹 Audio   : {d['audio']} #Official\n"
-        f"🔹 Genres  : {d['genres']}\n"
-        f"────────────────────\n"
-        f"🏷 Main Channel : {d['main_channel']}"
-    )
+def _t_style10(d: dict) -> dict:
+    lines = [
+        f"▶️ {d['anime_name']} [S{d['season']:02d}-E{d['episode']:02d}] (New)",
+        f"────────────────────",
+        f"🔹 Quality : {d['quality']}",
+        f"🔹 Audio   : {d['audio']} #Official",
+        f"🔹 Genres  : {d['genres']}",
+        f"────────────────────",
+        f"🏷 Main Channel : {d['main_channel']}",
+    ]
+    return {"lines": lines, "quote": {6}, "italic": set()}
 
 
 STYLES = {
@@ -198,14 +214,56 @@ PREVIEW_DATA = {
 
 
 def render_caption(style_id: str, data: dict) -> str:
-    """style_id se render function nikal ke data dict ke saath call karo.
-    Unknown style_id ya render error → default plain format pe fallback."""
+    """Plain joined text (koi Telegram entity nahi) — sirf /caption_style
+    ke preview screen ke liye. Asli posting ke liye render_caption_entities()
+    use karo (woh bold/blockquote/italic Telegram entities bhi deta hai)."""
     style = STYLES.get(style_id) or STYLES[DEFAULT_STYLE_ID]
     try:
-        return style["render"](data)
+        if style_id == DEFAULT_STYLE_ID:
+            return _t_default(data)
+        result = style["render"](data)
+        return "\n".join(result["lines"])
     except Exception as e:
         LOGGER.warning(f"[CaptionStyle] Render failed for '{style_id}': {e}")
         return _t_default(data)
+
+
+def _build_entities(lines: list, quote_idxs: set, italic_idxs: set) -> tuple:
+    """lines ko '\\n' se jod ke text banao, aur bold (poora text) +
+    blockquote/italic (jo line-indices di gayi hain unpe) entities compute
+    karo. Offsets UTF-16 code units mein hote hain (Bot API requirement)."""
+    text = "\n".join(lines)
+    entities = [{"type": "bold", "offset": 0, "length": _utf16_len(text)}]
+    offset = 0
+    for i, line in enumerate(lines):
+        line_len = _utf16_len(line)
+        if line_len:
+            if i in quote_idxs:
+                entities.append({"type": "blockquote", "offset": offset, "length": line_len})
+            if i in italic_idxs:
+                entities.append({"type": "italic", "offset": offset, "length": line_len})
+        offset += line_len + 1  # +1 for the '\n' separator
+    return text, entities
+
+
+def render_caption_entities(style_id: str, data: dict) -> tuple:
+    """Asli posting ke liye — (text, entities) deta hai jisme poora caption
+    bold hota hai aur "Main Channel" (kabhi-kabhi title bhi) line native
+    Telegram blockquote/italic ke saath highlight hoti hai — jaisa reference
+    screenshots mein hai. 'default' style ke liye yahan call mat karo (uska
+    entity-building bot_upload_engine.py mein alag se, custom-emoji ➲ ke
+    saath, hoti hai)."""
+    style = STYLES.get(style_id)
+    if not style or style_id == DEFAULT_STYLE_ID:
+        text = _t_default(data)
+        return text, [{"type": "bold", "offset": 0, "length": _utf16_len(text)}]
+    try:
+        result = style["render"](data)
+        return _build_entities(result["lines"], result["quote"], result["italic"])
+    except Exception as e:
+        LOGGER.warning(f"[CaptionStyle] Entity render failed for '{style_id}': {e}")
+        text = _t_default(data)
+        return text, [{"type": "bold", "offset": 0, "length": _utf16_len(text)}]
 
 
 # ─────────────────────────────────────────────

@@ -308,8 +308,7 @@ class EpisodePostManager:
             "genres": genres,
             "main_channel": main_channel,
         }
-        text = caption_style.render_caption(style_id, data)
-        return text, []
+        return caption_style.render_caption_entities(style_id, data)
 
     def _keyboard(self) -> InlineKeyboardMarkup | None:
         """
