@@ -38,8 +38,7 @@ def _status_text() -> str:
         f"Current: **{name}**\n\n"
         "Neeche se koi bhi style tap karo — pehle uska preview dikhega, "
         "phir chaaho toh apply kar sakte ho.\n\n"
-        "> ℹ️ _Yeh style HAR jagah lagega — `/bot_upload`, `/upload`, "
-        "`/url` (manual + auto upload) sabhi naye episode captions pe._"
+        "> ℹ️ _Yeh style har jagah lagega._"
     )
 
 
@@ -167,12 +166,7 @@ async def caption_style_callback(client: Client, cb: CallbackQuery):
         await caption_style.set_style(style_id)
         name = caption_style.STYLES.get(style_id, {}).get("name", style_id)
         try:
-            await cb.message.edit(
-                f"✅ **Applied: {name}**\n\n"
-                f"> ✨ _Ab har jagah se jaane waale naye episode caption pe "
-                f"yehi style lagega — `/bot_upload`, `/upload`, `/url` "
-                f"(manual + auto upload), sab jagah turant effective hai._"
-            )
+            await cb.message.edit(f"✅ **Applied: {name}**\n\n✨ _Ho gaya — sab jagah lagega._")
         except Exception:
             pass
         return
