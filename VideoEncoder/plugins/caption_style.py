@@ -44,16 +44,22 @@ def _status_text() -> str:
 
 
 def _list_keyboard() -> InlineKeyboardMarkup:
+    current = caption_style.get_current_style_id()
+
+    def _label(sid: str) -> str:
+        name = caption_style.STYLES[sid]["name"]
+        return f"✅ {name} (Current)" if sid == current else name
+
     rows = []
     ids = caption_style.STYLE_ORDER
     for i in range(0, len(ids), 2):
         row = [
-            InlineKeyboardButton(caption_style.STYLES[sid]["name"], callback_data=f"cst:prev:{sid}")
+            InlineKeyboardButton(_label(sid), callback_data=f"cst:prev:{sid}")
             for sid in ids[i:i + 2]
         ]
         rows.append(row)
     rows.append([InlineKeyboardButton(
-        caption_style.STYLES[caption_style.DEFAULT_STYLE_ID]["name"],
+        _label(caption_style.DEFAULT_STYLE_ID),
         callback_data=f"cst:prev:{caption_style.DEFAULT_STYLE_ID}",
     )])
     return InlineKeyboardMarkup(rows)

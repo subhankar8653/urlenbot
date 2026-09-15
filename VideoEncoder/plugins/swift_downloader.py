@@ -31,7 +31,8 @@ from .. import LOGGER, download_dir, app, log
 from ..utils.helper import check_chat
 from ..utils.uploads.telegram import upload_video, _make_uploader_client
 from ..utils.encoding import get_duration, get_thumbnail, get_width_height, _add_thumb_username_band
-from ..utils.auto_caption import build_auto_caption
+from ..utils.auto_caption import build_auto_caption, get_caption_data
+from ..utils import caption_style
 from ..utils.community import get_community_tag
 from ..utils.database.access_db import db
 from ..utils.thumb_source import get_tmdb_thumbnail
@@ -866,7 +867,27 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
         # cover (file_id) = video player background cover pic
         # thumb (local path) = gallery preview thumbnail
         width, height = get_width_height(filepath)
-        caption = f"<b>{fname}</b>"
+
+        # ── GLOBAL caption style (/caption_style) ──
+        # Pehle yahan hamesha hardcoded plain '<b>{fname}</b>' caption
+        # banta tha — /Rtic, RTI auto-monitor, aur /bot_upload (run_episode_rti)
+        # sab isi function (_upload_one_file) se video upload karte hain, isliye
+        # yeh asli channel-post caption hai jo viewers dekhte hain. Ab selected
+        # style yahan bhi lagti hai.
+        style_id = caption_style.get_current_style_id()
+        if style_id == caption_style.DEFAULT_STYLE_ID:
+            caption = f"<b>{fname}</b>"
+        else:
+            try:
+                _channel = await get_community_tag(user_id)
+                cap_data = get_caption_data(None, filepath, channel=_channel)
+                cap_data["quality"] = quality  # is file ki exact quality (already known)
+                cap_data["genres"] = await caption_style.lookup_genres(cap_data["anime_name"])
+                caption = caption_style.render_caption_html(style_id, cap_data)
+            except Exception as e:
+                LOGGER.warning(f"[CaptionStyle] Swift styled caption failed, fallback to default: {e}")
+                caption = f"<b>{fname}</b>"
+
         disk_fname = os.path.basename(filepath)
 
         # uploader_client=None hoga staggered flow mein — har file ka fresh uc
