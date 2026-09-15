@@ -266,23 +266,13 @@ class EpisodePostManager:
         self._genres_cache: str | None = None  # lazy, ek baar lookup karke cache
 
     async def _lookup_genres(self) -> str:
-        """anime_monitor_list mein se is anime ke saved genres dhoondo (best-effort)."""
+        """Saved anime_monitor_list genres, warna TMDB se live fetch
+        (caption_style.lookup_genres — shared across /bot_upload,
+        auto-monitor, /upload, /url)."""
         if self._genres_cache is not None:
             return self._genres_cache
-        genres = "—"
-        try:
-            from .database.access_db import db
-            from .. import owner
-            if owner:
-                user = await db._get_user(owner[0])
-                for entry in (user.get('anime_monitor_list') or []):
-                    if (entry.get('anime_name') or '').strip().lower() == self.anime_name.strip().lower():
-                        genres = entry.get('genres') or "—"
-                        break
-        except Exception as e:
-            LOGGER.warning(f"[EpisodePost] Genres lookup failed: {e}")
-        self._genres_cache = genres
-        return genres
+        self._genres_cache = await caption_style.lookup_genres(self.anime_name)
+        return self._genres_cache
 
     async def _caption(self) -> tuple:
         style_id = caption_style.get_current_style_id()

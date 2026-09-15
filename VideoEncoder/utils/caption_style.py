@@ -298,13 +298,19 @@ def render_caption_html(style_id: str, data: dict) -> str:
 
 
 async def lookup_genres(anime_name: str) -> str:
-    """anime_monitor_list mein se is anime ke saved genres dhoondo (best-effort).
-    Shared helper — bot_upload_engine.EpisodePostManager, auto_monitor's bot-mode
-    post, aur upload_to_tg (styled /upload, /url captions) sab isse use karte
-    hain taaki genres lookup logic ek hi jagah maintain ho."""
-    genres = "—"
+    """Genres nikalne ke 2 tareeke, order mein try karte hain:
+      1. anime_monitor_list mein saved genres (/add_anime ke time TMDB se
+         already fetch ho chuke hote hain — fastest, DB read only).
+      2. Agar wahan nahi mile (anime monitor list mein add hi nahi hai,
+         ya genres field khali hai) — TMDB API se LIVE fetch karo
+         (utils/anime_api.py, wahi jo /add_anime use karta hai).
+    Dono fail ho jaayein (TMDB_API_KEY set nahi hai, ya match nahi mila)
+    toh "—" fallback.
+    """
     if not anime_name:
-        return genres
+        return "—"
+
+    # 1) Saved monitor-list entry
     try:
         from .database.access_db import db
         from .. import owner
@@ -312,11 +318,26 @@ async def lookup_genres(anime_name: str) -> str:
             user = await db._get_user(owner[0])
             for entry in (user.get('anime_monitor_list') or []):
                 if (entry.get('anime_name') or '').strip().lower() == anime_name.strip().lower():
-                    genres = entry.get('genres') or "—"
+                    saved = (entry.get('genres') or '').strip()
+                    if saved and saved != "—":
+                        return saved
                     break
     except Exception as e:
-        LOGGER.warning(f"[CaptionStyle] Genres lookup failed: {e}")
-    return genres
+        LOGGER.warning(f"[CaptionStyle] Genres lookup (DB) failed: {e}")
+
+    # 2) Live TMDB fetch (fallback — anime monitor list mein nahi hai ya
+    #    genres khali the)
+    try:
+        from .anime_api import fetch_anime_details
+        details = await fetch_anime_details(anime_name)
+        if details:
+            live_genres = (details.get('genres') or '').strip()
+            if live_genres:
+                return live_genres
+    except Exception as e:
+        LOGGER.warning(f"[CaptionStyle] Genres lookup (TMDB) failed: {e}")
+
+    return "—"
 
 
 # ─────────────────────────────────────────────
