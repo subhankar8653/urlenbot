@@ -22,6 +22,7 @@ Yeh module sirf ENGINE hai:
        /caption_style se change hone par turant refresh)
 """
 
+import html as _html
 import logging
 
 LOGGER = logging.getLogger(__name__)
@@ -264,6 +265,58 @@ def render_caption_entities(style_id: str, data: dict) -> tuple:
         LOGGER.warning(f"[CaptionStyle] Entity render failed for '{style_id}': {e}")
         text = _t_default(data)
         return text, [{"type": "bold", "offset": 0, "length": _utf16_len(text)}]
+
+
+def render_caption_html(style_id: str, data: dict) -> str:
+    """render_caption_entities() jaisa hi output, lekin raw Bot-API entities
+    ki jagah HTML markup (<b>/<blockquote>/<i>) deta hai — un jagahon ke liye
+    jo pyrogram ke parse_mode=ParseMode.HTML se caption bhejte hain
+    (e.g. utils/uploads/telegram.py -> upload_to_tg, jo /upload, /url,
+    /bot_upload sabhi manual+auto video uploads ke peeche common hai).
+    Isse GLOBAL caption style /bot_upload ke alawa har jagah lagta hai."""
+    style = STYLES.get(style_id)
+    if not style or style_id == DEFAULT_STYLE_ID:
+        return f"<b>{_html.escape(_t_default(data))}</b>"
+    try:
+        result = style["render"](data)
+        lines = result["lines"]
+        quote_idxs = result["quote"]
+        italic_idxs = result["italic"]
+        html_lines = []
+        for i, line in enumerate(lines):
+            esc = _html.escape(line)
+            if i in italic_idxs:
+                esc = f"<i>{esc}</i>"
+            if i in quote_idxs:
+                esc = f"<blockquote>{esc}</blockquote>"
+            html_lines.append(esc)
+        body = "\n".join(html_lines)
+        return f"<b>{body}</b>"
+    except Exception as e:
+        LOGGER.warning(f"[CaptionStyle] HTML render failed for '{style_id}': {e}")
+        return f"<b>{_html.escape(_t_default(data))}</b>"
+
+
+async def lookup_genres(anime_name: str) -> str:
+    """anime_monitor_list mein se is anime ke saved genres dhoondo (best-effort).
+    Shared helper — bot_upload_engine.EpisodePostManager, auto_monitor's bot-mode
+    post, aur upload_to_tg (styled /upload, /url captions) sab isse use karte
+    hain taaki genres lookup logic ek hi jagah maintain ho."""
+    genres = "—"
+    if not anime_name:
+        return genres
+    try:
+        from .database.access_db import db
+        from .. import owner
+        if owner:
+            user = await db._get_user(owner[0])
+            for entry in (user.get('anime_monitor_list') or []):
+                if (entry.get('anime_name') or '').strip().lower() == anime_name.strip().lower():
+                    genres = entry.get('genres') or "—"
+                    break
+    except Exception as e:
+        LOGGER.warning(f"[CaptionStyle] Genres lookup failed: {e}")
+    return genres
 
 
 # ─────────────────────────────────────────────

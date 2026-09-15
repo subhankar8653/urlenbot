@@ -388,6 +388,41 @@ def build_auto_caption(filepath, resolution=None, channel='@SBANIME', override_f
     return caption
 
 
+def get_caption_data(original_caption, filepath, resolution=None, channel='@SBANIME', blacklist=None):
+    """smart_caption() jaisa hi cleaning + parsing pipeline chalata hai, lekin
+    ek joined string ki jagah STRUCTURED dict deta hai:
+    {anime_name, season, episode, quality, audio, main_channel}.
+    Isse caption_style engine (10 styled templates) ke saath use kiya ja
+    sakta hai un jagahon pe jahan pehle sirf plain build_auto_caption()
+    string use hota tha (e.g. /upload, /url — utils/uploads/telegram.py).
+    'genres' is dict mein nahi hai — woh caption_style.lookup_genres() se
+    alag se (async) laayi jaati hai.
+    """
+    raw = (original_caption or '').strip()
+    if not raw:
+        raw = os.path.basename(filepath)
+    raw_base = re.sub(r'\.(mp4|mkv|avi|mov|flv|wmv|ts|m4v|webm)$', '', raw, flags=re.IGNORECASE).strip()
+    cleaned = clean_caption(raw_base)
+    filename = (cleaned + '.mp4') if cleaned else os.path.basename(filepath)
+    base_filename = os.path.splitext(filename)[0]
+
+    metadata = get_media_metadata(filepath)
+    anime_name, season, episode = extract_anime_info(filename, metadata, blacklist=blacklist)
+    quality = detect_quality(metadata, resolution)
+    langs = detect_language(filename, metadata)
+    if not langs:
+        langs = detect_language(os.path.basename(filepath), metadata)
+
+    return {
+        "anime_name": (anime_name.strip() if anime_name else base_filename) or base_filename,
+        "season": season or 1,
+        "episode": episode or 0,
+        "quality": quality or "—",
+        "audio": " + ".join(langs) if langs else "—",
+        "main_channel": channel,
+    }
+
+
 def clean_caption(caption):
     """
     Original caption/filename se sab garbage remove karo:
