@@ -58,23 +58,35 @@ def _list_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _preview_keyboard(style_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Apply This Style", callback_data=f"cst:apply:{style_id}")],
-        [InlineKeyboardButton("🔙 Back to list", callback_data="cst:list")],
-    ])
+def _preview_keyboard_dict(style_id: str) -> dict:
+    """Bot API raw-dict keyboard (preview Bot API se hi bhejta/edit karta hai)."""
+    return {"inline_keyboard": [
+        [{"text": "✅ Apply This Style", "callback_data": f"cst:apply:{style_id}"}],
+        [{"text": "🔙 Back to list", "callback_data": "cst:list"}],
+    ]}
 
 
-def _preview_text(style_id: str) -> str:
+def _preview_payload(style_id: str) -> tuple:
+    """
+    Preview ko EXACT wahi Telegram entities (bold/blockquote/italic) ke saath
+    banata hai jo asli episode-post pe lagti hain — taaki preview 100%
+    accurate ho. (header/footer plain rehte hain, sirf style body pe
+    entities lagti hain, offsets header-length se shift ki jaati hain.)
+    """
     name = caption_style.STYLES.get(style_id, {}).get("name", style_id)
-    rendered = caption_style.render_caption(style_id, caption_style.PREVIEW_DATA)
-    return (
-        f"**👀 Preview: {name}**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"{rendered}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"_(sample data — asli post mein anime/episode ki apni details aayengi)_"
+    header = f"👀 Preview: {name}\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    body_text, body_entities = caption_style.render_caption_entities(style_id, caption_style.PREVIEW_DATA)
+    footer = (
+        "\n\n━━━━━━━━━━━━━━━━━━━━\n"
+        "(sample data — asli post mein anime/episode ki apni details aayengi)"
     )
+    full_text = header + body_text + footer
+    header_len = caption_style._utf16_len(header)
+
+    entities = [{"type": "bold", "offset": 0, "length": caption_style._utf16_len(f"👀 Preview: {name}")}]
+    for e in body_entities:
+        entities.append({**e, "offset": e["offset"] + header_len})
+    return full_text, entities
 
 
 @Client.on_message(filters.command("caption_style"))
@@ -105,10 +117,41 @@ async def caption_style_callback(client: Client, cb: CallbackQuery):
     if action == "prev":
         style_id = parts[2]
         await cb.answer("Preview render ho raha hai...")
-        try:
-            await cb.message.edit(_preview_text(style_id), reply_markup=_preview_keyboard(style_id))
-        except Exception:
-            pass
+        from ..utils.bot_upload_engine import _bot_api_send_message, _bot_api_edit_message
+        text, entities = _preview_payload(style_id)
+        chat_id = cb.message.chat.id
+        # Bot API se hi bhejo/edit karo — taaki bold/blockquote/italic entities
+        # EXACT wahi dikhein jo asli episode-post pe lagti hain.
+        success = await _bot_api_edit_message(
+            chat_id, cb.message.id, text, entities, _preview_keyboard_dict(style_id)
+        )
+        if not success:
+            try:
+                await cb.message.delete()
+            except Exception:
+                pass
+            sent = await _bot_api_send_message(chat_id, text, entities, _preview_keyboard_dict(style_id))
+            if not sent:
+                # BOT_TOKEN configured nahi hai — plain Markdown fallback (entities ke bina)
+                name = caption_style.STYLES.get(style_id, {}).get("name", style_id)
+                rendered = caption_style.render_caption(style_id, caption_style.PREVIEW_DATA)
+                fallback_text = (
+                    f"**👀 Preview: {name}**\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"{rendered}\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"_(sample data — asli post mein anime/episode ki apni details aayengi)_"
+                )
+                try:
+                    await client.send_message(
+                        chat_id, fallback_text,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("✅ Apply This Style", callback_data=f"cst:apply:{style_id}")],
+                            [InlineKeyboardButton("🔙 Back to list", callback_data="cst:list")],
+                        ]),
+                    )
+                except Exception:
+                    pass
         return
 
     if action == "apply":
