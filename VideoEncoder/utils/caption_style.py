@@ -50,7 +50,7 @@ def _t_style1(d: dict) -> dict:
     lines = [
         f"‣ {d['anime_name']} (S - {d['season']:02d}) • ✅",
         f"╭━━━━━━━━ °°★°° ━━━━━━━━",
-        f"├ Episode : {d['episode']:02d} (New)",
+        f"├ Episode : {d['episode']:02d}",
         f"├ Season : {d['season']:02d}",
         f"├ Quality : {d['quality']}",
         f"├ Audio : {d['audio']} | #Official",
@@ -64,7 +64,7 @@ def _t_style2(d: dict) -> dict:
     lines = [
         f"➲ {d['anime_name']} (S - {d['season']:02d})",
         f"╭┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
-        f"◈ Episode: {d['episode']:02d} (New)",
+        f"◈ Episode: {d['episode']:02d}",
         f"◈ Audio: {d['audio']} #Official",
         f"◈ Quality: {d['quality']}",
         f"◈ Genres: {d['genres']}",
@@ -79,7 +79,7 @@ def _t_style3(d: dict) -> dict:
         f"❖ {d['anime_name']}",
         f"┏────────────────────⍟",
         f"│‣ Season - {d['season']:02d}",
-        f"│‣ Episode - {d['episode']:02d} (New)",
+        f"│‣ Episode - {d['episode']:02d}",
         f"│‣ Audio - {d['audio']} #Official",
         f"│‣ Quality - {d['quality']}",
         f"│‣ Genres - {d['genres']}",
@@ -92,7 +92,7 @@ def _t_style3(d: dict) -> dict:
 def _t_style4(d: dict) -> dict:
     lines = [
         f"╭┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
-        f"◈ (S - {d['season']:02d}) Episode: {d['episode']:02d} (New)",
+        f"◈ (S - {d['season']:02d}) Episode: {d['episode']:02d}",
         f"◈ Audio: {d['audio']} #Official",
         f"◈ Quality: {d['quality']}",
         f"◈ Genres: {d['genres']}",
@@ -106,7 +106,7 @@ def _t_style5(d: dict) -> dict:
     lines = [
         f"🎬 {d['anime_name']} 𝗦{d['season']:02d}𝗘{d['episode']:02d}",
         f"▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰",
-        f"✦ Episode  : {d['episode']:02d} (New)",
+        f"✦ Episode  : {d['episode']:02d}",
         f"✦ Season   : {d['season']:02d}",
         f"✦ Quality  : {d['quality']}",
         f"✦ Audio    : {d['audio']} #Official",
@@ -120,7 +120,7 @@ def _t_style5(d: dict) -> dict:
 def _t_style6(d: dict) -> dict:
     lines = [
         f"【 {d['anime_name']} 】",
-        f"S{d['season']:02d} • E{d['episode']:02d} (New)",
+        f"S{d['season']:02d} • E{d['episode']:02d}",
         f"▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂",
         f"▸ Quality : {d['quality']}",
         f"▸ Audio   : {d['audio']} #Official",
@@ -134,7 +134,7 @@ def _t_style6(d: dict) -> dict:
 def _t_style7(d: dict) -> dict:
     lines = [
         f"▌ {d['anime_name']} ▐",
-        f"「 Season {d['season']:02d} ⋄ Episode {d['episode']:02d} (New) 」",
+        f"「 Season {d['season']:02d} ⋄ Episode {d['episode']:02d} 」",
         f"━━━━━━━━━━━━━━━━━━━",
         f"◇ Audio   : {d['audio']} #Official",
         f"◇ Quality : {d['quality']}",
@@ -162,7 +162,7 @@ def _t_style8(d: dict) -> dict:
 def _t_style9(d: dict) -> dict:
     lines = [
         f"🎞 {d['anime_name']}",
-        f"Season {d['season']:02d} | Episode {d['episode']:02d} (New)",
+        f"Season {d['season']:02d} | Episode {d['episode']:02d}",
         f"╔═══════════════════╗",
         f" Quality : {d['quality']}",
         f" Audio   : {d['audio']} #Official",
@@ -175,7 +175,7 @@ def _t_style9(d: dict) -> dict:
 
 def _t_style10(d: dict) -> dict:
     lines = [
-        f"▶️ {d['anime_name']} [S{d['season']:02d}-E{d['episode']:02d}] (New)",
+        f"▶️ {d['anime_name']} [S{d['season']:02d}-E{d['episode']:02d}]",
         f"────────────────────",
         f"🔹 Quality : {d['quality']}",
         f"🔹 Audio   : {d['audio']} #Official",
