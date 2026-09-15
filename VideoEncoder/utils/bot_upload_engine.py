@@ -20,6 +20,8 @@ from pyrogram.enums import ParseMode
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from .. import LOGGER, log as LOG_CHANNEL
+from . import caption_style
+from .community import get_community_tag
 from .uploads.telegram import upload_video, get_thumbnail, _make_uploader_client
 from ..plugins.swift_downloader import (
     _quality_from, _sort_by_size, _upload_one_file, _scrape_and_download,
@@ -261,11 +263,53 @@ class EpisodePostManager:
         self._buttons: dict[str, str] = {}
         self._lock = asyncio.Lock()
         self._db_loaded = False
+        self._genres_cache: str | None = None  # lazy, ek baar lookup karke cache
 
-    def _caption(self) -> tuple:
-        s = f"{self.season_num:02d}"
-        e = f"{self.episode_num:02d}"
-        return _make_caption_with_entity(f"Season {s} Episode {e} {self.language}")
+    async def _lookup_genres(self) -> str:
+        """anime_monitor_list mein se is anime ke saved genres dhoondo (best-effort)."""
+        if self._genres_cache is not None:
+            return self._genres_cache
+        genres = "—"
+        try:
+            from .database.access_db import db
+            from .. import owner
+            if owner:
+                user = await db._get_user(owner[0])
+                for entry in (user.get('anime_monitor_list') or []):
+                    if (entry.get('anime_name') or '').strip().lower() == self.anime_name.strip().lower():
+                        genres = entry.get('genres') or "—"
+                        break
+        except Exception as e:
+            LOGGER.warning(f"[EpisodePost] Genres lookup failed: {e}")
+        self._genres_cache = genres
+        return genres
+
+    async def _caption(self) -> tuple:
+        style_id = caption_style.get_current_style_id()
+        if style_id == caption_style.DEFAULT_STYLE_ID:
+            s = f"{self.season_num:02d}"
+            e = f"{self.episode_num:02d}"
+            return _make_caption_with_entity(f"Season {s} Episode {e} {self.language}")
+
+        quality_list = [q for q in self.QUALITY_ORDER if q in self._buttons]
+        quality_str = ", ".join(quality_list) if quality_list else "—"
+        genres = await self._lookup_genres()
+        try:
+            main_channel = await get_community_tag()
+        except Exception:
+            main_channel = "@SBANIME"
+
+        data = {
+            "anime_name": self.anime_name,
+            "season": self.season_num,
+            "episode": self.episode_num,
+            "quality": quality_str,
+            "audio": self.language,
+            "genres": genres,
+            "main_channel": main_channel,
+        }
+        text = caption_style.render_caption(style_id, data)
+        return text, []
 
     def _keyboard(self) -> InlineKeyboardMarkup | None:
         """
@@ -340,7 +384,7 @@ class EpisodePostManager:
             await self._load_from_db()
 
             self._buttons[quality] = deep_link_url
-            caption_text, caption_entities = self._caption()
+            caption_text, caption_entities = await self._caption()
 
             keyboard = self._keyboard()
 
