@@ -86,6 +86,7 @@ from pyrogram.types import (
 from .. import app, owner, sudo_users
 from ..utils.database.access_db import db
 from ..utils.bot_upload_engine import _bot_api_send_photo
+from ..utils import update_post_style
 
 LOGGER = logging.getLogger(__name__)
 
@@ -131,6 +132,23 @@ def _is_auth(user_id: int) -> bool:
 # ─────────────────────────────────────────────
 def _norm(s: str) -> str:
     return re.sub(r'[\s\-_]+', ' ', s.lower()).strip()
+
+
+async def _lookup_total_eps(anime_name: str) -> int:
+    """anime_monitor_list mein se is anime ke total_eps dhoondo (best-effort) —
+    /update_post_style ke New/Complete tags ke liye chahiye (season ka last
+    episode pehchanne ke liye)."""
+    if not anime_name:
+        return 0
+    try:
+        if owner:
+            user = await db._get_user(owner[0])
+            for e in (user.get('anime_monitor_list') or []):
+                if _norm(e.get('anime_name') or '') == _norm(anime_name):
+                    return int(e.get('total_eps') or 0)
+    except Exception as ex:
+        LOGGER.warning(f"[UpdateChannel] total_eps lookup failed: {ex}")
+    return 0
 
 
 # ─────────────────────────────────────────────
@@ -304,50 +322,76 @@ async def send_update_post(
     audio = entry.get("audio") or "—"
     genres = entry.get("genres") or "—"
 
-    # ── Episode line ──
-    if episode_start and episode_end and episode_start != episode_end:
-        ep_str = f"{episode_start}-{episode_end}"
-    elif episode_start:
-        ep_str = f"{episode_start:02d}" if episode_start < 100 else str(episode_start)
-    elif episode:
-        ep_str = f"{episode:02d}" if episode < 100 else str(episode)
+    style_id = update_post_style.get_current_style_id()
+
+    if style_id == update_post_style.DEFAULT_STYLE_ID:
+        # ── Purana hardcoded layout — bilkul unchanged ──
+        # ── Episode line ──
+        if episode_start and episode_end and episode_start != episode_end:
+            ep_str = f"{episode_start}-{episode_end}"
+        elif episode_start:
+            ep_str = f"{episode_start:02d}" if episode_start < 100 else str(episode_start)
+        elif episode:
+            ep_str = f"{episode:02d}" if episode < 100 else str(episode)
+        else:
+            ep_str = "—"
+
+        # ── Title line: ➲ Anime Name (S - 01) ──
+        season_str = f"(S - {season:02d})" if season else ""
+        title = f"➲ {display_name} {season_str}".strip() if season_str else f"➲ {display_name}"
+
+        # ── Caption (box layout) ──
+        box_top = "╭┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+        box_bottom = "╰┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+        ep_line = f"➲ Episode: {ep_str} Added!"
+        lines = [
+            title,
+            box_top,
+            f"◈ Audio: {audio}",
+            "◈ Quality: 360p, 720p, 1080p",
+            f"◈ Genres: {genres}",
+            box_bottom,
+            ep_line,
+        ]
+        caption = "\n".join(lines)
+
+        # Whole caption bold. Title line also gets blockquote (chip-look, matches
+        # reference screenshot). Episode line gets a clickable text_link instead of
+        # blockquote — blockquote + text_link can't safely overlap on the same range,
+        # so the episode line trades the chip-look for being tap-to-open.
+        title_len = len(title)
+        ep_offset = len(caption) - len(ep_line)
+        caption_entities = [
+            {"type": "bold", "offset": 0, "length": len(caption)},
+            {"type": "blockquote", "offset": 0, "length": title_len},
+        ]
+        if invite_link:
+            caption_entities.append({
+                "type": "text_link", "offset": ep_offset, "length": len(ep_line),
+                "url": invite_link,
+            })
     else:
-        ep_str = "—"
-
-    # ── Title line: ➲ Anime Name (S - 01) ──
-    season_str = f"(S - {season:02d})" if season else ""
-    title = f"➲ {display_name} {season_str}".strip() if season_str else f"➲ {display_name}"
-
-    # ── Caption (box layout) ──
-    box_top = "╭┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
-    box_bottom = "╰┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
-    ep_line = f"➲ Episode: {ep_str} Added!"
-    lines = [
-        title,
-        box_top,
-        f"◈ Audio: {audio}",
-        "◈ Quality: 360p, 720p, 1080p",
-        f"◈ Genres: {genres}",
-        box_bottom,
-        ep_line,
-    ]
-    caption = "\n".join(lines)
-
-    # Whole caption bold. Title line also gets blockquote (chip-look, matches
-    # reference screenshot). Episode line gets a clickable text_link instead of
-    # blockquote — blockquote + text_link can't safely overlap on the same range,
-    # so the episode line trades the chip-look for being tap-to-open.
-    title_len = len(title)
-    ep_offset = len(caption) - len(ep_line)
-    caption_entities = [
-        {"type": "bold", "offset": 0, "length": len(caption)},
-        {"type": "blockquote", "offset": 0, "length": title_len},
-    ]
-    if invite_link:
-        caption_entities.append({
-            "type": "text_link", "offset": ep_offset, "length": len(ep_line),
-            "url": invite_link,
-        })
+        # ── /update_post_style se chuni hui styled layout ──
+        try:
+            total_eps = await _lookup_total_eps(display_name)
+            ep_display = update_post_style.format_episode_display(
+                episode, episode_start, episode_end, total_eps
+            )
+            style_data = {
+                "anime_name": display_name,
+                "season": season or 1,
+                "episode": ep_display,
+                "quality": "360p, 720p, 1080p",
+                "audio": audio,
+                "genres": genres,
+            }
+            caption, caption_entities = update_post_style.render_update_caption_entities(
+                style_id, style_data
+            )
+        except Exception as ex:
+            LOGGER.warning(f"[UpdateChannel] Styled post render failed, falling back to plain: {ex}")
+            caption = f"{display_name} S{season or 1:02d}"
+            caption_entities = [{"type": "bold", "offset": 0, "length": len(caption)}]
 
     # ── Buttons ──
     button_defaults = await _get_button_defaults()
