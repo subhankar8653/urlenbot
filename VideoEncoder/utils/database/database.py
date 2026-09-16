@@ -385,6 +385,19 @@ class Database:
             return None
         return doc.get('style_id') or None
 
+    # Update-Post Style — /update_post_style command se set hota hai.
+    # GLOBAL (bot-wide), caption_style ki tarah hi — update channel pe
+    # jaane waale har post (send_update_post) ka box-layout isse control
+    # hota hai.
+    async def set_update_post_style(self, style_id):
+        await self.col2.update_one({'id': 'update_post_style'}, {'$set': {'style_id': style_id}}, upsert=True)
+
+    async def get_update_post_style(self):
+        doc = await self.col2.find_one({'id': 'update_post_style'})
+        if not doc:
+            return None
+        return doc.get('style_id') or None
+
     # Swap Rules
     async def set_swap(self, id, rules: dict):
         await self.col.update_one({'id': id}, {'$set': {'swap_rules': rules}}, upsert=True)
