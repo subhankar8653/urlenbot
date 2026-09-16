@@ -238,7 +238,11 @@ def format_episode_display(episode: int | None, episode_start: int | None,
 def render_update_caption_entities(style_id: str, data: dict) -> tuple:
     """(text, entities) — poora caption bold, header-line blockquote
     (jis template mein hai) ke saath. 'default' ke liye yahan call mat
-    karo — woh send_update_post ke purane hardcoded code se banta hai."""
+    karo — woh send_update_post ke purane hardcoded code se banta hai.
+
+    Agar data['how_to_get_link_url'] set hai (/how_to_get_link se), toh
+    box ke neeche ek clickable "➥ ʜᴏᴡ ᴛᴏ ɢᴇᴛ ʟɪɴᴋ" line add hoti hai —
+    khali/removed ho toh yeh line simply nahi aati."""
     style = STYLES.get(style_id)
     if not style or style_id == DEFAULT_STYLE_ID or "render" not in style:
         # Safe fallback — kabhi bhi crash nahi, bas plain bold text
@@ -246,11 +250,44 @@ def render_update_caption_entities(style_id: str, data: dict) -> tuple:
         return text, [{"type": "bold", "offset": 0, "length": _utf16_len(text)}]
     try:
         result = style["render"](data)
-        return _build_entities(result["lines"], result["quote"], result["italic"])
+        text, entities = _build_entities(result["lines"], result["quote"], result["italic"])
+
+        link_url = (data.get("how_to_get_link_url") or "").strip()
+        if link_url:
+            link_line = "➥ ʜᴏᴡ ᴛᴏ ɢᴇᴛ ʟɪɴᴋ"
+            new_text = f"{text}\n\n{link_line}"
+            link_offset = _utf16_len(text) + 2  # do '\n' skip karo
+            link_len = _utf16_len(link_line)
+            for e in entities:
+                if e["type"] == "bold" and e["offset"] == 0:
+                    e["length"] = _utf16_len(new_text)  # bold pura naya text cover kare
+                    break
+            entities.append({"type": "text_link", "offset": link_offset, "length": link_len, "url": link_url})
+            text = new_text
+
+        return text, entities
     except Exception as e:
         LOGGER.warning(f"[UpdatePostStyle] Entity render failed for '{style_id}': {e}")
         text = f"{data.get('anime_name', '')}"
         return text, [{"type": "bold", "offset": 0, "length": _utf16_len(text)}]
+
+
+# ─────────────────────────────────────────────
+#  "How to get link" — /how_to_get_link se set/remove hota hai. Set ho
+#  toh styled update-post templates (style1..style10, DEFAULT mein nahi)
+#  ke neeche "➥ ʜᴏᴡ ᴛᴏ ɢᴇᴛ ʟɪɴᴋ" clickable line add ho jaati hai.
+# ─────────────────────────────────────────────
+async def get_how_to_get_link() -> str:
+    from .database.access_db import db
+    doc = await db.col2.find_one({'id': 'how_to_get_link'})
+    if not doc:
+        return ""
+    return doc.get('url', '') or ""
+
+
+async def set_how_to_get_link(url: str):
+    from .database.access_db import db
+    await db.col2.update_one({'id': 'how_to_get_link'}, {'$set': {'url': url}}, upsert=True)
 
 
 # ─────────────────────────────────────────────
