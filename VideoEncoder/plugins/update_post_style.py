@@ -68,7 +68,7 @@ def _preview_keyboard_dict(style_id: str) -> dict:
     ]}
 
 
-def _preview_payload(style_id: str) -> tuple:
+async def _preview_payload(style_id: str) -> tuple:
     name = update_post_style.STYLES.get(style_id, {}).get("name", style_id)
     header = f"👀 Preview: {name}\n━━━━━━━━━━━━━━━━━━━━\n\n"
     footer = (
@@ -89,8 +89,10 @@ def _preview_payload(style_id: str) -> tuple:
         )
         body_entities = []
     else:
+        preview_data = dict(update_post_style.PREVIEW_DATA)
+        preview_data["how_to_get_link_url"] = await update_post_style.get_how_to_get_link()
         body_text, body_entities = update_post_style.render_update_caption_entities(
-            style_id, update_post_style.PREVIEW_DATA
+            style_id, preview_data
         )
 
     full_text = header + body_text + footer
@@ -132,7 +134,7 @@ async def update_post_style_callback(client: Client, cb: CallbackQuery):
         style_id = parts[2]
         await cb.answer("Preview render ho raha hai...")
         from ..utils.bot_upload_engine import _bot_api_send_message, _bot_api_edit_message
-        text, entities = _preview_payload(style_id)
+        text, entities = await _preview_payload(style_id)
         chat_id = cb.message.chat.id
         success = await _bot_api_edit_message(
             chat_id, cb.message.id, text, entities, _preview_keyboard_dict(style_id)

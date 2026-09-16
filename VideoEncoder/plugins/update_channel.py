@@ -377,6 +377,7 @@ async def send_update_post(
             ep_display = update_post_style.format_episode_display(
                 episode, episode_start, episode_end, total_eps
             )
+            how_to_get_link_url = await update_post_style.get_how_to_get_link()
             style_data = {
                 "anime_name": display_name,
                 "season": season or 1,
@@ -384,6 +385,7 @@ async def send_update_post(
                 "quality": "360p, 720p, 1080p",
                 "audio": audio,
                 "genres": genres,
+                "how_to_get_link_url": how_to_get_link_url,
             }
             caption, caption_entities = update_post_style.render_update_caption_entities(
                 style_id, style_data
