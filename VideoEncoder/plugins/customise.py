@@ -39,127 +39,108 @@ def _is_auth(user_id: int) -> bool:
 
 
 _MENU_TEXT = (
-    "🛠 **Customise — Auto Upload Settings**\n"
+    "🛠 **Customise Menu**\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
-    "Neeche se jo bhi customise karna hai usko tap karo — har button ke "
-    "naam se hi pata chal jaayega woh kis cheez ke liye hai:\n\n"
-    "**✍️ Post Look**\n"
-    "🎬 **Episode Caption Style** — jab video upload hota hai, uski "
-    "caption kaisi dikhegi\n"
-    "🖌 **Update-Post Caption Style** — Update Channel pe jaane waale "
-    "post ki caption kaisi dikhegi\n"
-    "🖼 **Thumbnail Band Style** — auto-thumbnail ke niche wale "
-    "band/box ka look\n"
-    "🔗 **How To Get Link** — update-post ke niche wali clickable line\n"
-    "🔘 **Update-Post Buttons** — \"Kaise Dekhein\" / \"Join Backup\" "
-    "wale default buttons\n"
-    "📋 **Update-Post List** — saare saved anime entries edit karo\n"
-    "📢 **Update Channels** — kaunse channels pe post jaata hai + on/off\n\n"
-    "**🤖 Auto-Monitor & Anime**\n"
-    "🤖 **Auto-Monitor & Anime List** — RTI channel se auto-detect + "
-    "saved anime list\n"
-    "📡 **Auto Channel Upload** — kaunsa channel kis anime se linked hai\n\n"
-    "**✂️ Filename**\n"
-    "🔄 **Filename Swap Rules** — filename ke andar ek text ko doosre se "
-    "replace karo\n"
-    "🚫 **Filename Blacklist** — kaunse words filename/caption se hat "
-    "jaayenge\n\n"
-    "**🖼 Thumbnails & Metadata**\n"
-    "🖼 **Custom Thumbnails (Keyword)** — filename mein keyword match "
-    "hone pe apni pic lage\n"
-    "🏷 **Metadata & URL Auto-Settings** — `/url` download ke auto "
-    "processing options\n\n"
-    "**🗑 Cleanup & Scheduling**\n"
-    "🗑 **Auto Delete Old Messages** — nayi video ke pehle 3 purane "
-    "messages auto-delete\n"
-    "📅 **Schedule & End Message** — \"next episode on ...\" / series "
-    "khatam hone ka message\n"
-    "🏁 **Upload Extras** — end template, border sticker, season "
-    "sticker (`/bot_upload`)\n\n"
-    "**⚙️ Bot Behaviour**\n"
-    "🔀 **Upload Mode** — file bhejein ya text-post + quality buttons\n"
-    "⚡ **Encode Mode** — pura VideoEncoder bot ya sirf auto-upload bot\n"
-    "👥 **Community Tag** — thumbnail/caption/metadata mein brand naam\n\n"
-    "> ℹ️ _Yeh sab GLOBAL (bot-wide) settings hain._"
+    "Jo bhi setting change karni hai, uska button neeche tap karo.\n"
+    "Har button ke saath ek chhoti si line hai jo bata degi ki woh "
+    "**kahan** use hota hai — koi command yaad rakhne ki zaroorat "
+    "nahi.\n\n"
+    "**✍️ 1. Caption & Post Look**\n"
+    "_Video/post kaisa dikhega, uski settings_\n\n"
+    "**🤖 2. Auto-Monitor & Channels**\n"
+    "_Anime auto-detect, upload channels, kaunsa anime kahan jaata hai_\n\n"
+    "**✂️ 3. Filename & Thumbnail**\n"
+    "_Filename ke text replace/hide, keyword se thumbnail_\n\n"
+    "**⏰ 4. Cleanup & Schedule**\n"
+    "_Purane messages hatana, next-episode message, end message_\n\n"
+    "**⚙️ 5. Other Settings**\n"
+    "_Baaki chhoti settings (community/brand naam waghera)_\n\n"
+    "> ℹ️ _Yeh sab settings poore bot ke liye hain (sabke liye same lagengi)._"
 )
+
+
+def _section_header(title: str) -> InlineKeyboardButton:
+    # Sirf ek visual divider — tap karne se kuch nahi hota.
+    return InlineKeyboardButton(title, callback_data="cmz:noop")
 
 
 def _menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [_section_header("✍️ ── Caption & Post Look ──")],
         [InlineKeyboardButton(
-            "🎬 Episode Caption Style (video upload caption)",
+            "🎬 Video Caption (upload hote waqt)",
             callback_data="cmz:open:caption_style",
         )],
         [InlineKeyboardButton(
-            "🖌 Update-Post Caption Style (update channel post)",
+            "🖌 Update-Post Caption (channel post ki caption)",
             callback_data="cmz:open:update_post_style",
         )],
         [InlineKeyboardButton(
-            "🖼 Thumbnail Band Style (thumbnail ka box/band)",
+            "🖼 Thumbnail Band Design",
             callback_data="cmz:open:setpic_style",
         )],
         [InlineKeyboardButton(
-            "🔗 How To Get Link (post ke neeche wali line)",
+            "🔗 Post ke Niche waali Link Line",
             callback_data="cmz:open:how_to_get_link",
         )],
         [InlineKeyboardButton(
-            "🔘 Update-Post Buttons (Kaise Dekhein / Join Backup)",
+            "🔘 \"Kaise Dekhein\" / \"Join\" Buttons",
             callback_data="cmz:open:update_post_button",
         )],
         [InlineKeyboardButton(
-            "📋 Update-Post List (saved anime entries edit karo)",
+            "📋 Saved Anime Posts (list/edit)",
             callback_data="cmz:open:update_post_list",
         )],
         [InlineKeyboardButton(
-            "📢 Update Channels (post kahan jaata hai + on/off)",
+            "📢 Update Channels (kahan post jaata hai)",
             callback_data="cmz:open:update_channels",
         )],
+
+        [_section_header("🤖 ── Auto-Monitor & Channels ──")],
         [InlineKeyboardButton(
-            "🤖 Auto-Monitor & Anime List (RTI auto-detect)",
+            "🤖 Auto-Monitor Anime List",
             callback_data="cmz:open:auto_monitor",
         )],
         [InlineKeyboardButton(
-            "📡 Auto Channel Upload (channel ↔ anime link)",
+            "📡 Channel ↔ Anime Link",
             callback_data="cmz:open:channel_upload",
         )],
+
+        [_section_header("✂️ ── Filename & Thumbnail ──")],
         [InlineKeyboardButton(
-            "🔄 Filename Swap Rules (text A → text B)",
+            "🔄 Filename Text Replace",
             callback_data="cmz:open:swap_rules",
         )],
         [InlineKeyboardButton(
-            "🚫 Filename Blacklist (banned words)",
+            "🚫 Filename Banned Words",
             callback_data="cmz:open:blacklist",
         )],
         [InlineKeyboardButton(
-            "🖼 Custom Thumbnails (keyword-based pic)",
+            "🖼 Keyword-wise Thumbnail",
             callback_data="cmz:open:custompic",
         )],
+
+        [_section_header("⏰ ── Cleanup & Schedule ──")],
         [InlineKeyboardButton(
-            "🏷 Metadata & URL Auto-Settings (/url ke liye)",
-            callback_data="cmz:open:url_settings",
-        )],
-        [InlineKeyboardButton(
-            "🗑 Auto Delete Old Messages (purane 3 msgs)",
+            "🗑 Auto-Delete Old Messages",
             callback_data="cmz:open:delete_message",
         )],
         [InlineKeyboardButton(
-            "📅 Schedule & End Message",
+            "📅 Next-Episode / End Message",
             callback_data="cmz:open:schedule",
         )],
         [InlineKeyboardButton(
-            "🏁 Upload Extras (end template / stickers)",
+            "🏁 Upload Extras (end template/stickers)",
             callback_data="cmz:open:bot_upload_extras",
         )],
+
+        [_section_header("⚙️ ── Other Settings ──")],
         [InlineKeyboardButton(
-            "🔀 Upload Mode (File / Bot text-post)",
-            callback_data="cmz:open:upload_mode",
+            "🏷 Metadata & URL Settings",
+            callback_data="cmz:open:url_settings",
         )],
         [InlineKeyboardButton(
-            "⚡ Encode Mode (bot ka overall behaviour)",
-            callback_data="cmz:open:encode_mode",
-        )],
-        [InlineKeyboardButton(
-            "👥 Community Tag (brand naam)",
+            "👥 Community / Brand Naam",
             callback_data="cmz:open:community",
         )],
         [InlineKeyboardButton("❌ Close", callback_data="cmz:close")],
@@ -223,6 +204,11 @@ async def customise_callback(client: Client, cb: CallbackQuery):
             pass
         return
 
+    if action == "noop":
+        # Sirf section-divider hai, ismein kuch karna nahi hai.
+        await cb.answer()
+        return
+
     if action == "open":
         section = parts[2]
         await cb.answer()
@@ -262,24 +248,6 @@ async def customise_callback(client: Client, cb: CallbackQuery):
         await cb.answer()
         from .url_settings import _show_setmeta_panel
         await _show_setmeta_panel(cb.message, cb.from_user.id, is_new=False)
-        return
-
-    # ── Encode Mode ON/OFF toggle ──
-    if action in ("encon", "encoff"):
-        from .encode_mode import _set_encode_mode
-        enabled = (action == "encon")
-        await _set_encode_mode(enabled)
-        await cb.answer("✅ Encode Mode: ON" if enabled else "🔴 Encode Mode: OFF")
-        await _open_section(client, cb, "encode_mode")
-        return
-
-    # ── Upload Mode: File / Bot toggle ──
-    if action in ("umfile", "umbot"):
-        from .upload_mode_plugin import set_upload_mode
-        mode = "file_mode" if action == "umfile" else "bot_mode"
-        await set_upload_mode(cb.from_user.id, mode)
-        await cb.answer("📁 File Mode ON" if mode == "file_mode" else "🤖 Bot Mode ON")
-        await _open_section(client, cb, "upload_mode")
         return
 
     # ── Community naam reset to default ──
@@ -552,64 +520,6 @@ async def _open_section(client: Client, cb: CallbackQuery, section: str):
             "hote hain._"
         )
         await _safe_edit(client, cb, text, InlineKeyboardMarkup([_back_row()]))
-        return
-
-    # ── 🔀 Upload Mode (File / Bot) ──
-    if section == "upload_mode":
-        from .upload_mode_plugin import get_upload_mode
-        mode = await get_upload_mode(user_id)
-        mode_text = "📁 **FILE MODE** — direct video file channel pe jaati hai" \
-            if mode == "file_mode" else \
-            "🤖 **BOT MODE** — text post + quality buttons (360p/720p/1080p) banta hai"
-        text = (
-            "🔀 **Upload Mode**\n\n"
-            f"Current: {mode_text}\n\n"
-            "📁 **File Mode** — jaisa abhi hai, video file seedhi upload "
-            "hoti hai.\n"
-            "🤖 **Bot Mode** — bot ek text post banata hai jisme quality "
-            "buttons jud-te jaate hain, har button = Suhani bot deep "
-            "link.\n\n"
-            "_Neeche se ek tap mein switch kar sakte ho._"
-        )
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    ("✅ " if mode == "file_mode" else "") + "📁 File Mode",
-                    callback_data="cmz:umfile",
-                ),
-                InlineKeyboardButton(
-                    ("✅ " if mode == "bot_mode" else "") + "🤖 Bot Mode",
-                    callback_data="cmz:umbot",
-                ),
-            ],
-            _back_row(),
-        ])
-        await _safe_edit(client, cb, text, kb)
-        return
-
-    # ── ⚡ Encode Mode ──
-    if section == "encode_mode":
-        from .encode_mode import get_encode_mode
-        enabled = await get_encode_mode()
-        status = "🟢 ON" if enabled else "🔴 OFF"
-        text = (
-            "⚡ **Encode Mode**\n\n"
-            f"Current Status: **{status}**\n\n"
-            "🟢 **ON** — full VideoEncoder bot: `/start` pe normal welcome "
-            "+ Settings button, sara existing feature-set kaam karta hai.\n"
-            "🔴 **OFF** _(default)_ — sirf auto-upload-bot mode: `/start` "
-            "sirf \"Yeh ek auto upload bot hai!\" bolega, video/document "
-            "bhejte hi seedha encode shuru ho jaayega.\n\n"
-            "_Neeche se ek tap mein switch kar sakte ho._"
-        )
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(("✅ " if enabled else "") + "🟢 ON", callback_data="cmz:encon"),
-                InlineKeyboardButton(("✅ " if not enabled else "") + "🔴 OFF", callback_data="cmz:encoff"),
-            ],
-            _back_row(),
-        ])
-        await _safe_edit(client, cb, text, kb)
         return
 
     # ── 👥 Community Tag ──
