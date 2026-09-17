@@ -1354,39 +1354,47 @@ async def cmd_set_monitor(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────
-#  /add_anime — Interactive button-flow (v3)
+#  /add_anime — Interactive button-flow (v4)
 #
-#  Step 1/4 (channel)  : "📢 Set Channel" button dabao → channel ID bhejo
+#  Step 1/5 (channel)   : "📢 Set Channel" button dabao → channel ID bhejo
 #                          YA us channel ka koi bhi message forward karo.
 #                          Bot us channel mein *admin* hona chahiye.
-#  Step 2/4 (name)      : 🤖 Auto Add  — channel ke naam se TMDB pe anime
+#  Step 2/5 (name)      : 🤖 Auto Add  — channel ke naam se TMDB pe anime
 #                                        dhoondta hai, match milte hi wahi
 #                                        naam save ho jaata hai; na mile
 #                                        toh error + Manual Add ka option.
 #                          ✍️ Manual Add — khud poora sahi naam type karo.
 #                          (Dono case mein genres turant TMDB se auto-fill
 #                          ho jaate hain — koi extra step nahi lagta.)
-#  Step 3/4 (poster)    : 🤖 Auto Add  — anime-name wale TMDB match se mila
+#  Step 3/5 (post pic)  : 🤖 Auto Add  — anime-name wale TMDB match se mila
 #                                        16:9 ("YouTube size") banner lagta hai.
 #                          🖼 Custom Add — khud ek photo bhejo.
-#  Step 4/4 (audio/dub) : 🎙 ORG ya 🎙 FanDub choose karo → is step ke baad
-#                          bas schedule-interval + channel-link (quick text)
-#                          maang ke sab kuch save ho jaata hai.
+#                          (Ye pic sirf UPDATE-CHANNEL POST ke liye hai.)
+#  Step 4/5 (video pic) : Ek photo bhejo — ye `/setpic` ki tarah save hota
+#                          hai aur uploaded EPISODE VIDEO FILES ke thumbnail
+#                          ke liye use hota hai. Post-pic se ALAG hai, isliye
+#                          alag se maanga jaata hai. Koi skip/auto nahi —
+#                          direct photo bhejna zaruri hai.
+#  Step 5/5 (audio/dub) : 🎙 ORG ya 🎙 FanDub choose karo → is step ke baad
+#                          bas schedule-interval + channel-link (quick text,
+#                          link ab MANDATORY hai) maang ke sab kuch save ho
+#                          jaata hai.
 #
 #  Finalize par teeno system ek saath save ho jaate hain:
 #    - anime_monitor_list   (RTI auto-monitor)
-#    - update_post_map      (update-channel post ke liye)
+#    - update_post_map      (update-channel post ke liye — Step 3/5 wali pic)
 #    - episode_schedule_list (agla episode kab expect karna hai)
+#    - custompics (/setpic)  (video-file thumbnail ke liye — Step 4/5 wali pic)
 # ─────────────────────────────────────────────
 
 # { user_id: {
 #     'step': 'await_start'|'channel'|'name_choice'|'name_manual'|
-#             'image_choice'|'image_custom'|'dub_choice'|
+#             'image_choice'|'image_custom'|'video_pic'|'dub_choice'|
 #             'interval_choice'|'interval_custom'|
 #             'link_choice'|'link_manual',
 #     'channel_id', 'channel_title',
-#     'anime_name', 'audio', 'genres', 'image', 'season', 'total_eps',
-#     'season_breakdown', 'interval_days', 'channel_link',
+#     'anime_name', 'audio', 'genres', 'image', 'video_pic', 'season',
+#     'total_eps', 'season_breakdown', 'interval_days', 'channel_link',
 # } }
 _add_anime_sessions: dict = {}
 
@@ -1472,12 +1480,24 @@ async def _show_image_choice(event, session: dict, user_id: int):
         "🤖 **Auto Add** — TMDB pe clean poster nahi mila\n> ⚠️ _Custom Add use karo_\n"
     )
     await event.reply(
-        f"**🖼 Step 3/4 — Thumbnail/Poster set karo**\n"
+        f"**🖼 Step 3/5 — Update-Channel POST ki pic set karo**\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"> ℹ️ _Ye pic sirf channel post ke liye use hogi._\n\n"
         f"{note}"
         f"🖼 **Custom Add** — khud ek photo bhejo\n\n"
         f"_Cancel karna ho toh `/cancel_add_anime` bhejo._",
         reply_markup=kb,
+    )
+
+
+async def _show_videopic_prompt(event, user_id: int):
+    await event.reply(
+        "**🎞 Step 4/5 — Video ki pic bhejo (`/setpic` ke liye)**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "> ℹ️ _Ye pic upload hone wali EPISODE VIDEO FILES ke thumbnail ke "
+        "liye use hogi — post-pic se ALAG hai._\n\n"
+        "Ek photo bhejo — seedha `/setpic` ki tarah save ho jaayegi.\n\n"
+        "_Cancel karna ho toh `/cancel_add_anime` bhejo._",
     )
 
 
@@ -1488,7 +1508,7 @@ async def _show_dub_choice(event, user_id: int):
         [InlineKeyboardButton("❌ Cancel", callback_data=f"aa_cancel_{user_id}")],
     ])
     await event.reply(
-        "**🎙 Step 4/4 — Audio/Dub type select karo**\n"
+        "**🎙 Step 5/5 — Audio/Dub type select karo**\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "🎙 **ORG** — _Official Hindi dub_\n"
         "🎙 **FanDub** — _Fan-made Hindi dub_\n\n"
@@ -1524,15 +1544,13 @@ async def _show_interval_choice(event, user_id: int):
 async def _show_link_choice(event, user_id: int):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Set Link", callback_data=f"aa_link_set_{user_id}")],
-        [InlineKeyboardButton("⏭️ Skip", callback_data=f"aa_link_skip_{user_id}")],
         [InlineKeyboardButton("❌ Cancel", callback_data=f"aa_cancel_{user_id}")],
     ])
     await event.reply(
         "**🔗 Channel Invite Link**\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "Ye link *\"Watch & Download\"* button ke liye use hoga.\n\n"
-        "🔗 **Set Link** — invite link bhejo\n"
-        "⏭️ **Skip** — link ke bina aage badho\n\n"
+        "🔗 **Set Link** — invite link bhejo (zaruri hai)\n\n"
         "_Cancel karna ho toh `/cancel_add_anime` bhejo._",
         reply_markup=kb,
     )
@@ -1540,7 +1558,7 @@ async def _show_link_choice(event, user_id: int):
 
 @Client.on_message(filters.command("add_anime") & filters.private)
 async def cmd_add_anime(client: Client, message: Message):
-    """/add_anime — button-flow shuru karo (Step 1/4: channel)."""
+    """/add_anime — button-flow shuru karo (Step 1/5: channel)."""
     if not _is_authorized(message.from_user.id):
         return
 
@@ -1553,8 +1571,8 @@ async def cmd_add_anime(client: Client, message: Message):
     await message.reply(
         "🌟 **➕ Add New Anime** 🌟\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "4 aasaan steps mein set ho jaayega — _channel, naam, poster aur "
-        "audio/dub_. Sab kuch button se. 🚀\n\n"
+        "5 aasaan steps mein set ho jaayega — _channel, naam, post-pic, "
+        "video-pic aur audio/dub_. Sab kuch button se. 🚀\n\n"
         "> ⚠️ **Note:** Jo channel add karna hai, usme bot ka **admin** hona zaruri hai.\n\n"
         "_Cancel karna ho toh `/cancel_add_anime` bhejo._",
         reply_markup=kb,
@@ -1620,7 +1638,7 @@ async def _add_anime_step_channel(client: Client, message: Message, session: dic
     ])
     await message.reply(
         f"✅ **Channel:** {channel_title}\n\n"
-        f"**📝 Step 2/4 — Anime ka naam kaise set karna hai?**\n"
+        f"**📝 Step 2/5 — Anime ka naam kaise set karna hai?**\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🤖 **Auto Add** — channel ke naam (\"_{channel_title}_\") se TMDB pe "
         f"anime dhoondega, match milte hi wahi naam save ho jaayega\n"
@@ -1699,6 +1717,7 @@ async def _finalize_add_anime(client: Client, message: Message, session: dict):
     audio = session.get("audio", "")
     genres = session.get("genres", "")
     image = session.get("image", "")
+    video_pic = session.get("video_pic", "")
     season = session.get("season")
     total_eps = session.get("total_eps", 0)
 
@@ -1730,11 +1749,12 @@ async def _finalize_add_anime(client: Client, message: Message, session: dict):
     }
     await _save_post_map(post_map)
 
-    # ── 2b) Wahi image `/setpic <anime_name>` ki tarah bhi save karo —
-    #        taaki is anime ki uploaded episode-files pe auto-thumbnail lage ──
+    # ── 2b) Video-pic (Step 4/5) ko `/setpic <anime_name>` ki tarah save
+    #        karo — taaki is anime ki uploaded episode-files pe wahi
+    #        auto-thumbnail lage. Ye POST pic (image) se ALAG pic hai ──
     setpic_saved = False
-    if image:
-        setpic_saved = await _register_setpic_from_url(message.from_user.id, anime_name, image)
+    if video_pic:
+        setpic_saved = await _register_setpic_from_url(message.from_user.id, anime_name, video_pic)
 
     # ── 3) episode schedule (jo pehle /schedule karta tha) ──
     _get_schedule_list, _save_schedule_list = _get_schedule_list_fns()
@@ -1753,8 +1773,8 @@ async def _finalize_add_anime(client: Client, message: Message, session: dict):
     await _save_schedule_list(slist)
 
     image_line = (
-        "🖼 **Poster:** ✅ set (16:9 banner)\n" if image
-        else "🖼 **Poster:** ⚠️ nahi mila — `/update_post_list` se add karo\n"
+        "🖼 **Post Pic:** ✅ set (channel post ke liye)\n" if image
+        else "🖼 **Post Pic:** ⚠️ nahi mila — `/update_post_list` se add karo\n"
     )
     season_breakdown = session.get("season_breakdown", "")
     if season:
@@ -1763,8 +1783,8 @@ async def _finalize_add_anime(client: Client, message: Message, session: dict):
         eps_str = f"{total_eps} episodes" if total_eps else "— (baad mein pata chalega)"
     season_line = f"📚 **Season-wise:** {season_breakdown}\n" if season_breakdown else ""
     setpic_line = (
-        "📌 **Auto-Thumbnail:** ✅ `/setpic` mein bhi save ho gaya\n" if setpic_saved
-        else ("📌 **Auto-Thumbnail:** ⚠️ save nahi ho paaya — `/setpic " + anime_name + "` manually karo\n" if image else "")
+        "📌 **Video Pic (`/setpic`):** ✅ saved\n" if setpic_saved
+        else "📌 **Video Pic (`/setpic`):** ⚠️ save nahi ho paaya — `/setpic " + anime_name + "` manually karo\n"
     )
     interval_str = "❓ Unknown" if interval_days == "unknown" else f"{interval_days} din"
     await message.reply(
@@ -1830,7 +1850,7 @@ async def add_anime_callbacks(client: Client, cb: CallbackQuery):
         await cb.answer()
         try:
             await cb.message.edit(
-                "**📢 Step 1/4 — Channel batao**\n"
+                "**📢 Step 1/5 — Channel batao**\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
                 "Channel ki ID bhejo (`-100xxxxxxxxx`) *ya* us channel ka koi bhi "
                 "message yahan forward kar do.\n\n"
@@ -1854,7 +1874,7 @@ async def add_anime_callbacks(client: Client, cb: CallbackQuery):
             await cb.answer()
             try:
                 await cb.message.edit(
-                    "**✍️ Step 2/4 — Anime ka poora aur bilkul sahi naam do**\n"
+                    "**✍️ Step 2/5 — Anime ka poora aur bilkul sahi naam do**\n"
                     "━━━━━━━━━━━━━━━━━━━━\n\n"
                     "_Isi naam se genres aur poster TMDB se auto-fetch honge._\n\n"
                     "**Example:** `Fullmetal Alchemist: Brotherhood`\n\n"
@@ -1916,14 +1936,14 @@ async def add_anime_callbacks(client: Client, cb: CallbackQuery):
             if not session.get("image"):
                 await cb.answer("⚠️ TMDB se koi image nahi mila — Custom Add try karo!", show_alert=True)
                 return
-            session["step"] = "dub_choice"
+            session["step"] = "video_pic"
             _add_anime_sessions[owner_id] = session
             await cb.answer("✅ TMDB poster use hoga")
             try:
-                await cb.message.edit("✅ **Poster:** TMDB se auto set ho gaya (16:9 banner).")
+                await cb.message.edit("✅ **Post Pic:** TMDB se auto set ho gaya (16:9 banner).")
             except Exception:
                 pass
-            await _show_dub_choice(cb.message, owner_id)
+            await _show_videopic_prompt(cb.message, owner_id)
             return
 
         # mode == "custom"
@@ -1932,7 +1952,7 @@ async def add_anime_callbacks(client: Client, cb: CallbackQuery):
         await cb.answer()
         try:
             await cb.message.edit(
-                "**Step 3/4 — Poster/thumbnail image bhejo:**\n\n"
+                "**Step 3/5 — Update-channel POST ki pic bhejo:**\n\n"
                 "_Photo bhejo, caption ki zaroorat nahi._\n\n"
                 "_Cancel karna ho toh `/cancel_add_anime` bhejo._"
             )
@@ -2007,25 +2027,14 @@ async def add_anime_callbacks(client: Client, cb: CallbackQuery):
         await _show_link_choice(cb.message, owner_id)
         return
 
-    # ── aa_link_set_<uid> / aa_link_skip_<uid> ──
+    # ── aa_link_set_<uid> ── (Skip button removed — link mandatory hai)
     if data.startswith("aa_link_"):
         if session.get("step") != "link_choice":
             await cb.answer("⚠️ Ye step ab active nahi hai.", show_alert=True)
             return
         mode = parts[2]
 
-        if mode == "skip":
-            session["channel_link"] = ""
-            _add_anime_sessions.pop(owner_id, None)
-            await cb.answer("✅ Skipped")
-            try:
-                await cb.message.edit("✅ **Link:** Skipped")
-            except Exception:
-                pass
-            await _finalize_add_anime(client, cb.message, session)
-            return
-
-        # mode == "set"
+        # mode == "set" (Skip button removed — link ab mandatory hai)
         session["step"] = "link_manual"
         _add_anime_sessions[owner_id] = session
         await cb.answer()
@@ -2042,7 +2051,8 @@ async def add_anime_callbacks(client: Client, cb: CallbackQuery):
     await cb.answer()
 
 
-# ── Photo handler — sirf "image_custom" step ke liye ───────────
+# ── Photo handler — "image_custom" (post pic) aur "video_pic"
+#    (setpic wali pic) — dono steps ke liye ─────────────────────
 @Client.on_message(filters.photo & filters.private, group=0)
 async def add_anime_photo_input(client: Client, message: Message):
     if not message.from_user:
@@ -2050,14 +2060,23 @@ async def add_anime_photo_input(client: Client, message: Message):
 
     user_id = message.from_user.id
     session = _add_anime_sessions.get(user_id)
-    if not session or not _is_authorized(user_id) or session.get("step") != "image_custom":
+    step = session.get("step") if session else None
+    if not session or not _is_authorized(user_id) or step not in ("image_custom", "video_pic"):
         raise ContinuePropagation
 
-    session["image"] = message.photo.file_id
+    if step == "image_custom":
+        session["image"] = message.photo.file_id
+        session["step"] = "video_pic"
+        _add_anime_sessions[user_id] = session
+        await message.reply("✅ **Post Pic:** custom image saved!")
+        await _show_videopic_prompt(message, user_id)
+        raise StopPropagation
+
+    # step == "video_pic"
+    session["video_pic"] = message.photo.file_id
     session["step"] = "dub_choice"
     _add_anime_sessions[user_id] = session
-
-    await message.reply("✅ **Poster:** custom image saved!")
+    await message.reply("✅ **Video Pic (`/setpic`):** saved!")
     await _show_dub_choice(message, user_id)
     raise StopPropagation
 
@@ -2101,7 +2120,7 @@ async def add_anime_flow_router(client: Client, message: Message):
     if step == "link_manual":
         await _add_anime_step_link(client, message, session, user_id)
         raise StopPropagation
-    if step == "image_custom":
+    if step in ("image_custom", "video_pic"):
         # Photos yahan nahi — dedicated add_anime_photo_input (upar) handle
         # karta hai. Sirf stray text ko yahan nudge karo.
         if message.text:
