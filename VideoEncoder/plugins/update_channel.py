@@ -937,7 +937,10 @@ async def _show_update_post_list_panel(event, user_id: int, page: int, is_new: b
 
     if not keys:
         text = "📭 Koi anime post entry save nahi hai.\n\nAdd karne ke liye: `/update_post`"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="closeMeh")]])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Customise Menu", callback_data="cmz:menu")],
+            [InlineKeyboardButton("❌ Close", callback_data="closeMeh")],
+        ])
         if is_new:
             await event.reply(text, reply_markup=kb)
         else:
@@ -971,6 +974,7 @@ async def _show_update_post_list_panel(event, user_id: int, page: int, is_new: b
     if page < total_pages - 1:
         nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"upe_page_{page + 1}_{user_id}"))
     rows.append(nav_row)
+    rows.append([InlineKeyboardButton("🔙 Customise Menu", callback_data="cmz:menu")])
     rows.append([InlineKeyboardButton("❌ Close", callback_data="closeMeh")])
 
     kb = InlineKeyboardMarkup(rows)

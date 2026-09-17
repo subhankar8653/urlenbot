@@ -70,6 +70,7 @@ For Sudo:
 For Owner:
 - /addchat and /addsudo
 - /rmsudo and /rmchat
+- /Customise - Auto-upload customise karne ka button-menu (caption style, post style, thumbnail, buttons, link, list, channels)
 - /update_channel - Update channel add karo
 - /update_channel_list - Update channels dekho
 - /delete_update_channel - Update channel remove karo
@@ -107,6 +108,7 @@ For Sudo:
 For Owner:
 - /addchat and /addsudo
 - /rmsudo and /rmchat
+- /Customise - Auto-upload customise karne ka button-menu (caption style, post style, thumbnail, buttons, link, list, channels)
 - /update_channel - Update channel add karo
 - /update_channel_list - Update channels dekho
 - /delete_update_channel - Update channel remove karo

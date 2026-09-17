@@ -57,6 +57,7 @@ def _list_keyboard() -> InlineKeyboardMarkup:
                for sid in ids[i:i + 2]]
         rows.append(row)
     rows.append([InlineKeyboardButton("🚫 Disable (No Style)", callback_data="sp:off")])
+    rows.append([InlineKeyboardButton("🔙 Customise Menu", callback_data="cmz:menu")])
     return InlineKeyboardMarkup(rows)
 
 

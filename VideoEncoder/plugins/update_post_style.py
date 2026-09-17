@@ -58,6 +58,7 @@ def _list_keyboard() -> InlineKeyboardMarkup:
         _label(update_post_style.DEFAULT_STYLE_ID),
         callback_data=f"ups:prev:{update_post_style.DEFAULT_STYLE_ID}",
     )])
+    rows.append([InlineKeyboardButton("🔙 Customise Menu", callback_data="cmz:menu")])
     return InlineKeyboardMarkup(rows)
 
 
