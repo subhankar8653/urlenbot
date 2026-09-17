@@ -43,6 +43,7 @@ _MENU_TEXT = (
     "━━━━━━━━━━━━━━━━━━━━\n\n"
     "Neeche se jo bhi customise karna hai usko tap karo — har button ke "
     "naam se hi pata chal jaayega woh kis cheez ke liye hai:\n\n"
+    "**✍️ Post Look**\n"
     "🎬 **Episode Caption Style** — jab video upload hota hai, uski "
     "caption kaisi dikhegi\n"
     "🖌 **Update-Post Caption Style** — Update Channel pe jaane waale "
@@ -54,6 +55,31 @@ _MENU_TEXT = (
     "wale default buttons\n"
     "📋 **Update-Post List** — saare saved anime entries edit karo\n"
     "📢 **Update Channels** — kaunse channels pe post jaata hai + on/off\n\n"
+    "**🤖 Auto-Monitor & Anime**\n"
+    "🤖 **Auto-Monitor & Anime List** — RTI channel se auto-detect + "
+    "saved anime list\n"
+    "📡 **Auto Channel Upload** — kaunsa channel kis anime se linked hai\n\n"
+    "**✂️ Filename**\n"
+    "🔄 **Filename Swap Rules** — filename ke andar ek text ko doosre se "
+    "replace karo\n"
+    "🚫 **Filename Blacklist** — kaunse words filename/caption se hat "
+    "jaayenge\n\n"
+    "**🖼 Thumbnails & Metadata**\n"
+    "🖼 **Custom Thumbnails (Keyword)** — filename mein keyword match "
+    "hone pe apni pic lage\n"
+    "🏷 **Metadata & URL Auto-Settings** — `/url` download ke auto "
+    "processing options\n\n"
+    "**🗑 Cleanup & Scheduling**\n"
+    "🗑 **Auto Delete Old Messages** — nayi video ke pehle 3 purane "
+    "messages auto-delete\n"
+    "📅 **Schedule & End Message** — \"next episode on ...\" / series "
+    "khatam hone ka message\n"
+    "🏁 **Upload Extras** — end template, border sticker, season "
+    "sticker (`/bot_upload`)\n\n"
+    "**⚙️ Bot Behaviour**\n"
+    "🔀 **Upload Mode** — file bhejein ya text-post + quality buttons\n"
+    "⚡ **Encode Mode** — pura VideoEncoder bot ya sirf auto-upload bot\n"
+    "👥 **Community Tag** — thumbnail/caption/metadata mein brand naam\n\n"
     "> ℹ️ _Yeh sab GLOBAL (bot-wide) settings hain._"
 )
 
@@ -87,6 +113,54 @@ def _menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(
             "📢 Update Channels (post kahan jaata hai + on/off)",
             callback_data="cmz:open:update_channels",
+        )],
+        [InlineKeyboardButton(
+            "🤖 Auto-Monitor & Anime List (RTI auto-detect)",
+            callback_data="cmz:open:auto_monitor",
+        )],
+        [InlineKeyboardButton(
+            "📡 Auto Channel Upload (channel ↔ anime link)",
+            callback_data="cmz:open:channel_upload",
+        )],
+        [InlineKeyboardButton(
+            "🔄 Filename Swap Rules (text A → text B)",
+            callback_data="cmz:open:swap_rules",
+        )],
+        [InlineKeyboardButton(
+            "🚫 Filename Blacklist (banned words)",
+            callback_data="cmz:open:blacklist",
+        )],
+        [InlineKeyboardButton(
+            "🖼 Custom Thumbnails (keyword-based pic)",
+            callback_data="cmz:open:custompic",
+        )],
+        [InlineKeyboardButton(
+            "🏷 Metadata & URL Auto-Settings (/url ke liye)",
+            callback_data="cmz:open:url_settings",
+        )],
+        [InlineKeyboardButton(
+            "🗑 Auto Delete Old Messages (purane 3 msgs)",
+            callback_data="cmz:open:delete_message",
+        )],
+        [InlineKeyboardButton(
+            "📅 Schedule & End Message",
+            callback_data="cmz:open:schedule",
+        )],
+        [InlineKeyboardButton(
+            "🏁 Upload Extras (end template / stickers)",
+            callback_data="cmz:open:bot_upload_extras",
+        )],
+        [InlineKeyboardButton(
+            "🔀 Upload Mode (File / Bot text-post)",
+            callback_data="cmz:open:upload_mode",
+        )],
+        [InlineKeyboardButton(
+            "⚡ Encode Mode (bot ka overall behaviour)",
+            callback_data="cmz:open:encode_mode",
+        )],
+        [InlineKeyboardButton(
+            "👥 Community Tag (brand naam)",
+            callback_data="cmz:open:community",
         )],
         [InlineKeyboardButton("❌ Close", callback_data="cmz:close")],
     ])
@@ -169,6 +243,53 @@ async def customise_callback(client: Client, cb: CallbackQuery):
         await _safe_edit(client, cb, text, InlineKeyboardMarkup([_back_row()]))
         return
 
+    # ── Anime list panel (reuses auto_monitor.py ka real panel) ──
+    if action == "analist":
+        await cb.answer()
+        from .auto_monitor import _show_list_anime_panel
+        await _show_list_anime_panel(client, cb.message, cb.from_user.id, page=0, is_new=False)
+        return
+
+    # ── URL auto-preset panel (reuses url_settings.py ka /urlpreset panel) ──
+    if action == "urlpresetpanel":
+        await cb.answer()
+        from .url_settings import _show_preset_panel
+        await _show_preset_panel(cb.message, cb.from_user.id, is_new=False)
+        return
+
+    # ── Metadata panel (reuses url_settings.py ka /setmeta panel) ──
+    if action == "setmetapanel":
+        await cb.answer()
+        from .url_settings import _show_setmeta_panel
+        await _show_setmeta_panel(cb.message, cb.from_user.id, is_new=False)
+        return
+
+    # ── Encode Mode ON/OFF toggle ──
+    if action in ("encon", "encoff"):
+        from .encode_mode import _set_encode_mode
+        enabled = (action == "encon")
+        await _set_encode_mode(enabled)
+        await cb.answer("✅ Encode Mode: ON" if enabled else "🔴 Encode Mode: OFF")
+        await _open_section(client, cb, "encode_mode")
+        return
+
+    # ── Upload Mode: File / Bot toggle ──
+    if action in ("umfile", "umbot"):
+        from .upload_mode_plugin import set_upload_mode
+        mode = "file_mode" if action == "umfile" else "bot_mode"
+        await set_upload_mode(cb.from_user.id, mode)
+        await cb.answer("📁 File Mode ON" if mode == "file_mode" else "🤖 Bot Mode ON")
+        await _open_section(client, cb, "upload_mode")
+        return
+
+    # ── Community naam reset to default ──
+    if action == "commreset":
+        from ..utils.database.access_db import db
+        await db.set_community(None)
+        await cb.answer("🔄 Community naam reset ho gaya!")
+        await _open_section(client, cb, "community")
+        return
+
     await cb.answer()
 
 
@@ -191,24 +312,10 @@ async def _open_section(client: Client, cb: CallbackQuery, section: str):
         return
 
     if section == "how_to_get_link":
-        from ..utils import update_post_style as ups_utils
-        current = await ups_utils.get_how_to_get_link()
-        if current:
-            text = (
-                f"🔗 **How to get link — abhi set hai:**\n`{current}`\n\n"
-                "Update karna ho toh: `/how_to_get_link <naya link>`\n"
-                "Hatana ho toh: `/how_to_get_link remove`"
-            )
-        else:
-            text = (
-                "📭 **How to get link** abhi set nahi hai.\n\n"
-                "Set karo: `/how_to_get_link <link>`\n\n"
-                "_Set hone ke baad, styled update-posts (Update-Post "
-                "Caption Style ke 1-10 waale styles) ke neeche ek "
-                "clickable_ **➥ ʜᴏᴡ ᴛᴏ ɢᴇᴛ ʟɪɴᴋ** _line add ho jaayegi. "
-                "\"Default\" style mein nahi aati._"
-            )
-        await _safe_edit(client, cb, text, InlineKeyboardMarkup([_back_row()]))
+        from . import how_to_get_link as mod
+        text = await mod._status_text()
+        kb_rows = list(mod._keyboard().inline_keyboard) + [_back_row()]
+        await _safe_edit(client, cb, text, InlineKeyboardMarkup(kb_rows))
         return
 
     if section == "update_post_button":
@@ -278,6 +385,254 @@ async def _open_section(client: Client, cb: CallbackQuery, section: str):
             text += "💡 Remove: `/delete_update_channel [channel_id]`\n"
             text += "💡 Toggle: `/updatechannel on` | `/updatechannel off`"
         await _safe_edit(client, cb, text, InlineKeyboardMarkup([_back_row()]))
+        return
+
+    # ── 🤖 Auto-Monitor & Anime List ──
+    if section == "auto_monitor":
+        from .auto_monitor import _get_anime_list, _get_monitor_channel
+        channel = await _get_monitor_channel()
+        anime_list = await _get_anime_list()
+        text = (
+            "🤖 **Auto-Monitor & Anime List**\n\n"
+            "RTI (source) channel pe jab bhi \"Episode X-Y Added\" type ka "
+            "post aata hai, bot use automatically detect karke, anime "
+            "match karke, saari qualities download + upload kar deta hai — "
+            "manually kuch karne ki zaroorat nahi.\n\n"
+            f"📡 **Monitor Channel ID:** `{channel}`\n"
+            f"📺 **Saved Anime:** `{len(anime_list)}`\n\n"
+            "**Commands:**\n"
+            "• `/add_anime` — button-driven flow se naya anime add karo "
+            "(channel, naam, poster, audio, interval, sab ek saath)\n"
+            "• `/list_anime` — saare saved anime dekho/edit karo (niche "
+            "button se bhi khul jayega)\n"
+            "• `/del_anime` — kisi anime ko list se hatao\n"
+            "• `/set_monitor <channel_id>` — RTI source channel badlo\n"
+            "• `/monitor_status` — abhi monitor kya kar raha hai, live dekho"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Open Anime List", callback_data="cmz:analist")],
+            _back_row(),
+        ])
+        await _safe_edit(client, cb, text, kb)
+        return
+
+    # ── 📡 Auto Channel Upload ──
+    if section == "channel_upload":
+        from ..utils.database.access_db import db
+        channels = await db.get_channels(user_id)
+        text = (
+            "📡 **Auto Channel Upload**\n\n"
+            "Kisi bhi anime naam ko ek specific channel se link kar do — "
+            "us anime ki files phir automatically usi channel pe jaayengi.\n\n"
+            f"🔗 **Linked Channels:** `{len(channels) if channels else 0}`\n\n"
+            "**Commands:**\n"
+            "• `/addchannel` — naya anime ↔ channel link add karo\n"
+            "• `/seechannel` — saare linked channels dekho\n"
+            "• `/delchannel` — kisi link ko remove karo"
+        )
+        await _safe_edit(client, cb, text, InlineKeyboardMarkup([_back_row()]))
+        return
+
+    # ── 🔄 Filename Swap Rules (reuses url_upload.py ka /addswap panel) ──
+    if section == "swap_rules":
+        from .url_upload import _show_addswap_panel
+        await _show_addswap_panel(cb.message, user_id, is_new=False)
+        return
+
+    # ── 🚫 Filename Blacklist (reuses url_upload.py ka /blacklist panel) ──
+    if section == "blacklist":
+        from .url_upload import _show_blacklist_panel
+        await _show_blacklist_panel(cb.message, user_id, is_new=False)
+        return
+
+    # ── 🖼 Custom Thumbnails (Keyword) ──
+    if section == "custompic":
+        from ..utils.database.access_db import db
+        pics = await db.get_all_custompics(user_id)
+        text = (
+            "🖼 **Custom Thumbnails (Keyword)**\n\n"
+            "Kisi bhi keyword (jaise anime ka naam) ke liye ek fix "
+            "thumbnail save kar do. Jab bhi upload hone waali file ke "
+            "filename/caption mein wo keyword match karega, thumbnail "
+            "automatically apply ho jaayegi.\n\n"
+            f"🖼 **Saved Pics:** `{len(pics) if pics else 0}`\n\n"
+            "**Commands:**\n"
+            "• `/setpic <keyword>` — photo reply karke keyword pic save "
+            "karo (bina keyword ke → default thumbnail)\n"
+            "• `/listpic` — sabki list dekho\n"
+            "• `/previewpic <keyword>` — us keyword ki pic dekho\n"
+            "• `/deletepic <keyword>` (alias: `/delpic`) — delete karo"
+        )
+        await _safe_edit(client, cb, text, InlineKeyboardMarkup([_back_row()]))
+        return
+
+    # ── 🏷 Metadata & URL Auto-Settings ──
+    if section == "url_settings":
+        text = (
+            "🏷 **Metadata & URL Auto-Settings**\n\n"
+            "Ye sab settings sirf `/url <link>` (manual URL upload/"
+            "download) ke auto-processing ko control karti hain:\n\n"
+            "• `/urlpreset` — auto-processing options (auto-rename, "
+            "auto-thumbnail, etc.) — niche button se interactive panel "
+            "khulega\n"
+            "• `/setmeta` — video metadata (title, author, etc.) jo har "
+            "upload mein auto-apply hogi — niche button se panel khulega\n"
+            "• `/urlsettings` — abhi sab kya set hai, poora summary "
+            "dekho\n"
+            "• `/clearmeta` — saari saved metadata clear karo"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎛 Open URL Preset Panel", callback_data="cmz:urlpresetpanel")],
+            [InlineKeyboardButton("🏷 Open Metadata Panel", callback_data="cmz:setmetapanel")],
+            _back_row(),
+        ])
+        await _safe_edit(client, cb, text, kb)
+        return
+
+    # ── 🗑 Auto Delete Old Messages ──
+    if section == "delete_message":
+        from .delete_msg import _get_delete_channels
+        channels = await _get_delete_channels()
+        text = (
+            "🗑 **Auto Delete Old Messages**\n\n"
+            "Jab set kiye hue channel pe koi nayi VIDEO FILE upload hoti "
+            "hai, uske niche wale purane 3 messages automatically delete "
+            "ho jaate hain (video khud delete nahi hoti — sirf usse pehle "
+            "ke 3 messages).\n\n"
+            f"📡 **Set Channels:** `{len(channels)}`\n\n"
+            "**Commands:**\n"
+            "• `/delete_message [channel_id]` — channel add karo (ya "
+            "bina id ke → list dikhao)\n"
+            "• `/delete_message_list` — saare set channels dekho\n"
+            "• `/delete_message_del [number]` — channel remove karo"
+        )
+        await _safe_edit(client, cb, text, InlineKeyboardMarkup([_back_row()]))
+        return
+
+    # ── 📅 Schedule & End Message ──
+    if section == "schedule":
+        from .schedule_notify import _get_schedule_list
+        slist = await _get_schedule_list()
+        text = (
+            "📅 **Schedule & End Message**\n\n"
+            "Episode complete hone ke baad bot automatically ek schedule "
+            "message post karta hai (\"Next episode on ...\"), aur series "
+            "ke last episode pe end messages + saare update channels pe "
+            "broadcast bhejta hai.\n\n"
+            f"📋 **Saved Schedules:** `{len(slist)}`\n\n"
+            "**Commands:**\n"
+            "• `/schedule [days] [total_eps] [Anime Name]` — schedule set "
+            "karo\n"
+            "• `/schedule_list` — saare saved schedules dekho\n"
+            "• `/schedule_del [Anime Name]` — schedule remove karo\n"
+            "• `/end_message` — default end message set karo (`/done` se "
+            "save)\n"
+            "• `/end_message [Channel Name]` — sirf ek channel ke liye "
+            "custom end message\n"
+            "• `/end_message_preview` — abhi kya set hai dekho\n"
+            "• `/end_message_del [Name]` — end message delete karo"
+        )
+        await _safe_edit(client, cb, text, InlineKeyboardMarkup([_back_row()]))
+        return
+
+    # ── 🏁 Upload Extras (bot_upload.py globals) ──
+    if section == "bot_upload_extras":
+        text = (
+            "🏁 **Upload Extras** _(`/bot_upload` pipeline ke liye)_\n\n"
+            "• `/set_end <template>` — end message template set karo. "
+            "Placeholders: `{anime_name}`, `{season}`, `{q480}`, `{q720}`, "
+            "`{q1080}`\n"
+            "• `/border` — sticker bhejo phir `/done` — batch summary ke "
+            "border pe use hoga\n"
+            "• `/season_sticker` — har season ke liye sticker set karo "
+            "(order mein bhejo, phir `/done`)\n\n"
+            "_Ye teeno `/bot_upload` ke full pipeline (IMDB info → "
+            "episode upload → batch links → border → summary → end "
+            "message → next season sticker) mein automatically use "
+            "hote hain._"
+        )
+        await _safe_edit(client, cb, text, InlineKeyboardMarkup([_back_row()]))
+        return
+
+    # ── 🔀 Upload Mode (File / Bot) ──
+    if section == "upload_mode":
+        from .upload_mode_plugin import get_upload_mode
+        mode = await get_upload_mode(user_id)
+        mode_text = "📁 **FILE MODE** — direct video file channel pe jaati hai" \
+            if mode == "file_mode" else \
+            "🤖 **BOT MODE** — text post + quality buttons (360p/720p/1080p) banta hai"
+        text = (
+            "🔀 **Upload Mode**\n\n"
+            f"Current: {mode_text}\n\n"
+            "📁 **File Mode** — jaisa abhi hai, video file seedhi upload "
+            "hoti hai.\n"
+            "🤖 **Bot Mode** — bot ek text post banata hai jisme quality "
+            "buttons jud-te jaate hain, har button = Suhani bot deep "
+            "link.\n\n"
+            "_Neeche se ek tap mein switch kar sakte ho._"
+        )
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    ("✅ " if mode == "file_mode" else "") + "📁 File Mode",
+                    callback_data="cmz:umfile",
+                ),
+                InlineKeyboardButton(
+                    ("✅ " if mode == "bot_mode" else "") + "🤖 Bot Mode",
+                    callback_data="cmz:umbot",
+                ),
+            ],
+            _back_row(),
+        ])
+        await _safe_edit(client, cb, text, kb)
+        return
+
+    # ── ⚡ Encode Mode ──
+    if section == "encode_mode":
+        from .encode_mode import get_encode_mode
+        enabled = await get_encode_mode()
+        status = "🟢 ON" if enabled else "🔴 OFF"
+        text = (
+            "⚡ **Encode Mode**\n\n"
+            f"Current Status: **{status}**\n\n"
+            "🟢 **ON** — full VideoEncoder bot: `/start` pe normal welcome "
+            "+ Settings button, sara existing feature-set kaam karta hai.\n"
+            "🔴 **OFF** _(default)_ — sirf auto-upload-bot mode: `/start` "
+            "sirf \"Yeh ek auto upload bot hai!\" bolega, video/document "
+            "bhejte hi seedha encode shuru ho jaayega.\n\n"
+            "_Neeche se ek tap mein switch kar sakte ho._"
+        )
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(("✅ " if enabled else "") + "🟢 ON", callback_data="cmz:encon"),
+                InlineKeyboardButton(("✅ " if not enabled else "") + "🔴 OFF", callback_data="cmz:encoff"),
+            ],
+            _back_row(),
+        ])
+        await _safe_edit(client, cb, text, kb)
+        return
+
+    # ── 👥 Community Tag ──
+    if section == "community":
+        from ..utils.community import DEFAULT_COMMUNITY, get_community_name
+        current = await get_community_name()
+        text = (
+            "👥 **Community Tag** _(bot-wide)_\n\n"
+            f"Current: `{current}`\n\n"
+            "Ye naam thumbnail band, auto-caption tag aur metadata title "
+            "mein — manual aur auto-monitor dono uploads mein — sabki "
+            "jagah use hota hai.\n\n"
+            "**Command:**\n"
+            "• `/community <name>` — naya naam set karo (sirf letters/"
+            "numbers/underscore)\n"
+            f"• `/communityclear` — default `{DEFAULT_COMMUNITY}` pe reset "
+            "(niche button se bhi ho jayega)"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Reset to Default", callback_data="cmz:commreset")],
+            _back_row(),
+        ])
+        await _safe_edit(client, cb, text, kb)
         return
 
     await cb.answer("Yeh section abhi available nahi hai.", show_alert=True)
