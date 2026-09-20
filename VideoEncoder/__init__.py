@@ -9,6 +9,18 @@ from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 from pyrogram import Client
 
+# ── uvloop: faster asyncio event loop (pyrofork ke apne official docs bhi
+# isse "speedup" extra mein recommend karte hain — C-based libuv pe chalta
+# hai, stock asyncio se kaafi tez event dispatch + I/O deta hai, jo network-
+# heavy kaam jaise Telegram upload/download mein directly madad karta hai).
+# Linux/macOS only hai — try/except taaki kisi aur OS pe crash na ho, sirf
+# silently normal asyncio pe fallback ho jaaye.
+try:
+    import uvloop
+    uvloop.install()
+except Exception:
+    pass
+
 botStartTime = time.time()
 
 if os.path.exists('config.env'):
