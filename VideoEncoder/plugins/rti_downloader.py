@@ -30,7 +30,6 @@ from pyrogram.types import (
 from .. import LOGGER, download_dir, app
 from ..utils.helper import check_chat
 from ..utils.database.access_db import db
-from .update_channel import _get_update_toggle, _set_update_toggle
 
 try:
     from selenium import webdriver
@@ -286,6 +285,7 @@ class RTISelector:
         self.channel_toggle = False
 
     async def populate_toggles(self):
+        from .update_channel import _get_update_toggle
         self.update_toggle = await _get_update_toggle()
         self.channel_toggle = await _get_rti_channel_upload(self.orig_message.from_user.id)
 
@@ -920,6 +920,7 @@ async def rti_callback_handler(client: Client, cb: CallbackQuery):
             return
 
         if action == "uptog":
+            from .update_channel import _set_update_toggle
             new_val = not sess.update_toggle
             await _set_update_toggle(new_val)
             sess.update_toggle = new_val
