@@ -6,6 +6,11 @@ pyrofork
 # hai (koi code change nahi chahiye) — pyrofork ke official docs bhi ab isi
 # ko recommend karte hain, plain TgCrypto ko nahi.
 TgCrypto-pyrofork
+# Faster event loop (Linux/macOS) — pyrofork ke apne "speedup" extras mein
+# recommended, upload/download jaisi network-heavy async cheezon ko tez
+# karta hai. __init__.py mein try/except ke saath install hota hai, isliye
+# agar kisi wajah se yeh install na ho paaye to bhi bot crash nahi hoga.
+uvloop
 python-dotenv
 hachoir
 beautifulsoup4==4.9.1
