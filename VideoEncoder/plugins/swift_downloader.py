@@ -750,6 +750,23 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
 # ─────────────────────────────────────────────
 #  Single file upload — returns sent Message object (for reorder)
 # ─────────────────────────────────────────────
+# ── Stagger trigger point ──────────────────────────────────────────────────
+# BUG (fixed): pehle yeh 0.50 (50%) tha — file[i+1] ka upload file[i] ke
+# aadhe (50%) pe hi shuru ho jaata tha. Matlab file[i] ki poori DOOSRI HALF
+# (50%→100%) hamesha ek aur fresh uploader_client (uc) ke saath bandwidth
+# SHARE karti thi. Isi wajah se symptom yeh dikhta tha: "pehle kuch min
+# achha speed, jaise-jaise upload end ki taraf aata hai speed slow ho jaata
+# hai" — kyunki 50% ke baad VPS ka pura upload bandwidth do active uploads
+# (uc) ke beech baant jaata tha.
+#
+# FIX: threshold ko 0.50 se 0.90 kar diya. Ab file[i+1] sirf file[i] ke
+# LAST ~10% mein hi shuru hota hai (thumbnail/message conflict avoid karne
+# ke liye itna gap kaafi hai), isliye file[i] apne 90% upload ke liye poora
+# bandwidth akela use karta hai — sirf aakhri chhoti si tail mein overlap
+# hota hai, jo barely noticeable hoga.
+_STAGGER_AT = 0.90
+
+
 async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, encode: bool,
                            on_half: asyncio.Event = None, skip_forward: bool = False,
                            uploader_client=None, label_prefix: str = ""):
@@ -757,7 +774,10 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
     Ek file upload karo.
     Returns: (success: bool, sent_message: Message | None, quality: str)
     sent_message = Telegram pe jo actual video message gaya (reorder ke liye chahiye)
-    on_half: asyncio.Event — jab upload 50% ho tab fire karo (next file ko signal karne ke liye)
+    on_half: asyncio.Event — jab upload _STAGGER_AT (default 90%) ho tab fire karo
+             (next file ko signal karne ke liye — naam 'on_half' legacy hai, ab
+             asal mein "on threshold" hai, poore bandwidth-sharing window ko
+             chhota karne ke liye)
     label_prefix: status messages ke upar dikhne wala prefix (e.g. "Ep 5" RTI flow ke liye) — optional
     """
     fname_orig = os.path.basename(filepath)
@@ -896,9 +916,11 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
         uc = uploader_client if uploader_client is not None else await _make_uploader_client(message.from_user.id)
         sent_msg = None
 
-        # ── 50% staggered upload ke liye custom progress wrapper ──
-        # on_half event tab fire hoga jab yeh file 50% upload ho jaaye
-        # isse next file ka upload shuru hoga (thumbnail conflict fix)
+        # ── Staggered upload ke liye custom progress wrapper ──
+        # on_half event tab fire hoga jab yeh file _STAGGER_AT (90%) upload ho
+        # jaaye — isse next file ka upload shuru hoga (thumbnail conflict fix),
+        # lekin ab sirf chhoti si tail mein bandwidth share hoga, poori doosri
+        # half mein nahi (dekho _STAGGER_AT ke upar comment)
         _half_fired = False
 
         async def _progress_with_half(current, total, ud_type, prog_msg, start):
@@ -906,8 +928,8 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
             from ..utils.display_progress import progress_for_pyrogram
             # Normal progress update
             await progress_for_pyrogram(current, total, ud_type, prog_msg, start)
-            # 50% check — sirf ek baar fire karo
-            if not _half_fired and on_half and total > 0 and current >= total * 0.50:
+            # threshold check — sirf ek baar fire karo
+            if not _half_fired and on_half and total > 0 and current >= total * _STAGGER_AT:
                 _half_fired = True
                 on_half.set()
 
@@ -1127,9 +1149,11 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
         f"📤 Upload ho raha hai..."
     )
 
-    # ── Staggered Upload: File N+1 tab start ho jab File N 50% reach kare ──
+    # ── Staggered Upload: File N+1 tab start ho jab File N _STAGGER_AT (90%) reach kare ──
     # Isse thumbnail conflict solve hota hai (parallel uploads mein ek pe thumb nahi lagta)
-    # Chain: file[0] → 50% → file[1] start → 50% → file[2] start → ...
+    # Chain: file[0] → 90% → file[1] start → 90% → file[2] start → ...
+    # (pehle yeh 50% tha — poori doosri half bandwidth-shared, slow rehta tha;
+    # ab sirf aakhri ~10% mein overlap hota hai)
 
     # Har file ke liye ek status message banao
     _dummy_msgs = {}
@@ -1148,8 +1172,8 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
     async def _upload_task_staggered(filepath, idx):
         """
         idx = 0  → immediately start
-        idx = 1  → wait for files[0] to reach 50%
-        idx = 2  → wait for files[1] to reach 50%
+        idx = 1  → wait for files[0] to reach _STAGGER_AT (90%)
+        idx = 2  → wait for files[1] to reach _STAGGER_AT (90%)
         etc.
 
         Har file ka APNA fresh uc — OLD (fast) approach.
@@ -1157,7 +1181,7 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
         upload ho rahi hai, isliye socket conflict nahi hoga.
         Alag uc = full bandwidth per file (shared uc bottleneck tha).
         """
-        # Apni turn ka wait karo (pichli file 50% tak pahunche)
+        # Apni turn ka wait karo (pichli file _STAGGER_AT / 90% tak pahunche)
         if idx > 0:
             await _half_events[idx - 1].wait()
 
