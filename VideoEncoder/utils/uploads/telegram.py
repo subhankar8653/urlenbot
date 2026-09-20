@@ -77,12 +77,13 @@ async def _make_uploader_client(user_id: int):
             api_id=api_id,
             api_hash=api_hash,
             in_memory=True,
-            # Was 4 (deadlock-safety fix from an old 20 value). App's main
-            # client runs stable at 8 (see VideoEncoder/__init__.py), so 6
-            # here is a moderate boost for upload speed while staying below
-            # that proven-stable number — safer on a 1GB/2-core box where
-            # this per-file client is created fresh for every upload.
-            max_concurrent_transmissions=6,
+            # Was 4 (deadlock-safety fix from an old 20 value), then 6.
+            # App's main client runs stable at 8 (see VideoEncoder/__init__.py)
+            # — bumped this per-file uploader client to match, for max
+            # upload speed. Higher se deadlock/OOM risk badhta hai on a
+            # tight-RAM box — agar bot restart/OOM hone lage to yeh pehla
+            # value hai jise wapas 6 karna chahiye.
+            max_concurrent_transmissions=8,
             workers=32,
             sleep_threshold=60,
         )
