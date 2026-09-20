@@ -1216,6 +1216,10 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
     except Exception:
         pass
 
+    # Caller (RTI channel-upload forward jaisa) ko pata chale kya-kya
+    # upload hua — [(quality, sent_message), ...]
+    return uploaded_results
+
 
 # ─────────────────────────────────────────────
 #  Commands

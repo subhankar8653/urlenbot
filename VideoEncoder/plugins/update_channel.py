@@ -223,11 +223,11 @@ async def _save_button_defaults(data: dict):
 
 # ── Toggle helpers ──
 async def _get_update_toggle() -> bool:
-    """True = on (default), False = off."""
+    """False = off (default), True = on."""
     doc = await db.col2.find_one({'id': 'update_toggle'})
     if not doc:
-        return True  # default on
-    return doc.get('enabled', True)
+        return False  # default off
+    return doc.get('enabled', False)
 
 
 async def _set_update_toggle(enabled: bool):
