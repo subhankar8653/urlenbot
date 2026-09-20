@@ -1,6 +1,11 @@
 # Required
 pyrofork
-TgCrypto
+# TgCrypto (original, by Dan) unmaintained hai — last release 1.2.5 (Nov 2022),
+# aur Python 3.12+ pe build hi nahi hoti. Pyrofork ne apna khud ka maintained
+# fork banaya hai jo isi 'import tgcrypto' module name se drop-in kaam karta
+# hai (koi code change nahi chahiye) — pyrofork ke official docs bhi ab isi
+# ko recommend karte hain, plain TgCrypto ko nahi.
+TgCrypto-pyrofork
 python-dotenv
 hachoir
 beautifulsoup4==4.9.1
