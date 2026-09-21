@@ -594,18 +594,26 @@ async def _process_toono_item(client, message, item: dict, status_msg, index: in
 
 async def _download_toono_items(client, status_msg, orig_message, sess: "ToonoSelector", idxs: list):
     total = len(idxs)
+    all_ok = True
     for i, idx in enumerate(idxs, 1):
         item = sess.items[idx]
         result = await _process_toono_item(client, orig_message, item, status_msg, i, total, sess=sess)
         if result != "ok":
+            all_ok = False
             break
         if i < total:
             await asyncio.sleep(3)
 
-    try:
-        await status_msg.delete()
-    except Exception:
-        pass
+    # Sirf success (all_ok) pe status_msg delete karo — error/fail message
+    # ko turant delete karne se pehle wala bug tha: "Link Fail" / "Upload
+    # Error" wala message ek fatak dikhta tha phir turant gayab ho jaata
+    # tha, isliye pata hi nahi chalta tha kya error aaya. Ab error hone pe
+    # message wahi rehta hai taaki error text padh sako.
+    if all_ok:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────
