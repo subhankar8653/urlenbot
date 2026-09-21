@@ -265,24 +265,33 @@ async def send_update_post(
     episode: int | None = None,
     episode_start: int | None = None,
     episode_end: int | None = None,
+    force: bool = False,
 ):
     """
     Update channels pe naya image-based stylish post bhejta hai.
 
     RULES:
-      1. /updatechannel off hai toh kuch nahi hoga.
+      1. /updatechannel off hai toh kuch nahi hoga — SIVAY jab force=True ho.
       2. Sirf wohi anime ka post jaayega jiska entry update_post_map mein hai
          (exact/fuzzy match) AUR jiska 5-step entry COMPLETE ho (image required).
          Incomplete entry (image missing) → post skip.
 
     Single episode:  episode=6        → ➲ Episode: 06 Added!
     Episode range:   episode_start=34, episode_end=36  → ➲ Episode: 34-36 Added!
+
+    force: /rti ke apne session-local "Update Post" toggle ke liye — jab True
+           ho, global /updatechannel toggle ka check SKIP ho jaata hai (na
+           padhta hai, na iska use badalta hai). Yeh isliye taaki /rti mein
+           kisi ek request ke liye Update Post ON/OFF karna sirf usi request
+           tak seemit rahe, /updatechannel ya doosre kisi bhi cheez pe koi
+           asar na pade.
     """
     # ── Toggle check ──
-    enabled = await _get_update_toggle()
-    if not enabled:
-        LOGGER.info(f"[UpdateChannel] Toggle OFF hai, '{anime_name}' ka post skip kiya.")
-        return
+    if not force:
+        enabled = await _get_update_toggle()
+        if not enabled:
+            LOGGER.info(f"[UpdateChannel] Toggle OFF hai, '{anime_name}' ka post skip kiya.")
+            return
 
     channels = await _get_update_channels()
     if not channels:

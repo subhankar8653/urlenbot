@@ -64,10 +64,14 @@ PER_PAGE = 10  # screenshot jaisa hi — 10 episode buttons per page
 
 # OVA/Special ko pehle check karo taaki generic "Episode" pattern
 # "OVA Episode 1" jaisa text galti se EP na bana de.
+# OVA wala pattern number ke around optional "( )" bhi allow karta hai
+# (e.g. "S2 OVA (1) – ...") — pehle sirf "OVA1"/"OVA 1" match hota tha,
+# "OVA (1)" (bracket wala) skip ho jaata tha isliye uska button hi
+# nahi banta tha.
 ITEM_PATTERNS = [
-    (re.compile(r"\bOVA\s*(\d+)\b", re.IGNORECASE), "OVA"),
-    (re.compile(r"\bSpecial(?:\s*Episode)?\s*(\d+)\b", re.IGNORECASE), "SP"),
-    (re.compile(r"\bEpisode\s*(\d+)\b", re.IGNORECASE), "EP"),
+    (re.compile(r"\bOVA\s*\(?\s*(\d+)\s*\)?", re.IGNORECASE), "OVA"),
+    (re.compile(r"\bSpecial(?:\s*Episode)?\s*\(?\s*(\d+)\s*\)?", re.IGNORECASE), "SP"),
+    (re.compile(r"\bEpisode\s*\(?\s*(\d+)\s*\)?", re.IGNORECASE), "EP"),
 ]
 
 
@@ -75,8 +79,11 @@ ITEM_PATTERNS = [
 #  NEW: RTI ka apna "Channel Upload" toggle — per user save hota hai.
 #  ON hone pe har successful upload us user ke pehle se /addchannel se
 #  add kiye gaye channel pe bhi copy ho jaata hai. Default OFF.
-#  ("Update Post" toggle ke liye humne update_channel.py ka already
-#  bana hua bot-wide _get_update_toggle/_set_update_toggle reuse kiya hai.)
+#
+#  ("Update Post" toggle iske bilkul alag hai — woh RTISelector session
+#  mein hi local rehta hai (in-memory, DB mein save nahi hota), taaki
+#  usko ek /rti request mein ON/OFF karne se global /updatechannel ya
+#  auto_monitor jaisi kisi bhi doosri cheez pe koi asar na pade.)
 # ─────────────────────────────────────────────
 async def _get_rti_channel_upload(user_id: int) -> bool:
     user = await db._get_user(user_id)
@@ -285,8 +292,10 @@ class RTISelector:
         self.channel_toggle = False
 
     async def populate_toggles(self):
-        from .update_channel import _get_update_toggle
-        self.update_toggle = await _get_update_toggle()
+        # "Update Post" toggle ab poori tarah session-local hai (default OFF,
+        # __init__ mein already set) — global /updatechannel toggle se na
+        # padhta hai, na likhta hai. Sirf "Channel Upload" (chtog) hi per-user
+        # persisted hai (rti_channel_upload), woh already independent tha.
         self.channel_toggle = await _get_rti_channel_upload(self.orig_message.from_user.id)
 
     @property
@@ -652,7 +661,8 @@ def argon_to_swift(argon_url: str):
 # ─────────────────────────────────────────────
 #  Step 4: Download + Sequential upload
 # ─────────────────────────────────────────────
-async def _run_rti_swift(client, message: Message, swift_url: str, status_msg, ep_num: int, total_eps: int):
+async def _run_rti_swift(client, message: Message, swift_url: str, status_msg, ep_num: int, total_eps: int,
+                          sess: "RTISelector" = None):
     from .swift_downloader import _run_swift
     ep_label = "Movie" if ep_num == 0 else f"Ep {ep_num}/{total_eps}"
     # /swift wala exact flow use karo — download + queued messages + sequential upload
@@ -662,7 +672,31 @@ async def _run_rti_swift(client, message: Message, swift_url: str, status_msg, e
         client, message, swift_url, encode=False, episode_label=ep_label, show_url=False
     )
     await _forward_to_channel_if_enabled(client, message, uploaded_results)
+    await _send_update_post_if_enabled(client, sess, ep_num, uploaded_results)
     return True
+
+
+async def _send_update_post_if_enabled(client, sess: "RTISelector", ep_num: int, uploaded_results):
+    """
+    Sess ka "Update Post" toggle ON hai to us anime/episode ka post
+    update channel pe bhejo — force=True se global /updatechannel toggle
+    bypass hota hai, taaki yeh sirf isi /rti session tak seemit rahe.
+    Range-mode (/rti <url> <start> <end>) mein sess None hota hai, wahan
+    yeh koi effect nahi karta — jaisa pehle tha.
+    """
+    if not sess or not sess.update_toggle or not uploaded_results:
+        return
+    try:
+        from .update_channel import send_update_post
+        await send_update_post(
+            client,
+            anime_name=sess.title,
+            season=sess.season,
+            episode=ep_num if ep_num else None,
+            force=True,
+        )
+    except Exception as e:
+        LOGGER.error(f"[RTI] Update post error: {e}")
 
 
 async def _forward_to_channel_if_enabled(client, message: Message, uploaded_results):
@@ -798,7 +832,7 @@ async def _process_episode(client, message, page_url, episode_num, total_episode
 #  (page dubara scrape nahi karna — link already discover_items() se
 #  mil chuka hai, seedha argon → swift step se shuru karo)
 # ─────────────────────────────────────────────
-async def _process_cached_item(client, message, item, status_msg, index, total):
+async def _process_cached_item(client, message, item, status_msg, index, total, sess: "RTISelector" = None):
     loop = asyncio.get_event_loop()
     ep_label = item["label"]
     wmq_link = item["wmq_link"]
@@ -852,7 +886,7 @@ async def _process_cached_item(client, message, item, status_msg, index, total):
             f"⬇️ Ab download shuru ho raha hai..."
         )
         ep_num_for_swift = 0 if item["kind"] == "MOVIE" else item["num"]
-        await _run_rti_swift(client, message, swift_url, status_msg, ep_num=ep_num_for_swift, total_eps=total)
+        await _run_rti_swift(client, message, swift_url, status_msg, ep_num=ep_num_for_swift, total_eps=total, sess=sess)
         return "ok"
     except Exception as e:
         LOGGER.error(f"[RTI] {ep_label} download/upload error: {e}")
@@ -871,7 +905,7 @@ async def _download_items(client, status_msg, orig_message, sess: "RTISelector",
     total = len(idxs)
     for i, idx in enumerate(idxs, 1):
         item = sess.items[idx]
-        result = await _process_cached_item(client, orig_message, item, status_msg, i, total)
+        result = await _process_cached_item(client, orig_message, item, status_msg, i, total, sess=sess)
         if result != "ok":
             break
         if i < total:
@@ -920,9 +954,10 @@ async def rti_callback_handler(client: Client, cb: CallbackQuery):
             return
 
         if action == "uptog":
-            from .update_channel import _set_update_toggle
+            # Session-local only — global /updatechannel toggle ko na
+            # padhte hain na likhte hain, isliye yeh sirf isi /rti request
+            # ke uploads pe asar karega, kahin aur nahi.
             new_val = not sess.update_toggle
-            await _set_update_toggle(new_val)
             sess.update_toggle = new_val
             await cb.answer("📢 Update Post " + ("ON" if new_val else "OFF"))
             await sess.render()
