@@ -232,32 +232,59 @@ def _xpath_text_click(word: str) -> str:
     )
 
 
-def _handle_new_windows(driver, known_handles: set, main_handle):
+def _handle_new_windows(driver, known_junk: set, pending: set, main_handle):
     """
-    Click ke baad agar naya tab/window khula ho to check karo:
-      - codedew.com hai -> usi pe switch rehne do, URL return karo
-      - kuch aur (ad/junk) hai -> band karke wapas main pe switch karo
+    Click ke baad agar naya tab/window khula ho to check karo.
+
+    IMPORTANT (site ka pattern): naya tab pehle "about:blank" khulta
+    hai, aur kuch second baad USI TAB ke andar JS khud codedew.com pe
+    redirect karta hai (naya tab nahi khulta, wahi tab navigate hota
+    hai). Isliye jab tak tab "about:blank"/khaali hai, use turant band
+    NAHI karna — "pending" mein rakho aur agli baar (agla poll) dobara
+    check karo. Sirf tab band karo jab woh kisi aur (non-codedew,
+    non-blank) URL pe chala jaaye — tabhi pakka pata chalta hai ki woh
+    ad/junk tab tha, koi asli redirect nahi.
+
+    `pending` set mutate hota hai in-place (jo tabs abhi bhi "loading/
+    about:blank" state mein hain unhe track karte rehne ke liye).
     Returns codedew URL ya None.
     """
     try:
-        handles = driver.window_handles
+        handles = set(driver.window_handles)
     except Exception:
         return None
-    new_handles = [h for h in handles if h not in known_handles]
-    if not new_handles:
-        return None
+
+    new_handles = handles - known_junk - pending - {main_handle}
+    pending.update(new_handles)
 
     found = None
-    for h in new_handles:
+    resolved = set()
+    for h in list(pending):
+        if h not in handles:
+            resolved.add(h)  # tab khud hi band ho gaya
+            continue
         try:
             driver.switch_to.window(h)
             cur = driver.current_url or ""
-            if CODEDEW_DOMAIN in cur:
-                found = cur
-            else:
-                driver.close()
         except Exception:
-            pass
+            resolved.add(h)
+            continue
+
+        if CODEDEW_DOMAIN in cur:
+            found = cur
+            break
+        elif cur not in ("about:blank", "", "data:,"):
+            # asli ad/junk tab nikla (blank nahi tha) — ab band karo
+            try:
+                driver.close()
+            except Exception:
+                pass
+            resolved.add(h)
+        # else: abhi bhi about:blank hai -> "pending" mein hi rehne do,
+        # agli poll pe dobara check hoga
+
+    pending.difference_update(resolved)
+    known_junk.update(resolved)
 
     try:
         if found:
@@ -282,7 +309,8 @@ def get_codedew_link(episode_url: str):
         driver = _make_selenium_driver()
         driver.get(episode_url)
         main = driver.current_window_handle
-        known = set(driver.window_handles)
+        known_junk = set()   # tabs jo junk/ad nikle, dobara check nahi karna
+        pending = set()      # naye tabs jo abhi about:blank pe hain, watch karte raho
         time.sleep(2)
 
         wait = WebDriverWait(driver, 10)
@@ -330,14 +358,17 @@ def get_codedew_link(episode_url: str):
 
         # ── Step C: codedew.com tak resilient click-chain (RTI ke
         # get_argon_link jaisa hi — beech mein ad-gate/redirect page
-        # aana normal hai, isliye retry karte raho) ──
-        for attempt in range(8):
+        # aana normal hai, isliye retry karte raho). Naya tab pehle
+        # about:blank khulta hai phir kuch second baad USI tab mein
+        # JS se codedew.com pe redirect hota hai — isliye 12 attempts
+        # x 3s = ~36s tak wait/poll karte hain, taaki slow network pe
+        # bhi redirect hone ka waqt mil jaaye. ──
+        for attempt in range(12):
             time.sleep(3)
 
-            found = _handle_new_windows(driver, known, main)
+            found = _handle_new_windows(driver, known_junk, pending, main)
             if found:
                 return found
-            known = set(driver.window_handles)
 
             cur = driver.current_url or ""
             if CODEDEW_DOMAIN in cur:
