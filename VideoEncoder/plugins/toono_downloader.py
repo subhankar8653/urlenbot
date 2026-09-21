@@ -355,15 +355,25 @@ def _finalize_codedew(driver, codedew_url: str):
 
 def get_codedew_link(episode_url: str):
     """
-    Returns swift-ready URL: ya to argon.razorshell.space ka "downlead"
-    link (agar codedew.com ke page mein embedded mil jaaye — RTI ke
-    Argon->Swift jaisa hi, zyada reliable, kyunki uski scraping
-    swift_downloader mein already battle-tested hai) ya, agar woh na
-    mile, codedew.com ka apna MultiQuality page URL (fallback — swift
-    downloader iske 360p/720p/1080p buttons khud scrape karne ki
-    koshish karega). None agar kahin atak gaya (log mein exact step
-    dikh jaayega).
+    Returns (result_url_or_None, debug_lines).
+
+    result_url: swift-ready URL — ya to argon.razorshell.space ka
+    "downlead" link (agar codedew.com ke page mein embedded mil jaaye
+    — RTI ke Argon->Swift jaisa hi, zyada reliable) ya, agar woh na
+    mile, codedew.com ka apna MultiQuality page URL (fallback). None
+    agar kahin atak gaya.
+
+    debug_lines: har major step ka status (list of str) — fail hone
+    par yeh Telegram ke "Link Fail" message mein dikhaya jaata hai,
+    taaki exact atakne ki jagah turant pata chal jaaye (screenshot ki
+    zaroorat na pade).
     """
+    debug = []
+
+    def log(msg):
+        debug.append(msg)
+        LOGGER.info(f"[Toono] {msg}")
+
     driver = None
     try:
         driver = _make_selenium_driver()
@@ -379,9 +389,10 @@ def get_codedew_link(episode_url: str):
         try:
             btn = wait.until(EC.element_to_be_clickable((By.XPATH, _xpath_text_click("Download"))))
             btn.click()
+            log("✅ Step A: episode page ka Download button mil gaya, click hua")
         except Exception as e:
-            LOGGER.warning(f"[Toono] Episode page ka Download button nahi mila: {e}")
-            return None
+            log(f"❌ Step A: episode page ka Download button hi nahi mila ({str(e).splitlines()[0][:90]})")
+            return None, debug
 
         time.sleep(1.5)
 
@@ -398,6 +409,7 @@ def get_codedew_link(episode_url: str):
             )))
             hindi_btn.click()
             clicked = True
+            log("✅ Step B: modal ke andar 'Hindi' Download button mila, click hua")
         except Exception:
             pass
 
@@ -412,9 +424,10 @@ def get_codedew_link(episode_url: str):
                 )))
                 any_dl.click()
                 clicked = True
+                log("✅ Step B: modal ke andar generic Download button mila, click hua")
             except Exception as e:
-                LOGGER.warning(f"[Toono] Modal ke andar Hindi/Download button nahi mila: {e}")
-                return None
+                log(f"❌ Step B: modal khula lekin andar koi Download button nahi mila ({str(e).splitlines()[0][:90]})")
+                return None, debug
 
         # ── Step C: codedew.com tak resilient click-chain (RTI ke
         # get_argon_link jaisa hi — beech mein ad-gate/redirect page
@@ -428,19 +441,32 @@ def get_codedew_link(episode_url: str):
 
             found = _handle_new_windows(driver, known_junk, pending, main)
             if found:
-                return _finalize_codedew(driver, found)
+                log(f"✅ Step C (attempt {attempt + 1}/12): naya tab codedew.com pe pahunch gaya")
+                return _finalize_codedew(driver, found), debug
 
             cur = driver.current_url or ""
             if CODEDEW_DOMAIN in cur:
-                return _finalize_codedew(driver, cur)
+                log(f"✅ Step C (attempt {attempt + 1}/12): main tab khud codedew.com pe navigate hua")
+                return _finalize_codedew(driver, cur), debug
 
             try:
                 html = driver.page_source
                 m = re.search(r'https?://[^\s"\'<>]*codedew\.com[^\s"\'<>]*', html)
                 if m:
-                    return _finalize_codedew(driver, m.group(0))
+                    log(f"✅ Step C (attempt {attempt + 1}/12): page HTML mein codedew.com link mila")
+                    return _finalize_codedew(driver, m.group(0)), debug
             except Exception:
                 pass
+
+            try:
+                n_windows = len(driver.window_handles)
+            except Exception:
+                n_windows = -1
+            log(
+                f"⏳ attempt {attempt + 1}/12: total tabs={n_windows}, "
+                f"pending(about:blank)={len(pending)}, junk band kiye={len(known_junk)}, "
+                f"main URL={cur[:70]}"
+            )
 
             for btn_text in _CLICK_TEXTS:
                 try:
@@ -455,13 +481,20 @@ def get_codedew_link(episode_url: str):
 
         cur = driver.current_url or ""
         if CODEDEW_DOMAIN in cur:
-            return _finalize_codedew(driver, cur)
-        LOGGER.warning(f"[Toono] codedew.com tak nahi pahunche. Last URL: {cur}")
-        return None
+            log("✅ (12 attempts ke baad, last check mein) main tab codedew.com pe mila")
+            return _finalize_codedew(driver, cur), debug
+
+        log(
+            f"❌ 12 attempts (~36s) ke baad bhi codedew.com nahi mila. "
+            f"Last main URL: {cur[:80] or '(khaali)'} | "
+            f"pending tabs (about:blank pe atke): {len(pending)} | "
+            f"junk tabs band kiye: {len(known_junk)}"
+        )
+        return None, debug
 
     except Exception as e:
-        LOGGER.error(f"[Toono] get_codedew_link error: {e}")
-        return None
+        log(f"❌ Unexpected error: {str(e).splitlines()[0][:150]}")
+        return None, debug
     finally:
         _kill_driver_tree(driver)
 
@@ -645,13 +678,20 @@ async def _process_toono_item(client, message, item: dict, status_msg, index: in
         pass
 
     loop = asyncio.get_event_loop()
-    codedew_url = await loop.run_in_executor(None, get_codedew_link, item["watch_url"])
+    codedew_url, debug_lines = await loop.run_in_executor(None, get_codedew_link, item["watch_url"])
 
     if not codedew_url:
+        # Telegram message mein last kuch debug lines dikhao — taaki
+        # exact pata chale kahan atka, screenshot lene ki zaroorat na
+        # pade. (Har line get_codedew_link ke andar step-by-step log
+        # hoti hai: Step A/B button clicks, phir Step C ke har poll
+        # attempt ka status.)
+        debug_text = "\n".join(debug_lines[-10:]) if debug_lines else "(koi debug info nahi mili)"
         try:
             await status_msg.edit(
                 f"🛑 **{ep_label} — Link Fail**\n\n"
-                f"❌ codedew.com ka MultiQuality link nahi mila.\n"
+                f"❌ codedew.com ka MultiQuality link nahi mila.\n\n"
+                f"**Debug (last steps):**\n```\n{debug_text}\n```\n"
                 f"⛔ Agle items **band** kar diye gaye."
             )
         except Exception:
