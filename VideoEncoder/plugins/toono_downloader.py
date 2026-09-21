@@ -425,9 +425,44 @@ def get_codedew_link(episode_url: str):
                 any_dl.click()
                 clicked = True
                 log("✅ Step B: modal ke andar generic Download button mila, click hua")
+            except Exception:
+                pass
+
+        if not clicked:
+            # Tier 3 (final fallback) — "Hindi" text ya modal/popup class
+            # pe bharosa mat karo (yeh site multiple jagah "Hindi" word
+            # use karta hai, aur modal shayad kisi alag class naam se
+            # bana ho). Iske bajaye: page pe jitne bhi "Download"-labelled
+            # clickable elements (a/button) hain unmein se, jo humne
+            # Step A mein already click kiya (`btn`) uske alawa jo bhi
+            # visible + enabled hai, unme se AAKHIRI wala lo — is theme
+            # ka modal HTML document ke bilkul end mein inject hota hai,
+            # isliye order mein sabse baad wala hi asli modal button
+            # hone ki sabse zyada sambhavna hai.
+            try:
+                els = driver.find_elements(By.XPATH, _xpath_text_click("Download"))
+                candidates = []
+                for el in els:
+                    try:
+                        if el.id == btn.id:
+                            continue
+                        if el.is_displayed() and el.is_enabled():
+                            candidates.append(el)
+                    except Exception:
+                        continue
+                if candidates:
+                    target = candidates[-1]
+                    target.click()
+                    clicked = True
+                    log(f"✅ Step B: generic scan se naya Download button mila ({len(candidates)} candidate(s)), click hua")
+                else:
+                    log(f"❌ Step B: generic scan mein {len(els)} 'Download' elements mile lekin koi naya/visible nahi tha")
             except Exception as e:
-                log(f"❌ Step B: modal khula lekin andar koi Download button nahi mila ({str(e).splitlines()[0][:90]})")
-                return None, debug
+                log(f"❌ Step B: generic scan bhi fail hua ({str(e).splitlines()[0][:90]})")
+
+        if not clicked:
+            log("❌ Step B: modal khula lekin andar koi Download button nahi mila (teeno tareeke fail)")
+            return None, debug
 
         # ── Step C: codedew.com tak resilient click-chain (RTI ke
         # get_argon_link jaisa hi — beech mein ad-gate/redirect page
