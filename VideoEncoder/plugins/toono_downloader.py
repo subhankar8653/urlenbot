@@ -69,6 +69,8 @@ HEADERS = {
 }
 
 CODEDEW_DOMAIN = "codedew.com"
+ARGON_DOMAIN = "argon.razorshell.space"
+SWIFT_BASE = "https://argon.razorshell.space/downlead/"
 # Hindi ko sabse pehli priority — user ne explicitly maanga hai
 AUDIO_PRIORITY = ["hindi", "dual", "multi", "tamil", "telugu", "english", "japanese", "sub", "unknown"]
 
@@ -299,10 +301,68 @@ def _handle_new_windows(driver, known_junk: set, pending: set, main_handle):
     return found
 
 
+def _extract_swift_from_page(driver):
+    """
+    codedew.com ke MultiQuality page mein agar argon.razorshell.space
+    wala iframe embedded hai (Inspect > Resources mein "Iframe" ke
+    andar dikhta hai — RTI ke Argon->Swift flow jaisa hi pattern),
+    to seedha wahi swift-ready "downlead" URL nikal lo. codedew.com
+    ke apne UI buttons se click-chain karne se yeh kahin zyada
+    reliable hai, kyunki argon->swift scraping already RTI mein
+    battle-tested hai. Agar iframe "/embed/<code>" form mein mila
+    (already-converted "downlead" form ki jagah), usse bhi convert
+    kar dete hain.
+    """
+    try:
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        for iframe in soup.find_all("iframe"):
+            src = (iframe.get("src") or "").strip()
+            if ARGON_DOMAIN not in src:
+                continue
+            if "/downlead/" in src:
+                return src
+            if "/embed/" in src:
+                parts = [p for p in src.rstrip("/").split("/") if p]
+                code = parts[-1] if parts else ""
+                if len(code) >= 5:
+                    return SWIFT_BASE + code + "/"
+            return src  # kuch bhi ho jo mila, wahi de do
+    except Exception as e:
+        LOGGER.warning(f"[Toono] Argon iframe extract error: {e}")
+    return None
+
+
+def _finalize_codedew(driver, codedew_url: str):
+    """
+    codedew.com ke MultiQuality page pe pahunch gaye — is page ke
+    andar embedded argon.razorshell.space iframe dhundo. Mil jaaye to
+    seedha wahi swift-ready URL use karo (codedew ke UI ko chuo mat).
+    Na mile to codedew URL hi return karo, jaisa pehle hota tha.
+    """
+    try:
+        cur = driver.current_url or ""
+        if CODEDEW_DOMAIN not in cur:
+            driver.get(codedew_url)
+            time.sleep(2)
+        swift_url = _extract_swift_from_page(driver)
+        if swift_url:
+            LOGGER.info(f"[Toono] Argon/Swift iframe mil gaya, codedew UI skip: {swift_url}")
+            return swift_url
+    except Exception as e:
+        LOGGER.warning(f"[Toono] _finalize_codedew error: {e}")
+    return codedew_url
+
+
 def get_codedew_link(episode_url: str):
     """
-    Returns codedew.com ka final MultiQuality page URL, ya None agar
-    kahin atak gaya (log mein exact step dikh jaayega).
+    Returns swift-ready URL: ya to argon.razorshell.space ka "downlead"
+    link (agar codedew.com ke page mein embedded mil jaaye — RTI ke
+    Argon->Swift jaisa hi, zyada reliable, kyunki uski scraping
+    swift_downloader mein already battle-tested hai) ya, agar woh na
+    mile, codedew.com ka apna MultiQuality page URL (fallback — swift
+    downloader iske 360p/720p/1080p buttons khud scrape karne ki
+    koshish karega). None agar kahin atak gaya (log mein exact step
+    dikh jaayega).
     """
     driver = None
     try:
@@ -368,17 +428,17 @@ def get_codedew_link(episode_url: str):
 
             found = _handle_new_windows(driver, known_junk, pending, main)
             if found:
-                return found
+                return _finalize_codedew(driver, found)
 
             cur = driver.current_url or ""
             if CODEDEW_DOMAIN in cur:
-                return cur
+                return _finalize_codedew(driver, cur)
 
             try:
                 html = driver.page_source
                 m = re.search(r'https?://[^\s"\'<>]*codedew\.com[^\s"\'<>]*', html)
                 if m:
-                    return m.group(0)
+                    return _finalize_codedew(driver, m.group(0))
             except Exception:
                 pass
 
@@ -395,7 +455,7 @@ def get_codedew_link(episode_url: str):
 
         cur = driver.current_url or ""
         if CODEDEW_DOMAIN in cur:
-            return cur
+            return _finalize_codedew(driver, cur)
         LOGGER.warning(f"[Toono] codedew.com tak nahi pahunche. Last URL: {cur}")
         return None
 
