@@ -1,8 +1,9 @@
 """
-haz_downloader.py  v1
+haz_downloader.py  v3
 ========================
 Command:
   /Haz <series_page_url>   (hindianimeszone.com ka ek anime/series post)
+  /hazcookie <cookie>      (manual-verify cookie relay — neeche point 5)
 
 Flow (jaisa Subhankar ne screenshots + text mein bataya):
   1. Series page (static HTML, requests+BS4 se seedha scrape) se title,
@@ -14,10 +15,16 @@ Flow (jaisa Subhankar ne screenshots + text mein bataya):
      (720p x264 aur 1080p HQ jaanbujh kar skip, jaisa bataya gaya).
   4. Phir episode list (RTI/Toono jaisa hi multi-select button menu).
   5. Chosen quality ka link (002.hindianimeszone.com/download1.php?...)
-     Selenium se khola jaata hai — kabhi-kabhi ek "Verify You're Human"
-     (I'm not a robot) gate aata hai, usko pass karke asli server-list
-     page (GDFlix / MEGA / Gdshare / FilePress) tak pahunchte hain, wahan
-     se sirf MEGA wala link nikalte hain.
+     kholne pe kabhi-kabhi Cloudflare Turnstile ka "Verify You're Human"
+     gate aata hai. Isko code se automatically solve/bypass NAHI kiya jaata
+     (Cloudflare ka anti-abuse protection jaanbujh kar todna hoga) — iski
+     jagah manual-verify cookie relay use hoti hai: Subhankar khud ek baar
+     browser mein verify karke apna cookie `/hazcookie` se deta hai, aur
+     bot uss cookie ke saath seedha requests.get() karta hai (site khud
+     bolta hai "1 hour tak dubara verify nahi hoga" — yani verification
+     hi cookie-based hai). Valid cookie ho to seedha asli server-list page
+     (GDFlix / MEGA / Gdshare / FilePress) milta hai, wahan se sirf MEGA
+     wala link nikalte hain.
   6. MEGA link ko mega_download.py ke existing download_mega() se download
      karte hain.
   7. url_upload.py ke existing audio/subtitle-filter helpers reuse karte
@@ -31,16 +38,12 @@ NOTE / assumptions (live site pe test karke confirm karna padega):
   - Is site pe HAR SEASON APNA ALAG POST/URL hai (tabs nahi, jaisa RTI mein
     hota hai) — isliye is command mein in-bot "season selector" nahi hai;
     jis season ka chahiye uska URL hi /Haz ko do.
-  - "Verify You're Human" gate ek baar pass hone ke baad ~1 hour tak
-    dubara nahi aata (site khud bolta hai) — isliye ek hi Chrome session
-    (driver) poore multi-episode download ke dauran reuse hota hai, taaki
-    baar baar checkbox na todna pade.
-  - Gate ke checkbox aur MEGA-link-wale server row ke exact selectors is
-    sandbox se live click karke test nahi ho paaye (network yahan band
-    hai) — isliye kaafi fallback strategies + step-by-step LOGGER.info
-    daale hain (jaisa /toono ke codedew step mein), taaki agar kahin atak
-    jaaye to turant pata chale (Debug block message mein dikhega) aur
-    ek round mein hi fix ho jaaye.
+  - Server-list page pe MEGA row ka exact HTML structure is sandbox se
+    (network band hai) live dekh ke confirm nahi ho paaya — isliye BS4-based
+    kaafi fallback strategies + step-by-step LOGGER.info daale hain
+    (jaisa /toono ke codedew step mein), taaki agar kahin miss ho to turant
+    pata chale (Debug block message mein dikhega) aur ek round mein hi
+    fix ho jaaye.
 """
 
 import asyncio
@@ -63,7 +66,7 @@ from pyrogram.types import (
 from .. import LOGGER, download_dir
 from ..utils.helper import check_chat
 from ..utils.url_processor import get_audio_streams
-from .rti_downloader import SELENIUM_OK, _kill_driver_tree, _kb
+from .rti_downloader import _kb
 from .mega_download import is_mega_link, download_mega
 from .url_upload import (
     get_subtitle_streams,
@@ -72,12 +75,6 @@ from .url_upload import (
     _keep_subtitle_streams,
     _do_upload,
 )
-
-try:
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-except ImportError:
-    pass
 
 HEADERS = {
     "User-Agent": (
@@ -104,51 +101,19 @@ PER_PAGE = 10
 HAZ_SESSIONS = {}
 HAZ_SESSION_TIMEOUT = 3600
 
+# User ek baar manually 'Verify You're Human' solve karke apne browser ka
+# cookie yahan deta hai (/hazcookie command se). Site khud bolta hai "1 hour
+# tak dubara verify nahi hoga" — isliye ~55 min tak isi cookie ko reuse
+# karte hain (5 min safety buffer).
+HAZ_COOKIE = {"value": None, "saved_at": 0.0}
+HAZ_COOKIE_TTL = 55 * 60
 
-def _make_haz_driver():
-    """
-    _make_selenium_driver() jaisa hi (eager load, images off, disposable
-    profile), plus Cloudflare Turnstile ke liye thoda "stealth": headless
-    Chrome ko navigator.webdriver flag aur "automation" switches se pehchana
-    jaata hai, jisse Turnstile apne-aap verify hone ke bajaye interactive/
-    stuck challenge dikha sakta hai (E01 ka "MEGA text wale 0 element mile"
-    — gate kabhi pass hi nahi hua — isi wajah se ho sakta hai).
-    """
-    profile_dir = os.path.join(download_dir, "_chrome_tmp", f"haz_{uuid.uuid4().hex}")
-    os.makedirs(profile_dir, exist_ok=True)
 
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument(f"user-agent={HEADERS['User-Agent']}")
-    options.add_argument(f"--user-data-dir={profile_dir}")
-    options.add_argument("--disable-crash-reporter")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-    options.add_experimental_option("prefs", {
-        "profile.managed_default_content_settings.images": 2
-    })
-    options.page_load_strategy = "eager"
-
-    driver = webdriver.Chrome(options=options)
-    driver.set_page_load_timeout(40)
-    try:
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": (
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                "Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});"
-                "Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});"
-                "window.chrome = window.chrome || { runtime: {} };"
-            )
-        })
-    except Exception as e:
-        LOGGER.warning(f"[Haz] stealth CDP script inject fail (chalega phir bhi): {e}")
-    driver._suhani_profile_dir = profile_dir
-    return driver
+def _get_haz_cookie():
+    val = HAZ_COOKIE.get("value")
+    if val and (time.time() - HAZ_COOKIE.get("saved_at", 0)) < HAZ_COOKIE_TTL:
+        return val
+    return None
 
 
 def _prune_haz_sessions():
@@ -223,153 +188,78 @@ def discover_haz_items(series_url: str) -> dict:
 #  Poori tarah Selenium/JS-driven, is sandbox mein live test nahi ho paaya
 #  (network band hai) — isliye har step LOGGER.info/warning karta hai.
 # ─────────────────────────────────────────────
-def _solve_haz_gate_and_get_mega(driver, download_url: str, debug: list) -> str | None:
+def _fetch_mega_link_with_cookie(download_url: str, cookie_str: str, debug: list) -> str | None:
+    """
+    Selenium/Turnstile-solving ki jagah: user khud ek baar browser mein
+    'Verify You're Human' solve karke apna cookie /hazcookie se deta hai.
+    Us cookie ke saath seedha requests.get() karte hain — site khud bolta
+    hai "1 hour tak dubara verify nahi karna", matlab verification ek
+    cookie mein hi store hoti hai. Valid cookie ho to seedha asli
+    server-list (GDFlix/MEGA/Gdshare/FilePress) page milega, gate nahi.
+    """
     def log(msg):
         debug.append(msg)
         LOGGER.info(f"[Haz] {msg}")
 
+    headers = dict(HEADERS)
+    headers["Cookie"] = cookie_str
+    headers["Referer"] = "https://hindianimeszone.com/"
+
     try:
-        driver.get(download_url)
+        r = requests.get(download_url, headers=headers, timeout=25, allow_redirects=True)
     except Exception as e:
-        log(f"⚠️ Page load warning: {str(e).splitlines()[0][:120]} (aage badhte hain)")
+        log(f"❌ Page fetch fail: {str(e).splitlines()[0][:120]}")
+        return None
 
-    try:
-        is_gate = "not a robot" in driver.page_source.lower() or "verify you" in driver.page_source.lower()
-    except Exception:
-        is_gate = False
+    text = r.text
+    low = text.lower()
+    if "not a robot" in low or "verify you" in low:
+        log("❌ Is cookie ke saath bhi 'Verify You're Human' gate hi mila — "
+            "cookie expire ho gaya hai ya galat hai. `/hazcookie <naya cookie>` se update karo.")
+        return None
 
-    if is_gate:
-        log("🤖 Cloudflare 'Verify You're Human' (Turnstile) gate mila.")
-        # Turnstile khud hi (headless-detection na ho to) 2-8s mein "Verifying..."
-        # se auto-pass ho jaata hai — checkbox/Continue ko force-click karna
-        # ULTA nuksaan karta hai (widget reset/challenge-again ho sakta hai).
-        # Isliye seedha uska hidden response-token aane ka wait karo.
-        verified = False
-        for _ in range(50):  # ~25s
-            time.sleep(0.5)
-            try:
-                resp = driver.execute_script(
-                    "var el = document.querySelector("
-                    "'input[name^=\"cf-turnstile-response\"], "
-                    "input[name=\"cf-turnstile-response\"]');"
-                    "return el ? el.value : '';"
-                )
-            except Exception:
-                resp = ""
-            if resp:
-                verified = True
-                log("✅ Turnstile response-token mil gaya (auto-verified)")
-                break
-        if not verified:
-            log("⚠️ 25s mein Turnstile token nahi mila — headless Chrome ki wajah se "
-                "interactive challenge aaya ho sakta hai jo yahan solve nahi ho sakta. "
-                "Phir bhi Continue try kar rahe hain.")
+    log(f"✅ Cookie se seedha server-list page mil gaya (HTTP {r.status_code}, gate skip)")
 
-        # Continue button ab tak enabled ho chuka hoga (token mil chuka hai)
-        for _ in range(10):
-            clicked = False
-            try:
-                for b in driver.find_elements(By.XPATH, '//*[contains(text(), "Continue")]'):
-                    if b.is_displayed() and b.is_enabled():
-                        b.click()
-                        clicked = True
-                        log("✅ 'Continue' button click kiya")
-                        break
-            except Exception:
-                pass
-            if clicked:
-                break
-            time.sleep(0.5)
-
-        gone = False
-        for _ in range(40):
-            time.sleep(0.5)
-            try:
-                pt = driver.page_source.lower()
-            except Exception:
-                continue
-            if "not a robot" not in pt and "verify you" not in pt:
-                gone = True
-                break
-        log("✅ Verification gate pass ho gaya" if gone else
-            "❌ 20s baad bhi gate wahi hai — pass nahi ho paaya")
-        if not gone:
-            return None
-    else:
-        log("➡️ Verification gate nahi aaya (shayad pehle se verified session hai)")
-
-    # ── MEGA server row dhoondo ──
+    soup = BeautifulSoup(text, "html.parser")
     mega_url = None
-    try:
-        els = driver.find_elements(
-            By.XPATH, '//*[contains(translate(text(),"mega","MEGA"),"MEGA")]'
-        )
-        log(f"🔎 'MEGA' text wale {len(els)} element mile")
 
-        # Pehle: seedha href attribute mein mega.nz check karo
-        for el in els:
+    # Strategy 1: koi <a> jiske text/href mein "MEGA" ho
+    for a in soup.find_all("a", href=True):
+        label = a.get_text(" ", strip=True)
+        href = a["href"]
+        if "mega.nz" in href.lower():
+            mega_url = href
+            log("✅ MEGA href seedha mila")
+            break
+        if re.search(r'\bmega\b', label, re.IGNORECASE) and "no ads" not in label.lower():
+            # Ye "MEGA" card hai lekin href khud mega.nz nahi (redirect wrapper
+            # ho sakta hai) — ek hop follow karo
             try:
-                href = el.get_attribute("href")
-            except Exception:
-                href = None
-            if href and "mega.nz" in href:
-                mega_url = href
-                log("✅ MEGA href seedha mil gaya")
-                break
+                r2 = requests.get(href, headers=headers, timeout=25, allow_redirects=True)
+                m = re.search(
+                    r'https?://mega\.nz/(?:file|folder)/[A-Za-z0-9_\-]+#[A-Za-z0-9_\-!]+', r2.text
+                )
+                if m:
+                    mega_url = m.group(0)
+                    log("✅ MEGA card follow karke link mila")
+                    break
+                if "mega.nz" in r2.url:
+                    mega_url = r2.url
+                    log("✅ MEGA card follow karke redirect se link mila")
+                    break
+            except Exception as e:
+                log(f"⚠️ MEGA card follow karte waqt error: {str(e).splitlines()[0][:100]}")
+                continue
 
-        # Nahi mila to click karke dekho — naya tab khul sakta hai
-        if not mega_url:
-            main = driver.current_window_handle
-            for el in els:
-                try:
-                    if not el.is_displayed():
-                        continue
-                    before = set(driver.window_handles)
-                    el.click()
-                    time.sleep(1.2)
-                    after = set(driver.window_handles)
-                    new_tabs = after - before
-                    if new_tabs:
-                        driver.switch_to.window(new_tabs.pop())
-                        time.sleep(1)
-                    cur = driver.current_url or ""
-                    if "mega.nz" in cur:
-                        mega_url = cur
-                    else:
-                        m = re.search(
-                            r'https?://mega\.nz/(?:file|folder)/[A-Za-z0-9_\-]+#[A-Za-z0-9_\-!]+',
-                            driver.page_source,
-                        )
-                        if m:
-                            mega_url = m.group(0)
-                    if new_tabs:
-                        try:
-                            driver.close()
-                        except Exception:
-                            pass
-                        driver.switch_to.window(main)
-                    if mega_url:
-                        log("✅ MEGA row click karke link mila")
-                        break
-                except Exception as e:
-                    log(f"⚠️ MEGA row click error: {str(e).splitlines()[0][:100]}")
-                    continue
-    except Exception as e:
-        log(f"⚠️ MEGA element dhoondte waqt error: {str(e).splitlines()[0][:100]}")
+    # Strategy 2: fallback — poore HTML mein seedha regex se mega.nz dhoondo
+    if not mega_url:
+        m = re.search(r'https?://mega\.nz/(?:file|folder)/[A-Za-z0-9_\-]+#[A-Za-z0-9_\-!]+', text)
+        if m:
+            mega_url = m.group(0)
+            log("✅ MEGA link page HTML mein regex se mila (fallback)")
 
     if not mega_url:
-        try:
-            m = re.search(
-                r'https?://mega\.nz/(?:file|folder)/[A-Za-z0-9_\-]+#[A-Za-z0-9_\-!]+',
-                driver.page_source,
-            )
-            if m:
-                mega_url = m.group(0)
-                log("✅ MEGA link page HTML mein regex se mil gaya (fallback)")
-        except Exception:
-            pass
-
-    log(f"✅ Final MEGA link: {mega_url}" if mega_url else "❌ MEGA link nahi mila")
+        log("❌ MEGA link is page pe nahi mila — server-list ka structure ummeed se alag ho sakta hai")
     return mega_url
 
 
@@ -522,7 +412,7 @@ async def _apply_language_filter(filepath: str, language: str, status_msg: Messa
 #  Ek episode: link nikaalo -> mega download -> filter -> upload
 # ─────────────────────────────────────────────
 async def _process_haz_item(client, message, ep: dict, status_msg, index: int, total: int,
-                             language: str, quality: str, driver):
+                             language: str, quality: str, cookie_str: str):
     ep_label = f"E{ep['num']:02d}"
     loop = asyncio.get_event_loop()
     download_url = ep["qualities"].get(quality)
@@ -539,7 +429,9 @@ async def _process_haz_item(client, message, ep: dict, status_msg, index: int, t
         pass
 
     debug = []
-    mega_url = await loop.run_in_executor(None, _solve_haz_gate_and_get_mega, driver, download_url, debug)
+    mega_url = await loop.run_in_executor(
+        None, _fetch_mega_link_with_cookie, download_url, cookie_str, debug
+    )
 
     if mega_url and not is_mega_link(mega_url):
         debug.append(f"⚠️ Mila hua link MEGA jaisa nahi lagta: {mega_url[:80]}")
@@ -607,30 +499,27 @@ async def _process_haz_item(client, message, ep: dict, status_msg, index: int, t
 
 async def _download_haz_items(client, status_msg, orig_message, sess: "HazSelector", idxs: list):
     total = len(idxs)
-    if not SELENIUM_OK:
-        await status_msg.edit("❌ Selenium install nahi hai!")
+    cookie_str = _get_haz_cookie()
+    if not cookie_str:
+        await status_msg.edit(
+            "❌ **Cookie nahi mila ya expire ho gaya hai.**\n\n"
+            "Pehle browser mein 'Verify You're Human' manually solve karo, phir\n"
+            "`/hazcookie <cookie string>` se bot ko de do — uske baad dubara try karo."
+        )
         return
 
-    driver = _make_haz_driver()
     all_ok = True
-    try:
-        for i, idx in enumerate(idxs, 1):
-            ep = sess.episodes[idx]
-            result = await _process_haz_item(
-                client, orig_message, ep, status_msg, i, total, sess.language, sess.quality, driver,
-            )
-            if result != "ok":
-                all_ok = False
-                break
-            if i < total:
-                status_msg = await orig_message.reply("⏳ Agla episode shuru ho raha hai...")
-                await asyncio.sleep(1)
-    finally:
-        loop = asyncio.get_event_loop()
-        try:
-            await loop.run_in_executor(None, _kill_driver_tree, driver)
-        except Exception:
-            pass
+    for i, idx in enumerate(idxs, 1):
+        ep = sess.episodes[idx]
+        result = await _process_haz_item(
+            client, orig_message, ep, status_msg, i, total, sess.language, sess.quality, cookie_str,
+        )
+        if result != "ok":
+            all_ok = False
+            break
+        if i < total:
+            status_msg = await orig_message.reply("⏳ Agla episode shuru ho raha hai...")
+            await asyncio.sleep(1)
 
     if all_ok:
         try:
@@ -778,10 +667,6 @@ async def haz_command(client: Client, message: Message):
     if not c:
         return
 
-    if not SELENIUM_OK:
-        await message.reply("❌ Selenium install nahi hai! `pip install selenium`")
-        return
-
     parts = message.text.split()
     if len(parts) < 2:
         await message.reply(
@@ -822,3 +707,42 @@ async def haz_command(client: Client, message: Message):
         pass
 
     sess.msg = await message.reply(sess.header_text(), reply_markup=sess.build_markup())
+
+
+# ─────────────────────────────────────────────
+#  /hazcookie — manual-verify cookie relay
+# ─────────────────────────────────────────────
+_HAZCOOKIE_HELP = (
+    "**Cookie kaise nikaalo (ek baar manually verify karke):**\n\n"
+    "1️⃣ Phone/PC ke normal browser mein koi bhi Haz download link kholo\n"
+    "   (jaisa `002.hindianimeszone.com/download1.php?...`)\n"
+    "2️⃣ 'Verify You're Human' checkbox jaise normally solve karte ho, karo\n"
+    "3️⃣ Verify ho jaane ke baad, browser ke DevTools ya 'Cookie-Editor' jaisi\n"
+    "   extension se `hindianimeszone.com` ke saare cookies copy karo — ek\n"
+    "   hi line mein `naam1=value1; naam2=value2; ...` is format mein\n"
+    "4️⃣ Yahan bhejo: `/hazcookie <pura cookie string>`\n\n"
+    "Ye cookie ~1 hour tak valid rehta hai (site khud batata hai). Expire\n"
+    "hone pe /Haz download mein error aayega — tab dubara solve karke naya\n"
+    "cookie bhej dena."
+)
+
+
+@Client.on_message(filters.command("hazcookie"))
+async def hazcookie_command(client: Client, message: Message):
+    c = await check_chat(message, chat="Sudo")
+    if not c:
+        return
+
+    parts = message.text.split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        cur = _get_haz_cookie()
+        status = "✅ Abhi ek valid cookie saved hai." if cur else "❌ Abhi koi valid cookie saved nahi hai."
+        await message.reply(f"{status}\n\n{_HAZCOOKIE_HELP}")
+        return
+
+    HAZ_COOKIE["value"] = parts[1].strip()
+    HAZ_COOKIE["saved_at"] = time.time()
+    await message.reply(
+        "✅ **Cookie save ho gaya!**\n\nAgle ~1 hour tak `/Haz` downloads isi cookie se "
+        "Verify gate skip karke seedha MEGA link nikaalenge."
+    )
