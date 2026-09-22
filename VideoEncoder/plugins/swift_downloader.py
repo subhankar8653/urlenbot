@@ -17,8 +17,10 @@ Commands:
 """
 
 import asyncio
+import functools
 import glob
 import os
+import shutil
 import re
 import time
 import uuid
@@ -62,8 +64,15 @@ def _sort_by_size(files: list) -> list:
 # ─────────────────────────────────────────────
 #  Driver — download folder set, same session
 # ─────────────────────────────────────────────
-def _make_driver(dl_dir: str):
+def _make_driver(dl_dir: str, fast: bool = False):
     options = webdriver.ChromeOptions()
+
+    # fast=True (sirf /toono se): page-load 'eager' — DOMContentLoaded pe hi
+    # driver.get() return ho jaata hai, ads/iframes/trackers ke poore load hone
+    # ka wait nahi karta. Ye "downlead page pe aake ruk gaya" wale pause ki
+    # sabse badi wajah thi (360p gate to waise bhi khud poll karta hai).
+    if fast:
+        options.page_load_strategy = "eager"
 
     # Railway pe headless=new better JS rendering karta hai (old headless JS execute karta hai)
     options.add_argument("--headless=new")
@@ -153,7 +162,7 @@ def _make_driver(dl_dir: str):
     else:
         driver = webdriver.Chrome(options=options)
     # Page load timeout badha diya — slow Railway server ke liye
-    driver.set_page_load_timeout(90)
+    driver.set_page_load_timeout(30 if fast else 90)
     driver.set_script_timeout(30)
 
     try:
@@ -445,6 +454,65 @@ def _scan_for_360p(driver) -> bool:
     return False
 
 
+_JS_HAS_360P = """
+var body = document.body;
+if (body && (body.innerText || '').toLowerCase().indexOf('360p') !== -1) { return true; }
+var a = document.querySelectorAll('a[href]');
+for (var i = 0; i < a.length; i++) {
+  if (a[i].classList.contains('d-none')) continue;
+  if ((a[i].getAttribute('href') || '').toLowerCase().indexOf('360p') !== -1) { return true; }
+}
+return false;
+"""
+
+
+def _scan_for_360p_fast(driver) -> bool:
+    """
+    Single JS call (~ms) — pehle wale _scan_for_360p mein har tick pe 3 tarike
+    (find_elements + XPATH + poora page_source BS4 parse) chalte the, jo slow
+    Railway CPU pe khud kaafi time khaate the. innerText sirf *rendered/visible*
+    text deta hai, isliye d-none/hidden elements khud skip ho jaate hain.
+    """
+    try:
+        return bool(driver.execute_script(_JS_HAS_360P))
+    except Exception:
+        return False
+
+
+def _adopt_driver(driver, dl_dir: str) -> bool:
+    """
+    /toono ne link nikalne ke liye jo Chrome already chalaya tha use hi yahan
+    reuse karo (naya Chrome launch = 3-8s bachao + cookies same session ki
+    milti hain). Extra tabs band karo, download folder set karo.
+    Returns False agar driver kharab nikla — caller naya driver bana lega.
+    """
+    try:
+        handles = driver.window_handles
+        if not handles:
+            return False
+        keep = handles[0]
+        for h in handles[1:]:
+            try:
+                driver.switch_to.window(h)
+                driver.close()
+            except Exception:
+                pass
+        driver.switch_to.window(keep)
+        for cmd, args in (
+            ("Page.setDownloadBehavior", {"behavior": "allow", "downloadPath": dl_dir}),
+            ("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": dl_dir}),
+        ):
+            try:
+                driver.execute_cdp_cmd(cmd, args)
+            except Exception:
+                pass
+        driver.set_page_load_timeout(30)
+        return True
+    except Exception as e:
+        LOGGER.warning(f"[Swift] reuse driver adopt failed: {e}")
+        return False
+
+
 def _collect_visible_links(driver) -> list:
     """
     Page pe saare visible download links collect karo.
@@ -532,7 +600,8 @@ def _fast_download_link(href: str, dl_dir: str, quality: str, referer: str, cook
         return None
 
 
-def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_filter: str = None) -> dict:
+def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_filter: str = None,
+                         fast: bool = False, reuse_driver=None, progress: dict = None) -> dict:
     """
     Same Selenium session mein:
       1. Page visit karo — immediately download mat karo
@@ -544,17 +613,36 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
       7. Downloads complete hone ka wait karo
 
     quality_filter: "1080p" / "720p" / "480p" etc — sirf wahi click karo
+
+    fast (sirf /toono): eager page-load, 0.25s 360p-scan (JS), aur reuse_driver
+    (pehle se khula Chrome) — baaki sab callers (RTI, /swift, auto-monitor)
+    ke liye behaviour bilkul purana hi rehta hai.
+    progress: dict jisme {"phase": "scan"|"download", "dls": {quality: SmartDL}}
+    live update hota hai taaki Telegram status mein asli speed/MB dikhe.
+
     Returns: {"files": [...paths], "qualities": [...], "error": str or None}
     """
     driver = None
     result = {"files": [], "qualities": [], "error": None}
 
     # ── Scan constants ──
-    SCAN_INTERVAL = 1       # seconds between each scan
-    SCAN_MAX_TRIES = 20     # max 20 tries = 20 seconds timeout
+    SCAN_INTERVAL = 0.25 if fast else 1        # seconds between each scan
+    SCAN_MAX_TRIES = 80 if fast else 20        # dono case mein max 20 seconds timeout
+
+    if progress is None:
+        progress = {}
+    progress["phase"] = "scan"
+    progress.setdefault("dls", {})
 
     try:
-        driver = _make_driver(dl_dir)
+        if reuse_driver is not None:
+            if _adopt_driver(reuse_driver, dl_dir):
+                driver = reuse_driver
+                LOGGER.info("[Swift] Reusing already-open Chrome session (no cold start)")
+            else:
+                _kill_driver_tree(reuse_driver)
+        if driver is None:
+            driver = _make_driver(dl_dir, fast=fast)
         LOGGER.info(f"[Swift] Opening: {swift_url}")
 
         # Page load with retry — renderer timeout se bachne ke liye
@@ -567,7 +655,7 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
                 break
             except Exception as e:
                 LOGGER.warning(f"[Swift] Page load attempt {attempt+1} failed: {e}")
-                time.sleep(5)
+                time.sleep(1 if fast else 5)
 
         if not loaded:
             result["error"] = "Page load 3 baar fail hua — Chrome renderer timeout"
@@ -580,9 +668,18 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
         LOGGER.info("[Swift] Starting 360p scan loop (max 20s)...")
         found_360p = False
         for scan_num in range(1, SCAN_MAX_TRIES + 1):
-            _close_popups(driver, main)
-            if _scan_for_360p(driver):
-                LOGGER.info(f"[Swift] ✅ 360p gate PASSED at scan #{scan_num} ({scan_num}s)")
+            if fast:
+                # Popups har tick pe nahi — har 4th tick pe check karo (window_handles
+                # ek round-trip hai). Har 8th tick pe purana poora scan bhi chalao
+                # (safety net, agar JS scan kisi DOM shape pe miss kare).
+                if scan_num % 4 == 1:
+                    _close_popups(driver, main)
+                hit = _scan_for_360p_fast(driver) or (scan_num % 8 == 0 and _scan_for_360p(driver))
+            else:
+                _close_popups(driver, main)
+                hit = _scan_for_360p(driver)
+            if hit:
+                LOGGER.info(f"[Swift] ✅ 360p gate PASSED at scan #{scan_num} (~{scan_num * SCAN_INTERVAL:.1f}s)")
                 found_360p = True
                 break
             LOGGER.info(f"[Swift] Scan #{scan_num}/{SCAN_MAX_TRIES} — 360p not yet visible")
@@ -602,6 +699,12 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
         _close_popups(driver, main)
         download_links = _collect_visible_links(driver)
         LOGGER.info(f"[Swift] Total visible links collected: {len(download_links)}")
+
+        if fast:
+            # Sirf quality-labelled links — nav/ad anchors ko top-4 slot lene se roko
+            known = [l for l in download_links if l["quality"] != "unknown"]
+            if known:
+                download_links = sorted(known, key=lambda l: QUALITY_ORDER.get(l["quality"], 99))
 
         # ── STEP 3: Quality filter apply karo (agar diya gaya) ──
         if quality_filter:
@@ -675,8 +778,10 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
                 dl = _fast_download_link(href, dl_dir, q, swift_url, cookie_header)
                 if dl:
                     active_dls[q] = (dl, href)
+                    progress["dls"][q] = dl
                 else:
                     fallback_links.append(lnk)
+            progress["phase"] = "download"
 
             for q, (dl, href) in active_dls.items():
                 try:
@@ -743,6 +848,10 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
         LOGGER.error(f"[Swift] Error: {e}")
     finally:
         _kill_driver_tree(driver)
+        # /toono se aaya (rti-style) driver ka disposable profile dir bhi saaf karo
+        _pd = getattr(driver, "_suhani_profile_dir", None) if driver else None
+        if _pd:
+            shutil.rmtree(_pd, ignore_errors=True)
 
     return result
 
@@ -1044,7 +1153,8 @@ async def _reorder_if_needed(client, message, uploaded_results: list):
 #  Core command logic
 # ─────────────────────────────────────────────
 async def _run_swift(client, message, swift_url: str, encode: bool, quality_filter: str = None,
-                      episode_label: str = None, show_url: bool = True):
+                      episode_label: str = None, show_url: bool = True,
+                      fast: bool = False, driver=None):
     """
     episode_label: status messages ke upar dikhne wala label (e.g. "Ep 5") — optional,
                    RTI flow (/rti, /rtic) se pass hota hai taaki pata chale kaunsa
@@ -1052,6 +1162,8 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
     show_url: False hone pe swift_url kahin bhi user-facing message mein nahi dikhega
               (sirf status — downloading/uploading/quality/episode). /rti, /rtic isse
               False rakhte hain; /swift, /swiftencode mein normal True rehta hai.
+    fast / driver: sirf /toono use karta hai — fast scan + already-khula Chrome reuse +
+              live speed dikhane wala progress. Default (False/None) = purana behaviour.
     """
     session_id = str(int(time.time()))
     dl_dir = os.path.join(download_dir, f"swift_{session_id}")
@@ -1074,30 +1186,73 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
 
     loop = asyncio.get_event_loop()
 
+    progress = {"phase": "scan", "dls": {}}
+
     async def _progress_updater():
         start = time.time()
+        last_bytes, last_t = 0, start
         while True:
             done = _get_done_files(dl_dir)
             in_prog = _in_progress(dl_dir)
             elapsed = int(time.time() - start)
-            total_mb = sum(
+            disk_bytes = sum(
                 os.path.getsize(f) for f in glob.glob(os.path.join(dl_dir, "*"))
                 if os.path.isfile(f)
-            ) / (1024 * 1024)
-            try:
-                await msg.edit(
+            )
+            if not fast:
+                total_mb = disk_bytes / (1024 * 1024)
+                text = (
                     f"{prefix}⬇️ **Downloading...**\n\n"
                     f"✅ Complete : `{len(done)}`\n"
                     f"📥 In Progress : `{len(in_prog)}`\n"
                     f"💾 Downloaded : `{total_mb:.1f} MB`\n"
                     f"⏱️ Elapsed : `{elapsed}s`"
                 )
+            elif progress.get("phase") == "scan":
+                text = (
+                    f"{prefix}🔍 **Link scan ho raha hai...**\n\n"
+                    f"Download links ka wait (max 20s)\n"
+                    f"⏱️ Elapsed : `{elapsed}s`"
+                )
+            else:
+                dls = list(progress.get("dls", {}).values())
+                live_bytes, fin = 0, 0
+                for d in dls:
+                    try:
+                        live_bytes += int(d.get_dl_size())
+                        if d.isFinished():
+                            fin += 1
+                    except Exception:
+                        pass
+                total_bytes = max(disk_bytes, live_bytes)
+                now = time.time()
+                dt = max(now - last_t, 0.001)
+                speed = max(total_bytes - last_bytes, 0) / dt / (1024 * 1024)
+                last_bytes, last_t = total_bytes, now
+                n_total = len(dls) or (len(done) + len(in_prog))
+                n_done = fin if dls else len(done)
+                text = (
+                    f"{prefix}⬇️ **Downloading...**\n\n"
+                    f"✅ Complete : `{n_done}`\n"
+                    f"📥 In Progress : `{max(n_total - n_done, 0)}`\n"
+                    f"💾 Downloaded : `{total_bytes / (1024 * 1024):.1f} MB`\n"
+                    f"🚀 Speed : `{speed:.1f} MB/s`\n"
+                    f"⏱️ Elapsed : `{elapsed}s`"
+                )
+            try:
+                await msg.edit(text)
             except Exception:
                 pass
-            await asyncio.sleep(5)   # was 8s — progress updates more frequent
+            await asyncio.sleep(4 if fast else 5)
 
     prog_task = asyncio.create_task(_progress_updater())
-    result = await loop.run_in_executor(None, _scrape_and_download, swift_url, dl_dir, None, quality_filter)
+    result = await loop.run_in_executor(
+        None,
+        functools.partial(
+            _scrape_and_download, swift_url, dl_dir, None, quality_filter,
+            fast=fast, reuse_driver=driver, progress=progress,
+        ),
+    )
     prog_task.cancel()
     try:
         await prog_task

@@ -1,6 +1,16 @@
 """
-toono_downloader.py  v1
+toono_downloader.py  v2 (speed pass)
 ========================
+v2 changes (sirf speed, flow same):
+  - Step C polling 3s -> 0.5s (click-chain ab bhi har 3s pe, ads zyada na khulein)
+  - fixed sleeps hata diye (page-load wait, codedew iframe ke liye 2s sleep)
+  - codedew iframe ke liye 6s tak fast poll (pehle 1 hi check -> slow fallback)
+  - system chromedriver seedha (selenium-manager ka startup delay nahi)
+  - link nikalne wala Chrome hi download-scrape ke liye reuse (2nd Chrome cold start bacha)
+  - agla episode ka link pichhle ke download/upload ke DAURAN nikal lo (multi-select)
+  - swift scrape "fast" mode (eager page load + 0.25s scan) — sirf /toono ke liye
+  - status msg mein asli speed / MB
+  - env TOONO_PREFETCH=0 se prefetch band kar sakte ho (agar RAM tight ho)
 Commands:
   /toono <series_url>  -> Season button menu -> episode button menu
                            -> har episode "Watch SxEy" page se hoke
@@ -29,6 +39,7 @@ selector fail ho to logs se turant pata chal jaaye kahan atka.
 """
 
 import asyncio
+import os
 import re
 import time
 import uuid
@@ -43,7 +54,7 @@ from pyrogram.types import (
     Message,
 )
 
-from .. import LOGGER
+from .. import LOGGER, download_dir
 from ..utils.helper import check_chat
 from ..utils.database.access_db import db
 from .rti_downloader import (
@@ -54,6 +65,8 @@ from .rti_downloader import (
 )
 
 try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service as ChromeService
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
@@ -75,6 +88,10 @@ SWIFT_BASE = "https://argon.razorshell.space/downlead/"
 AUDIO_PRIORITY = ["hindi", "dual", "multi", "tamil", "telugu", "english", "japanese", "sub", "unknown"]
 
 PER_PAGE = 10  # RTI jaisa hi — 10 episode buttons per page
+
+# Multi-episode mein agla link pichhle ke download/upload ke saath-saath nikalo.
+# RAM tight ho to Railway variable TOONO_PREFETCH=0 kar do.
+TOONO_PREFETCH = os.getenv("TOONO_PREFETCH", "1") != "0"
 
 # sid -> ToonoSelector. In-memory hai, redeploy pe clear ho jaata hai.
 TOONO_SESSIONS = {}
@@ -219,6 +236,55 @@ def discover_toono_items(series_url: str):
 #  Step 2: episode page -> "Download" click -> modal "Hindi Download"
 #  click -> codedew.com MultiQuality page (poori tarah Selenium, JS-driven)
 # ─────────────────────────────────────────────
+def _make_toono_driver():
+    """
+    rti ke _make_selenium_driver jaisa hi (eager page-load, images off,
+    disposable profile) — bas system chromedriver seedha use karta hai taaki
+    selenium-manager ka har launch pe wala startup/lookup delay na lage.
+    Kuch bhi fail ho to purane rti driver pe fallback.
+    """
+    try:
+        profile_dir = os.path.join(download_dir, "_chrome_tmp", f"toono_{uuid.uuid4().hex}")
+        os.makedirs(profile_dir, exist_ok=True)
+
+        options = webdriver.ChromeOptions()
+        for arg in (
+            "--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+            "--disable-software-rasterizer", "--disable-extensions",
+            "--disable-background-networking", "--disable-default-apps", "--disable-sync",
+            "--disable-translate", "--mute-audio", "--no-first-run", "--disable-crash-reporter",
+            "--window-size=1920,1080", f"user-agent={HEADERS['User-Agent']}",
+            f"--user-data-dir={profile_dir}",
+        ):
+            options.add_argument(arg)
+        options.add_experimental_option("prefs", {
+            "profile.managed_default_content_settings.images": 2
+        })
+        options.page_load_strategy = "eager"
+
+        for binary in ("/usr/bin/chromium", "/usr/bin/chromium-browser",
+                       "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"):
+            if os.path.exists(binary):
+                options.binary_location = binary
+                break
+
+        service = None
+        for cd in (os.getenv("CHROMEDRIVER_PATH", ""), "/usr/bin/chromedriver",
+                   "/usr/lib/chromium/chromedriver", "/usr/lib/chromium-browser/chromedriver"):
+            if cd and os.path.exists(cd):
+                service = ChromeService(executable_path=cd)
+                break
+
+        driver = webdriver.Chrome(service=service, options=options) if service \
+            else webdriver.Chrome(options=options)
+        driver.set_page_load_timeout(30)
+        driver._suhani_profile_dir = profile_dir
+        return driver
+    except Exception as e:
+        LOGGER.warning(f"[Toono] fast driver fail ({e}), rti driver pe fallback")
+        return _make_selenium_driver()
+
+
 _CLICK_TEXTS = ["Continue", "Get Link", "Verify", "Click Here", "Get Download Link", "Download"]
 
 
@@ -332,30 +398,74 @@ def _extract_swift_from_page(driver):
     return None
 
 
+def _quick_iframe_src(driver):
+    """Selenium se seedha iframe src (page_source + BS4 se kaafi halka)."""
+    try:
+        for fr in driver.find_elements(By.CSS_SELECTOR, "iframe"):
+            src = (fr.get_attribute("src") or "").strip()
+            if ARGON_DOMAIN in src:
+                return src
+    except Exception:
+        pass
+    return None
+
+
+def _argon_to_swift(src: str) -> str:
+    if "/downlead/" in src:
+        return src
+    if "/embed/" in src:
+        parts = [p for p in src.rstrip("/").split("/") if p]
+        code = parts[-1] if parts else ""
+        if len(code) >= 5:
+            return SWIFT_BASE + code + "/"
+    return src
+
+
 def _finalize_codedew(driver, codedew_url: str):
     """
     codedew.com ke MultiQuality page pe pahunch gaye — is page ke
     andar embedded argon.razorshell.space iframe dhundo. Mil jaaye to
     seedha wahi swift-ready URL use karo (codedew ke UI ko chuo mat).
     Na mile to codedew URL hi return karo, jaisa pehle hota tha.
+
+    v2: iframe JS se inject hota hai, isliye fixed 2s sleep + 1 check ki
+    jagah 6s tak har 0.3s pe poll (mil jaaye to turant return).
     """
     try:
         cur = driver.current_url or ""
         if CODEDEW_DOMAIN not in cur:
             driver.get(codedew_url)
-            time.sleep(2)
+
+        deadline = time.time() + 6
+        while True:
+            src = _quick_iframe_src(driver)
+            if src:
+                swift_url = _argon_to_swift(src)
+                LOGGER.info(f"[Toono] Argon/Swift iframe mil gaya, codedew UI skip: {swift_url}")
+                return swift_url
+            if time.time() >= deadline:
+                break
+            time.sleep(0.3)
+
+        # last resort: purana page_source/BS4 wala check
         swift_url = _extract_swift_from_page(driver)
         if swift_url:
-            LOGGER.info(f"[Toono] Argon/Swift iframe mil gaya, codedew UI skip: {swift_url}")
+            LOGGER.info(f"[Toono] Argon/Swift iframe mil gaya (BS4), codedew UI skip: {swift_url}")
             return swift_url
     except Exception as e:
         LOGGER.warning(f"[Toono] _finalize_codedew error: {e}")
     return codedew_url
 
 
-def get_codedew_link(episode_url: str):
+def get_codedew_link(episode_url: str, keep_driver: bool = False):
     """
-    Returns (result_url_or_None, debug_lines).
+    Returns (result_url_or_None, debug_lines, driver_or_None).
+
+    keep_driver=True: kaam successful hone par Chrome band NAHI hota, driver
+    return hota hai taaki swift scrape usi session ko reuse kare (naya Chrome
+    cold-start bachta hai). Caller ki zimmedari hai ki driver ko kill kare
+    (_run_swift(driver=...) khud kar deta hai). Fail hone par ya keep_driver=False
+    pe hamesha yahin band ho jaata hai.
 
     result_url: swift-ready URL — ya to argon.razorshell.space ka
     "downlead" link (agar codedew.com ke page mein embedded mil jaaye
@@ -369,6 +479,19 @@ def get_codedew_link(episode_url: str):
     zaroorat na pade).
     """
     debug = []
+    holder = {"driver": None}
+    url = _codedew_flow(episode_url, debug, holder)
+    drv = holder["driver"]
+    if url and keep_driver and drv is not None:
+        return url, debug, drv
+    if drv is not None:
+        _kill_driver_tree(drv)
+    return url, debug, None
+
+
+def _codedew_flow(episode_url: str, debug: list, holder: dict):
+    """Asli click-chain. Sirf result URL (ya None) return karta hai; Chrome band
+    karna get_codedew_link ka kaam hai (holder['driver'] mein rakha hai)."""
 
     def log(msg):
         debug.append(msg)
@@ -376,14 +499,16 @@ def get_codedew_link(episode_url: str):
 
     driver = None
     try:
-        driver = _make_selenium_driver()
+        driver = _make_toono_driver()
+        holder["driver"] = driver
         driver.get(episode_url)
         main = driver.current_window_handle
         known_junk = set()   # tabs jo junk/ad nikle, dobara check nahi karna
         pending = set()      # naye tabs jo abhi about:blank pe hain, watch karte raho
-        time.sleep(2)
 
-        wait = WebDriverWait(driver, 10)
+        # v2: fixed time.sleep(2) hata diya — neeche ka wait already button
+        # clickable hone tak ruk-ta hai (2s sleep + 10s wait = 12s budget rakha)
+        wait = WebDriverWait(driver, 12)
 
         # ── Step A: episode page ka main "Download" button ──
         try:
@@ -392,7 +517,7 @@ def get_codedew_link(episode_url: str):
             log("✅ Step A: episode page ka Download button mil gaya, click hua")
         except Exception as e:
             log(f"❌ Step A: episode page ka Download button hi nahi mila ({str(e).splitlines()[0][:90]})")
-            return None, debug
+            return None
 
         time.sleep(1.5)
 
@@ -462,7 +587,7 @@ def get_codedew_link(episode_url: str):
 
         if not clicked:
             log("❌ Step B: modal khula lekin andar koi Download button nahi mila (teeno tareeke fail)")
-            return None, debug
+            return None
 
         # ── Step C: codedew.com tak resilient click-chain (RTI ke
         # get_argon_link jaisa hi — beech mein ad-gate/redirect page
@@ -471,25 +596,39 @@ def get_codedew_link(episode_url: str):
         # JS se codedew.com pe redirect hota hai — isliye 12 attempts
         # x 3s = ~36s tak wait/poll karte hain, taaki slow network pe
         # bhi redirect hone ka waqt mil jaaye. ──
-        for attempt in range(12):
-            time.sleep(3)
+        # v2: 0.5s tick pe naye tab / redirect ko check karo (pehle 3s tick tha,
+        # isliye redirect ho jaane ke baad bhi 0-3s extra wait hota tha).
+        # Click-chain + page_source regex ab bhi har 3s (6 ticks) pe — warna
+        # zyada baar click se zyada junk/ad tabs khulte.
+        TICK = 0.5
+        CLICK_EVERY = 6      # 6 x 0.5s = 3s
+        MAX_TICKS = 72       # 72 x 0.5s = ~36s (purana budget)
+        for tick in range(1, MAX_TICKS + 1):
+            time.sleep(TICK)
+            attempt = (tick + CLICK_EVERY - 1) // CLICK_EVERY
 
             found = _handle_new_windows(driver, known_junk, pending, main)
             if found:
-                log(f"✅ Step C (attempt {attempt + 1}/12): naya tab codedew.com pe pahunch gaya")
-                return _finalize_codedew(driver, found), debug
+                log(f"✅ Step C (~{tick * TICK:.1f}s): naya tab codedew.com pe pahunch gaya")
+                return _finalize_codedew(driver, found)
 
-            cur = driver.current_url or ""
+            try:
+                cur = driver.current_url or ""
+            except Exception:
+                cur = ""
             if CODEDEW_DOMAIN in cur:
-                log(f"✅ Step C (attempt {attempt + 1}/12): main tab khud codedew.com pe navigate hua")
-                return _finalize_codedew(driver, cur), debug
+                log(f"✅ Step C (~{tick * TICK:.1f}s): main tab khud codedew.com pe navigate hua")
+                return _finalize_codedew(driver, cur)
+
+            if tick % CLICK_EVERY:
+                continue
 
             try:
                 html = driver.page_source
                 m = re.search(r'https?://[^\s"\'<>]*codedew\.com[^\s"\'<>]*', html)
                 if m:
-                    log(f"✅ Step C (attempt {attempt + 1}/12): page HTML mein codedew.com link mila")
-                    return _finalize_codedew(driver, m.group(0)), debug
+                    log(f"✅ Step C (attempt {attempt}/12): page HTML mein codedew.com link mila")
+                    return _finalize_codedew(driver, m.group(0))
             except Exception:
                 pass
 
@@ -498,7 +637,7 @@ def get_codedew_link(episode_url: str):
             except Exception:
                 n_windows = -1
             log(
-                f"⏳ attempt {attempt + 1}/12: total tabs={n_windows}, "
+                f"⏳ attempt {attempt}/12: total tabs={n_windows}, "
                 f"pending(about:blank)={len(pending)}, junk band kiye={len(known_junk)}, "
                 f"main URL={cur[:70]}"
             )
@@ -517,7 +656,7 @@ def get_codedew_link(episode_url: str):
         cur = driver.current_url or ""
         if CODEDEW_DOMAIN in cur:
             log("✅ (12 attempts ke baad, last check mein) main tab codedew.com pe mila")
-            return _finalize_codedew(driver, cur), debug
+            return _finalize_codedew(driver, cur)
 
         log(
             f"❌ 12 attempts (~36s) ke baad bhi codedew.com nahi mila. "
@@ -525,13 +664,11 @@ def get_codedew_link(episode_url: str):
             f"pending tabs (about:blank pe atke): {len(pending)} | "
             f"junk tabs band kiye: {len(known_junk)}"
         )
-        return None, debug
+        return None
 
     except Exception as e:
         log(f"❌ Unexpected error: {str(e).splitlines()[0][:150]}")
-        return None, debug
-    finally:
-        _kill_driver_tree(driver)
+        return None
 
 
 # ─────────────────────────────────────────────
@@ -700,48 +837,106 @@ async def _send_toono_update_post_if_enabled(client, sess: "ToonoSelector", item
         LOGGER.error(f"[Toono] Update post error: {e}")
 
 
-async def _process_toono_item(client, message, item: dict, status_msg, index: int, total: int,
-                               sess: "ToonoSelector" = None):
-    ep_label = f"S{item['season']}E{item['num']:02d}"
-
+def _swallow_future(fut):
+    """Orphaned prefetch future ka exception 'never retrieved' warning na de."""
     try:
-        await status_msg.edit(
-            f"🔍 **{ep_label}** (`{index}/{total}`)\n"
-            f"Download link nikal raha hoon (isme thoda time lag sakta hai, ruk jao)..."
-        )
-    except Exception:
+        fut.result()
+    except BaseException:
         pass
 
-    loop = asyncio.get_event_loop()
-    codedew_url, debug_lines = await loop.run_in_executor(None, get_codedew_link, item["watch_url"])
 
-    if not codedew_url:
-        # Telegram message mein last kuch debug lines dikhao — taaki
-        # exact pata chale kahan atka, screenshot lene ki zaroorat na
-        # pade. (Har line get_codedew_link ke andar step-by-step log
-        # hoti hai: Step A/B button clicks, phir Step C ke har poll
-        # attempt ka status.)
-        debug_text = "\n".join(debug_lines[-10:]) if debug_lines else "(koi debug info nahi mili)"
-        try:
-            await status_msg.edit(
-                f"🛑 **{ep_label} — Link Fail**\n\n"
-                f"❌ codedew.com ka MultiQuality link nahi mila.\n\n"
-                f"**Debug (last steps):**\n```\n{debug_text}\n```\n"
-                f"⛔ Agle items **band** kar diye gaye."
-            )
-        except Exception:
-            pass
-        return "error"
+async def _process_toono_item(client, message, item: dict, status_msg, index: int, total: int,
+                               sess: "ToonoSelector" = None, prefetched=None,
+                               next_item: dict = None, pf: dict = None):
+    """
+    prefetched: pichhle episode ke dauran shuru hua get_codedew_link future (ya None)
+    next_item / pf: agar diye gaye to current ka link milte hi agle episode ka link
+                    background mein nikalna shuru (pf["fut"] mein rakha jaata hai)
+    """
+    ep_label = f"S{item['season']}E{item['num']:02d}"
+    loop = asyncio.get_event_loop()
+    driver = None
+    from_prefetch = prefetched is not None
 
     try:
+        if from_prefetch:
+            try:
+                await status_msg.edit(
+                    f"🔍 **{ep_label}** (`{index}/{total}`)\n"
+                    f"Link pehle se nikal raha tha, check kar raha hoon..."
+                )
+            except Exception:
+                pass
+            try:
+                codedew_url, debug_lines, driver = await prefetched
+            except Exception as e:
+                codedew_url, debug_lines, driver = None, [f"❌ prefetch error: {str(e)[:100]}"], None
+        else:
+            try:
+                await status_msg.edit(
+                    f"🔍 **{ep_label}** (`{index}/{total}`)\n"
+                    f"Download link nikal raha hoon (isme thoda time lag sakta hai, ruk jao)..."
+                )
+            except Exception:
+                pass
+            codedew_url, debug_lines, driver = await loop.run_in_executor(
+                None, get_codedew_link, item["watch_url"], True
+            )
+
+        if not codedew_url:
+            # Telegram message mein last kuch debug lines dikhao — taaki
+            # exact pata chale kahan atka, screenshot lene ki zaroorat na
+            # pade. (Har line get_codedew_link ke andar step-by-step log
+            # hoti hai: Step A/B button clicks, phir Step C ke har poll
+            # attempt ka status.)
+            debug_text = "\n".join(debug_lines[-10:]) if debug_lines else "(koi debug info nahi mili)"
+            try:
+                await status_msg.edit(
+                    f"🛑 **{ep_label} — Link Fail**\n\n"
+                    f"❌ codedew.com ka MultiQuality link nahi mila.\n\n"
+                    f"**Debug (last steps):**\n```\n{debug_text}\n```\n"
+                    f"⛔ Agle items **band** kar diye gaye."
+                )
+            except Exception:
+                pass
+            return "error"
+
+        # Link mil gaya — agle episode ka link abhi se background mein nikalna shuru
+        if TOONO_PREFETCH and next_item is not None and pf is not None:
+            fut = loop.run_in_executor(None, get_codedew_link, next_item["watch_url"], False)
+            fut.add_done_callback(_swallow_future)
+            pf["fut"] = fut
+
         await status_msg.edit(
             f"✅ **{ep_label}** (`{index}/{total}`) — Link mil gaya\n\n"
             f"⬇️ Ab download shuru ho raha hai..."
         )
         from .swift_downloader import _run_swift
         uploaded_results = await _run_swift(
-            client, message, codedew_url, encode=False, episode_label=ep_label, show_url=False
+            client, message, codedew_url, encode=False, episode_label=ep_label, show_url=False,
+            fast=True, driver=driver,
         )
+        driver = None  # ownership _run_swift -> _scrape_and_download ko chali gayi (wahi kill karta hai)
+
+        # Prefetched link pe scrape/download hi fail hua (link expire ho gaya ho sakta hai)
+        # to ek baar fresh link nikal ke retry. (None = scrape/download failure path;
+        # upload fail pe list aati hai, usse retry nahi karte.)
+        if uploaded_results is None and from_prefetch:
+            LOGGER.warning(f"[Toono] {ep_label}: prefetched link fail hua, fresh link se ek retry")
+            try:
+                await status_msg.edit(f"🔁 **{ep_label}** — naya link nikal raha hoon (retry)...")
+            except Exception:
+                pass
+            codedew_url, debug_lines, driver = await loop.run_in_executor(
+                None, get_codedew_link, item["watch_url"], True
+            )
+            if codedew_url:
+                uploaded_results = await _run_swift(
+                    client, message, codedew_url, encode=False, episode_label=ep_label,
+                    show_url=False, fast=True, driver=driver,
+                )
+                driver = None
+
         await _forward_to_toono_channel_if_enabled(client, message, uploaded_results)
         await _send_toono_update_post_if_enabled(client, sess, item, uploaded_results)
         return "ok"
@@ -756,19 +951,31 @@ async def _process_toono_item(client, message, item: dict, status_msg, index: in
         except Exception:
             pass
         return "error"
+    finally:
+        if driver is not None:
+            try:
+                await loop.run_in_executor(None, _kill_driver_tree, driver)
+            except Exception:
+                pass
 
 
 async def _download_toono_items(client, status_msg, orig_message, sess: "ToonoSelector", idxs: list):
     total = len(idxs)
     all_ok = True
+    pf = {}
     for i, idx in enumerate(idxs, 1):
         item = sess.items[idx]
-        result = await _process_toono_item(client, orig_message, item, status_msg, i, total, sess=sess)
+        next_item = sess.items[idxs[i]] if i < total else None
+        prefetched = pf.pop("fut", None)
+        result = await _process_toono_item(
+            client, orig_message, item, status_msg, i, total, sess=sess,
+            prefetched=prefetched, next_item=next_item, pf=pf,
+        )
         if result != "ok":
             all_ok = False
             break
         if i < total:
-            await asyncio.sleep(3)
+            await asyncio.sleep(1)
 
     # Sirf success (all_ok) pe status_msg delete karo — error/fail message
     # ko turant delete karne se pehle wala bug tha: "Link Fail" / "Upload
