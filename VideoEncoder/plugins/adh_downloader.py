@@ -60,7 +60,7 @@ import asyncio
 import re
 import time
 import uuid
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -232,11 +232,43 @@ def _find_adh_episode_list_url(soup: BeautifulSoup, raw_html: str, debug: list) 
 
 
 # ─────────────────────────────────────────────
+#  Series-URL slug se seedha episode-list URL derive karo — jaisa khud
+#  confirm kiya:
+#    .../daemons-of-the-shadow-realm-season-1-hindi-multi-audio/
+#      -> https://new.adhlinks.com/episode/daemons-of-the-shadow-realm/
+#    .../mushoku-tensei-jobless-reincarnation-season-3-hindi-multi-audio/
+#      -> https://new.adhlinks.com/episode/mushoku-tensei-jobless-reincarnation/
+#  "-season-<N>" ke baad ka sab (season number + audio/quality suffix)
+#  hata dete hain. Isse ek extra HTTP request bachta hai aur button ki
+#  JS-obfuscation wali dikkat bhi bypass ho jaati hai.
+# ─────────────────────────────────────────────
+def _derive_adh_episode_list_url(series_url: str) -> str | None:
+    path = urlparse(series_url).path.strip("/")
+    if not path:
+        return None
+    slug = path.split("/")[-1]
+
+    new_slug = re.sub(r'-season-\d+.*$', '', slug, flags=re.IGNORECASE)
+    if new_slug == slug:
+        # "-season-" nahi mila (movie/OVA jaisa single-part title) — common
+        # audio/dub suffix khud try karke hata do
+        new_slug = re.sub(
+            r'-(hindi-multi-audio|multi-audio|hindi-dubbed|hindi-dub|dual-audio)$',
+            '', slug, flags=re.IGNORECASE,
+        )
+
+    if not new_slug:
+        return None
+    return f"https://new.adhlinks.com/episode/{new_slug}/"
+
+
+# ─────────────────────────────────────────────
 #  Step 1: series page -> title / languages / episode-list page url
 # ─────────────────────────────────────────────
 def discover_adh_series(series_url: str) -> dict:
     """
-    Returns: {"title": str, "languages": [str,...], "episode_list_url": str|None, "debug": list}
+    Returns: {"title": str, "languages": [str,...], "episode_list_url": str|None,
+              "episode_list_html": str|None, "debug": list}
     """
     debug = []
     r = _http_get(series_url, debug=debug)
@@ -256,24 +288,59 @@ def discover_adh_series(series_url: str) -> dict:
     if not languages:
         languages = ["Hindi", "English"]
 
-    # ── "Download / Watch" button -> episode-list page ──
-    episode_list_url = _find_adh_episode_list_url(soup, r.text, debug)
-    if episode_list_url:
-        episode_list_url = urljoin(series_url, episode_list_url)
+    episode_list_url = None
+    episode_list_html = None
 
-    return {"title": title, "languages": languages, "episode_list_url": episode_list_url, "debug": debug}
+    # ── Strategy A (fast, confirmed): URL-slug se seedha derive karo ──
+    candidate = _derive_adh_episode_list_url(series_url)
+    if candidate:
+        try:
+            r2 = _http_get(candidate, debug=debug)
+            if r2.status_code == 200 and (
+                re.search(r'Episode\s*:?\s*\d+', r2.text, re.IGNORECASE) or "gdf" in r2.text.lower()
+            ):
+                episode_list_url = candidate
+                episode_list_html = r2.text
+                debug.append(f"✅ URL-pattern se derive kiya episode-list URL valid nikla: {candidate}")
+            else:
+                debug.append(
+                    f"⚠️ Derived URL ({candidate}) valid episode-page jaisa nahi laga "
+                    f"(HTTP {r2.status_code}) — button-scrape try kar rahe hain"
+                )
+        except Exception as e:
+            debug.append(
+                f"⚠️ Derived URL fetch fail: {str(e).splitlines()[0][:100]} — button-scrape try kar rahe hain"
+            )
+
+    # ── Strategy B (fallback): series page ke "Download / Watch" button ──
+    if not episode_list_url:
+        found = _find_adh_episode_list_url(soup, r.text, debug)
+        if found:
+            episode_list_url = urljoin(series_url, found)
+
+    return {
+        "title": title,
+        "languages": languages,
+        "episode_list_url": episode_list_url,
+        "episode_list_html": episode_list_html,
+        "debug": debug,
+    }
 
 
 # ─────────────────────────────────────────────
 #  Step 2: episode-list page -> {ep_num: {quality: gdf_href}}
 # ─────────────────────────────────────────────
-def discover_adh_episodes(episode_list_url: str) -> list:
+def discover_adh_episodes(episode_list_url: str, html: str | None = None) -> list:
     """
     Returns: [{"num": int, "qualities": {q: gdf_href}}, ...]
+    `html` diya ho (discover_adh_series ke Strategy-A validation se already
+    fetch ho chuka) to dobara request nahi bhejte — sirf usse parse karte hain.
     """
-    r = _http_get(episode_list_url)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+    if html is None:
+        r = _http_get(episode_list_url)
+        r.raise_for_status()
+        html = r.text
+    soup = BeautifulSoup(html, "html.parser")
 
     episodes = {}
     for a in soup.find_all("a", string=re.compile(r'^\s*GDF\s*$', re.IGNORECASE)):
@@ -784,7 +851,9 @@ async def adh_command(client: Client, message: Message):
         pass
 
     try:
-        episodes = await loop.run_in_executor(None, discover_adh_episodes, series_data["episode_list_url"])
+        episodes = await loop.run_in_executor(
+            None, discover_adh_episodes, series_data["episode_list_url"], series_data.get("episode_list_html")
+        )
     except Exception as e:
         LOGGER.error(f"[Adh] discover_adh_episodes error: {e}")
         await status_msg.edit(
