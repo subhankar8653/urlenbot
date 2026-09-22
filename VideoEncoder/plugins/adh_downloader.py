@@ -165,13 +165,81 @@ def _normalize_adh_quality(raw_text: str) -> str | None:
 
 
 # ─────────────────────────────────────────────
+#  "Download / Watch" button ka target URL dhoondo — 6 fallback strategies,
+#  kyunki kai WP "download" themes button ko plain <a href> ki jagah
+#  onclick JS / data-attribute se bhi bana dete hain (bot-scraping se bachne
+#  ke liye jaanbujh kar).
+# ─────────────────────────────────────────────
+def _find_adh_episode_list_url(soup: BeautifulSoup, raw_html: str, debug: list) -> str | None:
+    def log(msg):
+        debug.append(msg)
+        LOGGER.info(f"[Adh] {msg}")
+
+    # 1) <a href> jiske visible text mein "download" + "watch" dono ho
+    for a in soup.find_all("a", href=True):
+        label = a.get_text(" ", strip=True).lower()
+        href = a["href"].strip()
+        if "download" in label and "watch" in label and href and href != "#":
+            log(f"✅ Strategy1 (a[href] text-match) se mila: {href[:100]}")
+            return href
+
+    # 2) href value khud "/episode/" contain karta ho (is site ka episode-list
+    #    URL pattern, jaisa user ne screenshot mein dikhaya)
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if "/episode/" in href.lower():
+            log(f"✅ Strategy2 (href mein /episode/) se mila: {href[:100]}")
+            return href
+
+    # 3) onclick="location.href='...'" / window.location / window.open jaisa
+    #    JS redirect — <button> ya <a href="#"> pe common hota hai
+    for tag in soup.find_all(onclick=True):
+        m = re.search(
+            r'''(?:location\.href|window\.location(?:\.href)?|window\.open)\s*=?\s*\(?['"]([^'"]+)['"]''',
+            tag["onclick"],
+        )
+        if m:
+            log(f"✅ Strategy3 (onclick JS redirect) se mila: {m.group(1)[:100]}")
+            return m.group(1)
+
+    # 4) data-href / data-url / data-link attribute
+    for attr in ("data-href", "data-url", "data-link"):
+        tag = soup.find(attrs={attr: True})
+        if tag:
+            val = (tag.get(attr) or "").strip()
+            if val and val != "#":
+                log(f"✅ Strategy4 (attribute {attr}) se mila: {val[:100]}")
+                return val
+
+    # 5) raw-HTML regex — koi bhi href jisme "/episode/" ho (nested tags ki
+    #    wajah se BS4 se text-match miss ho jaaye to bhi yeh pakad lega)
+    m = re.search(r'''href=["\']([^"\']*?/episode/[^"\']*)["\']''', raw_html, re.IGNORECASE)
+    if m:
+        log(f"✅ Strategy5 (raw-HTML /episode/ regex) se mila: {m.group(1)[:100]}")
+        return m.group(1)
+
+    # 6) raw-HTML regex — "Download / Watch" text ke turant pehle wala href
+    m = re.search(
+        r'href=["\'](https?://[^"\']+)["\'][^>]*>\s*(?:<[^>]+>\s*)*Download\s*/\s*Watch',
+        raw_html, re.IGNORECASE,
+    )
+    if m:
+        log(f"✅ Strategy6 (raw-HTML Download/Watch regex) se mila: {m.group(1)[:100]}")
+        return m.group(1)
+
+    log("❌ 6 strategies try ki, kisi se bhi 'Download / Watch' ka target URL nahi mila")
+    return None
+
+
+# ─────────────────────────────────────────────
 #  Step 1: series page -> title / languages / episode-list page url
 # ─────────────────────────────────────────────
 def discover_adh_series(series_url: str) -> dict:
     """
-    Returns: {"title": str, "languages": [str,...], "episode_list_url": str|None}
+    Returns: {"title": str, "languages": [str,...], "episode_list_url": str|None, "debug": list}
     """
-    r = _http_get(series_url)
+    debug = []
+    r = _http_get(series_url, debug=debug)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -189,23 +257,11 @@ def discover_adh_series(series_url: str) -> dict:
         languages = ["Hindi", "English"]
 
     # ── "Download / Watch" button -> episode-list page ──
-    episode_list_url = None
-    for a in soup.find_all("a", href=True):
-        label = a.get_text(" ", strip=True).lower()
-        if "download" in label and "watch" in label:
-            episode_list_url = a["href"]
-            break
-    if not episode_list_url:
-        # Fallback: raw-HTML regex (agar text kisi nested tag ke andar hai
-        # jisse get_text() ka simple join match nahi kar paaya)
-        m2 = re.search(
-            r'href=["\'](https?://[^"\']+)["\'][^>]*>\s*(?:<[^>]+>\s*)*Download\s*/\s*Watch',
-            r.text, re.IGNORECASE,
-        )
-        if m2:
-            episode_list_url = m2.group(1)
+    episode_list_url = _find_adh_episode_list_url(soup, r.text, debug)
+    if episode_list_url:
+        episode_list_url = urljoin(series_url, episode_list_url)
 
-    return {"title": title, "languages": languages, "episode_list_url": episode_list_url}
+    return {"title": title, "languages": languages, "episode_list_url": episode_list_url, "debug": debug}
 
 
 # ─────────────────────────────────────────────
@@ -715,7 +771,11 @@ async def adh_command(client: Client, message: Message):
         return
 
     if not series_data.get("episode_list_url"):
-        await status_msg.edit("❌ Is page pe 'Download / Watch' button ka link nahi mila.")
+        debug_text = "\n".join(series_data.get("debug", [])[-10:]) or "(koi debug info nahi mili)"
+        await status_msg.edit(
+            "❌ Is page pe 'Download / Watch' button ka link nahi mila.\n\n"
+            f"**Debug (last steps):**\n```\n{debug_text}\n```"
+        )
         return
 
     try:
