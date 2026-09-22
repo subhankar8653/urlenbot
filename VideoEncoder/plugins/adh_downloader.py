@@ -83,8 +83,51 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
 }
+
+# Session reuse karte hain — connection-keepalive + agar site pehli hit pe
+# Cloudflare "cookie/JS check" jaisa kuch set karti hai (bina full challenge
+# ke, sirf ek set-cookie) to woh dusri attempt mein kaam aa jaaye.
+_SESSION = requests.Session()
+_SESSION.headers.update(HEADERS)
+
+# animedubhindi.link jaisi shared-hosting/Cloudflare site kabhi-kabhi pehli
+# request pe 20s se zyada le leti hai (cold start / anti-bot delay) —
+# isliye lamba timeout + retry-with-backoff, taaki genuine slow response
+# aur "site hi down hai" mein farak pata chale.
+def _http_get(url: str, timeout: int = 35, retries: int = 2, debug: list | None = None, **kwargs):
+    def log(msg):
+        if debug is not None:
+            debug.append(msg)
+        LOGGER.info(f"[Adh] {msg}")
+
+    last_exc = None
+    for attempt in range(1, retries + 2):  # total attempts = retries + 1
+        try:
+            r = _SESSION.get(url, timeout=timeout, **kwargs)
+            return r
+        except requests.exceptions.ReadTimeout as e:
+            last_exc = e
+            log(f"⚠️ Attempt {attempt}: read timed out ({timeout}s) on {url[:80]}")
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            log(f"⚠️ Attempt {attempt}: {str(e).splitlines()[0][:120]}")
+        if attempt < retries + 1:
+            time.sleep(2 * attempt)
+    raise last_exc
 
 # Sirf yehi 3 qualities dikhani hain (4 available hain page pe, HQ skip)
 ADH_QUALITIES = ["480p x264", "720p x264", "1080p x265 10bit"]
@@ -128,7 +171,7 @@ def discover_adh_series(series_url: str) -> dict:
     """
     Returns: {"title": str, "languages": [str,...], "episode_list_url": str|None}
     """
-    r = requests.get(series_url, headers=HEADERS, timeout=20)
+    r = _http_get(series_url)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -172,7 +215,7 @@ def discover_adh_episodes(episode_list_url: str) -> list:
     """
     Returns: [{"num": int, "qualities": {q: gdf_href}}, ...]
     """
-    r = requests.get(episode_list_url, headers=HEADERS, timeout=20)
+    r = _http_get(episode_list_url)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -217,9 +260,9 @@ def _resolve_adh_download_link(gdf_url: str, debug: list) -> str | None:
         LOGGER.info(f"[Adh] {msg}")
 
     try:
-        r = requests.get(gdf_url, headers=HEADERS, timeout=25, allow_redirects=True)
+        r = _http_get(gdf_url, timeout=30, debug=debug, allow_redirects=True)
     except Exception as e:
-        log(f"❌ GDF page fetch fail: {str(e).splitlines()[0][:120]}")
+        log(f"❌ GDF page fetch fail (after retries): {str(e).splitlines()[0][:120]}")
         return None
 
     instant_href = None
@@ -245,9 +288,9 @@ def _resolve_adh_download_link(gdf_url: str, debug: list) -> str | None:
     log(f"✅ INSTANT DL link mila: {instant_href[:100]}")
 
     try:
-        r2 = requests.get(instant_href, headers=HEADERS, timeout=25, allow_redirects=True)
+        r2 = _http_get(instant_href, timeout=30, debug=debug, allow_redirects=True)
     except Exception as e:
-        log(f"❌ Instant-DL wait-page fetch fail: {str(e).splitlines()[0][:120]}")
+        log(f"❌ Instant-DL wait-page fetch fail (after retries): {str(e).splitlines()[0][:120]}")
         return None
 
     text2 = r2.text
@@ -664,7 +707,11 @@ async def adh_command(client: Client, message: Message):
         series_data = await loop.run_in_executor(None, discover_adh_series, series_url)
     except Exception as e:
         LOGGER.error(f"[Adh] discover_adh_series error: {e}")
-        await status_msg.edit(f"❌ Series page load nahi hua: `{str(e)[:100]}`")
+        await status_msg.edit(
+            f"❌ Series page load nahi hua (3 attempts ke baad bhi): `{str(e)[:100]}`\n\n"
+            f"Site slow ho sakti hai ya bot traffic block kar rahi ho — thodi der baad "
+            f"dubara try karo."
+        )
         return
 
     if not series_data.get("episode_list_url"):
@@ -680,7 +727,11 @@ async def adh_command(client: Client, message: Message):
         episodes = await loop.run_in_executor(None, discover_adh_episodes, series_data["episode_list_url"])
     except Exception as e:
         LOGGER.error(f"[Adh] discover_adh_episodes error: {e}")
-        await status_msg.edit(f"❌ Episode list load nahi hua: `{str(e)[:100]}`")
+        await status_msg.edit(
+            f"❌ Episode list load nahi hua (3 attempts ke baad bhi): `{str(e)[:100]}`\n\n"
+            f"Site slow ho sakti hai ya bot traffic block kar rahi ho — thodi der baad "
+            f"dubara try karo."
+        )
         return
 
     if not episodes:
