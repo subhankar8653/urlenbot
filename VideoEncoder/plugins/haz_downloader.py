@@ -63,7 +63,7 @@ from pyrogram.types import (
 from .. import LOGGER, download_dir
 from ..utils.helper import check_chat
 from ..utils.url_processor import get_audio_streams
-from .rti_downloader import SELENIUM_OK, _make_selenium_driver, _kill_driver_tree, _kb
+from .rti_downloader import SELENIUM_OK, _kill_driver_tree, _kb
 from .mega_download import is_mega_link, download_mega
 from .url_upload import (
     get_subtitle_streams,
@@ -74,6 +74,7 @@ from .url_upload import (
 )
 
 try:
+    from selenium import webdriver
     from selenium.webdriver.common.by import By
 except ImportError:
     pass
@@ -102,6 +103,52 @@ PER_PAGE = 10
 
 HAZ_SESSIONS = {}
 HAZ_SESSION_TIMEOUT = 3600
+
+
+def _make_haz_driver():
+    """
+    _make_selenium_driver() jaisa hi (eager load, images off, disposable
+    profile), plus Cloudflare Turnstile ke liye thoda "stealth": headless
+    Chrome ko navigator.webdriver flag aur "automation" switches se pehchana
+    jaata hai, jisse Turnstile apne-aap verify hone ke bajaye interactive/
+    stuck challenge dikha sakta hai (E01 ka "MEGA text wale 0 element mile"
+    — gate kabhi pass hi nahi hua — isi wajah se ho sakta hai).
+    """
+    profile_dir = os.path.join(download_dir, "_chrome_tmp", f"haz_{uuid.uuid4().hex}")
+    os.makedirs(profile_dir, exist_ok=True)
+
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument(f"user-agent={HEADERS['User-Agent']}")
+    options.add_argument(f"--user-data-dir={profile_dir}")
+    options.add_argument("--disable-crash-reporter")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    options.add_experimental_option("prefs", {
+        "profile.managed_default_content_settings.images": 2
+    })
+    options.page_load_strategy = "eager"
+
+    driver = webdriver.Chrome(options=options)
+    driver.set_page_load_timeout(40)
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": (
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                "Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});"
+                "Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});"
+                "window.chrome = window.chrome || { runtime: {} };"
+            )
+        })
+    except Exception as e:
+        LOGGER.warning(f"[Haz] stealth CDP script inject fail (chalega phir bhi): {e}")
+    driver._suhani_profile_dir = profile_dir
+    return driver
 
 
 def _prune_haz_sessions():
@@ -192,38 +239,51 @@ def _solve_haz_gate_and_get_mega(driver, download_url: str, debug: list) -> str 
         is_gate = False
 
     if is_gate:
-        log("🤖 'Verify You're Human' gate mila, pass karne ki koshish...")
-        clicked = False
-        for sel in ("input[type=checkbox]", "[class*=checkbox]", "[class*=captcha]", "[class*=verify]"):
+        log("🤖 Cloudflare 'Verify You're Human' (Turnstile) gate mila.")
+        # Turnstile khud hi (headless-detection na ho to) 2-8s mein "Verifying..."
+        # se auto-pass ho jaata hai — checkbox/Continue ko force-click karna
+        # ULTA nuksaan karta hai (widget reset/challenge-again ho sakta hai).
+        # Isliye seedha uska hidden response-token aane ka wait karo.
+        verified = False
+        for _ in range(50):  # ~25s
+            time.sleep(0.5)
             try:
-                for el in driver.find_elements(By.CSS_SELECTOR, sel):
-                    if el.is_displayed():
-                        el.click()
+                resp = driver.execute_script(
+                    "var el = document.querySelector("
+                    "'input[name^=\"cf-turnstile-response\"], "
+                    "input[name=\"cf-turnstile-response\"]');"
+                    "return el ? el.value : '';"
+                )
+            except Exception:
+                resp = ""
+            if resp:
+                verified = True
+                log("✅ Turnstile response-token mil gaya (auto-verified)")
+                break
+        if not verified:
+            log("⚠️ 25s mein Turnstile token nahi mila — headless Chrome ki wajah se "
+                "interactive challenge aaya ho sakta hai jo yahan solve nahi ho sakta. "
+                "Phir bhi Continue try kar rahe hain.")
+
+        # Continue button ab tak enabled ho chuka hoga (token mil chuka hai)
+        for _ in range(10):
+            clicked = False
+            try:
+                for b in driver.find_elements(By.XPATH, '//*[contains(text(), "Continue")]'):
+                    if b.is_displayed() and b.is_enabled():
+                        b.click()
                         clicked = True
-                        log(f"✅ Checkbox click kiya ({sel})")
+                        log("✅ 'Continue' button click kiya")
                         break
             except Exception:
                 pass
             if clicked:
                 break
-
-        for word in ("I'm not a robot", "I am not a robot", "Not a robot", "Continue", "Verify"):
-            try:
-                for el in driver.find_elements(By.XPATH, f'//*[contains(text(), "{word}")]'):
-                    if el.is_displayed():
-                        el.click()
-                        clicked = True
-                        log(f"✅ '{word}' button/label click kiya")
-                        time.sleep(0.5)
-            except Exception:
-                pass
-
-        if not clicked:
-            log("⚠️ Koi checkbox/button click nahi hua — shayad JS auto-pass kare")
+            time.sleep(0.5)
 
         gone = False
-        for _ in range(50):
-            time.sleep(0.3)
+        for _ in range(40):
+            time.sleep(0.5)
             try:
                 pt = driver.page_source.lower()
             except Exception:
@@ -231,8 +291,10 @@ def _solve_haz_gate_and_get_mega(driver, download_url: str, debug: list) -> str 
             if "not a robot" not in pt and "verify you" not in pt:
                 gone = True
                 break
-        log("✅ Verification gate pass ho gaya (~15s ke andar)" if gone else
-            "⚠️ 15s baad bhi gate wahi hai — aage bhi try kar rahe hain")
+        log("✅ Verification gate pass ho gaya" if gone else
+            "❌ 20s baad bhi gate wahi hai — pass nahi ho paaya")
+        if not gone:
+            return None
     else:
         log("➡️ Verification gate nahi aaya (shayad pehle se verified session hai)")
 
@@ -549,7 +611,7 @@ async def _download_haz_items(client, status_msg, orig_message, sess: "HazSelect
         await status_msg.edit("❌ Selenium install nahi hai!")
         return
 
-    driver = _make_selenium_driver()
+    driver = _make_haz_driver()
     all_ok = True
     try:
         for i, idx in enumerate(idxs, 1):
