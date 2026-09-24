@@ -21,8 +21,9 @@ Flow (jaisa Subhankar ne screenshots + text mein bataya):
      provider se token leta hai, form submit karta hai, aur gate-pass ki
      cookies ~55 min cache karta hai (ek token se poori series). Phir server-list
      page (GDFlix / MEGA / Gdshare / FilePress) se sirf MEGA link nikalta hai.
-     Env vars: PEAKFO_KEY + CAPTCHA_PROXY (Peak.fo, default agar key ho),
-     ya NOPECHA_KEY/NOPECHA_PROXY, ya AZAPI_KEY; CAPTCHA_PROVIDER=peakfo|nopecha|azapi.
+     Default provider: Bright Data Web Unlocker (BRIGHTDATA_API_KEY + BRIGHTDATA_ZONE)
+     agar key set ho, warna NopeCHA (NOPECHA_KEY + CAPTCHA_PROXY/NOPECHA_PROXY).
+     CAPTCHA_PROVIDER=brightdata|nopecha|peakfo|azapi se force kar sakte ho.
   6. MEGA link ko mega_download.py ke existing download_mega() se download
      karte hain.
   7. url_upload.py ke existing audio/subtitle-filter helpers reuse karte
@@ -377,6 +378,57 @@ def _nopecha_status() -> str:
 
 
 # ─────────────────────────────────────────────
+#  Bright Data Web Unlocker API
+#  Docs: https://docs.brightdata.com/products/web-unlocker/introduction
+#  NOTE: NopeCHA ki tarah token nahi milta — Web Unlocker khud captcha solve
+#  karke page ka unblocked HTML wapas deta hai. Isliye yahan requests.Session
+#  ki jagah ek chhota wrapper (_BDSession) hai jiska .get() har page Bright
+#  Data ke through laata hai; baaki MEGA-link nikaalne ka code same rehta hai.
+#  Env:
+#    BRIGHTDATA_API_KEY   (dashboard -> API key; header: Authorization: Bearer <key>)
+#    BRIGHTDATA_ZONE      (Web Unlocker zone ka naam; zone mein CAPTCHA Solver ON rakhna)
+# ─────────────────────────────────────────────
+BD_API_URL = "https://api.brightdata.com/request"
+
+
+def _bd_cfg() -> dict:
+    return {
+        "key": (os.getenv("BRIGHTDATA_API_KEY") or "").strip(),
+        "zone": (os.getenv("BRIGHTDATA_ZONE") or "").strip(),
+    }
+
+
+class _BDResponse:
+    def __init__(self, text: str, url: str, status_code: int):
+        self.text = text
+        self.url = url
+        self.status_code = status_code
+
+
+class _BDSession:
+    """requests.Session jaisa minimal interface — sirf wahi jo _fetch_mega_link_with_api use karta hai."""
+
+    def __init__(self, log):
+        self.log = log
+        self.headers = {}
+        self.proxies = {}
+        self.cookies = requests.cookies.RequestsCookieJar()
+
+    def get(self, url, timeout=120, allow_redirects=True, **kwargs):
+        cfg = _bd_cfg()
+        if not cfg["key"] or not cfg["zone"]:
+            raise RuntimeError("BRIGHTDATA_API_KEY / BRIGHTDATA_ZONE set nahi hai")
+        body = {"zone": cfg["zone"], "url": url, "format": "raw"}
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {cfg['key']}"}
+        r = requests.post(BD_API_URL, json=body, headers=headers, timeout=max(timeout, 120))
+        if r.status_code != 200:
+            err = r.headers.get("x-brd-err-msg") or r.headers.get("x-brd-error") or ""
+            self.log(f"❌ Bright Data HTTP {r.status_code} {err[:120]} | {r.text[:120]!r}")
+            raise RuntimeError(f"Bright Data HTTP {r.status_code}")
+        return _BDResponse(r.text, url, r.status_code)
+
+
+# ─────────────────────────────────────────────
 #  Peak.fo Turnstile solver (official SDK: pip install peakfo)
 #  Env: PEAKFO_KEY (pk_...), CAPTCHA_PROXY (ya purana NOPECHA_PROXY) —
 #  Turnstile ke liye proxy chahiye aur bot ki requests bhi usi proxy se jaati hain.
@@ -387,9 +439,10 @@ def _proxy_url() -> str:
 
 def _provider() -> str:
     p = (os.getenv("CAPTCHA_PROVIDER") or "").strip().lower()
-    if p in ("peakfo", "nopecha", "azapi"):
+    if p in ("brightdata", "peakfo", "nopecha", "azapi"):
         return p
-    return "peakfo" if (os.getenv("PEAKFO_KEY") or "").strip() else "nopecha"
+    # default: Bright Data (agar key set hai), warna NopeCHA
+    return "brightdata" if (os.getenv("BRIGHTDATA_API_KEY") or "").strip() else "nopecha"
 
 
 def _peak_client():
@@ -470,6 +523,11 @@ def _peak_status() -> str:
 
 def _solve_turnstile(page_url: str, sitekey: str, log, winfo: dict | None = None) -> str | None:
     provider = _provider()
+    if provider == "brightdata":
+        log("❌ Bright Data token nahi deta (Web Unlocker page khud unblock karta hai) — "
+            "phir bhi gate aa raha hai. Zone mein CAPTCHA Solver ON hai? Nahi to "
+            "CAPTCHA_PROVIDER=nopecha se try karo.")
+        return None
     if provider == "azapi":
         return _azapi_solve_turnstile(page_url, sitekey, log)
     if provider == "peakfo":
@@ -579,18 +637,19 @@ def _fetch_mega_link_with_api(download_url: str, debug: list) -> str | None:
         debug.append(msg)
         LOGGER.info(f"[Haz] {msg}")
 
-    sess = requests.Session()
+    provider = _provider()
+    sess = _BDSession(log) if provider == "brightdata" else requests.Session()
     sess.headers.update(HEADERS)
     sess.headers["Referer"] = "https://hindianimeszone.com/"
 
     # Provider proxy use karta hai to token usi IP se valid hota hai — isliye
-    # saari requests bhi usi proxy se bhejte hain.
-    proxy_url = _proxy_url() if _provider() != "azapi" else ""
+    # saari requests bhi usi proxy se bhejte hain. (Bright Data / AZAPI mein nahi)
+    proxy_url = _proxy_url() if provider not in ("azapi", "brightdata") else ""
     if proxy_url:
         sess.proxies = {"http": proxy_url, "https": proxy_url}
 
     # Pichhle gate-pass ki cookies (55 min tak valid) reuse karo
-    if GATE_CACHE["jar"] is not None and (time.time() - GATE_CACHE["saved_at"]) < GATE_CACHE_TTL:
+    if provider != "brightdata" and GATE_CACHE["jar"] is not None and (time.time() - GATE_CACHE["saved_at"]) < GATE_CACHE_TTL:
         sess.cookies.update(GATE_CACHE["jar"])
         log("♻️ Cached gate cookies use kar raha hoon (naya token nahi lagega)")
 
@@ -921,6 +980,9 @@ async def _process_haz_item(client, message, ep: dict, status_msg, index: int, t
 async def _download_haz_items(client, status_msg, orig_message, sess: "HazSelector", idxs: list):
     total = len(idxs)
     provider = _provider()
+    if provider == "brightdata" and not (_bd_cfg()["key"] and _bd_cfg()["zone"]):
+        await status_msg.edit("❌ **BRIGHTDATA_API_KEY / BRIGHTDATA_ZONE set nahi hai.** (CAPTCHA_PROVIDER=brightdata)")
+        return
     if provider == "azapi" and not _azapi_cfg()["key"]:
         await status_msg.edit("❌ **AZAPI_KEY set nahi hai.** (CAPTCHA_PROVIDER=azapi)")
         return
@@ -1145,13 +1207,17 @@ async def hazapi_command(client: Client, message: Message):
         status = await loop.run_in_executor(None, _peak_status)
     elif provider == "nopecha":
         status = await loop.run_in_executor(None, _nopecha_status)
+    elif provider == "brightdata":
+        status = "key+zone set ✅ (credits dashboard pe dekho)" if (_bd_cfg()["key"] and _bd_cfg()["zone"]) else "❌ key/zone set nahi"
     else:
         status = "azapi (status check nahi)"
     cache_left = max(0, int(GATE_CACHE_TTL - (time.time() - GATE_CACHE["saved_at"]))) if GATE_CACHE["jar"] is not None else 0
     await message.reply(
         "**🔐 Captcha config**\n\n"
         f"• Provider: `{provider}`\n"
-        f"• PEAKFO_KEY: `{_mask((os.getenv('PEAKFO_KEY') or '').strip())}`\n"
+        f"• BRIGHTDATA_API_KEY: `{_mask(_bd_cfg()['key'])}`\n"
+        f"• BRIGHTDATA_ZONE: `{_bd_cfg()['zone'] or '❌ NOT SET'}`\n"
+        f"• NOPECHA_KEY: `{_mask((os.getenv('NOPECHA_KEY') or '').strip())}`\n"
         f"• Proxy host: `{proxy_host}`\n"
         f"• Gate cookie cache: `{cache_left // 60} min left`\n\n"
         f"**{provider} status:** `{status}`"
@@ -1175,6 +1241,20 @@ def _run_solve_test(target: str | None) -> list:
         LOGGER.info(f"[HazTest] {m}")
 
     log(f"provider={_provider()} proxy={'yes' if _proxy_url() else 'no'}")
+    if _provider() == "brightdata":
+        if not target:
+            log("ℹ️ Bright Data mein token API nahi hai — /hazsolvetest <download link> do")
+            return out
+        t0 = time.time()
+        try:
+            r = _BDSession(log).get(target)
+        except Exception as e:
+            log(f"❌ Bright Data fetch fail: {str(e).splitlines()[0][:120]}")
+            return out
+        has_mega = bool(re.search(r"mega\.nz/(?:file|folder)/", r.text))
+        log(f"HTTP {r.status_code}, gate={'yes' if _is_gate(r.text) else 'no'}, "
+            f"mega link={'yes' if has_mega else 'no'} ({time.time() - t0:.0f}s)")
+        return out
     winfo = {}
     if target:
         sess = requests.Session()
