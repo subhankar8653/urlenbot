@@ -3,7 +3,7 @@ haz_downloader.py  v4 (AZAPI captcha API)
 ========================
 Command:
   /Haz <series_page_url>   (hindianimeszone.com ka ek anime/series post)
-  /hazapi                  (AZAPI config status check — sudo only)
+  /hazapi                  (captcha provider config + credits status — sudo only)
 
 Flow (jaisa Subhankar ne screenshots + text mein bataya):
   1. Series page (static HTML, requests+BS4 se seedha scrape) se title,
@@ -16,13 +16,13 @@ Flow (jaisa Subhankar ne screenshots + text mein bataya):
   4. Phir episode list (RTI/Toono jaisa hi multi-select button menu).
   5. Chosen quality ka link (002.hindianimeszone.com/download1.php?...)
      kholne pe kabhi-kabhi Cloudflare Turnstile ka "Verify You're Human"
-     gate aata hai. Ab cookies ki jagah AZAPI.ai (https://app.azapi.ai) ka
-     captcha-solver API use hota hai: bot gate page se sitekey nikaalta hai,
-     AZAPI se token leta hai, token ko gate form mein submit karta hai, phir
-     asli server-list page (GDFlix / MEGA / Gdshare / FilePress) se sirf
-     MEGA wala link nikalta hai. Manual cookie (/hazcookie) ab NAHI chahiye.
-     Env vars: AZAPI_KEY (zaroori), AZAPI_BASE_URL, AZAPI_CAPTCHA_PATH,
-     AZAPI_PAYLOAD (optional — neeche AZAPI section dekho).
+     gate aata hai. Cookies ki jagah ab captcha-provider API use hota hai
+     (default NopeCHA, optional AZAPI): bot gate page se sitekey nikaalta hai,
+     provider se token leta hai, form submit karta hai, aur gate-pass ki
+     cookies ~55 min cache karta hai (ek token se poori series). Phir server-list
+     page (GDFlix / MEGA / Gdshare / FilePress) se sirf MEGA link nikalta hai.
+     Env vars: NOPECHA_KEY (optional), NOPECHA_PROXY (Turnstile ke liye
+     required), CAPTCHA_PROVIDER (nopecha|azapi), AZAPI_KEY (sirf azapi ke liye).
   6. MEGA link ko mega_download.py ke existing download_mega() se download
      karte hain.
   7. url_upload.py ke existing audio/subtitle-filter helpers reuse karte
@@ -50,7 +50,7 @@ import os
 import re
 import time
 import uuid
-from urllib.parse import unquote_plus, urljoin
+from urllib.parse import unquote_plus, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -257,6 +257,138 @@ def discover_haz_items(series_url: str) -> dict:
 #  Poori tarah Selenium/JS-driven, is sandbox mein live test nahi ho paaya
 #  (network band hai) — isliye har step LOGGER.info/warning karta hai.
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+#  NopeCHA Turnstile token API (default provider)
+#  Docs: https://nopecha.com/api-reference  (Token → Turnstile)
+#  Env:
+#    NOPECHA_KEY    (optional — khali ho to IP-based free quota use hota hai)
+#    NOPECHA_PROXY  (Turnstile ke liye docs mein REQUIRED: http://user:pass@host:port)
+#                   Token usi IP se use hona chahiye, isliye bot ki saari requests
+#                   bhi isi proxy se jaati hain.
+#    CAPTCHA_PROVIDER = nopecha (default) | azapi
+# ─────────────────────────────────────────────
+NOPECHA_BASE = "https://api.nopecha.com"
+
+
+def _nopecha_cfg() -> dict:
+    return {
+        "key": (os.getenv("NOPECHA_KEY") or "").strip(),
+        "proxy": (os.getenv("NOPECHA_PROXY") or "").strip(),
+    }
+
+
+def _nopecha_headers(key: str) -> dict:
+    h = {"Content-Type": "application/json"}
+    if key:
+        h["Authorization"] = f"Basic {key}"
+    return h
+
+
+def _proxy_dict(proxy_url: str):
+    """'http://user:pass@host:port' -> NopeCHA ka proxy object."""
+    if not proxy_url:
+        return None
+    u = urlparse(proxy_url if "://" in proxy_url else "http://" + proxy_url)
+    if not u.hostname or not u.port:
+        return None
+    d = {"scheme": u.scheme or "http", "host": u.hostname, "port": u.port}
+    if u.username:
+        d["username"] = unquote_plus(u.username)
+    if u.password:
+        d["password"] = unquote_plus(u.password)
+    return d
+
+
+def _nopecha_err(r) -> str:
+    try:
+        j = r.json()
+        return f"HTTP {r.status_code} code={j.get('code')} msg={j.get('message')} type={j.get('type')}"
+    except Exception:
+        return f"HTTP {r.status_code} {r.text[:120]!r}"
+
+
+def _nopecha_solve_turnstile(page_url: str, sitekey: str, log) -> str | None:
+    cfg = _nopecha_cfg()
+    body = {"sitekey": sitekey, "url": page_url}
+    proxy = _proxy_dict(cfg["proxy"])
+    if proxy:
+        body["proxy"] = proxy
+    else:
+        log("⚠️ NOPECHA_PROXY set nahi — docs ke hisaab se Turnstile ke liye proxy required hai, "
+            "bina proxy ke try kar raha hoon")
+    body["useragent"] = HEADERS["User-Agent"]
+    headers = _nopecha_headers(cfg["key"])
+
+    try:
+        r = requests.post(f"{NOPECHA_BASE}/v1/token/turnstile", json=body, headers=headers, timeout=30)
+    except Exception as e:
+        log(f"❌ NopeCHA submit fail: {str(e).splitlines()[0][:120]}")
+        return None
+    if r.status_code != 200:
+        log(f"❌ NopeCHA submit: {_nopecha_err(r)}")
+        return None
+    try:
+        job_id = r.json().get("data")
+    except Exception:
+        job_id = None
+    if not job_id:
+        log(f"❌ NopeCHA ne job id nahi diya: {r.text[:120]!r}")
+        return None
+    log(f"⏳ NopeCHA job submit ho gaya, token ka wait...")
+
+    deadline = time.time() + 100
+    while time.time() < deadline:
+        time.sleep(1.5)
+        try:
+            g = requests.get(f"{NOPECHA_BASE}/v1/token/turnstile", params={"id": job_id},
+                             headers=headers, timeout=30)
+        except Exception as e:
+            log(f"⚠️ NopeCHA poll error: {str(e).splitlines()[0][:80]}")
+            continue
+        if g.status_code == 409:      # incomplete job — dubara try
+            continue
+        if g.status_code != 200:
+            log(f"❌ NopeCHA result: {_nopecha_err(g)}")
+            return None
+        try:
+            token = g.json().get("data")
+        except Exception:
+            token = None
+        if isinstance(token, str) and len(token) > 20:
+            log(f"✅ NopeCHA se Turnstile token mila ({len(token)} chars)")
+            return token
+        log(f"❌ NopeCHA result mein token nahi: {g.text[:120]!r}")
+        return None
+    log("❌ NopeCHA timeout (100s) — token nahi aaya")
+    return None
+
+
+def _nopecha_status() -> str:
+    cfg = _nopecha_cfg()
+    try:
+        r = requests.get(f"{NOPECHA_BASE}/v1/status", headers=_nopecha_headers(cfg["key"]), timeout=15)
+        j = r.json()
+        if r.status_code != 200:
+            return _nopecha_err(r)
+        return (f"plan={j.get('plan')} status={j.get('status')} "
+                f"credit={j.get('credit')}/{j.get('quota')} reset≈{int(j.get('ttl', 0)) // 60}min")
+    except Exception as e:
+        return f"error: {str(e).splitlines()[0][:100]}"
+
+
+def _solve_turnstile(page_url: str, sitekey: str, log) -> str | None:
+    provider = (os.getenv("CAPTCHA_PROVIDER") or "nopecha").strip().lower()
+    if provider == "azapi":
+        return _azapi_solve_turnstile(page_url, sitekey, log)
+    return _nopecha_solve_turnstile(page_url, sitekey, log)
+
+
+# Gate ek baar pass ho jaye to site ~1 ghante tak dubara verify nahi maangti —
+# isliye cookies cache karte hain (55 min) taaki ek token se poori series nikle.
+GATE_CACHE = {"jar": None, "saved_at": 0.0}
+GATE_CACHE_TTL = 55 * 60
+
+
 def _is_gate(text: str) -> bool:
     low = text.lower()
     return ("not a robot" in low or "verify you" in low
@@ -337,6 +469,17 @@ def _fetch_mega_link_with_api(download_url: str, debug: list) -> str | None:
     sess.headers.update(HEADERS)
     sess.headers["Referer"] = "https://hindianimeszone.com/"
 
+    # Provider proxy use karta hai to token usi IP se valid hota hai — isliye
+    # saari requests bhi usi proxy se bhejte hain.
+    proxy_url = _nopecha_cfg()["proxy"] if (os.getenv("CAPTCHA_PROVIDER") or "nopecha").lower() != "azapi" else ""
+    if proxy_url:
+        sess.proxies = {"http": proxy_url, "https": proxy_url}
+
+    # Pichhle gate-pass ki cookies (55 min tak valid) reuse karo
+    if GATE_CACHE["jar"] is not None and (time.time() - GATE_CACHE["saved_at"]) < GATE_CACHE_TTL:
+        sess.cookies.update(GATE_CACHE["jar"])
+        log("♻️ Cached gate cookies use kar raha hoon (naya token nahi lagega)")
+
     try:
         r = sess.get(download_url, timeout=25, allow_redirects=True)
     except Exception as e:
@@ -344,7 +487,8 @@ def _fetch_mega_link_with_api(download_url: str, debug: list) -> str | None:
         return None
 
     if _is_gate(r.text):
-        log("🔒 Verify gate mila — AZAPI se solve kar raha hoon...")
+        GATE_CACHE["jar"] = None      # purani cookies expire — naya solve chahiye
+        log("🔒 Verify gate mila — captcha provider se solve kar raha hoon...")
         sitekey = _extract_sitekey(r.text)
         if not sitekey:
             log("❌ Gate page pe Turnstile sitekey nahi mili")
@@ -352,7 +496,7 @@ def _fetch_mega_link_with_api(download_url: str, debug: list) -> str | None:
             return None
         log(f"🔑 sitekey: {sitekey[:14]}…")
 
-        token = _azapi_solve_turnstile(r.url, sitekey, log)
+        token = _solve_turnstile(r.url, sitekey, log)
         if not token:
             return None
 
@@ -373,6 +517,8 @@ def _fetch_mega_link_with_api(download_url: str, debug: list) -> str | None:
                 return None
             r = r3
         log(f"✅ Gate pass ho gaya (HTTP {r.status_code})")
+        GATE_CACHE["jar"] = sess.cookies.copy()
+        GATE_CACHE["saved_at"] = time.time()
     else:
         log(f"✅ Gate nahi aaya, seedha server-list page mila (HTTP {r.status_code})")
 
@@ -657,12 +803,9 @@ async def _process_haz_item(client, message, ep: dict, status_msg, index: int, t
 
 async def _download_haz_items(client, status_msg, orig_message, sess: "HazSelector", idxs: list):
     total = len(idxs)
-    if not _azapi_cfg()["key"]:
-        await status_msg.edit(
-            "❌ **AZAPI_KEY set nahi hai.**\n\n"
-            "https://app.azapi.ai → **API Key** → **View Key** se key copy karo aur "
-            "`config.env` / hosting ke config vars mein `AZAPI_KEY=...` daal ke bot restart karo."
-        )
+    provider = (os.getenv("CAPTCHA_PROVIDER") or "nopecha").strip().lower()
+    if provider == "azapi" and not _azapi_cfg()["key"]:
+        await status_msg.edit("❌ **AZAPI_KEY set nahi hai.** (CAPTCHA_PROVIDER=azapi)")
         return
 
     all_ok = True
@@ -867,22 +1010,29 @@ async def haz_command(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────
-#  /hazapi — AZAPI config status (sudo only, key kabhi show nahi hoti)
+#  /hazapi — captcha provider config + credits status (sudo only)
 # ─────────────────────────────────────────────
+def _mask(v: str) -> str:
+    return (v[:4] + "…" + v[-3:]) if len(v) > 10 else ("set" if v else "❌ NOT SET")
+
+
 @Client.on_message(filters.command("hazapi"))
 async def hazapi_command(client: Client, message: Message):
     c = await check_chat(message, chat="Sudo")
     if not c:
         return
-    cfg = _azapi_cfg()
-    key = cfg["key"]
-    masked = (key[:5] + "…" + key[-4:]) if len(key) > 12 else ("set" if key else "❌ NOT SET")
+    provider = (os.getenv("CAPTCHA_PROVIDER") or "nopecha").strip().lower()
+    n = _nopecha_cfg()
+    a = _azapi_cfg()
+    proxy_host = (_proxy_dict(n["proxy"]) or {}).get("host", "❌ NOT SET")
+    status = await asyncio.get_event_loop().run_in_executor(None, _nopecha_status)
+    cache_left = max(0, int(GATE_CACHE_TTL - (time.time() - GATE_CACHE["saved_at"]))) if GATE_CACHE["jar"] is not None else 0
     await message.reply(
-        "**🔐 AZAPI captcha config**\n\n"
-        f"• AZAPI_KEY: `{masked}`\n"
-        f"• Endpoint: `{cfg['base']}{cfg['path']}`\n"
-        f"• Payload: `{cfg['payload'][:120]}`\n\n"
-        "Key: https://app.azapi.ai → API Key → View Key\n"
-        "Endpoint/payload AZAPI ke Postman docs ke hisaab se `AZAPI_CAPTCHA_PATH` / "
-        "`AZAPI_PAYLOAD` env se badal sakte ho."
+        "**🔐 Captcha config**\n\n"
+        f"• Provider: `{provider}`\n"
+        f"• NOPECHA_KEY: `{_mask(n['key']) if n['key'] else 'not set (IP free quota)'}`\n"
+        f"• NOPECHA_PROXY host: `{proxy_host}`\n"
+        f"• AZAPI_KEY: `{_mask(a['key'])}`\n"
+        f"• Gate cookie cache: `{cache_left // 60} min left`\n\n"
+        f"**NopeCHA status:** `{status}`"
     )
