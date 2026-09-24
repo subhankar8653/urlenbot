@@ -1,9 +1,9 @@
 """
-haz_downloader.py  v3
+haz_downloader.py  v4 (AZAPI captcha API)
 ========================
 Command:
   /Haz <series_page_url>   (hindianimeszone.com ka ek anime/series post)
-  /hazcookie <cookie>      (manual-verify cookie relay — neeche point 5)
+  /hazapi                  (AZAPI config status check — sudo only)
 
 Flow (jaisa Subhankar ne screenshots + text mein bataya):
   1. Series page (static HTML, requests+BS4 se seedha scrape) se title,
@@ -16,15 +16,13 @@ Flow (jaisa Subhankar ne screenshots + text mein bataya):
   4. Phir episode list (RTI/Toono jaisa hi multi-select button menu).
   5. Chosen quality ka link (002.hindianimeszone.com/download1.php?...)
      kholne pe kabhi-kabhi Cloudflare Turnstile ka "Verify You're Human"
-     gate aata hai. Isko code se automatically solve/bypass NAHI kiya jaata
-     (Cloudflare ka anti-abuse protection jaanbujh kar todna hoga) — iski
-     jagah manual-verify cookie relay use hoti hai: Subhankar khud ek baar
-     browser mein verify karke apna cookie `/hazcookie` se deta hai, aur
-     bot uss cookie ke saath seedha requests.get() karta hai (site khud
-     bolta hai "1 hour tak dubara verify nahi hoga" — yani verification
-     hi cookie-based hai). Valid cookie ho to seedha asli server-list page
-     (GDFlix / MEGA / Gdshare / FilePress) milta hai, wahan se sirf MEGA
-     wala link nikalte hain.
+     gate aata hai. Ab cookies ki jagah AZAPI.ai (https://app.azapi.ai) ka
+     captcha-solver API use hota hai: bot gate page se sitekey nikaalta hai,
+     AZAPI se token leta hai, token ko gate form mein submit karta hai, phir
+     asli server-list page (GDFlix / MEGA / Gdshare / FilePress) se sirf
+     MEGA wala link nikalta hai. Manual cookie (/hazcookie) ab NAHI chahiye.
+     Env vars: AZAPI_KEY (zaroori), AZAPI_BASE_URL, AZAPI_CAPTCHA_PATH,
+     AZAPI_PAYLOAD (optional — neeche AZAPI section dekho).
   6. MEGA link ko mega_download.py ke existing download_mega() se download
      karte hain.
   7. url_upload.py ke existing audio/subtitle-filter helpers reuse karte
@@ -47,11 +45,12 @@ NOTE / assumptions (live site pe test karke confirm karna padega):
 """
 
 import asyncio
+import json
 import os
 import re
 import time
 import uuid
-from urllib.parse import unquote_plus
+from urllib.parse import unquote_plus, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -101,19 +100,89 @@ PER_PAGE = 10
 HAZ_SESSIONS = {}
 HAZ_SESSION_TIMEOUT = 3600
 
-# User ek baar manually 'Verify You're Human' solve karke apne browser ka
-# cookie yahan deta hai (/hazcookie command se). Site khud bolta hai "1 hour
-# tak dubara verify nahi hoga" — isliye ~55 min tak isi cookie ko reuse
-# karte hain (5 min safety buffer).
-HAZ_COOKIE = {"value": None, "saved_at": 0.0}
-HAZ_COOKIE_TTL = 55 * 60
+# ─────────────────────────────────────────────
+#  AZAPI.ai captcha API config (env vars se)
+#  Dashboard: https://app.azapi.ai  ->  "API Key" card  ->  View Key
+#  Header format (AZAPI docs): Authorization: prod-xxxx  (Sand ho to sand-xxxx)
+# ─────────────────────────────────────────────
+def _azapi_cfg() -> dict:
+    return {
+        "key": (os.getenv("AZAPI_KEY") or "").strip(),
+        "base": (os.getenv("AZAPI_BASE_URL") or "https://api.azapi.ai").strip().rstrip("/"),
+        # NOTE: exact Turnstile endpoint path AZAPI ke Postman docs se confirm karke
+        # env mein daalo. Default sirf placeholder hai.
+        "path": (os.getenv("AZAPI_CAPTCHA_PATH") or "/v1/captcha/turnstile").strip(),
+        # JSON body template. %URL% aur %SITEKEY% auto-replace hote hain.
+        "payload": (os.getenv("AZAPI_PAYLOAD")
+                    or '{"type":"turnstile","url":"%URL%","sitekey":"%SITEKEY%"}'),
+    }
 
 
-def _get_haz_cookie():
-    val = HAZ_COOKIE.get("value")
-    if val and (time.time() - HAZ_COOKIE.get("saved_at", 0)) < HAZ_COOKIE_TTL:
-        return val
+_TOKEN_KEYS = ("token", "cf-turnstile-response", "captcha_token", "captchaToken",
+               "gRecaptchaResponse", "solution", "result", "code", "answer", "response", "text")
+
+
+def _find_token(obj, depth: int = 0):
+    """AZAPI response (data wrapper ke andar bhi) mein se token string dhoondo."""
+    if depth > 5:
+        return None
+    if isinstance(obj, str):
+        return obj if len(obj) >= 20 else None
+    if isinstance(obj, dict):
+        for k in _TOKEN_KEYS:
+            if k in obj:
+                t = _find_token(obj[k], depth + 1)
+                if t:
+                    return t
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                t = _find_token(v, depth + 1)
+                if t:
+                    return t
+    if isinstance(obj, list):
+        for v in obj:
+            t = _find_token(v, depth + 1)
+            if t:
+                return t
     return None
+
+
+def _azapi_solve_turnstile(page_url: str, sitekey: str, log) -> str | None:
+    """AZAPI se Turnstile token lo. Fail hone par None (reason log mein)."""
+    cfg = _azapi_cfg()
+    if not cfg["key"]:
+        log("❌ AZAPI_KEY set nahi hai (config.env / Heroku config vars mein daalo)")
+        return None
+
+    body = cfg["payload"].replace("%URL%", page_url).replace("%SITEKEY%", sitekey)
+    try:
+        payload = json.loads(body)
+    except Exception as e:
+        log(f"❌ AZAPI_PAYLOAD valid JSON nahi hai: {str(e)[:80]}")
+        return None
+
+    endpoint = cfg["base"] + (cfg["path"] if cfg["path"].startswith("/") else "/" + cfg["path"])
+    headers = {"Authorization": cfg["key"], "Content-Type": "application/json"}
+    try:
+        r = requests.post(endpoint, json=payload, headers=headers, timeout=120)
+    except Exception as e:
+        log(f"❌ AZAPI request fail: {str(e).splitlines()[0][:120]}")
+        return None
+
+    try:
+        data = r.json()
+    except Exception:
+        log(f"❌ AZAPI HTTP {r.status_code}, non-JSON reply: {r.text[:150]!r}")
+        return None
+
+    token = _find_token(data)
+    if r.status_code != 200 or not token:
+        # key kabhi log mein nahi jaati; sirf response ka chhota hissa
+        log(f"❌ AZAPI HTTP {r.status_code} — token nahi mila. Reply: {json.dumps(data)[:200]}")
+        return None
+
+    log(f"✅ AZAPI se Turnstile token mila ({len(token)} chars)")
+    return token
 
 
 def _prune_haz_sessions():
@@ -188,37 +257,126 @@ def discover_haz_items(series_url: str) -> dict:
 #  Poori tarah Selenium/JS-driven, is sandbox mein live test nahi ho paaya
 #  (network band hai) — isliye har step LOGGER.info/warning karta hai.
 # ─────────────────────────────────────────────
-def _fetch_mega_link_with_cookie(download_url: str, cookie_str: str, debug: list) -> str | None:
+def _is_gate(text: str) -> bool:
+    low = text.lower()
+    return ("not a robot" in low or "verify you" in low
+            or "cf-turnstile" in low or "challenges.cloudflare.com/turnstile" in low)
+
+
+def _extract_sitekey(html: str) -> str | None:
+    for pat in (
+        r'data-sitekey=["\']([^"\']+)["\']',
+        r'sitekey["\']?\s*[:=]\s*["\']([0-9A-Za-z_\-]{16,})["\']',
+        r'\b(0x[0-9A-Za-z_\-]{16,})\b',
+    ):
+        m = re.search(pat, html)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _describe_gate(html: str, log):
+    """Gate page ka structure debug mein daalo (form/inputs/ajax url)."""
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for f in soup.find_all("form")[:2]:
+            names = [i.get("name") for i in f.find_all(["input", "button"]) if i.get("name")]
+            log(f"ℹ️ gate form: action={f.get('action')!r} method={f.get('method')!r} inputs={names[:8]}")
+        urls = re.findall(r"""(?:fetch|\.post|\.get|\.ajax|url\s*:)\s*\(?\s*["']([^"']+)["']""", html)
+        if urls:
+            log(f"ℹ️ gate JS urls: {urls[:4]}")
+    except Exception:
+        pass
+
+
+def _submit_gate(sess, gate_resp, token: str, log):
+    """Solved token ko gate form mein submit karo. Naya response (ya None) return."""
+    fields = {"cf-turnstile-response": token, "g-recaptcha-response": token}
+    soup = BeautifulSoup(gate_resp.text, "html.parser")
+    form = None
+    for f in soup.find_all("form"):
+        if f.find(attrs={"name": re.compile("turnstile|recaptcha", re.I)}) or \
+           f.find(class_=re.compile("turnstile", re.I)):
+            form = f
+            break
+    if form is None:
+        form = soup.find("form")
+
+    try:
+        if form is not None:
+            data = {}
+            for inp in form.find_all("input"):
+                if inp.get("name"):
+                    data[inp["name"]] = inp.get("value", "")
+            data.update(fields)
+            action = urljoin(gate_resp.url, form.get("action") or gate_resp.url)
+            method = (form.get("method") or "post").lower()
+            log(f"➡️ Gate form submit: {method.upper()} {action[:80]}")
+            if method == "get":
+                return sess.get(action, params=data, timeout=25, allow_redirects=True)
+            return sess.post(action, data=data, timeout=25, allow_redirects=True)
+        # Form nahi mila — same URL pe POST try karo
+        log("➡️ Gate mein form nahi mila — same URL pe token POST kar raha hoon")
+        return sess.post(gate_resp.url, data=fields, timeout=25, allow_redirects=True)
+    except Exception as e:
+        log(f"❌ Gate submit fail: {str(e).splitlines()[0][:120]}")
+        return None
+
+
+def _fetch_mega_link_with_api(download_url: str, debug: list) -> str | None:
     """
-    Selenium/Turnstile-solving ki jagah: user khud ek baar browser mein
-    'Verify You're Human' solve karke apna cookie /hazcookie se deta hai.
-    Us cookie ke saath seedha requests.get() karte hain — site khud bolta
-    hai "1 hour tak dubara verify nahi karna", matlab verification ek
-    cookie mein hi store hoti hai. Valid cookie ho to seedha asli
-    server-list (GDFlix/MEGA/Gdshare/FilePress) page milega, gate nahi.
+    download1.php -> (Turnstile gate aaye to) AZAPI se token solve karke gate
+    pass karo -> server-list page se MEGA link nikaalo. Cookies ki zaroorat nahi;
+    ek requests.Session gate-pass ke baad ki cookies khud sambhal leta hai.
     """
     def log(msg):
         debug.append(msg)
         LOGGER.info(f"[Haz] {msg}")
 
-    headers = dict(HEADERS)
-    headers["Cookie"] = cookie_str
-    headers["Referer"] = "https://hindianimeszone.com/"
+    sess = requests.Session()
+    sess.headers.update(HEADERS)
+    sess.headers["Referer"] = "https://hindianimeszone.com/"
 
     try:
-        r = requests.get(download_url, headers=headers, timeout=25, allow_redirects=True)
+        r = sess.get(download_url, timeout=25, allow_redirects=True)
     except Exception as e:
         log(f"❌ Page fetch fail: {str(e).splitlines()[0][:120]}")
         return None
 
-    text = r.text
-    low = text.lower()
-    if "not a robot" in low or "verify you" in low:
-        log("❌ Is cookie ke saath bhi 'Verify You're Human' gate hi mila — "
-            "cookie expire ho gaya hai ya galat hai. `/hazcookie <naya cookie>` se update karo.")
-        return None
+    if _is_gate(r.text):
+        log("🔒 Verify gate mila — AZAPI se solve kar raha hoon...")
+        sitekey = _extract_sitekey(r.text)
+        if not sitekey:
+            log("❌ Gate page pe Turnstile sitekey nahi mili")
+            _describe_gate(r.text, log)
+            return None
+        log(f"🔑 sitekey: {sitekey[:14]}…")
 
-    log(f"✅ Cookie se seedha server-list page mil gaya (HTTP {r.status_code}, gate skip)")
+        token = _azapi_solve_turnstile(r.url, sitekey, log)
+        if not token:
+            return None
+
+        r2 = _submit_gate(sess, r, token, log)
+        if r2 is not None and not _is_gate(r2.text):
+            r = r2
+        else:
+            # Kai sites token verify karke cookie set karti hain aur page dubara
+            # kholne pe hi content dikhati hain — ek baar re-GET karo.
+            try:
+                r3 = sess.get(download_url, timeout=25, allow_redirects=True)
+            except Exception as e:
+                log(f"❌ Re-fetch fail: {str(e).splitlines()[0][:120]}")
+                return None
+            if _is_gate(r3.text):
+                log("❌ Token submit ke baad bhi gate hi mila — site ka verify flow alag ho sakta hai")
+                _describe_gate(r.text, log)
+                return None
+            r = r3
+        log(f"✅ Gate pass ho gaya (HTTP {r.status_code})")
+    else:
+        log(f"✅ Gate nahi aaya, seedha server-list page mila (HTTP {r.status_code})")
+
+    text = r.text
 
     soup = BeautifulSoup(text, "html.parser")
     mega_url = None
@@ -235,7 +393,7 @@ def _fetch_mega_link_with_cookie(download_url: str, cookie_str: str, debug: list
             # Ye "MEGA" card hai lekin href khud mega.nz nahi (redirect wrapper
             # ho sakta hai) — ek hop follow karo
             try:
-                r2 = requests.get(href, headers=headers, timeout=25, allow_redirects=True)
+                r2 = sess.get(href, timeout=25, allow_redirects=True)
                 m = re.search(
                     r'https?://mega\.nz/(?:file|folder)/[A-Za-z0-9_\-]+#[A-Za-z0-9_\-!]+', r2.text
                 )
@@ -412,7 +570,7 @@ async def _apply_language_filter(filepath: str, language: str, status_msg: Messa
 #  Ek episode: link nikaalo -> mega download -> filter -> upload
 # ─────────────────────────────────────────────
 async def _process_haz_item(client, message, ep: dict, status_msg, index: int, total: int,
-                             language: str, quality: str, cookie_str: str):
+                             language: str, quality: str):
     ep_label = f"E{ep['num']:02d}"
     loop = asyncio.get_event_loop()
     download_url = ep["qualities"].get(quality)
@@ -430,7 +588,7 @@ async def _process_haz_item(client, message, ep: dict, status_msg, index: int, t
 
     debug = []
     mega_url = await loop.run_in_executor(
-        None, _fetch_mega_link_with_cookie, download_url, cookie_str, debug
+        None, _fetch_mega_link_with_api, download_url, debug
     )
 
     if mega_url and not is_mega_link(mega_url):
@@ -499,12 +657,11 @@ async def _process_haz_item(client, message, ep: dict, status_msg, index: int, t
 
 async def _download_haz_items(client, status_msg, orig_message, sess: "HazSelector", idxs: list):
     total = len(idxs)
-    cookie_str = _get_haz_cookie()
-    if not cookie_str:
+    if not _azapi_cfg()["key"]:
         await status_msg.edit(
-            "❌ **Cookie nahi mila ya expire ho gaya hai.**\n\n"
-            "Pehle browser mein 'Verify You're Human' manually solve karo, phir\n"
-            "`/hazcookie <cookie string>` se bot ko de do — uske baad dubara try karo."
+            "❌ **AZAPI_KEY set nahi hai.**\n\n"
+            "https://app.azapi.ai → **API Key** → **View Key** se key copy karo aur "
+            "`config.env` / hosting ke config vars mein `AZAPI_KEY=...` daal ke bot restart karo."
         )
         return
 
@@ -512,7 +669,7 @@ async def _download_haz_items(client, status_msg, orig_message, sess: "HazSelect
     for i, idx in enumerate(idxs, 1):
         ep = sess.episodes[idx]
         result = await _process_haz_item(
-            client, orig_message, ep, status_msg, i, total, sess.language, sess.quality, cookie_str,
+            client, orig_message, ep, status_msg, i, total, sess.language, sess.quality,
         )
         if result != "ok":
             all_ok = False
@@ -710,39 +867,22 @@ async def haz_command(client: Client, message: Message):
 
 
 # ─────────────────────────────────────────────
-#  /hazcookie — manual-verify cookie relay
+#  /hazapi — AZAPI config status (sudo only, key kabhi show nahi hoti)
 # ─────────────────────────────────────────────
-_HAZCOOKIE_HELP = (
-    "**Cookie kaise nikaalo (ek baar manually verify karke):**\n\n"
-    "1️⃣ Phone/PC ke normal browser mein koi bhi Haz download link kholo\n"
-    "   (jaisa `002.hindianimeszone.com/download1.php?...`)\n"
-    "2️⃣ 'Verify You're Human' checkbox jaise normally solve karte ho, karo\n"
-    "3️⃣ Verify ho jaane ke baad, browser ke DevTools ya 'Cookie-Editor' jaisi\n"
-    "   extension se `hindianimeszone.com` ke saare cookies copy karo — ek\n"
-    "   hi line mein `naam1=value1; naam2=value2; ...` is format mein\n"
-    "4️⃣ Yahan bhejo: `/hazcookie <pura cookie string>`\n\n"
-    "Ye cookie ~1 hour tak valid rehta hai (site khud batata hai). Expire\n"
-    "hone pe /Haz download mein error aayega — tab dubara solve karke naya\n"
-    "cookie bhej dena."
-)
-
-
-@Client.on_message(filters.command("hazcookie"))
-async def hazcookie_command(client: Client, message: Message):
+@Client.on_message(filters.command("hazapi"))
+async def hazapi_command(client: Client, message: Message):
     c = await check_chat(message, chat="Sudo")
     if not c:
         return
-
-    parts = message.text.split(None, 1)
-    if len(parts) < 2 or not parts[1].strip():
-        cur = _get_haz_cookie()
-        status = "✅ Abhi ek valid cookie saved hai." if cur else "❌ Abhi koi valid cookie saved nahi hai."
-        await message.reply(f"{status}\n\n{_HAZCOOKIE_HELP}")
-        return
-
-    HAZ_COOKIE["value"] = parts[1].strip()
-    HAZ_COOKIE["saved_at"] = time.time()
+    cfg = _azapi_cfg()
+    key = cfg["key"]
+    masked = (key[:5] + "…" + key[-4:]) if len(key) > 12 else ("set" if key else "❌ NOT SET")
     await message.reply(
-        "✅ **Cookie save ho gaya!**\n\nAgle ~1 hour tak `/Haz` downloads isi cookie se "
-        "Verify gate skip karke seedha MEGA link nikaalenge."
+        "**🔐 AZAPI captcha config**\n\n"
+        f"• AZAPI_KEY: `{masked}`\n"
+        f"• Endpoint: `{cfg['base']}{cfg['path']}`\n"
+        f"• Payload: `{cfg['payload'][:120]}`\n\n"
+        "Key: https://app.azapi.ai → API Key → View Key\n"
+        "Endpoint/payload AZAPI ke Postman docs ke hisaab se `AZAPI_CAPTCHA_PATH` / "
+        "`AZAPI_PAYLOAD` env se badal sakte ho."
     )
