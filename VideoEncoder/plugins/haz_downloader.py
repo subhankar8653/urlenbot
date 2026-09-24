@@ -397,7 +397,7 @@ def _peak_client():
     return PeakClient((os.getenv("PEAKFO_KEY") or "").strip())
 
 
-def _peak_solve_turnstile(page_url: str, sitekey: str, log) -> str | None:
+def _peak_solve_turnstile(page_url: str, sitekey: str, log, winfo: dict | None = None) -> str | None:
     if not (os.getenv("PEAKFO_KEY") or "").strip():
         log("❌ PEAKFO_KEY set nahi hai")
         return None
@@ -422,7 +422,16 @@ def _peak_solve_turnstile(page_url: str, sitekey: str, log) -> str | None:
             kwargs = {"sitekey": sitekey, "url": page_url}
             if px:
                 kwargs["proxy"] = px
-            res = _peak_client().solve_turnstile(**kwargs)
+            extra = {}
+            for src, dst in (("action", "action"), ("cdata", "cdata"), ("cData", "cdata")):
+                if winfo and winfo.get(src):
+                    extra[dst] = winfo[src]
+            try:
+                res = _peak_client().solve_turnstile(**kwargs, **extra) if extra else \
+                      _peak_client().solve_turnstile(**kwargs)
+            except TypeError:
+                # SDK in extra params ko support nahi karta — bina unke try karo
+                res = _peak_client().solve_turnstile(**kwargs)
         except AuthenticationError:
             log("❌ Peak.fo: API key galat hai (AuthenticationError)")
             return None
@@ -459,12 +468,12 @@ def _peak_status() -> str:
         return f"error: {type(e).__name__}: {str(e)[:100]}"
 
 
-def _solve_turnstile(page_url: str, sitekey: str, log) -> str | None:
+def _solve_turnstile(page_url: str, sitekey: str, log, winfo: dict | None = None) -> str | None:
     provider = _provider()
     if provider == "azapi":
         return _azapi_solve_turnstile(page_url, sitekey, log)
     if provider == "peakfo":
-        return _peak_solve_turnstile(page_url, sitekey, log)
+        return _peak_solve_turnstile(page_url, sitekey, log, winfo)
     return _nopecha_solve_turnstile(page_url, sitekey, log)
 
 
@@ -490,6 +499,26 @@ def _extract_sitekey(html: str) -> str | None:
         if m:
             return m.group(1)
     return None
+
+
+def _widget_info(html: str) -> dict:
+    """Turnstile widget ke extra params (action/cdata/size/theme) nikaalo."""
+    info = {}
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        el = soup.find(attrs={"data-sitekey": True}) or soup.find(class_=re.compile("turnstile", re.I))
+        if el is not None:
+            for k, v in el.attrs.items():
+                if str(k).startswith("data-") and k != "data-sitekey":
+                    info[k[5:]] = v if isinstance(v, str) else " ".join(v)
+        # explicit render: turnstile.render(..., {sitekey:..., action:..., cData:...})
+        for key in ("action", "cData", "cdata"):
+            m = re.search(key + r"""["']?\s*:\s*["']([^"']{1,80})["']""", html)
+            if m and key.lower() not in [x.lower() for x in info]:
+                info[key] = m.group(1)
+    except Exception:
+        pass
+    return info
 
 
 def _describe_gate(html: str, log):
@@ -580,8 +609,11 @@ def _fetch_mega_link_with_api(download_url: str, debug: list) -> str | None:
             _describe_gate(r.text, log)
             return None
         log(f"🔑 sitekey: {sitekey[:14]}…")
+        winfo = _widget_info(r.text)
+        if winfo:
+            log(f"ℹ️ widget params: {json.dumps(winfo)[:150]}")
 
-        token = _solve_turnstile(r.url, sitekey, log)
+        token = _solve_turnstile(r.url, sitekey, log, winfo)
         if not token:
             return None
 
@@ -1124,3 +1156,67 @@ async def hazapi_command(client: Client, message: Message):
         f"• Gate cookie cache: `{cache_left // 60} min left`\n\n"
         f"**{provider} status:** `{status}`"
     )
+
+
+# ─────────────────────────────────────────────
+#  /hazsolvetest — solver ka seedha test (sudo only)
+#    /hazsolvetest                 -> NopeCHA ke public demo Turnstile pe
+#    /hazsolvetest <download link> -> asli Haz gate page pe (episode download nahi hota)
+# ─────────────────────────────────────────────
+DEMO_SITEKEY = "0x4AAAAAAAA-1LUipBaoBpsG"
+DEMO_URL = "https://nopecha.com/demo/turnstile"
+
+
+def _run_solve_test(target: str | None) -> list:
+    out = []
+
+    def log(m):
+        out.append(m)
+        LOGGER.info(f"[HazTest] {m}")
+
+    log(f"provider={_provider()} proxy={'yes' if _proxy_url() else 'no'}")
+    winfo = {}
+    if target:
+        sess = requests.Session()
+        sess.headers.update(HEADERS)
+        sess.headers["Referer"] = "https://hindianimeszone.com/"
+        if _proxy_url():
+            sess.proxies = {"http": _proxy_url(), "https": _proxy_url()}
+        try:
+            r = sess.get(target, timeout=25, allow_redirects=True)
+        except Exception as e:
+            log(f"❌ Page fetch fail: {str(e).splitlines()[0][:120]}")
+            return out
+        log(f"gate page: HTTP {r.status_code}, gate={'yes' if _is_gate(r.text) else 'no'}")
+        sitekey = _extract_sitekey(r.text)
+        if not sitekey:
+            log("❌ sitekey nahi mili")
+            _describe_gate(r.text, log)
+            return out
+        page_url = r.url
+        winfo = _widget_info(r.text)
+    else:
+        sitekey, page_url = DEMO_SITEKEY, DEMO_URL
+
+    log(f"sitekey={sitekey[:16]}… url={page_url[:60]}")
+    if winfo:
+        log(f"widget params: {json.dumps(winfo)[:150]}")
+    t0 = time.time()
+    token = _solve_turnstile(page_url, sitekey, log, winfo)
+    log(("✅ TOKEN MILA" if token else "❌ TOKEN NAHI MILA") + f" ({time.time() - t0:.0f}s)")
+    return out
+
+
+@Client.on_message(filters.command("hazsolvetest"))
+async def hazsolvetest_command(client: Client, message: Message):
+    c = await check_chat(message, chat="Sudo")
+    if not c:
+        return
+    parts = message.text.split(None, 1)
+    target = parts[1].strip() if len(parts) > 1 and parts[1].strip().startswith("http") else None
+    st = await message.reply("🧪 Solver test chal raha hai" + (" (Haz gate pe)" if target else " (demo Turnstile pe)") + "...")
+    lines = await asyncio.get_event_loop().run_in_executor(None, _run_solve_test, target)
+    try:
+        await st.edit("**🧪 Solver test**\n\n```\n" + "\n".join(lines[-14:]) + "\n```")
+    except Exception:
+        pass
