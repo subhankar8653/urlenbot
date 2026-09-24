@@ -17,12 +17,12 @@ Flow (jaisa Subhankar ne screenshots + text mein bataya):
   5. Chosen quality ka link (002.hindianimeszone.com/download1.php?...)
      kholne pe kabhi-kabhi Cloudflare Turnstile ka "Verify You're Human"
      gate aata hai. Cookies ki jagah ab captcha-provider API use hota hai
-     (default NopeCHA, optional AZAPI): bot gate page se sitekey nikaalta hai,
+     (Peak.fo / NopeCHA / AZAPI): bot gate page se sitekey nikaalta hai,
      provider se token leta hai, form submit karta hai, aur gate-pass ki
      cookies ~55 min cache karta hai (ek token se poori series). Phir server-list
      page (GDFlix / MEGA / Gdshare / FilePress) se sirf MEGA link nikalta hai.
-     Env vars: NOPECHA_KEY (optional), NOPECHA_PROXY (Turnstile ke liye
-     required), CAPTCHA_PROVIDER (nopecha|azapi), AZAPI_KEY (sirf azapi ke liye).
+     Env vars: PEAKFO_KEY + CAPTCHA_PROXY (Peak.fo, default agar key ho),
+     ya NOPECHA_KEY/NOPECHA_PROXY, ya AZAPI_KEY; CAPTCHA_PROVIDER=peakfo|nopecha|azapi.
   6. MEGA link ko mega_download.py ke existing download_mega() se download
      karte hain.
   7. url_upload.py ke existing audio/subtitle-filter helpers reuse karte
@@ -273,7 +273,7 @@ NOPECHA_BASE = "https://api.nopecha.com"
 def _nopecha_cfg() -> dict:
     return {
         "key": (os.getenv("NOPECHA_KEY") or "").strip(),
-        "proxy": (os.getenv("NOPECHA_PROXY") or "").strip(),
+        "proxy": _proxy_url(),
     }
 
 
@@ -376,10 +376,80 @@ def _nopecha_status() -> str:
         return f"error: {str(e).splitlines()[0][:100]}"
 
 
+# ─────────────────────────────────────────────
+#  Peak.fo Turnstile solver (official SDK: pip install peakfo)
+#  Env: PEAKFO_KEY (pk_...), CAPTCHA_PROXY (ya purana NOPECHA_PROXY) —
+#  Turnstile ke liye proxy chahiye aur bot ki requests bhi usi proxy se jaati hain.
+# ─────────────────────────────────────────────
+def _proxy_url() -> str:
+    return ((os.getenv("CAPTCHA_PROXY") or os.getenv("NOPECHA_PROXY") or "").strip())
+
+
+def _provider() -> str:
+    p = (os.getenv("CAPTCHA_PROVIDER") or "").strip().lower()
+    if p in ("peakfo", "nopecha", "azapi"):
+        return p
+    return "peakfo" if (os.getenv("PEAKFO_KEY") or "").strip() else "nopecha"
+
+
+def _peak_client():
+    from peakfo import PeakClient   # lazy import: SDK na ho to clear error mile
+    return PeakClient((os.getenv("PEAKFO_KEY") or "").strip())
+
+
+def _peak_solve_turnstile(page_url: str, sitekey: str, log) -> str | None:
+    if not (os.getenv("PEAKFO_KEY") or "").strip():
+        log("❌ PEAKFO_KEY set nahi hai")
+        return None
+    proxy = _proxy_url()
+    if not proxy:
+        log("❌ CAPTCHA_PROXY set nahi hai — Peak.fo Turnstile ke liye proxy chahiye")
+        return None
+    try:
+        from peakfo import AuthenticationError, InsufficientBalanceError, SolveError
+    except Exception as e:
+        log(f"❌ peakfo SDK install nahi hai (requirements.txt mein `peakfo` + redeploy): {str(e)[:80]}")
+        return None
+    try:
+        log("⏳ Peak.fo se Turnstile solve ho raha hai...")
+        res = _peak_client().solve_turnstile(sitekey=sitekey, url=page_url, proxy=proxy)
+    except AuthenticationError:
+        log("❌ Peak.fo: API key galat hai (AuthenticationError)")
+        return None
+    except InsufficientBalanceError:
+        log("❌ Peak.fo: balance khatam (InsufficientBalanceError)")
+        return None
+    except SolveError as e:
+        log(f"❌ Peak.fo solve fail: {str(e)[:150]}")
+        return None
+    except Exception as e:
+        log(f"❌ Peak.fo error: {type(e).__name__}: {str(e)[:150]}")
+        return None
+
+    token = res.get("token") if isinstance(res, dict) else None
+    if not (isinstance(token, str) and len(token) > 20):
+        log(f"❌ Peak.fo reply mein token nahi: {str(res)[:150]}")
+        return None
+    log(f"✅ Peak.fo se Turnstile token mila ({len(token)} chars)")
+    return token
+
+
+def _peak_status() -> str:
+    if not (os.getenv("PEAKFO_KEY") or "").strip():
+        return "PEAKFO_KEY not set"
+    try:
+        b = _peak_client().get_balance()
+        return f"balance=${b.get('balance')}" if isinstance(b, dict) else str(b)[:100]
+    except Exception as e:
+        return f"error: {type(e).__name__}: {str(e)[:100]}"
+
+
 def _solve_turnstile(page_url: str, sitekey: str, log) -> str | None:
-    provider = (os.getenv("CAPTCHA_PROVIDER") or "nopecha").strip().lower()
+    provider = _provider()
     if provider == "azapi":
         return _azapi_solve_turnstile(page_url, sitekey, log)
+    if provider == "peakfo":
+        return _peak_solve_turnstile(page_url, sitekey, log)
     return _nopecha_solve_turnstile(page_url, sitekey, log)
 
 
@@ -471,7 +541,7 @@ def _fetch_mega_link_with_api(download_url: str, debug: list) -> str | None:
 
     # Provider proxy use karta hai to token usi IP se valid hota hai — isliye
     # saari requests bhi usi proxy se bhejte hain.
-    proxy_url = _nopecha_cfg()["proxy"] if (os.getenv("CAPTCHA_PROVIDER") or "nopecha").lower() != "azapi" else ""
+    proxy_url = _proxy_url() if _provider() != "azapi" else ""
     if proxy_url:
         sess.proxies = {"http": proxy_url, "https": proxy_url}
 
@@ -803,7 +873,7 @@ async def _process_haz_item(client, message, ep: dict, status_msg, index: int, t
 
 async def _download_haz_items(client, status_msg, orig_message, sess: "HazSelector", idxs: list):
     total = len(idxs)
-    provider = (os.getenv("CAPTCHA_PROVIDER") or "nopecha").strip().lower()
+    provider = _provider()
     if provider == "azapi" and not _azapi_cfg()["key"]:
         await status_msg.edit("❌ **AZAPI_KEY set nahi hai.** (CAPTCHA_PROVIDER=azapi)")
         return
@@ -1021,18 +1091,21 @@ async def hazapi_command(client: Client, message: Message):
     c = await check_chat(message, chat="Sudo")
     if not c:
         return
-    provider = (os.getenv("CAPTCHA_PROVIDER") or "nopecha").strip().lower()
-    n = _nopecha_cfg()
-    a = _azapi_cfg()
-    proxy_host = (_proxy_dict(n["proxy"]) or {}).get("host", "❌ NOT SET")
-    status = await asyncio.get_event_loop().run_in_executor(None, _nopecha_status)
+    provider = _provider()
+    proxy_host = (_proxy_dict(_proxy_url()) or {}).get("host", "❌ NOT SET")
+    loop = asyncio.get_event_loop()
+    if provider == "peakfo":
+        status = await loop.run_in_executor(None, _peak_status)
+    elif provider == "nopecha":
+        status = await loop.run_in_executor(None, _nopecha_status)
+    else:
+        status = "azapi (status check nahi)"
     cache_left = max(0, int(GATE_CACHE_TTL - (time.time() - GATE_CACHE["saved_at"]))) if GATE_CACHE["jar"] is not None else 0
     await message.reply(
         "**🔐 Captcha config**\n\n"
         f"• Provider: `{provider}`\n"
-        f"• NOPECHA_KEY: `{_mask(n['key']) if n['key'] else 'not set (IP free quota)'}`\n"
-        f"• NOPECHA_PROXY host: `{proxy_host}`\n"
-        f"• AZAPI_KEY: `{_mask(a['key'])}`\n"
+        f"• PEAKFO_KEY: `{_mask((os.getenv('PEAKFO_KEY') or '').strip())}`\n"
+        f"• Proxy host: `{proxy_host}`\n"
         f"• Gate cookie cache: `{cache_left // 60} min left`\n\n"
-        f"**NopeCHA status:** `{status}`"
+        f"**{provider} status:** `{status}`"
     )
