@@ -402,36 +402,51 @@ def _peak_solve_turnstile(page_url: str, sitekey: str, log) -> str | None:
         log("❌ PEAKFO_KEY set nahi hai")
         return None
     proxy = _proxy_url()
-    if not proxy:
-        log("❌ CAPTCHA_PROXY set nahi hai — Peak.fo Turnstile ke liye proxy chahiye")
-        return None
     try:
         from peakfo import AuthenticationError, InsufficientBalanceError, SolveError
     except Exception as e:
         log(f"❌ peakfo SDK install nahi hai (requirements.txt mein `peakfo` + redeploy): {str(e)[:80]}")
         return None
-    try:
-        log("⏳ Peak.fo se Turnstile solve ho raha hai...")
-        res = _peak_client().solve_turnstile(sitekey=sitekey, url=page_url, proxy=proxy)
-    except AuthenticationError:
-        log("❌ Peak.fo: API key galat hai (AuthenticationError)")
-        return None
-    except InsufficientBalanceError:
-        log("❌ Peak.fo: balance khatam (InsufficientBalanceError)")
-        return None
-    except SolveError as e:
-        log(f"❌ Peak.fo solve fail: {str(e)[:150]}")
-        return None
-    except Exception as e:
-        log(f"❌ Peak.fo error: {type(e).__name__}: {str(e)[:150]}")
-        return None
 
-    token = res.get("token") if isinstance(res, dict) else None
-    if not (isinstance(token, str) and len(token) > 20):
-        log(f"❌ Peak.fo reply mein token nahi: {str(res)[:150]}")
-        return None
-    log(f"✅ Peak.fo se Turnstile token mila ({len(token)} chars)")
-    return token
+    # Attempts: proxy ke saath 2 baar, phir (agar allowed) bina proxy ke 1 baar.
+    attempts = [proxy, proxy] if proxy else []
+    if (os.getenv("PEAKFO_NO_PROXY_FALLBACK") or "1").strip() != "0":
+        attempts.append(None)
+    if not attempts:
+        attempts = [None]
+
+    for n, px in enumerate(attempts, 1):
+        label = "proxy ke saath" if px else "bina proxy ke"
+        log(f"⏳ Peak.fo solve try {n}/{len(attempts)} ({label})...")
+        try:
+            kwargs = {"sitekey": sitekey, "url": page_url}
+            if px:
+                kwargs["proxy"] = px
+            res = _peak_client().solve_turnstile(**kwargs)
+        except AuthenticationError:
+            log("❌ Peak.fo: API key galat hai (AuthenticationError)")
+            return None
+        except InsufficientBalanceError:
+            log("❌ Peak.fo: balance khatam (InsufficientBalanceError)")
+            return None
+        except SolveError as e:
+            log(f"⚠️ Peak.fo solve fail ({label}): {str(e)[:100]}")
+            time.sleep(2)
+            continue
+        except Exception as e:
+            log(f"⚠️ Peak.fo error ({label}): {type(e).__name__}: {str(e)[:100]}")
+            time.sleep(2)
+            continue
+
+        token = res.get("token") if isinstance(res, dict) else None
+        if isinstance(token, str) and len(token) > 20:
+            log(f"✅ Peak.fo se Turnstile token mila ({len(token)} chars, {label})")
+            return token
+        log(f"⚠️ Peak.fo reply mein token nahi: {str(res)[:120]}")
+
+    log("❌ Peak.fo ke saare attempts fail — proxy IP Cloudflare ne reject kiya ho sakta hai "
+        "(datacenter proxy). Residential/ISP proxy try karo.")
+    return None
 
 
 def _peak_status() -> str:
