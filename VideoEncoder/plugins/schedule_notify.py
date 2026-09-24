@@ -14,6 +14,11 @@ Commands:
   /schedule [days] [total_eps] [Anime Name]
       Example: /schedule 7 12 Witch Hat Atelier
 
+  /schedule_on / /schedule_off / /schedule_status
+      → Schedule message posting ko globally ON/OFF karo.
+        OFF hone par "Next episode upload on..." / "END" post nahi hoga,
+        end messages hamesha ki tarah post hote rahenge.
+
   /end_message
       → Default end message set karo (sab channels pe apply)
   /end_message [Channel Name]
@@ -100,6 +105,67 @@ async def _get_schedule_for_anime(anime_name: str) -> dict | None:
         if en and en in name_norm and len(en) > best_len:
             best, best_len = entry, len(en)
     return best
+
+
+# ─────────────────────────────────────────────
+#  /schedule ON/OFF toggle
+#  ON  → sab kuch abhi jaisa hi chalega (schedule msg post hoga)
+#  OFF → schedule msg ("Next episode upload on...") channel pe post
+#        NAHI hoga. End messages iske bina bhi hamesha post hote rahenge.
+# ─────────────────────────────────────────────
+async def _is_schedule_enabled() -> bool:
+    oid = await _owner_id()
+    if not oid:
+        return True
+    user = await db._get_user(oid)
+    # Default True — pehle se koi flag nahi tha, toh behaviour same rahega
+    return user.get('schedule_posting_enabled', True)
+
+
+async def _set_schedule_enabled(enabled: bool):
+    oid = await _owner_id()
+    if not oid:
+        return
+    await db.col.update_one(
+        {'id': oid}, {'$set': {'schedule_posting_enabled': enabled}}, upsert=True
+    )
+
+
+@Client.on_message(filters.command("schedule_on") & filters.private)
+async def cmd_schedule_on(client: Client, message: Message):
+    if not _is_authorized(message.from_user.id):
+        return
+    await _set_schedule_enabled(True)
+    await message.reply(
+        "✅ **Schedule Posting: ON**\n\n"
+        "Har episode ke baad schedule message ('Next episode upload on...' "
+        "ya 'END') channel pe post hoga — jaisa pehle hota tha."
+    )
+
+
+@Client.on_message(filters.command("schedule_off") & filters.private)
+async def cmd_schedule_off(client: Client, message: Message):
+    if not _is_authorized(message.from_user.id):
+        return
+    await _set_schedule_enabled(False)
+    await message.reply(
+        "🚫 **Schedule Posting: OFF**\n\n"
+        "Ab schedule message channel pe post **nahi** hoga.\n"
+        "End messages (agar set hain) hamesha ki tarah post hote rahenge.\n\n"
+        "Wapas on karne ke liye: `/schedule_on`"
+    )
+
+
+@Client.on_message(filters.command("schedule_status") & filters.private)
+async def cmd_schedule_status(client: Client, message: Message):
+    if not _is_authorized(message.from_user.id):
+        return
+    enabled = await _is_schedule_enabled()
+    state = "✅ ON" if enabled else "🚫 OFF"
+    await message.reply(
+        f"📅 **Schedule Posting:** {state}\n\n"
+        f"Toggle karne ke liye: `/schedule_on` ya `/schedule_off`"
+    )
 
 
 # ─────────────────────────────────────────────
@@ -355,8 +421,11 @@ async def send_schedule_notification(
     schedule = await _get_schedule_for_anime(anime_name)
     posted_ids = []  # Yahan saare posted msg IDs collect karenge
 
-    # Step 1: Schedule message — sirf tab jab schedule set ho
-    if schedule:
+    # Step 1: Schedule message — sirf tab jab schedule set ho AND toggle ON ho
+    schedule_enabled = await _is_schedule_enabled()
+    if schedule and not schedule_enabled:
+        LOGGER.info(f"[Schedule] Posting OFF (toggle) — skipping schedule msg for '{anime_name}'.")
+    elif schedule:
         interval_days = schedule.get('interval_days', 7)
         total_eps     = schedule.get('total_eps', 0)
         is_last_ep    = total_eps > 0 and episode_num >= total_eps
@@ -444,6 +513,7 @@ async def cmd_end_message(client: Client, message: Message):
         # schedule_notify commands
         "done", "cancel_end", "end_message", "schedule", "schedule_list",
         "schedule_del", "end_message_preview", "end_message_del",
+        "schedule_on", "schedule_off", "schedule_status",
         # encode / download commands
         "swift", "swiftdl", "swiftencode", "url", "mega", "meganow",
         "rti", "dl", "ddl", "batch", "af",
@@ -473,6 +543,8 @@ async def cmd_end_message(client: Client, message: Message):
         "rename",
         # auto_monitor
         "set_monitor", "add_anime", "list_anime", "del_anime", "monitor_status",
+        # upload_control
+        "cancel_season", "cancel_episode", "active_uploads",
         # update_channel
         "update_channel", "update_channel_list", "delete_update_channel",
         "update_post", "cancel_update_post", "update_post_list", "delete_update_post",

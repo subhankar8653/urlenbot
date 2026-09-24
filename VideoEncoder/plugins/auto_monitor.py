@@ -73,6 +73,15 @@ def _get_schedule_list_fns():
     from .schedule_notify import _get_schedule_list, _save_schedule_list
     return _get_schedule_list, _save_schedule_list
 
+def _get_upload_control_fns():
+    from .upload_control import (
+        mark_active, unmark_active, should_stop,
+        is_season_cancelled, is_episode_cancelled,
+        consume_season_cancel, consume_episode_cancel,
+    )
+    return (mark_active, unmark_active, should_stop, is_season_cancelled,
+            is_episode_cancelled, consume_season_cancel, consume_episode_cancel)
+
 # ─────────────────────────────────────────────
 #  Constants
 # ─────────────────────────────────────────────
@@ -342,6 +351,19 @@ async def _episode_quality_poller(
         f"⏳ Swift page scan ho raha hai..."
     )
 
+    mark_active, unmark_active, should_stop, _, _, _, _ = _get_upload_control_fns()
+    mark_active(anime_name, episode_num, status_msg)
+
+    async def _mark_cancelled():
+        try:
+            await status_msg.edit(
+                f"🛑 **Cancelled!** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                f"User ne is episode ka process rok diya."
+            )
+        except Exception:
+            pass
+        LOGGER.info(f"[AutoMonitor] Ep {episode_num} '{anime_name}': cancelled by user.")
+
     # ──────────────────────────────────────────────────────
     #  Direct Poll Mode — Chrome attempt skip, seedha scrape
     # ──────────────────────────────────────────────────────
@@ -361,6 +383,11 @@ async def _episode_quality_poller(
     _old_msgs_deleted_poll = False
 
     while remaining:
+        if should_stop(anime_name, episode_num):
+            await _mark_cancelled()
+            unmark_active(anime_name, episode_num)
+            return False
+
         poll_attempt += 1
         is_fast = poll_attempt <= POLL_FAST_ATTEMPTS
         is_slow = POLL_FAST_ATTEMPTS < poll_attempt <= (POLL_FAST_ATTEMPTS + POLL_SLOW_ATTEMPTS)
@@ -413,6 +440,12 @@ async def _episode_quality_poller(
             shutil.rmtree(poll_dl_dir, ignore_errors=True)
             await asyncio.sleep(interval)
             continue
+
+        if should_stop(anime_name, episode_num):
+            shutil.rmtree(poll_dl_dir, ignore_errors=True)
+            await _mark_cancelled()
+            unmark_active(anime_name, episode_num)
+            return False
 
         qualities_found = [_quality_from(os.path.basename(f)) for f in new_files]
         try:
@@ -540,6 +573,7 @@ async def _episode_quality_poller(
             pass
 
     LOGGER.info(f"[AutoMonitor] Ep {episode_num}: done in {poll_elapsed}m — {uploaded_qualities}")
+    unmark_active(anime_name, episode_num)
     return len(uploaded_qualities) > 0
 
 
@@ -1031,6 +1065,20 @@ async def auto_monitor_handler(client: Client, message: Message):
     for i, ep_num in enumerate(range(start_ep, end_ep + 1), 1):
         is_last = (i == total)
 
+        (_mac, _uac, _ssc, is_season_cancelled, is_episode_cancelled,
+         consume_season_cancel, consume_episode_cancel) = _get_upload_control_fns()
+        if is_season_cancelled(anime_name):
+            consume_season_cancel(anime_name)
+            await message.reply(
+                f"🛑 **Season Upload Cancelled!** | `{anime_name}`\n\n"
+                f"Baaki queued episodes (`{ep_num}`-`{end_ep}`) skip kar diye gaye."
+            )
+            break
+        if is_episode_cancelled(anime_name, ep_num):
+            consume_episode_cancel(anime_name, ep_num)
+            await message.reply(f"⏭️ **Skipped** — `{anime_name}` Ep `{ep_num}` (cancel request).")
+            continue
+
         # Swift URL nikalo
         prep_msg = await message.reply(
             f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{ep_num}/{end_ep}`\n\n"
@@ -1223,6 +1271,20 @@ async def cmd_rtic(client: Client, message: Message):
     for i, ep_num in enumerate(range(start_ep, end_ep + 1), 1):
         is_last = (i == total)
         ep_lbl = "Movie" if ep_num == 0 else f"Ep {ep_num}"
+
+        (_mac, _uac, _ssc, is_season_cancelled, is_episode_cancelled,
+         consume_season_cancel, consume_episode_cancel) = _get_upload_control_fns()
+        if is_season_cancelled(anime_name):
+            consume_season_cancel(anime_name)
+            await message.reply(
+                f"🛑 **Season Upload Cancelled!** | `{anime_name}`\n\n"
+                f"Baaki queued episodes skip kar diye gaye."
+            )
+            break
+        if is_episode_cancelled(anime_name, ep_num):
+            consume_episode_cancel(anime_name, ep_num)
+            await message.reply(f"⏭️ **Skipped** — `{anime_name}` {ep_lbl} (cancel request).")
+            continue
 
         find_msg = await message.reply(
             f"🎌 **Rtic** | `{anime_name}` | {ep_lbl}\n\n"
