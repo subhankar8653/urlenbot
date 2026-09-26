@@ -320,11 +320,18 @@ def _nopecha_solve_turnstile(page_url: str, sitekey: str, log) -> str | None:
     body["useragent"] = HEADERS["User-Agent"]
     headers = _nopecha_headers(cfg["key"])
 
-    try:
-        r = requests.post(f"{NOPECHA_BASE}/v1/token/turnstile", json=body, headers=headers, timeout=30)
-    except Exception as e:
-        log(f"❌ NopeCHA submit fail: {str(e).splitlines()[0][:120]}")
-        return None
+    r = None
+    for n, wait in enumerate((0, 5, 12), 1):   # 429 par khud retry: 0s, 5s, 12s ruk ke
+        if wait:
+            log(f"⏳ NopeCHA rate limit — {wait}s ruk ke retry {n}/3...")
+            time.sleep(wait)
+        try:
+            r = requests.post(f"{NOPECHA_BASE}/v1/token/turnstile", json=body, headers=headers, timeout=30)
+        except Exception as e:
+            log(f"❌ NopeCHA submit fail: {str(e).splitlines()[0][:120]}")
+            return None
+        if r.status_code != 429:
+            break
     if r.status_code != 200:
         log(f"❌ NopeCHA submit: {_nopecha_err(r)}")
         return None
