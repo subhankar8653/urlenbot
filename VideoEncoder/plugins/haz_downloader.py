@@ -23,7 +23,7 @@ Flow (jaisa Subhankar ne screenshots + text mein bataya):
      page (GDFlix / MEGA / Gdshare / FilePress) se sirf MEGA link nikalta hai.
      Default provider: Bright Data Web Unlocker (BRIGHTDATA_API_KEY + BRIGHTDATA_ZONE)
      agar key set ho, warna NopeCHA (NOPECHA_KEY + CAPTCHA_PROXY/NOPECHA_PROXY).
-     CAPTCHA_PROVIDER=brightdata|nopecha|peakfo|azapi se force kar sakte ho.
+     CAPTCHA_PROVIDER=brightdata|nopecha|peakfo|azapi|captchaai se force kar sakte ho.
   6. MEGA link ko mega_download.py ke existing download_mega() se download
      karte hain.
   7. url_upload.py ke existing audio/subtitle-filter helpers reuse karte
@@ -436,6 +436,90 @@ class _BDSession:
 
 
 # ─────────────────────────────────────────────
+#  CaptchaAI Turnstile solver (official SDK: pip install captchaai)
+#  Env: CAPTCHAAI_KEY (32-char key), CAPTCHA_PROXY (ya purana NOPECHA_PROXY)
+# ─────────────────────────────────────────────
+def _captchaai_client():
+    from captchaai import CaptchaAI   # lazy import: SDK na ho to clear error mile
+    proxy = _proxy_url()
+    kwargs = {"api_key": (os.getenv("CAPTCHAAI_KEY") or "").strip()}
+    if proxy:
+        u = urlparse(proxy if "://" in proxy else "http://" + proxy)
+        cred = f"{unquote_plus(u.username)}:{unquote_plus(u.password)}@" if u.username else ""
+        kwargs["proxy"] = f"{cred}{u.hostname}:{u.port}"
+        kwargs["proxytype"] = "HTTP"
+    return CaptchaAI(**kwargs)
+
+
+def _captchaai_solve_turnstile(page_url: str, sitekey: str, log) -> str | None:
+    if not (os.getenv("CAPTCHAAI_KEY") or "").strip():
+        log("❌ CAPTCHAAI_KEY set nahi hai")
+        return None
+    try:
+        from captchaai import (
+            InvalidKeyError, ValidationError, ProxyError, ThreadLimitError,
+            NoThreadsError, UnsolvableError, NetworkError, TimeoutError as CATimeoutError,
+            CaptchaAIError,
+        )
+    except Exception as e:
+        log(f"❌ captchaai SDK install nahi hai (requirements.txt mein `captchaai` + redeploy): {str(e)[:80]}")
+        return None
+
+    log("⏳ CaptchaAI se solve ho raha hai...")
+    try:
+        solver = _captchaai_client()
+        try:
+            res = solver.turnstile(sitekey=sitekey, url=page_url)
+        finally:
+            solver.close()
+    except InvalidKeyError:
+        log("❌ CaptchaAI: API key galat hai")
+        return None
+    except NoThreadsError:
+        log("❌ CaptchaAI: account expired ya koi active plan nahi hai")
+        return None
+    except ProxyError as e:
+        log(f"❌ CaptchaAI: proxy error: {str(e)[:100]}")
+        return None
+    except ThreadLimitError:
+        log("⚠️ CaptchaAI: saare threads busy hain")
+        return None
+    except UnsolvableError:
+        log("⚠️ CaptchaAI: challenge solve nahi ho paya (UnsolvableError)")
+        return None
+    except (NetworkError, CATimeoutError) as e:
+        log(f"⚠️ CaptchaAI: {type(e).__name__}: {str(e)[:100]}")
+        return None
+    except (ValidationError, CaptchaAIError) as e:
+        log(f"❌ CaptchaAI error: {type(e).__name__}: {str(e)[:100]}")
+        return None
+    except Exception as e:
+        log(f"❌ CaptchaAI unexpected error: {type(e).__name__}: {str(e)[:100]}")
+        return None
+
+    token = getattr(res, "solution", None)
+    if isinstance(token, str) and len(token) > 20:
+        log(f"✅ CaptchaAI se Turnstile token mila ({len(token)} chars)")
+        return token
+    log(f"⚠️ CaptchaAI reply mein token nahi: {str(token)[:120]}")
+    return None
+
+
+def _captchaai_status() -> str:
+    if not (os.getenv("CAPTCHAAI_KEY") or "").strip():
+        return "CAPTCHAAI_KEY not set"
+    try:
+        solver = _captchaai_client()
+        try:
+            info = solver.threads_info()
+        finally:
+            solver.close()
+        return f"threads={info.get('threads')} working={info.get('working_threads')}"
+    except Exception as e:
+        return f"error: {type(e).__name__}: {str(e)[:100]}"
+
+
+# ─────────────────────────────────────────────
 #  Peak.fo Turnstile solver (official SDK: pip install peakfo)
 #  Env: PEAKFO_KEY (pk_...), CAPTCHA_PROXY (ya purana NOPECHA_PROXY) —
 #  Turnstile ke liye proxy chahiye aur bot ki requests bhi usi proxy se jaati hain.
@@ -446,7 +530,7 @@ def _proxy_url() -> str:
 
 def _provider() -> str:
     p = (os.getenv("CAPTCHA_PROVIDER") or "").strip().lower()
-    if p in ("brightdata", "peakfo", "nopecha", "azapi"):
+    if p in ("brightdata", "peakfo", "nopecha", "azapi", "captchaai"):
         return p
     # default: Bright Data (agar key set hai), warna NopeCHA
     return "brightdata" if (os.getenv("BRIGHTDATA_API_KEY") or "").strip() else "nopecha"
@@ -539,6 +623,8 @@ def _solve_turnstile(page_url: str, sitekey: str, log, winfo: dict | None = None
         return _azapi_solve_turnstile(page_url, sitekey, log)
     if provider == "peakfo":
         return _peak_solve_turnstile(page_url, sitekey, log, winfo)
+    if provider == "captchaai":
+        return _captchaai_solve_turnstile(page_url, sitekey, log)
     return _nopecha_solve_turnstile(page_url, sitekey, log)
 
 
@@ -1216,6 +1302,8 @@ async def hazapi_command(client: Client, message: Message):
         status = await loop.run_in_executor(None, _nopecha_status)
     elif provider == "brightdata":
         status = "key+zone set ✅ (credits dashboard pe dekho)" if (_bd_cfg()["key"] and _bd_cfg()["zone"]) else "❌ key/zone set nahi"
+    elif provider == "captchaai":
+        status = await loop.run_in_executor(None, _captchaai_status)
     else:
         status = "azapi (status check nahi)"
     cache_left = max(0, int(GATE_CACHE_TTL - (time.time() - GATE_CACHE["saved_at"]))) if GATE_CACHE["jar"] is not None else 0
@@ -1225,6 +1313,7 @@ async def hazapi_command(client: Client, message: Message):
         f"• BRIGHTDATA_API_KEY: `{_mask(_bd_cfg()['key'])}`\n"
         f"• BRIGHTDATA_ZONE: `{_bd_cfg()['zone'] or '❌ NOT SET'}`\n"
         f"• NOPECHA_KEY: `{_mask((os.getenv('NOPECHA_KEY') or '').strip())}`\n"
+        f"• CAPTCHAAI_KEY: `{_mask((os.getenv('CAPTCHAAI_KEY') or '').strip())}`\n"
         f"• Proxy host: `{proxy_host}`\n"
         f"• Gate cookie cache: `{cache_left // 60} min left`\n\n"
         f"**{provider} status:** `{status}`"
