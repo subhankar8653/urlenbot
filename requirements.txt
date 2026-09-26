@@ -52,3 +52,4 @@ selenium
 
 # Captcha solver (Haz downloader)
 peakfo
+captchaai
