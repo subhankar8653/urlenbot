@@ -74,15 +74,19 @@ from pyrogram.types import (
     Message,
 )
 
-from .. import LOGGER
+from .. import LOGGER, download_dir
 from ..utils.helper import check_chat
 from .rti_downloader import _kb, SELENIUM_OK, _kill_driver_tree
 from .haz_downloader import _apply_language_filter
 from .url_upload import _get_filename_from_url, _download_url, _do_upload
 
 try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service as ChromeService
     from selenium.webdriver.common.by import By
 except ImportError:  # selenium na ho to sirf static path chalega
+    webdriver = None
+    ChromeService = None
     By = None
 
 HEADERS = {
@@ -888,6 +892,112 @@ def _fprs_static_resolve(fprs_url: str, debug: list) -> str | None:
 
 
 # ── Path 2: Selenium (real clicks + ad handling) ──
+def _make_adh_driver():
+    """
+    Stealth headless Chromium: navigator.webdriver hide, "HeadlessChrome" UA
+    se "Headless" hata, performance-log ON (network debug ke liye). FilePress jaisi
+    SPA headless dekhkar spinner pe hi atka deti hai — isliye yeh sab zaroori hai.
+    Fail ho to Toono wale driver pe fallback.
+    """
+    try:
+        profile_dir = os.path.join(download_dir, "_chrome_tmp", f"adh_{uuid.uuid4().hex}")
+        os.makedirs(profile_dir, exist_ok=True)
+
+        options = webdriver.ChromeOptions()
+        for arg in (
+            "--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+            "--disable-extensions", "--mute-audio", "--no-first-run", "--disable-crash-reporter",
+            "--window-size=1366,900", "--lang=en-US",
+            "--disable-blink-features=AutomationControlled",
+            f"--user-data-dir={profile_dir}",
+        ):
+            options.add_argument(arg)
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+        options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+        options.page_load_strategy = "none"   # SPA: DOMContentLoaded ka wait nahi, hum khud poll karte hain
+
+        for binary in ("/usr/bin/chromium", "/usr/bin/chromium-browser",
+                       "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"):
+            if os.path.exists(binary):
+                options.binary_location = binary
+                break
+
+        service = None
+        for cd in (os.getenv("CHROMEDRIVER_PATH", ""), "/usr/bin/chromedriver",
+                   "/usr/lib/chromium/chromedriver", "/usr/lib/chromium-browser/chromedriver"):
+            if cd and os.path.exists(cd):
+                service = ChromeService(executable_path=cd)
+                break
+
+        driver = webdriver.Chrome(service=service, options=options) if service \
+            else webdriver.Chrome(options=options)
+        driver.set_page_load_timeout(45)
+        driver._suhani_profile_dir = profile_dir
+        try:
+            ua = driver.execute_script("return navigator.userAgent") or ""
+            driver.execute_cdp_cmd("Network.setUserAgentOverride", {
+                "userAgent": ua.replace("HeadlessChrome", "Chrome"),
+                "acceptLanguage": "en-US,en;q=0.9",
+            })
+            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": (
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                "window.chrome=window.chrome||{runtime:{}};"
+                "Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});"
+                "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
+            )})
+        except Exception as e:
+            LOGGER.warning(f"[Adh] stealth CDP setup fail: {e}")
+        return driver
+    except Exception as e:
+        LOGGER.warning(f"[Adh] stealth driver fail ({e}), toono driver pe fallback")
+        from .toono_downloader import _make_toono_driver
+        return _make_toono_driver()
+
+
+def _sel_diag(driver, debug: list, tag: str, shot: bool = True):
+    """Page kis haal mein hai: title, body text, XHR/fetch calls + screenshot (Telegram pe jayega)."""
+    def log(msg):
+        debug.append(msg)
+        LOGGER.info(f"[Adh] {msg}")
+    try:
+        state = driver.execute_script("return document.readyState")
+        title = (driver.title or "")[:50]
+        body = driver.execute_script("return (document.body&&document.body.innerText||'').slice(0,160)") or ""
+        body = re.sub(r"\s+", " ", body)
+        n_btn = driver.execute_script("return document.querySelectorAll('a,button').length")
+        log(f"🩺 [{tag}] ready={state} title={title!r} a/button={n_btn} body={body!r}")
+    except Exception as e:
+        log(f"🩺 [{tag}] diag fail: {str(e).splitlines()[0][:80]}")
+    try:
+        import json as _json
+        seen = []
+        for ent in driver.get_log("performance"):
+            try:
+                m = _json.loads(ent["message"])["message"]
+            except Exception:
+                continue
+            prm = m.get("params", {})
+            if m.get("method") == "Network.responseReceived" and prm.get("type") in ("XHR", "Fetch"):
+                rs = prm.get("response", {})
+                seen.append(f"{rs.get('status')} {rs.get('url', '')[:75]}")
+            elif m.get("method") == "Network.loadingFailed":
+                seen.append(f"FAIL {prm.get('errorText', '')} {prm.get('type', '')}")
+        if seen:
+            log("🌐 XHR: " + " | ".join(seen[-6:]))
+        else:
+            log("🌐 XHR/fetch calls: koi nahi dikhi")
+    except Exception:
+        pass
+    if shot and not any(str(x).startswith("__SHOT__:") for x in debug):
+        try:
+            path = os.path.join(download_dir, f"adh_dbg_{uuid.uuid4().hex[:8]}.png")
+            if driver.save_screenshot(path):
+                debug.append(f"__SHOT__:{path}")
+        except Exception:
+            pass
+
+
 def _xpath_ci(phrase: str) -> str:
     up = "translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ')"
     P = phrase.upper()
@@ -900,6 +1010,20 @@ def _xpath_ci(phrase: str) -> str:
 def _sel_find(driver, phrase: str):
     try:
         for el in driver.find_elements(By.XPATH, _xpath_ci(phrase)):
+            try:
+                if el.is_displayed():
+                    return el
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # fallback: koi bhi element (div/span/etc.) jiska apna text phrase ho (deepest wala)
+    try:
+        up = "translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ')"
+        P = phrase.upper()
+        xp = (f"//*[not(self::script or self::style or self::head or self::title)]"
+              f"[contains({up},'{P}')][not(*[contains({up},'{P}')])]")
+        for el in driver.find_elements(By.XPATH, xp):
             try:
                 if el.is_displayed():
                     return el
@@ -1001,24 +1125,34 @@ def _fprs_selenium_resolve(fprs_url: str, debug: list) -> str | None:
         log("❌ Selenium install nahi hai — Fprs click-flow nahi chal sakta")
         return None
 
-    from .toono_downloader import _make_toono_driver
-
     driver = None
     try:
         log("🌐 [Fprs] Selenium browser khol rahe hain")
-        driver = _make_toono_driver()
-        driver.get(fprs_url)
+        driver = _make_adh_driver()
+        try:
+            driver.get(fprs_url)
+        except Exception as e:
+            log(f"⚠️ [Fprs] get() timeout/err (aage badh rahe hain): {str(e).splitlines()[0][:60]}")
         main = driver.current_window_handle
         page_url = driver.current_url or fprs_url
         log(f"🌐 [Fprs] page: {page_url[:90]}")
 
         # ── Stage 1: INSTANT DOWNLOAD -> dotflix ──
         dot_handle = None
-        for attempt in range(1, 9):
-            el = _sel_wait_find(driver, "instant download", 25 if attempt == 1 else 10)
+        for attempt in range(1, 6):
+            el = _sel_wait_find(driver, "instant download", 40 if attempt == 1 else 30)
             if el is None:
                 log(f"⚠️ [Fprs] attempt {attempt}: INSTANT DOWNLOAD button nahi dikha (url: {(driver.current_url or '')[:70]})")
+                if attempt in (1, 3):
+                    _sel_diag(driver, debug, "Fprs")
                 _sel_recover_from_ad(driver, page_url, log)
+                try:
+                    if any(x in (driver.current_url or "").lower() for x in _SITE_HINTS):
+                        # spinner pe atka ho sakta hai — page dobara load karo
+                        driver.get(page_url) if attempt % 2 == 0 else driver.refresh()
+                        log(f"🔄 [Fprs] page reload kiya (attempt {attempt})")
+                except Exception:
+                    pass
                 continue
 
             href = ""
@@ -1048,7 +1182,7 @@ def _fprs_selenium_resolve(fprs_url: str, debug: list) -> str | None:
             _sel_recover_from_ad(driver, page_url, log)
 
         if not dot_handle:
-            log("❌ [Fprs] 8 attempts ke baad bhi dotflix page nahi mila")
+            log("❌ [Fprs] 5 attempts ke baad bhi dotflix page nahi mila")
             return None
 
         try:
@@ -1068,8 +1202,8 @@ def _fprs_selenium_resolve(fprs_url: str, debug: list) -> str | None:
         log(f"✅ [Dotflix] page mila: {dot_url[:90]}")
 
         # ── Stage 2: Direct Download -> final link ──
-        for attempt in range(1, 9):
-            el = _sel_wait_find(driver, "direct download", 30 if attempt == 1 else 10)
+        for attempt in range(1, 6):
+            el = _sel_wait_find(driver, "direct download", 40 if attempt == 1 else 20)
             if el is None:
                 # page-source se bhi try (button JS se ban ke chhupa ho sakta hai)
                 link = _dotflix_final_from_html(driver.page_source or "", driver.current_url or dot_url, log)
@@ -1077,6 +1211,8 @@ def _fprs_selenium_resolve(fprs_url: str, debug: list) -> str | None:
                     log(f"✅ [Dotflix] page source se final link: {link[:100]}")
                     return link
                 log(f"⚠️ [Dotflix] attempt {attempt}: Direct Download button nahi dikha")
+                if attempt in (1, 3):
+                    _sel_diag(driver, debug, "Dotflix")
                 _sel_recover_from_ad(driver, dot_url, log)
                 continue
 
@@ -1138,7 +1274,7 @@ def _fprs_selenium_resolve(fprs_url: str, debug: list) -> str | None:
 
             _sel_recover_from_ad(driver, dot_url, log)
 
-        log("❌ [Dotflix] 8 attempts ke baad bhi final link nahi mila")
+        log("❌ [Dotflix] 5 attempts ke baad bhi final link nahi mila")
         return None
     except Exception as e:
         log(f"❌ [Fprs] Selenium error: {type(e).__name__}: {str(e).splitlines()[0][:120] if str(e) else ''}")
@@ -1303,8 +1439,16 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
     debug = []
     final_url = await loop.run_in_executor(None, _resolve_adh_download_link, gdf_url, debug, fprs_url)
 
+    shot_paths = [str(x)[len("__SHOT__:"):] for x in debug if str(x).startswith("__SHOT__:")]
+    debug[:] = [x for x in debug if not str(x).startswith("__SHOT__:")]
+
     if not final_url:
-        debug_text = _safe_debug(debug[-14:]) if debug else "(koi debug info nahi mili)"
+        for sp in shot_paths:
+            try:
+                await message.reply_photo(sp, caption=f"🩺 {ep_label} — bot ke browser ne yeh page dekha")
+            except Exception as e:
+                LOGGER.warning(f"[Adh] debug screenshot bhej nahi paye: {e}")
+        debug_text = _safe_debug(debug[-18:]) if debug else "(koi debug info nahi mili)"
         try:
             await status_msg.edit(
                 f"🛑 **{ep_label} — Link Resolve Fail**\n\n"
@@ -1317,6 +1461,11 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
             pass
         return "error"
 
+    for sp in shot_paths:
+        try:
+            os.remove(sp)
+        except Exception:
+            pass
     try:
         await status_msg.edit(f"⬇️ **{ep_label}** — download ho raha hai...")
     except Exception:
