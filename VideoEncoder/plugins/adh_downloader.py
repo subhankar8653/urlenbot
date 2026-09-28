@@ -57,6 +57,7 @@ khud bataya gaya "pehle testing ke liye karna, dikkat ho to bata dena"):
 """
 
 import asyncio
+import os
 import re
 import time
 import uuid
@@ -75,9 +76,14 @@ from pyrogram.types import (
 
 from .. import LOGGER
 from ..utils.helper import check_chat
-from .rti_downloader import _kb
+from .rti_downloader import _kb, SELENIUM_OK, _kill_driver_tree
 from .haz_downloader import _apply_language_filter
 from .url_upload import _get_filename_from_url, _download_url, _do_upload
+
+try:
+    from selenium.webdriver.common.by import By
+except ImportError:  # selenium na ho to sirf static path chalega
+    By = None
 
 HEADERS = {
     "User-Agent": (
@@ -454,7 +460,7 @@ def discover_adh_series(series_url: str) -> dict:
 # ─────────────────────────────────────────────
 def discover_adh_episodes(episode_list_url: str, html: str | None = None) -> dict:
     """
-    Returns: {"episodes": [{"num": int, "qualities": {q: gdf_href}}, ...], "debug": list}
+    Returns: {"episodes": [{"num": int, "qualities": {q: gdf_href}, "fprs": {q: fprs_href}}, ...], "debug": list}
     `html` diya ho (discover_adh_series ke Strategy-A validation se already
     fetch ho chuka) to dobara request nahi bhejte — sirf usse parse karte hain.
     """
@@ -469,30 +475,36 @@ def discover_adh_episodes(episode_list_url: str, html: str | None = None) -> dic
     soup = BeautifulSoup(html, "html.parser")
 
     episodes = {}
-    for a in soup.find_all("a", string=re.compile(r'^\s*GDF\s*$', re.IGNORECASE)):
-        href = a.get("href")
-        if not href:
-            continue
 
-        qual_marker = a.find_previous(
-            string=re.compile(r'\b(480P|720P|1080P)\b[^[\n]*x26[45]', re.IGNORECASE)
-        )
-        if not qual_marker:
-            continue
-        quality = _normalize_adh_quality(str(qual_marker))
-        if not quality:
-            continue  # HQ ya unrecognized quality — skip
+    def _collect(label_re: str, key: str):
+        for a in soup.find_all("a", string=re.compile(label_re, re.IGNORECASE)):
+            href = a.get("href")
+            if not href:
+                continue
 
-        ep_marker = a.find_previous(string=re.compile(r'Episode\s*:?\s*\d+', re.IGNORECASE))
-        if not ep_marker:
-            continue
-        num_m = re.search(r'\d+', ep_marker)
-        if not num_m:
-            continue
-        ep_num = int(num_m.group())
+            qual_marker = a.find_previous(
+                string=re.compile(r'\b(480P|720P|1080P)\b[^[\n]*x26[45]', re.IGNORECASE)
+            )
+            if not qual_marker:
+                continue
+            quality = _normalize_adh_quality(str(qual_marker))
+            if not quality:
+                continue  # HQ ya unrecognized quality — skip
 
-        ep = episodes.setdefault(ep_num, {"num": ep_num, "qualities": {}})
-        ep["qualities"][quality] = href
+            ep_marker = a.find_previous(string=re.compile(r'Episode\s*:?\s*\d+', re.IGNORECASE))
+            if not ep_marker:
+                continue
+            num_m = re.search(r'\d+', ep_marker)
+            if not num_m:
+                continue
+            ep_num = int(num_m.group())
+
+            ep = episodes.setdefault(ep_num, {"num": ep_num, "qualities": {}, "fprs": {}})
+            ep[key][quality] = href
+
+    # GDF (purana, ab sirf optional fallback) + Fprs (ab primary)
+    _collect(r'^\s*GDF\s*$', "qualities")
+    _collect(r'^\s*Fprs\s*$', "fprs")
 
     if not episodes:
         debug.append(
@@ -500,7 +512,8 @@ def discover_adh_episodes(episode_list_url: str, html: str | None = None) -> dic
             f"ho sakta hai yeh ek ad-page ho, ya site ka HTML structure badal gaya ho"
         )
     else:
-        debug.append(f"✅ {len(episodes)} episode(s) mile GDF links ke saath")
+        n_f = sum(1 for e in episodes.values() if e["fprs"])
+        debug.append(f"✅ {len(episodes)} episode(s) mile ({n_f} mein Fprs link)")
 
     return {"episodes": sorted(episodes.values(), key=lambda x: x["num"]), "debug": debug}
 
@@ -648,7 +661,7 @@ def _script_hints(html: str, limit: int = 6) -> str:
     return f"js={sorted(set(hints)) or '-'} urls={[u[:80] for u in urls[:limit]] or '-'}"
 
 
-def _resolve_adh_download_link(gdf_url: str, debug: list) -> str | None:
+def _resolve_adh_gdf_link(gdf_url: str, debug: list) -> str | None:
     def log(msg):
         debug.append(msg)
         LOGGER.info(f"[Adh] {msg}")
@@ -743,6 +756,422 @@ def _resolve_adh_download_link(gdf_url: str, debug: list) -> str | None:
 
     log(f"✅ Final direct link mila: {final_url[:100]}")
     return final_url
+
+
+# ─────────────────────────────────────────────
+#  Fprs (FilePress) flow — ab primary:
+#    Fprs link -> new1.filepress.lat/file/... page
+#      -> "INSTANT DOWNLOAD" click (3-4 baar ad-redirect, back karna padta hai)
+#      -> new2.dotflix.shop/sha... page ("Ready for download!")
+#      -> "Direct Download" click (1-2 baar ad-redirect, back)
+#      -> final direct link
+#
+#  Do raaste:
+#    1) Static (requests+BS4): agar buttons plain <a href> hain to seedha
+#       href follow — sabse tez, browser ki zaroorat nahi.
+#    2) Selenium fallback: buttons JS se bante hain / href nahi hai to real
+#       click, ad-tab band, ad-redirect pe back — bilkul waise jaisa insaan
+#       karta hai. (Chromium + selenium already deployed hai — Toono/RTI wala.)
+# ─────────────────────────────────────────────
+_SITE_HINTS = ("filepress", "dotflix", "adhlinks")
+_MEDIA_EXT_RE = re.compile(r'\.(mkv|mp4|avi|webm|mov)(\?|#|$)', re.IGNORECASE)
+
+
+def _gdf_fallback_on() -> bool:
+    """GDF ko sirf tab try karo jab env ADH_GDF_FALLBACK=1 ho (default: band)."""
+    return (os.getenv("ADH_GDF_FALLBACK") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _real_href(h: str | None) -> bool:
+    h = (h or "").strip()
+    return bool(h) and h != "#" and not h.lower().startswith(("javascript:", "about:", "data:", "mailto:"))
+
+
+def _probe_file_url(url: str, log) -> bool:
+    """
+    URL ek asli file hai ya ad/html page? Extension (.mkv/.mp4) ho to seedha haan;
+    warna headers dekhte hain (Content-Disposition: attachment ya non-html Content-Type).
+    """
+    if _MEDIA_EXT_RE.search(urlparse(url).path or "") or _MEDIA_EXT_RE.search(url):
+        return True
+    try:
+        r = _SESSION.get(url, stream=True, timeout=20, allow_redirects=True)
+        ct = (r.headers.get("Content-Type") or "").lower()
+        cd = (r.headers.get("Content-Disposition") or "").lower()
+        code = r.status_code
+        r.close()
+        ok = code < 400 and ("attachment" in cd or (ct and "html" not in ct and not ct.startswith("text/")))
+        log(f"🔬 Probe {url[:70]} → HTTP {code}, type={ct or '-'}, file={'haan' if ok else 'nahi'}")
+        return ok
+    except Exception as e:
+        log(f"⚠️ Probe fail ({str(e).splitlines()[0][:80]}) — is URL ko file nahi maan rahe")
+        return False
+
+
+def _dotflix_final_from_html(html: str, page_url: str, log) -> str | None:
+    """Dotflix page ke static HTML se 'Direct Download' ka href / fallbacks."""
+    soup = BeautifulSoup(html, "html.parser")
+    for a in soup.find_all("a", href=True):
+        if "direct download" in a.get_text(" ", strip=True).lower() and _real_href(a["href"]):
+            return urljoin(page_url, a["href"].strip())
+
+    m = re.search(
+        r'href=["\'](https?://[^"\']+)["\'][^>]*>\s*(?:<[^>]+>\s*)*.*?Direct\s*Download',
+        html, re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        return m.group(1)
+
+    q = _link_from_query(page_url)
+    if q:
+        log("✅ Dotflix URL ke query-param se link mila")
+        return q
+
+    for m in re.finditer(r'atob\(["\']([A-Za-z0-9+/=]+)["\']\)', html):
+        try:
+            dec = base64.b64decode(m.group(1)).decode("utf-8", "ignore").strip()
+            if dec.startswith("http"):
+                log("✅ Dotflix page pe base64 link decode hua")
+                return dec
+        except Exception:
+            continue
+
+    m = re.search(r'(https?://[^\s"\'<>\\]+\.(?:mkv|mp4))', html, re.IGNORECASE)
+    if m:
+        log("✅ Dotflix HTML mein raw .mkv/.mp4 link mila")
+        return m.group(1)
+    return None
+
+
+# ── Path 1: static ──
+def _fprs_static_resolve(fprs_url: str, debug: list) -> str | None:
+    def log(msg):
+        debug.append(msg)
+        LOGGER.info(f"[Adh] {msg}")
+
+    got = _fetch_page(fprs_url, debug, "Fprs page", None)
+    if not got:
+        log("⚠️ Fprs page static fetch nahi hua")
+        return None
+    html, final = got
+    soup = BeautifulSoup(html, "html.parser")
+
+    instant = None
+    for a in soup.find_all("a", href=True):
+        if "instant download" in a.get_text(" ", strip=True).lower() and _real_href(a["href"]):
+            instant = urljoin(final, a["href"].strip())
+            break
+    if not instant:
+        m = re.search(r'https?://[^\s"\'<>\\]*dotflix[^\s"\'<>\\]*', html, re.IGNORECASE)
+        if m:
+            instant = m.group(0)
+    if not instant:
+        log(f"ℹ️ Static HTML mein INSTANT DOWNLOAD ka href nahi (JS button hoga) — final URL: {final[:80]}")
+        log(f"🔗 Page links: {_describe_links(soup)}")
+        return None
+    log(f"✅ INSTANT DOWNLOAD href mila: {instant[:100]}")
+
+    # href kabhi seedha dotflix hota hai, kabhi ek redirector — _fetch_page redirects follow karta hai
+    got2 = _fetch_page(instant, debug, "Dotflix page", None)
+    if not got2:
+        return None
+    html2, final2 = got2
+    link = _dotflix_final_from_html(html2, final2, log)
+    if not link:
+        log(f"ℹ️ Dotflix static HTML mein Direct Download href nahi — final URL: {final2[:80]}")
+        return None
+    if _probe_file_url(link, log):
+        log(f"✅ Static path se final link mila: {link[:100]}")
+        return link
+    log("⚠️ Static path ka link file jaisa nahi laga (ad/html) — Selenium try karenge")
+    return None
+
+
+# ── Path 2: Selenium (real clicks + ad handling) ──
+def _xpath_ci(phrase: str) -> str:
+    up = "translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ')"
+    P = phrase.upper()
+    return (
+        f"//a[contains({up},'{P}')] | //button[contains({up},'{P}')] | "
+        f"//*[@role='button'][contains({up},'{P}')]"
+    )
+
+
+def _sel_find(driver, phrase: str):
+    try:
+        for el in driver.find_elements(By.XPATH, _xpath_ci(phrase)):
+            try:
+                if el.is_displayed():
+                    return el
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _sel_click(driver, el) -> bool:
+    try:
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        except Exception:
+            pass
+        try:
+            driver.execute_script("arguments[0].click();", el)
+        except Exception:
+            el.click()
+        return True
+    except Exception:
+        return False
+
+
+def _sel_sweep(driver, main, hint: str):
+    """
+    Saare tabs dekho: `hint` wala tab mila to uska handle return. Baaki non-blank,
+    non-site tabs (ads) band. about:blank tabs ko chhod do (JS baad mein redirect
+    kar sakta hai). Ant mein main tab pe wapas.
+    """
+    try:
+        handles = list(driver.window_handles)
+    except Exception:
+        return None
+    for h in handles:
+        try:
+            driver.switch_to.window(h)
+            cur = (driver.current_url or "").lower()
+        except Exception:
+            continue
+        if hint in cur:
+            return h
+        if h == main:
+            continue
+        if cur in ("about:blank", "", "data:,"):
+            continue
+        if not any(x in cur for x in _SITE_HINTS):
+            try:
+                driver.close()
+            except Exception:
+                pass
+    try:
+        hs = driver.window_handles
+        driver.switch_to.window(main if main in hs else hs[0])
+    except Exception:
+        pass
+    return None
+
+
+def _sel_recover_from_ad(driver, back_url: str, log):
+    """Main tab kisi ad-site pe chala gaya ho to back karo (ya page dobara kholo)."""
+    try:
+        cur = (driver.current_url or "").lower()
+    except Exception:
+        return
+    if cur in ("about:blank", "", "data:,") or any(x in cur for x in _SITE_HINTS):
+        return
+    log(f"↩️ Ad-redirect mila ({urlparse(cur).netloc[:40]}) — back kar rahe hain")
+    try:
+        driver.back()
+        time.sleep(1.5)
+        cur2 = (driver.current_url or "").lower()
+        if not any(x in cur2 for x in _SITE_HINTS):
+            driver.get(back_url)
+    except Exception:
+        try:
+            driver.get(back_url)
+        except Exception:
+            pass
+
+
+def _sel_wait_find(driver, phrase: str, timeout: float):
+    end = time.time() + timeout
+    while time.time() < end:
+        el = _sel_find(driver, phrase)
+        if el is not None:
+            return el
+        time.sleep(0.7)
+    return None
+
+
+def _fprs_selenium_resolve(fprs_url: str, debug: list) -> str | None:
+    def log(msg):
+        debug.append(msg)
+        LOGGER.info(f"[Adh] {msg}")
+
+    if not SELENIUM_OK or By is None:
+        log("❌ Selenium install nahi hai — Fprs click-flow nahi chal sakta")
+        return None
+
+    from .toono_downloader import _make_toono_driver
+
+    driver = None
+    try:
+        log("🌐 [Fprs] Selenium browser khol rahe hain")
+        driver = _make_toono_driver()
+        driver.get(fprs_url)
+        main = driver.current_window_handle
+        page_url = driver.current_url or fprs_url
+        log(f"🌐 [Fprs] page: {page_url[:90]}")
+
+        # ── Stage 1: INSTANT DOWNLOAD -> dotflix ──
+        dot_handle = None
+        for attempt in range(1, 9):
+            el = _sel_wait_find(driver, "instant download", 25 if attempt == 1 else 10)
+            if el is None:
+                log(f"⚠️ [Fprs] attempt {attempt}: INSTANT DOWNLOAD button nahi dikha (url: {(driver.current_url or '')[:70]})")
+                _sel_recover_from_ad(driver, page_url, log)
+                continue
+
+            href = ""
+            try:
+                href = el.get_attribute("href") or ""
+            except Exception:
+                pass
+            if _real_href(href) and "dotflix" in href.lower():
+                log("✅ [Fprs] INSTANT DOWNLOAD ke href mein seedha dotflix link mila")
+                driver.get(href)
+                dot_handle = driver.current_window_handle
+                break
+
+            if not _sel_click(driver, el):
+                log(f"⚠️ [Fprs] attempt {attempt}: click fail")
+                continue
+            log(f"🖱️ [Fprs] attempt {attempt}: INSTANT DOWNLOAD click kiya")
+
+            for _ in range(16):  # ~8 sec poll
+                time.sleep(0.5)
+                h = _sel_sweep(driver, main, "dotflix")
+                if h:
+                    dot_handle = h
+                    break
+            if dot_handle:
+                break
+            _sel_recover_from_ad(driver, page_url, log)
+
+        if not dot_handle:
+            log("❌ [Fprs] 8 attempts ke baad bhi dotflix page nahi mila")
+            return None
+
+        try:
+            driver.switch_to.window(dot_handle)
+        except Exception:
+            pass
+        main = dot_handle
+        for h in list(driver.window_handles):
+            if h != main:
+                try:
+                    driver.switch_to.window(h)
+                    driver.close()
+                except Exception:
+                    pass
+        driver.switch_to.window(main)
+        dot_url = driver.current_url or ""
+        log(f"✅ [Dotflix] page mila: {dot_url[:90]}")
+
+        # ── Stage 2: Direct Download -> final link ──
+        for attempt in range(1, 9):
+            el = _sel_wait_find(driver, "direct download", 30 if attempt == 1 else 10)
+            if el is None:
+                # page-source se bhi try (button JS se ban ke chhupa ho sakta hai)
+                link = _dotflix_final_from_html(driver.page_source or "", driver.current_url or dot_url, log)
+                if link and _probe_file_url(link, log):
+                    log(f"✅ [Dotflix] page source se final link: {link[:100]}")
+                    return link
+                log(f"⚠️ [Dotflix] attempt {attempt}: Direct Download button nahi dikha")
+                _sel_recover_from_ad(driver, dot_url, log)
+                continue
+
+            href = ""
+            try:
+                href = el.get_attribute("href") or ""
+            except Exception:
+                pass
+            if _real_href(href):
+                full = urljoin(driver.current_url or dot_url, href.strip())
+                if _probe_file_url(full, log):
+                    log(f"✅ [Dotflix] Direct Download href se final link: {full[:100]}")
+                    return full
+                log(f"ℹ️ [Dotflix] href file jaisa nahi ({full[:70]}) — click karke dekhte hain")
+
+            if not _sel_click(driver, el):
+                log(f"⚠️ [Dotflix] attempt {attempt}: click fail")
+                continue
+            log(f"🖱️ [Dotflix] attempt {attempt}: Direct Download click kiya")
+
+            for _ in range(16):
+                time.sleep(0.5)
+                # naye tabs: file-jaisa URL mila to wahi final, warna ad -> band
+                try:
+                    for h in list(driver.window_handles):
+                        driver.switch_to.window(h)
+                        cur = driver.current_url or ""
+                        if cur in ("about:blank", "", "data:,"):
+                            continue
+                        if h != main or "dotflix" not in cur.lower():
+                            if _real_href(cur) and _probe_file_url(cur, log):
+                                log(f"✅ [Dotflix] click ke baad final link: {cur[:100]}")
+                                return cur
+                        if h != main:
+                            try:
+                                driver.close()
+                            except Exception:
+                                pass
+                    driver.switch_to.window(main)
+                except Exception:
+                    try:
+                        driver.switch_to.window(driver.window_handles[0])
+                        main = driver.current_window_handle
+                    except Exception:
+                        pass
+
+                # click ke baad button ka href JS se set ho gaya ho
+                el2 = _sel_find(driver, "direct download")
+                if el2 is not None:
+                    try:
+                        h2 = el2.get_attribute("href") or ""
+                    except Exception:
+                        h2 = ""
+                    if _real_href(h2) and h2 != href:
+                        full = urljoin(driver.current_url or dot_url, h2.strip())
+                        if _probe_file_url(full, log):
+                            log(f"✅ [Dotflix] click ke baad href badla, final link: {full[:100]}")
+                            return full
+
+            _sel_recover_from_ad(driver, dot_url, log)
+
+        log("❌ [Dotflix] 8 attempts ke baad bhi final link nahi mila")
+        return None
+    except Exception as e:
+        log(f"❌ [Fprs] Selenium error: {type(e).__name__}: {str(e).splitlines()[0][:120] if str(e) else ''}")
+        return None
+    finally:
+        if driver is not None:
+            try:
+                _kill_driver_tree(driver)
+            except Exception:
+                pass
+
+
+def _resolve_adh_fprs_link(fprs_url: str, debug: list) -> str | None:
+    link = _fprs_static_resolve(fprs_url, debug)
+    if link:
+        return link
+    debug.append("➡️ Static path se nahi mila — Selenium (real click) path shuru")
+    return _fprs_selenium_resolve(fprs_url, debug)
+
+
+def _resolve_adh_download_link(gdf_url: str | None, debug: list, fprs_url: str | None = None) -> str | None:
+    """Fprs primary. GDF sirf env ADH_GDF_FALLBACK=1 hone pe fallback."""
+    if fprs_url:
+        link = _resolve_adh_fprs_link(fprs_url, debug)
+        if link:
+            return link
+        debug.append("❌ Fprs se final link nahi mila")
+        if not (gdf_url and _gdf_fallback_on()):
+            return None
+        debug.append("➡️ ADH_GDF_FALLBACK on hai — GDF try kar rahe hain")
+    if gdf_url:
+        return _resolve_adh_gdf_link(gdf_url, debug)
+    return None
 
 
 # ─────────────────────────────────────────────
@@ -851,16 +1280,17 @@ class AdhSelector:
 
 
 # ─────────────────────────────────────────────
-#  Ek episode: GDF link -> resolve -> download -> filter -> upload
+#  Ek episode: Fprs link -> resolve -> download -> filter -> upload
 # ─────────────────────────────────────────────
 async def _process_adh_item(client, message, ep: dict, status_msg, index: int, total: int,
                              language: str, quality: str):
     ep_label = f"E{ep['num']:02d}"
     loop = asyncio.get_event_loop()
-    gdf_url = ep["qualities"].get(quality)
-    if not gdf_url:
+    gdf_url = (ep.get("qualities") or {}).get(quality)
+    fprs_url = (ep.get("fprs") or {}).get(quality)
+    if not fprs_url and not (gdf_url and _gdf_fallback_on()):
         try:
-            await status_msg.edit(f"🛑 **{ep_label}** — is episode mein `{quality}` quality available nahi hai.")
+            await status_msg.edit(f"🛑 **{ep_label}** — is episode mein `{quality}` ka Fprs link available nahi hai.")
         except Exception:
             pass
         return "error"
@@ -871,7 +1301,7 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
         pass
 
     debug = []
-    final_url = await loop.run_in_executor(None, _resolve_adh_download_link, gdf_url, debug)
+    final_url = await loop.run_in_executor(None, _resolve_adh_download_link, gdf_url, debug, fprs_url)
 
     if not final_url:
         debug_text = _safe_debug(debug[-14:]) if debug else "(koi debug info nahi mili)"
@@ -879,7 +1309,7 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
             await status_msg.edit(
                 f"🛑 **{ep_label} — Link Resolve Fail**\n\n"
                 f"❌ Final download link nahi mila.\n\n"
-                f"**GDF URL:** `{gdf_url}`\n\n"
+                f"**Fprs URL:** `{fprs_url or '-'}`\n\n"
                 f"**Debug (kaha atka, step-by-step):**\n```\n{debug_text}\n```\n"
                 f"⛔ Agle items **band** kar diye gaye."
             )
