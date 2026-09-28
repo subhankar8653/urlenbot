@@ -104,30 +104,128 @@ HEADERS = {
 _SESSION = requests.Session()
 _SESSION.headers.update(HEADERS)
 
+# ─────────────────────────────────────────────
+#  Ad/interstitial-wall detection
+#  --------------------------------------------
+#  Root-cause (Subhankar ne confirm kiya): is site ke har page pe ek
+#  "1-click ad" laga hai — real browser mein pehla click ek ad-tab/redirect
+#  khol deta hai, aur sahi target sirf "wapas aakar dubara click karne" pe
+#  milta hai. requests/BS4 JS execute nahi karte, isliye humein woh popup
+#  nahi dikhta — lekin kai baar server khud bhi pehli hit pe ek ad-network
+#  ka interstitial HTML bhej deta hai (cookie/session set karne ke baad hi
+#  asli page deta hai). Isliye: pehli response ko "adwall jaisa lagta hai
+#  kya" check karo, agar haan to seedha wahi URL dubara fetch karo (jaisa
+#  "back karke fir click" karna hota) — session cookies persist rehti hain
+#  isliye dusri hit real page de sakti hai.
+# ─────────────────────────────────────────────
+_ADWALL_MARKERS = [
+    "propellerads", "adsterra", "popads", "exoclick", "juicyads",
+    "highperformanceformat", "onclickmega", "adcash", "clickadu",
+    "revenuehits", "monetag", "galaksion", "verify you are human",
+    "checking your browser", "please wait while we redirect",
+    "click here to continue", "continue to your link", "get link",
+    "unlock link", "redirecting you", "you will be redirected",
+    "skip ad", "ad will close",
+]
+
+
+def _looks_like_adwall(html: str, expected_markers: list | None = None) -> str | None:
+    """
+    Agar page ek ad/interstitial jaisa lagta hai to reason-string return
+    karta hai, warna None. Do signals check karte hain:
+      1) Known ad-network script/keyword directly HTML mein mila.
+      2) `expected_markers` diye gaye (jaise "Download Here", "INSTANT DL")
+         aur unmein se koi bhi text mein nahi mila, jabki page chhota/khaali
+         jaisa hai — yeh bhi wrong/ad page pe hone ka signal ho sakta hai.
+    """
+    low = (html or "").lower()
+    for marker in _ADWALL_MARKERS:
+        if marker in low:
+            return f"ad-network marker '{marker}' mila"
+    if expected_markers and len(html or "") < 4000:
+        if not any(em.lower() in low for em in expected_markers):
+            return f"expected content ({', '.join(expected_markers)}) nahi mila aur page bahut chhota hai ({len(html or '')} chars)"
+    return None
+
+
 # animedubhindi.link jaisi shared-hosting/Cloudflare site kabhi-kabhi pehli
 # request pe 20s se zyada le leti hai (cold start / anti-bot delay) —
 # isliye lamba timeout + retry-with-backoff, taaki genuine slow response
 # aur "site hi down hai" mein farak pata chale.
-def _http_get(url: str, timeout: int = 35, retries: int = 2, debug: list | None = None, **kwargs):
+def _http_get(
+    url: str,
+    timeout: int = 35,
+    retries: int = 2,
+    debug: list | None = None,
+    step: str = "",
+    expected_markers: list | None = None,
+    ad_retries: int = 2,
+    **kwargs,
+):
+    """
+    step: is call ka human-readable naam (jaise "GDF page", "Instant-DL
+    wait-page") — sirf logging/debug-trail ke liye, taaki user ko exactly
+    pata chale ki kaun se page pe/kaun se link pe bot atka.
+    expected_markers + ad_retries: fetch karne ke baad agar response
+    ad-interstitial jaisa lage to (jaisa real browser mein "back + click
+    again" karna padta hai) wahi URL dubara fetch karte hain, max
+    `ad_retries` baar.
+    """
+    tag = f"[{step}] " if step else ""
+
     def log(msg):
         if debug is not None:
-            debug.append(msg)
-        LOGGER.info(f"[Adh] {msg}")
+            debug.append(f"{tag}{msg}")
+        LOGGER.info(f"[Adh] {tag}{msg}")
+
+    log(f"🌐 GET {url}")
 
     last_exc = None
+    r = None
     for attempt in range(1, retries + 2):  # total attempts = retries + 1
         try:
             r = _SESSION.get(url, timeout=timeout, **kwargs)
-            return r
+            break
         except requests.exceptions.ReadTimeout as e:
             last_exc = e
-            log(f"⚠️ Attempt {attempt}: read timed out ({timeout}s) on {url[:80]}")
+            log(f"⚠️ Attempt {attempt}: read timed out ({timeout}s)")
         except requests.exceptions.RequestException as e:
             last_exc = e
             log(f"⚠️ Attempt {attempt}: {str(e).splitlines()[0][:120]}")
         if attempt < retries + 1:
             time.sleep(2 * attempt)
-    raise last_exc
+    if r is None:
+        log(f"❌ {retries + 1} attempts ke baad bhi fetch fail: {str(last_exc).splitlines()[0][:120] if last_exc else 'unknown error'}")
+        raise last_exc
+
+    if r.history:
+        chain = " → ".join([str(h.status_code) for h in r.history] + [str(r.status_code)])
+        log(f"↪️ Redirect chain ({chain}) final URL: {r.url}")
+    else:
+        log(f"✅ HTTP {r.status_code}, {len(r.text)} chars, final URL: {r.url}")
+
+    reason = _looks_like_adwall(r.text, expected_markers)
+    if reason:
+        log(f"🛑 Ad/interstitial page jaisa lag raha hai ({reason}) — 'back + dubara click' simulate kar rahe hain")
+        for ad_attempt in range(1, ad_retries + 1):
+            time.sleep(1.5)
+            try:
+                r2 = _SESSION.get(url, timeout=timeout, **kwargs)
+            except requests.exceptions.RequestException as e:
+                log(f"⚠️ Ad-retry {ad_attempt}: fetch fail — {str(e).splitlines()[0][:120]}")
+                continue
+            reason2 = _looks_like_adwall(r2.text, expected_markers)
+            if not reason2:
+                log(f"✅ Ad-retry {ad_attempt}: is baar clean page mila (final URL: {r2.url})")
+                r = r2
+                reason = None
+                break
+            log(f"🛑 Ad-retry {ad_attempt}: abhi bhi ad-page jaisa lag raha hai ({reason2})")
+            r = r2
+        if reason:
+            log(f"❌ {ad_retries} ad-retries ke baad bhi ad-page/wrong-page se nahi nikal paaye — parsing aage try karenge lekin fail ho sakta hai")
+
+    return r
 
 # Sirf yehi 3 qualities dikhani hain (4 available hain page pe, HQ skip)
 ADH_QUALITIES = ["480p x264", "720p x264", "1080p x265 10bit"]
@@ -271,7 +369,7 @@ def discover_adh_series(series_url: str) -> dict:
               "episode_list_html": str|None, "debug": list}
     """
     debug = []
-    r = _http_get(series_url, debug=debug)
+    r = _http_get(series_url, debug=debug, step="Series page", expected_markers=["Audio Tracks", "Download", "Watch"])
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -295,7 +393,10 @@ def discover_adh_series(series_url: str) -> dict:
     candidate = _derive_adh_episode_list_url(series_url)
     if candidate:
         try:
-            r2 = _http_get(candidate, debug=debug)
+            r2 = _http_get(
+                candidate, debug=debug, step="Derived episode-list URL",
+                expected_markers=["Episode", "GDF"],
+            )
             if r2.status_code == 200 and (
                 re.search(r'Episode\s*:?\s*\d+', r2.text, re.IGNORECASE) or "gdf" in r2.text.lower()
             ):
@@ -330,14 +431,18 @@ def discover_adh_series(series_url: str) -> dict:
 # ─────────────────────────────────────────────
 #  Step 2: episode-list page -> {ep_num: {quality: gdf_href}}
 # ─────────────────────────────────────────────
-def discover_adh_episodes(episode_list_url: str, html: str | None = None) -> list:
+def discover_adh_episodes(episode_list_url: str, html: str | None = None) -> dict:
     """
-    Returns: [{"num": int, "qualities": {q: gdf_href}}, ...]
+    Returns: {"episodes": [{"num": int, "qualities": {q: gdf_href}}, ...], "debug": list}
     `html` diya ho (discover_adh_series ke Strategy-A validation se already
     fetch ho chuka) to dobara request nahi bhejte — sirf usse parse karte hain.
     """
+    debug: list = []
     if html is None:
-        r = _http_get(episode_list_url)
+        r = _http_get(
+            episode_list_url, debug=debug, step="Episode-list page",
+            expected_markers=["Episode", "GDF"],
+        )
         r.raise_for_status()
         html = r.text
     soup = BeautifulSoup(html, "html.parser")
@@ -368,7 +473,15 @@ def discover_adh_episodes(episode_list_url: str, html: str | None = None) -> lis
         ep = episodes.setdefault(ep_num, {"num": ep_num, "qualities": {}})
         ep["qualities"][quality] = href
 
-    return sorted(episodes.values(), key=lambda x: x["num"])
+    if not episodes:
+        debug.append(
+            f"❌ Episode-list page pe koi bhi GDF link nahi mila (page length: {len(html)} chars) — "
+            f"ho sakta hai yeh ek ad-page ho, ya site ka HTML structure badal gaya ho"
+        )
+    else:
+        debug.append(f"✅ {len(episodes)} episode(s) mile GDF links ke saath")
+
+    return {"episodes": sorted(episodes.values(), key=lambda x: x["num"]), "debug": debug}
 
 
 # ─────────────────────────────────────────────
@@ -383,7 +496,10 @@ def _resolve_adh_download_link(gdf_url: str, debug: list) -> str | None:
         LOGGER.info(f"[Adh] {msg}")
 
     try:
-        r = _http_get(gdf_url, timeout=30, debug=debug, allow_redirects=True)
+        r = _http_get(
+            gdf_url, timeout=30, debug=debug, allow_redirects=True,
+            step="GDF page", expected_markers=["INSTANT DL", "instant dl"],
+        )
     except Exception as e:
         log(f"❌ GDF page fetch fail (after retries): {str(e).splitlines()[0][:120]}")
         return None
@@ -404,14 +520,17 @@ def _resolve_adh_download_link(gdf_url: str, debug: list) -> str | None:
             instant_href = m.group(1)
 
     if not instant_href:
-        log("❌ GDF page pe 'INSTANT DL' button nahi mila")
+        log(f"❌ GDF page ({gdf_url}) pe 'INSTANT DL' button nahi mila")
         return None
 
     instant_href = urljoin(gdf_url, instant_href)
     log(f"✅ INSTANT DL link mila: {instant_href[:100]}")
 
     try:
-        r2 = _http_get(instant_href, timeout=30, debug=debug, allow_redirects=True)
+        r2 = _http_get(
+            instant_href, timeout=30, debug=debug, allow_redirects=True,
+            step="Instant-DL wait-page", expected_markers=["Download Here", "download here"],
+        )
     except Exception as e:
         log(f"❌ Instant-DL wait-page fetch fail (after retries): {str(e).splitlines()[0][:120]}")
         return None
@@ -457,7 +576,8 @@ def _resolve_adh_download_link(gdf_url: str, debug: list) -> str | None:
             log("✅ Raw HTML regex se .mkv/.mp4 link mila (fallback)")
 
     if not final_url:
-        log("❌ Wait-page pe 'Download Here' final link nahi mila")
+        log(f"❌ Wait-page ({instant_href}) pe 'Download Here' final link nahi mila — "
+            f"shayad abhi bhi ad-page pe hain ya button ka HTML badal gaya hai")
         return None
 
     log(f"✅ Final direct link mila: {final_url[:100]}")
@@ -593,12 +713,13 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
     final_url = await loop.run_in_executor(None, _resolve_adh_download_link, gdf_url, debug)
 
     if not final_url:
-        debug_text = "\n".join(debug[-10:]) if debug else "(koi debug info nahi mili)"
+        debug_text = "\n".join(debug[-14:]) if debug else "(koi debug info nahi mili)"
         try:
             await status_msg.edit(
                 f"🛑 **{ep_label} — Link Resolve Fail**\n\n"
                 f"❌ Final download link nahi mila.\n\n"
-                f"**Debug (last steps):**\n```\n{debug_text}\n```\n"
+                f"**GDF URL:** `{gdf_url}`\n\n"
+                f"**Debug (kaha atka, step-by-step):**\n```\n{debug_text}\n```\n"
                 f"⛔ Agle items **band** kar diye gaye."
             )
         except Exception:
@@ -832,16 +953,18 @@ async def adh_command(client: Client, message: Message):
         LOGGER.error(f"[Adh] discover_adh_series error: {e}")
         await status_msg.edit(
             f"❌ Series page load nahi hua (3 attempts ke baad bhi): `{str(e)[:100]}`\n\n"
+            f"**URL:** `{series_url}`\n\n"
             f"Site slow ho sakti hai ya bot traffic block kar rahi ho — thodi der baad "
             f"dubara try karo."
         )
         return
 
     if not series_data.get("episode_list_url"):
-        debug_text = "\n".join(series_data.get("debug", [])[-10:]) or "(koi debug info nahi mili)"
+        debug_text = "\n".join(series_data.get("debug", [])[-12:]) or "(koi debug info nahi mili)"
         await status_msg.edit(
             "❌ Is page pe 'Download / Watch' button ka link nahi mila.\n\n"
-            f"**Debug (last steps):**\n```\n{debug_text}\n```"
+            f"**URL:** `{series_url}`\n\n"
+            f"**Debug (kaha atka, step-by-step):**\n```\n{debug_text}\n```"
         )
         return
 
@@ -851,20 +974,27 @@ async def adh_command(client: Client, message: Message):
         pass
 
     try:
-        episodes = await loop.run_in_executor(
+        ep_result = await loop.run_in_executor(
             None, discover_adh_episodes, series_data["episode_list_url"], series_data.get("episode_list_html")
         )
     except Exception as e:
         LOGGER.error(f"[Adh] discover_adh_episodes error: {e}")
         await status_msg.edit(
             f"❌ Episode list load nahi hua (3 attempts ke baad bhi): `{str(e)[:100]}`\n\n"
+            f"**URL:** `{series_data['episode_list_url']}`\n\n"
             f"Site slow ho sakti hai ya bot traffic block kar rahi ho — thodi der baad "
             f"dubara try karo."
         )
         return
 
+    episodes = ep_result["episodes"]
     if not episodes:
-        await status_msg.edit("❌ Episode-list page se koi episode nahi mila (480p/720p/1080p x265 mein se koi bhi).")
+        debug_text = "\n".join(ep_result.get("debug", [])[-12:]) or "(koi debug info nahi mili)"
+        await status_msg.edit(
+            "❌ Episode-list page se koi episode nahi mila (480p/720p/1080p x265 mein se koi bhi).\n\n"
+            f"**URL:** `{series_data['episode_list_url']}`\n\n"
+            f"**Debug (kaha atka, step-by-step):**\n```\n{debug_text}\n```"
+        )
         return
 
     _prune_adh_sessions()
