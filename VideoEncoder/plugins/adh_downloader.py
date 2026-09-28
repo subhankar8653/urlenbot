@@ -504,7 +504,7 @@ def discover_adh_episodes(episode_list_url: str, html: str | None = None) -> dic
             ep_num = int(num_m.group())
 
             ep = episodes.setdefault(ep_num, {"num": ep_num, "qualities": {}, "fprs": {}, "multi": {}})
-            ep[key][quality] = href
+            ep[key][quality] = urljoin(episode_list_url, href.strip())
 
     # GDF (purana, ab sirf optional fallback) + Fprs (ab primary)
     _collect(r'^\s*GDF\s*$', "qualities")
@@ -1305,6 +1305,10 @@ def _resolve_adh_fprs_link(fprs_url: str, debug: list) -> str | None:
 def _resolve_adh_download_link(gdf_url: str | None, debug: list, fprs_url: str | None = None,
                                multi_url: str | None = None) -> str | None:
     """Multi primary. Fprs = env ADH_FPRS_FALLBACK=1, GDF = env ADH_GDF_FALLBACK=1 hone pe fallback."""
+    _base = "https://new.adhlinks.com/"
+    multi_url = urljoin(_base, multi_url) if multi_url else multi_url
+    fprs_url = urljoin(_base, fprs_url) if fprs_url else fprs_url
+    gdf_url = urljoin(_base, gdf_url) if gdf_url else gdf_url
     if multi_url:
         link = _multi_selenium_resolve(multi_url, debug)
         if link:
@@ -1332,7 +1336,7 @@ def _resolve_adh_download_link(gdf_url: str | None, debug: list, fprs_url: str |
 #  browser ke network-log se (video/attachment response ka URL).
 # ─────────────────────────────────────────────
 _MULTI_KEEP = ("adhlinks", "filesforever", "iqsmartgames", "cldst")
-_BLANK = ("about:blank", "", "data:,")
+_BLANK = ("about:blank", "", "data:,", "chrome://new-tab-page/", "chrome://new-tab-page")
 
 
 def _env_on(name: str) -> bool:
