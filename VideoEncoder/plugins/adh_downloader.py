@@ -464,7 +464,7 @@ def discover_adh_series(series_url: str) -> dict:
 # ─────────────────────────────────────────────
 def discover_adh_episodes(episode_list_url: str, html: str | None = None) -> dict:
     """
-    Returns: {"episodes": [{"num": int, "qualities": {q: gdf_href}, "fprs": {q: fprs_href}}, ...], "debug": list}
+    Returns: {"episodes": [{"num": int, "qualities": {q: gdf_href}, "fprs": {q: fprs_href}, "multi": {q: multi_href}}, ...], "debug": list}
     `html` diya ho (discover_adh_series ke Strategy-A validation se already
     fetch ho chuka) to dobara request nahi bhejte — sirf usse parse karte hain.
     """
@@ -503,12 +503,13 @@ def discover_adh_episodes(episode_list_url: str, html: str | None = None) -> dic
                 continue
             ep_num = int(num_m.group())
 
-            ep = episodes.setdefault(ep_num, {"num": ep_num, "qualities": {}, "fprs": {}})
+            ep = episodes.setdefault(ep_num, {"num": ep_num, "qualities": {}, "fprs": {}, "multi": {}})
             ep[key][quality] = href
 
     # GDF (purana, ab sirf optional fallback) + Fprs (ab primary)
     _collect(r'^\s*GDF\s*$', "qualities")
     _collect(r'^\s*Fprs\s*$', "fprs")
+    _collect(r'^\s*Multi\s*$', "multi")
 
     if not episodes:
         debug.append(
@@ -516,8 +517,8 @@ def discover_adh_episodes(episode_list_url: str, html: str | None = None) -> dic
             f"ho sakta hai yeh ek ad-page ho, ya site ka HTML structure badal gaya ho"
         )
     else:
-        n_f = sum(1 for e in episodes.values() if e["fprs"])
-        debug.append(f"✅ {len(episodes)} episode(s) mile ({n_f} mein Fprs link)")
+        n_m = sum(1 for e in episodes.values() if e["multi"])
+        debug.append(f"✅ {len(episodes)} episode(s) mile ({n_m} mein Multi link)")
 
     return {"episodes": sorted(episodes.values(), key=lambda x: x["num"]), "debug": debug}
 
@@ -915,6 +916,12 @@ def _make_adh_driver():
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
         options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+        dl_dir = os.path.join(profile_dir, "dl")
+        os.makedirs(dl_dir, exist_ok=True)
+        options.add_experimental_option("prefs", {
+            "download.default_directory": dl_dir,
+            "download.prompt_for_download": False,
+        })
         options.page_load_strategy = "none"   # SPA: DOMContentLoaded ka wait nahi, hum khud poll karte hain
 
         for binary in ("/usr/bin/chromium", "/usr/bin/chromium-browser",
@@ -1295,19 +1302,335 @@ def _resolve_adh_fprs_link(fprs_url: str, debug: list) -> str | None:
     return _fprs_selenium_resolve(fprs_url, debug)
 
 
-def _resolve_adh_download_link(gdf_url: str | None, debug: list, fprs_url: str | None = None) -> str | None:
-    """Fprs primary. GDF sirf env ADH_GDF_FALLBACK=1 hone pe fallback."""
-    if fprs_url:
+def _resolve_adh_download_link(gdf_url: str | None, debug: list, fprs_url: str | None = None,
+                               multi_url: str | None = None) -> str | None:
+    """Multi primary. Fprs = env ADH_FPRS_FALLBACK=1, GDF = env ADH_GDF_FALLBACK=1 hone pe fallback."""
+    if multi_url:
+        link = _multi_selenium_resolve(multi_url, debug)
+        if link:
+            return link
+        debug.append("❌ Multi se final link nahi mila")
+    if fprs_url and _env_on("ADH_FPRS_FALLBACK"):
+        debug.append("➡️ ADH_FPRS_FALLBACK on — Fprs try kar rahe hain")
         link = _resolve_adh_fprs_link(fprs_url, debug)
         if link:
             return link
-        debug.append("❌ Fprs se final link nahi mila")
-        if not (gdf_url and _gdf_fallback_on()):
-            return None
-        debug.append("➡️ ADH_GDF_FALLBACK on hai — GDF try kar rahe hain")
-    if gdf_url:
+    if gdf_url and _gdf_fallback_on():
+        debug.append("➡️ ADH_GDF_FALLBACK on — GDF try kar rahe hain")
         return _resolve_adh_gdf_link(gdf_url, debug)
     return None
+
+
+# ─────────────────────────────────────────────
+#  MULTI flow (ab primary):
+#    Multi link (new.adhlinks.com/re.php?data=...)  -> "Redirecting in 0 seconds" page
+#      -> FilesForever page ("Direct Links" mein "Cloud Download" button)
+#      -> click -> cldst "Preparing Your File" page (transfer ho raha hota hai, 1-2+ min)
+#      -> "Download File" button (transfer 100% ke baad) -> click -> file download
+#  Poori tarah Selenium (JS-redirect + JS-progress wali pages hain). Ad-tabs band,
+#  same-tab ad-redirect pe back. Final URL: button ke href se, ya click ke baad
+#  browser ke network-log se (video/attachment response ka URL).
+# ─────────────────────────────────────────────
+_MULTI_KEEP = ("adhlinks", "filesforever", "iqsmartgames", "cldst")
+_BLANK = ("about:blank", "", "data:,")
+
+
+def _env_on(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _body_text(driver) -> str:
+    try:
+        return (driver.execute_script("return (document.body&&document.body.innerText)||''") or "").lower()
+    except Exception:
+        return ""
+
+
+def _multi_sweep(driver, main, pred):
+    """
+    Saare tabs dekho. `pred(driver)` True wala tab mila to uska handle return.
+    Baaki naye/foreign tabs (ads) band — blank tabs aur known-site tabs chhod ke.
+    """
+    try:
+        handles = list(driver.window_handles)
+    except Exception:
+        return None
+    found = None
+    for h in handles:
+        cur = ""
+        try:
+            driver.switch_to.window(h)
+            cur = (driver.current_url or "").lower()
+            if pred(driver):
+                found = h
+                break
+        except Exception:
+            continue
+        if h == main or cur in _BLANK or any(x in cur for x in _MULTI_KEEP):
+            continue
+        try:
+            driver.close()
+        except Exception:
+            pass
+    try:
+        hs = driver.window_handles
+        if found and found in hs:
+            driver.switch_to.window(found)
+        elif main in hs:
+            driver.switch_to.window(main)
+        elif hs:
+            driver.switch_to.window(hs[0])
+    except Exception:
+        pass
+    return found
+
+
+def _multi_back_if_ad(driver, log) -> bool:
+    """Main tab kisi ad-site pe chala gaya ho to back karo."""
+    try:
+        cur = (driver.current_url or "").lower()
+    except Exception:
+        return False
+    if cur in _BLANK or any(x in cur for x in _MULTI_KEEP):
+        return False
+    log(f"↩️ Ad-redirect ({urlparse(cur).netloc[:40]}) — back")
+    try:
+        driver.back()
+        time.sleep(1.5)
+        return True
+    except Exception:
+        return False
+
+
+def _perf_file_url(driver) -> str | None:
+    """Network-log se file-download ka URL (video/octet-stream/attachment/.mkv)."""
+    import json as _json
+    best = None
+    try:
+        logs = driver.get_log("performance")
+    except Exception:
+        return None
+    for ent in logs:
+        try:
+            m = _json.loads(ent["message"])["message"]
+        except Exception:
+            continue
+        prm = m.get("params", {})
+        meth = m.get("method")
+        if meth == "Network.responseReceived":
+            rs = prm.get("response", {})
+            url = rs.get("url", "")
+            if not url.startswith("http"):
+                continue
+            mime = (rs.get("mimeType") or "").lower()
+            hdr = {str(k).lower(): str(v).lower() for k, v in (rs.get("headers") or {}).items()}
+            if (mime.startswith("video/")
+                    or mime in ("application/octet-stream", "application/x-matroska", "binary/octet-stream")
+                    or "attachment" in hdr.get("content-disposition", "")
+                    or _MEDIA_EXT_RE.search(url.split("?")[0])):
+                best = url
+        elif meth == "Network.requestWillBeSent":
+            url = (prm.get("request") or {}).get("url", "")
+            if url.startswith("http") and _MEDIA_EXT_RE.search(url.split("?")[0]):
+                best = url
+    return best
+
+
+def _multi_selenium_resolve(multi_url: str, debug: list) -> str | None:
+    def log(msg):
+        debug.append(msg)
+        LOGGER.info(f"[Adh] {msg}")
+
+    if not SELENIUM_OK or By is None:
+        log("❌ Selenium install nahi hai — Multi flow nahi chal sakta")
+        return None
+
+    try:
+        wait_total = int((os.getenv("ADH_MULTI_WAIT") or "420").strip())
+    except Exception:
+        wait_total = 420
+
+    driver = None
+    try:
+        log("🌐 [Multi] Selenium browser khol rahe hain")
+        driver = _make_adh_driver()
+        try:
+            driver.get(multi_url)
+        except Exception as e:
+            log(f"⚠️ [Multi] get() err (aage badh rahe hain): {str(e).splitlines()[0][:60]}")
+        main = driver.current_window_handle
+
+        # ── Stage A: re.php redirect -> FilesForever page ("Cloud Download" button) ──
+        has_cloud = lambda d: _sel_find(d, "cloud download") is not None
+        found = False
+        t0 = time.time()
+        reloaded = False
+        while time.time() - t0 < 70:
+            h = _multi_sweep(driver, main, has_cloud)
+            if h:
+                main = h
+                found = True
+                break
+            if not reloaded and time.time() - t0 > 30:
+                reloaded = True
+                if not _multi_back_if_ad(driver, log):
+                    log("🔄 [Multi] 30s ho gaye, Multi link dobara khol rahe hain")
+                    try:
+                        driver.get(multi_url)
+                    except Exception:
+                        pass
+            time.sleep(1)
+        if not found:
+            log(f"❌ [Multi] FilesForever page pe 'Cloud Download' nahi mila (url: {(driver.current_url or '')[:80]})")
+            _sel_diag(driver, debug, "Multi-A")
+            return None
+        log(f"✅ [Multi] FilesForever page mila: {(driver.current_url or '')[:80]}")
+
+        # ── Stage B: Cloud Download click -> cldst "Preparing Your File" ──
+        def is_prep(d):
+            try:
+                cu = (d.current_url or "").lower()
+            except Exception:
+                cu = ""
+            if "cldst" in cu:
+                return True
+            t = _body_text(d)
+            return "preparing your file" in t or "transfer completed" in t or "download file" in t
+
+        prep = False
+        for attempt in range(1, 7):
+            el = _sel_find(driver, "cloud download")
+            if el is None:
+                h = _multi_sweep(driver, main, is_prep)
+                if h:
+                    main = h
+                    prep = True
+                    break
+                log(f"⚠️ [Multi] attempt {attempt}: Cloud Download button nahi dikha")
+                _multi_back_if_ad(driver, log)
+                time.sleep(2)
+                continue
+            if not _sel_click(driver, el):
+                log(f"⚠️ [Multi] attempt {attempt}: Cloud Download click fail")
+                continue
+            log(f"🖱️ [Multi] attempt {attempt}: Cloud Download click kiya")
+            for _ in range(24):  # ~12s
+                time.sleep(0.5)
+                h = _multi_sweep(driver, main, is_prep)
+                if h:
+                    main = h
+                    prep = True
+                    break
+            if prep:
+                break
+            _multi_back_if_ad(driver, log)
+        if not prep:
+            log("❌ [Multi] Cloud Download ke baad 'Preparing' page nahi aaya")
+            _sel_diag(driver, debug, "Multi-B")
+            return None
+        log(f"✅ [Multi] Preparing page: {(driver.current_url or '')[:80]}")
+
+        # ── Stage C: transfer complete -> "Download File" button (lamba wait) ──
+        btn = None
+        t0 = time.time()
+        last_log = 0
+        while time.time() - t0 < wait_total:
+            btn = _sel_find(driver, "download file")
+            if btn is not None:
+                break
+            el_s = int(time.time() - t0)
+            if el_s - last_log >= 30:
+                last_log = el_s
+                t = re.sub(r"\s+", " ", _body_text(driver))[:90]
+                log(f"⏳ [Multi] {el_s}s: transfer chal raha hai… ({t})")
+            time.sleep(2)
+        if btn is None:
+            log(f"❌ [Multi] {wait_total}s mein 'Download File' button nahi aaya")
+            _sel_diag(driver, debug, "Multi-C")
+            return None
+        log(f"✅ [Multi] Download File button aa gaya ({int(time.time() - t0)}s)")
+
+        # ── Stage D: Download File -> final URL ──
+        try:
+            driver.get_log("performance")  # purana log saaf
+        except Exception:
+            pass
+        for attempt in range(1, 6):
+            el = _sel_find(driver, "download file")
+            if el is None:
+                el = btn
+            href = ""
+            try:
+                href = el.get_attribute("href") or ""
+            except Exception:
+                pass
+            cur_url = driver.current_url or ""
+            if _real_href(href):
+                full = urljoin(cur_url, href.strip())
+                if full.split("#")[0] != cur_url.split("#")[0]:
+                    log(f"✅ [Multi] Download File ke href se final link: {full[:100]}")
+                    return full
+
+            if not _sel_click(driver, el):
+                log(f"⚠️ [Multi] attempt {attempt}: Download File click fail")
+                continue
+            log(f"🖱️ [Multi] attempt {attempt}: Download File click kiya")
+
+            for _ in range(30):  # ~15s
+                time.sleep(0.5)
+                u = _perf_file_url(driver)
+                if u:
+                    log(f"✅ [Multi] network-log se download URL mila: {u[:100]}")
+                    return u
+                try:
+                    for h in list(driver.window_handles):
+                        if h == main:
+                            continue
+                        driver.switch_to.window(h)
+                        cu = driver.current_url or ""
+                        if cu in _BLANK:
+                            continue
+                        if _MEDIA_EXT_RE.search(cu.split("?")[0]):
+                            log(f"✅ [Multi] naye tab mein file URL: {cu[:100]}")
+                            return cu
+                        if not any(x in cu.lower() for x in _MULTI_KEEP):
+                            try:
+                                driver.close()
+                            except Exception:
+                                pass
+                    driver.switch_to.window(main)
+                except Exception:
+                    try:
+                        driver.switch_to.window(driver.window_handles[0])
+                        main = driver.current_window_handle
+                    except Exception:
+                        pass
+                # click ke baad button ka href set ho gaya?
+                el2 = _sel_find(driver, "download file")
+                if el2 is not None:
+                    try:
+                        h2 = el2.get_attribute("href") or ""
+                    except Exception:
+                        h2 = ""
+                    if _real_href(h2):
+                        full = urljoin(driver.current_url or cur_url, h2.strip())
+                        if full.split("#")[0] != (driver.current_url or "").split("#")[0]:
+                            log(f"✅ [Multi] click ke baad href badla: {full[:100]}")
+                            return full
+            _multi_back_if_ad(driver, log)
+
+        log("❌ [Multi] Download File click ke baad file URL pakad nahi paaye")
+        _sel_diag(driver, debug, "Multi-D")
+        return None
+    except Exception as e:
+        log(f"❌ [Multi] Selenium error: {type(e).__name__}: {str(e).splitlines()[0][:120] if str(e) else ''}")
+        return None
+    finally:
+        if driver is not None:
+            try:
+                _kill_driver_tree(driver)
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────
@@ -1416,7 +1739,7 @@ class AdhSelector:
 
 
 # ─────────────────────────────────────────────
-#  Ek episode: Fprs link -> resolve -> download -> filter -> upload
+#  Ek episode: Multi link -> resolve -> download -> filter -> upload
 # ─────────────────────────────────────────────
 async def _process_adh_item(client, message, ep: dict, status_msg, index: int, total: int,
                              language: str, quality: str):
@@ -1424,9 +1747,10 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
     loop = asyncio.get_event_loop()
     gdf_url = (ep.get("qualities") or {}).get(quality)
     fprs_url = (ep.get("fprs") or {}).get(quality)
-    if not fprs_url and not (gdf_url and _gdf_fallback_on()):
+    multi_url = (ep.get("multi") or {}).get(quality)
+    if not multi_url and not (fprs_url and _env_on("ADH_FPRS_FALLBACK")) and not (gdf_url and _gdf_fallback_on()):
         try:
-            await status_msg.edit(f"🛑 **{ep_label}** — is episode mein `{quality}` ka Fprs link available nahi hai.")
+            await status_msg.edit(f"🛑 **{ep_label}** — is episode mein `{quality}` ka Multi link available nahi hai.")
         except Exception:
             pass
         return "error"
@@ -1437,7 +1761,7 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
         pass
 
     debug = []
-    final_url = await loop.run_in_executor(None, _resolve_adh_download_link, gdf_url, debug, fprs_url)
+    final_url = await loop.run_in_executor(None, _resolve_adh_download_link, gdf_url, debug, fprs_url, multi_url)
 
     shot_paths = [str(x)[len("__SHOT__:"):] for x in debug if str(x).startswith("__SHOT__:")]
     debug[:] = [x for x in debug if not str(x).startswith("__SHOT__:")]
@@ -1453,7 +1777,7 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
             await status_msg.edit(
                 f"🛑 **{ep_label} — Link Resolve Fail**\n\n"
                 f"❌ Final download link nahi mila.\n\n"
-                f"**Fprs URL:** `{fprs_url or '-'}`\n\n"
+                f"**Multi URL:** `{multi_url or '-'}`\n\n"
                 f"**Debug (kaha atka, step-by-step):**\n```\n{debug_text}\n```\n"
                 f"⛔ Agle items **band** kar diye gaye."
             )
