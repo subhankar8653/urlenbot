@@ -89,7 +89,11 @@ HEADERS = {
         "image/avif,image/webp,*/*;q=0.8"
     ),
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    # NOTE: "br" jaanbujh kar hataya — brotli package installed nahi hai, to
+    # Cloudflare-fronted pages (new.adhlinks.com) brotli mein compressed aate
+    # the aur requests unhe decode nahi kar paata tha (56k chars ka garbage
+    # text -> na "Episode" mila na "GDF").
+    "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
     "Sec-Fetch-Dest": "document",
@@ -129,6 +133,15 @@ _ADWALL_MARKERS = [
 ]
 
 
+def _looks_garbled(text: str) -> bool:
+    """Undecoded compressed/binary body pakadne ke liye (replacement chars / control chars zyada)."""
+    if not text:
+        return False
+    sample = text[:3000]
+    bad = sum(1 for ch in sample if ch == "\ufffd" or (ord(ch) < 32 and ch not in "\r\n\t"))
+    return bad / max(len(sample), 1) > 0.05
+
+
 def _looks_like_adwall(html: str, expected_markers: list | None = None) -> str | None:
     """
     Agar page ek ad/interstitial jaisa lagta hai to reason-string return
@@ -142,9 +155,11 @@ def _looks_like_adwall(html: str, expected_markers: list | None = None) -> str |
     for marker in _ADWALL_MARKERS:
         if marker in low:
             return f"ad-network marker '{marker}' mila"
-    if expected_markers and len(html or "") < 4000:
+    if _looks_garbled(html):
+        return "response garbled/binary jaisa hai (compression/encoding issue?)"
+    if expected_markers:
         if not any(em.lower() in low for em in expected_markers):
-            return f"expected content ({', '.join(expected_markers)}) nahi mila aur page bahut chhota hai ({len(html or '')} chars)"
+            return f"expected content ({', '.join(expected_markers)}) page mein nahi mila ({len(html or '')} chars)"
     return None
 
 
@@ -206,6 +221,9 @@ def _http_get(
 
     reason = _looks_like_adwall(r.text, expected_markers)
     if reason:
+        enc = r.headers.get("Content-Encoding", "-")
+        snippet = re.sub(r"\s+", " ", r.text[:160])
+        log(f"🔎 Content-Encoding={enc}, snippet: {snippet!r}")
         log(f"🛑 Ad/interstitial page jaisa lag raha hai ({reason}) — 'back + dubara click' simulate kar rahe hain")
         for ad_attempt in range(1, ad_retries + 1):
             time.sleep(1.5)
@@ -490,6 +508,18 @@ def discover_adh_episodes(episode_list_url: str, html: str | None = None) -> dic
 #  captcha nahi, sirf client-side wait/ad page hai jiska asli link static
 #  HTML mein hi maujood hota hai).
 # ─────────────────────────────────────────────
+def _describe_links(soup: BeautifulSoup, limit: int = 8) -> str:
+    """Page pe jo buttons/links dikhe unka short summary (debug ke liye)."""
+    items = []
+    for a in soup.find_all("a", href=True):
+        label = a.get_text(" ", strip=True)[:25]
+        if label:
+            items.append(f"{label}→{urlparse(a['href']).netloc or a['href'][:20]}")
+        if len(items) >= limit:
+            break
+    return " | ".join(items) or "(koi link nahi)"
+
+
 def _resolve_adh_download_link(gdf_url: str, debug: list) -> str | None:
     def log(msg):
         debug.append(msg)
@@ -521,6 +551,7 @@ def _resolve_adh_download_link(gdf_url: str, debug: list) -> str | None:
 
     if not instant_href:
         log(f"❌ GDF page ({gdf_url}) pe 'INSTANT DL' button nahi mila")
+        log(f"🔗 Page pe mile links: {_describe_links(soup)}")
         return None
 
     instant_href = urljoin(gdf_url, instant_href)
@@ -576,6 +607,7 @@ def _resolve_adh_download_link(gdf_url: str, debug: list) -> str | None:
             log("✅ Raw HTML regex se .mkv/.mp4 link mila (fallback)")
 
     if not final_url:
+        log(f"🔗 Wait-page pe mile links: {_describe_links(soup2)}")
         log(f"❌ Wait-page ({instant_href}) pe 'Download Here' final link nahi mila — "
             f"shayad abhi bhi ad-page pe hain ya button ka HTML badal gaya hai")
         return None
