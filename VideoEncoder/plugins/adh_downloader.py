@@ -60,7 +60,8 @@ import asyncio
 import re
 import time
 import uuid
-from urllib.parse import urljoin, urlparse
+import base64
+from urllib.parse import parse_qsl, unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -220,7 +221,9 @@ def _http_get(
         log(f"✅ HTTP {r.status_code}, {len(r.text)} chars, final URL: {r.url}")
 
     reason = _looks_like_adwall(r.text, expected_markers)
-    if reason:
+    if reason and ad_retries <= 0:
+        log(f"🔎 Page expected jaisa nahi laga ({reason}); Content-Encoding={r.headers.get('Content-Encoding', '-')}")
+    elif reason:
         enc = r.headers.get("Content-Encoding", "-")
         snippet = re.sub(r"\s+", " ", r.text[:160])
         log(f"🔎 Content-Encoding={enc}, snippet: {snippet!r}")
@@ -508,6 +511,95 @@ def discover_adh_episodes(episode_list_url: str, html: str | None = None) -> dic
 #  captcha nahi, sirf client-side wait/ad page hai jiska asli link static
 #  HTML mein hi maujood hota hai).
 # ─────────────────────────────────────────────
+def _safe_debug(lines: list) -> str:
+    """
+    Debug lines ko Telegram message ke liye safe banao. Pyrogram default
+    parse-mode HTML+Markdown dono samajhta hai, isliye page-snippet mein
+    '<title>' jaise tags ya backticks aa jaayein to poora message
+    mangle/truncate ho jaata tha (aakhri lines gayab). Yahan unhe neutralise
+    karte hain.
+    """
+    text = "\n".join(lines)
+    return (text.replace("`", "'").replace("<", "\u2039").replace(">", "\u203a"))[:2800]
+
+
+def _is_cf_challenge(status: int, text: str, headers=None) -> bool:
+    """Cloudflare 'Just a moment...' / managed-challenge page pehchano."""
+    low = (text or "")[:4000].lower()
+    if headers is not None and str(headers.get("cf-mitigated", "")).lower() == "challenge":
+        return True
+    return status in (403, 429, 503) and (
+        "just a moment" in low or "challenge-platform" in low
+        or "cf-chl" in low or "attention required" in low
+    )
+
+
+def _fetch_page(url: str, debug: list, step: str, expected_markers: list, timeout: int = 30):
+    """
+    Page fetch with Cloudflare fallback chain. Returns (html, final_url) ya None.
+      1) plain requests session (ad-wall retry ke saath)
+      2) Cloudflare 'Just a moment' mila to -> cloudscraper
+      3) phir bhi block to -> Bright Data Web Unlocker (haz_downloader wala
+         hi _BDSession; BRIGHTDATA_API_KEY + BRIGHTDATA_ZONE env)
+    """
+    tag = f"[{step}] "
+
+    def log(msg):
+        debug.append(f"{tag}{msg}")
+        LOGGER.info(f"[Adh] {tag}{msg}")
+
+    try:
+        r = _http_get(url, timeout=timeout, debug=debug, step=step, allow_redirects=True,
+                      expected_markers=expected_markers, ad_retries=0)
+    except Exception as e:
+        log(f"❌ fetch fail (after retries): {str(e).splitlines()[0][:120]}")
+        return None
+
+    if not _is_cf_challenge(r.status_code, r.text, r.headers):
+        if _looks_like_adwall(r.text, expected_markers):
+            # ad-page jaisa laga — 'back + dubara click' simulate
+            time.sleep(1.5)
+            try:
+                r = _http_get(r.url, timeout=timeout, debug=debug, step=step + " (retry)",
+                              allow_redirects=True, expected_markers=expected_markers, ad_retries=0)
+            except Exception as e:
+                log(f"❌ retry fetch fail: {str(e).splitlines()[0][:120]}")
+        return r.text, r.url
+
+    target = r.url
+    log(f"🛡️ Cloudflare challenge (HTTP {r.status_code}) — {target} — bypass fallbacks try kar rahe hain")
+
+    # ── Fallback 1: cloudscraper ──
+    try:
+        import cloudscraper
+        sc = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "desktop": True})
+        r2 = sc.get(target, timeout=timeout)
+        if not _is_cf_challenge(r2.status_code, r2.text, r2.headers) and r2.status_code == 200:
+            log(f"✅ cloudscraper se pass ho gaya ({len(r2.text)} chars)")
+            return r2.text, r2.url
+        log(f"⚠️ cloudscraper bhi block (HTTP {r2.status_code})")
+    except Exception as e:
+        log(f"⚠️ cloudscraper error: {str(e).splitlines()[0][:100]}")
+
+    # ── Fallback 2: Bright Data Web Unlocker ──
+    try:
+        from .haz_downloader import _BDSession, _bd_cfg
+        cfg = _bd_cfg()
+        if not cfg["key"] or not cfg["zone"]:
+            log("❌ BRIGHTDATA_API_KEY / BRIGHTDATA_ZONE set nahi hain — Cloudflare bypass ke liye "
+                "ye env vars chahiye (jo /haz ke liye use hote hain)")
+            return None
+        r3 = _BDSession(log).get(target, timeout=120)
+        if _is_cf_challenge(r3.status_code, r3.text):
+            log("❌ Bright Data se bhi challenge page hi mila")
+            return None
+        log(f"✅ Bright Data Web Unlocker se page mila ({len(r3.text)} chars)")
+        return r3.text, target
+    except Exception as e:
+        log(f"❌ Bright Data error: {str(e).splitlines()[0][:120]}")
+        return None
+
+
 def _describe_links(soup: BeautifulSoup, limit: int = 8) -> str:
     """Page pe jo buttons/links dikhe unka short summary (debug ke liye)."""
     items = []
@@ -520,22 +612,55 @@ def _describe_links(soup: BeautifulSoup, limit: int = 8) -> str:
     return " | ".join(items) or "(koi link nahi)"
 
 
+def _link_from_query(page_url: str) -> str | None:
+    """
+    fastdl-one.pages.dev/?url=<...> jaise wait-page ka asli download link
+    aksar URL ke query-param mein hi hota hai (page ka "Download Here"
+    button JS se baad mein banta hai, isliye static HTML mein nahi milta).
+    Value plain/percent-encoded http link ho ya base64 — dono try karte hain.
+    """
+    for key, val in parse_qsl(urlparse(page_url).query, keep_blank_values=False):
+        if key.lower() not in ("url", "link", "file", "download", "dl", "u", "d", "data", "id", "src"):
+            continue
+        cand = unquote(val).strip()
+        if cand.lower().startswith("http"):
+            return cand
+        try:
+            b = cand.replace(" ", "+").replace("-", "+").replace("_", "/")
+            dec = base64.b64decode(b + "=" * (-len(b) % 4)).decode("utf-8", "ignore").strip()
+            if dec.lower().startswith("http"):
+                return dec
+        except Exception:
+            continue
+    return None
+
+
+def _script_hints(html: str, limit: int = 6) -> str:
+    """Wait-page ki <script> mein dikhe http URLs / fetch / atob (debug ke liye)."""
+    hints = []
+    for m in re.finditer(r'(fetch\(|axios\.|XMLHttpRequest|atob\(|location\.href|window\.open)', html):
+        hints.append(m.group(1))
+    urls = []
+    for m in re.finditer(r'https?://[^\s"\'<>\\)]+', html):
+        u = m.group(0)
+        if u not in urls:
+            urls.append(u)
+    return f"js={sorted(set(hints)) or '-'} urls={[u[:80] for u in urls[:limit]] or '-'}"
+
+
 def _resolve_adh_download_link(gdf_url: str, debug: list) -> str | None:
     def log(msg):
         debug.append(msg)
         LOGGER.info(f"[Adh] {msg}")
 
-    try:
-        r = _http_get(
-            gdf_url, timeout=30, debug=debug, allow_redirects=True,
-            step="GDF page", expected_markers=["INSTANT DL", "instant dl"],
-        )
-    except Exception as e:
-        log(f"❌ GDF page fetch fail (after retries): {str(e).splitlines()[0][:120]}")
+    got = _fetch_page(gdf_url, debug, "GDF page", ["INSTANT DL"])
+    if not got:
+        log(f"❌ GDF page ({gdf_url}) load nahi ho paaya")
         return None
+    gdf_html, gdf_final = got
 
     instant_href = None
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(gdf_html, "html.parser")
     for a in soup.find_all("a", href=True):
         label = a.get_text(" ", strip=True)
         if "instant dl" in label.lower():
@@ -544,7 +669,7 @@ def _resolve_adh_download_link(gdf_url: str, debug: list) -> str | None:
     if not instant_href:
         m = re.search(
             r'href=["\'](https?://[^"\']+)["\'][^>]*>\s*(?:<[^>]+>\s*)*.*?INSTANT\s*DL',
-            r.text, re.IGNORECASE | re.DOTALL,
+            gdf_html, re.IGNORECASE | re.DOTALL,
         )
         if m:
             instant_href = m.group(1)
@@ -554,19 +679,15 @@ def _resolve_adh_download_link(gdf_url: str, debug: list) -> str | None:
         log(f"🔗 Page pe mile links: {_describe_links(soup)}")
         return None
 
-    instant_href = urljoin(gdf_url, instant_href)
+    instant_href = urljoin(gdf_final, instant_href)
     log(f"✅ INSTANT DL link mila: {instant_href[:100]}")
 
-    try:
-        r2 = _http_get(
-            instant_href, timeout=30, debug=debug, allow_redirects=True,
-            step="Instant-DL wait-page", expected_markers=["Download Here", "download here"],
-        )
-    except Exception as e:
-        log(f"❌ Instant-DL wait-page fetch fail (after retries): {str(e).splitlines()[0][:120]}")
+    got2 = _fetch_page(instant_href, debug, "Instant-DL wait-page", None)
+    if not got2:
+        log(f"❌ Instant-DL wait-page ({instant_href}) load nahi ho paaya")
         return None
 
-    text2 = r2.text
+    text2 = got2[0]
     soup2 = BeautifulSoup(text2, "html.parser")
     final_url = None
 
@@ -586,11 +707,18 @@ def _resolve_adh_download_link(gdf_url: str, debug: list) -> str | None:
         if m:
             final_url = m.group(1)
 
+    # Strategy 2b: wait-page URL ke query-param (?url=...) mein hi link hota hai —
+    # page pe "Please wait" spinner ke baad JS "Download Here" button banata hai
+    if not final_url:
+        q_link = _link_from_query(instant_href)
+        if q_link:
+            final_url = q_link
+            log(f"✅ Wait-page URL ke ?url= param se link mila: {q_link[:100]}")
+
     # Strategy 3: base64-encoded link (kai "wait" pages atob() se link banate hain)
     if not final_url:
         for m in re.finditer(r'atob\(["\']([A-Za-z0-9+/=]+)["\']\)', text2):
             try:
-                import base64
                 decoded = base64.b64decode(m.group(1)).decode("utf-8", "ignore").strip()
                 if decoded.startswith("http"):
                     final_url = decoded
@@ -608,6 +736,7 @@ def _resolve_adh_download_link(gdf_url: str, debug: list) -> str | None:
 
     if not final_url:
         log(f"🔗 Wait-page pe mile links: {_describe_links(soup2)}")
+        log(f"🧩 Wait-page URL query keys: {[k for k, _ in parse_qsl(urlparse(instant_href).query)] or '-'} | {_script_hints(text2)}")
         log(f"❌ Wait-page ({instant_href}) pe 'Download Here' final link nahi mila — "
             f"shayad abhi bhi ad-page pe hain ya button ka HTML badal gaya hai")
         return None
@@ -745,7 +874,7 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
     final_url = await loop.run_in_executor(None, _resolve_adh_download_link, gdf_url, debug)
 
     if not final_url:
-        debug_text = "\n".join(debug[-14:]) if debug else "(koi debug info nahi mili)"
+        debug_text = _safe_debug(debug[-14:]) if debug else "(koi debug info nahi mili)"
         try:
             await status_msg.edit(
                 f"🛑 **{ep_label} — Link Resolve Fail**\n\n"
@@ -992,7 +1121,7 @@ async def adh_command(client: Client, message: Message):
         return
 
     if not series_data.get("episode_list_url"):
-        debug_text = "\n".join(series_data.get("debug", [])[-12:]) or "(koi debug info nahi mili)"
+        debug_text = _safe_debug(series_data.get("debug", [])[-12:]) or "(koi debug info nahi mili)"
         await status_msg.edit(
             "❌ Is page pe 'Download / Watch' button ka link nahi mila.\n\n"
             f"**URL:** `{series_url}`\n\n"
@@ -1021,7 +1150,7 @@ async def adh_command(client: Client, message: Message):
 
     episodes = ep_result["episodes"]
     if not episodes:
-        debug_text = "\n".join(ep_result.get("debug", [])[-12:]) or "(koi debug info nahi mili)"
+        debug_text = _safe_debug(ep_result.get("debug", [])[-12:]) or "(koi debug info nahi mili)"
         await status_msg.edit(
             "❌ Episode-list page se koi episode nahi mila (480p/720p/1080p x265 mein se koi bhi).\n\n"
             f"**URL:** `{series_data['episode_list_url']}`\n\n"
