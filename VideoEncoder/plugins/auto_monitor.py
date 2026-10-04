@@ -27,7 +27,9 @@ Commands:
   /list_anime           → Kya set hai dekho
   /del_anime [number]   → Remove karo
   /set_monitor          → Monitor channel set karo (forward reply ya ID)
-  /monitor_status       → System health check
+  /monitor_status       → System health + bot access + received-updates check
+  /monitor_debug on|off → Har monitor post ka verdict DM mein
+  /check_post           → Forwarded post pe reply: dry-run verdict
 """
 
 import asyncio
@@ -991,64 +993,316 @@ def _extract_new_format_info(message: Message, text: str) -> tuple[str, tuple[in
 
 
 # ─────────────────────────────────────────────
+#  Monitor Diagnostics (v3)
+#  ─────────────────────────────────────────────
+#  Pehle handler har problem pe chupchaap `return` kar deta tha, isliye
+#  pata hi nahi chalta tha ki post detect kyun nahi hui. Ab har post ka
+#  poora verdict owner ko DM aata hai (kya mila, kya nahi, kyun, fix kya
+#  hai) + monitor channel set karne ke buttons.
+# ─────────────────────────────────────────────
+import difflib
+import traceback
+
+_seen_channels: dict = {}        # chat_id -> {title, ts, count, preview}
+_processed_posts: dict = {}      # (chat_id, msg_id) -> ts   (duplicate guard)
+_last_foreign_notice: dict = {}  # chat_id -> ts             (DM throttle)
+_EPISODE_HINT_RE = re.compile(r'\bep(?:isode)?s?\b\s*\d|title\s*:', re.IGNORECASE)
+
+
+def _fwd_chat(msg):
+    """Forwarded message ka source chat — pyrofork ke purane/naye dono attrs."""
+    if not msg:
+        return None
+    c = getattr(msg, 'forward_from_chat', None)
+    if c:
+        return c
+    fo = getattr(msg, 'forward_origin', None)
+    return getattr(fo, 'chat', None) if fo else None
+
+
+async def _get_notify_mode() -> bool:
+    """True = HAR post ka verdict bhejo. False = sirf episode-jaise posts ka."""
+    oid = await _owner_id()
+    if not oid:
+        return False
+    user = await db._get_user(oid)
+    return bool(user.get('monitor_debug_all', False))
+
+
+async def _notify_owner(client: Client, text: str, buttons=None):
+    markup = InlineKeyboardMarkup(buttons) if buttons else None
+    for uid in list(owner):
+        try:
+            await client.send_message(
+                uid, text, parse_mode=ParseMode.HTML,
+                reply_markup=markup, disable_web_page_preview=True,
+            )
+        except Exception as e:
+            LOGGER.warning(f"[AutoMonitor] owner DM fail ({uid}): {e}")
+
+
+async def _bot_access_line(client: Client, chat_id: int, need_post: bool = True) -> str:
+    """Bot us channel mein hai? admin hai? post kar sakta hai?"""
+    try:
+        me = await client.get_chat_member(chat_id, "me")
+        status = str(getattr(me.status, 'name', me.status)).upper()
+        if status == "OWNER":
+            return "✅ Bot channel ka OWNER hai"
+        if status != "ADMINISTRATOR":
+            return (f"❌ Bot is channel mein <b>{status}</b> hai, <b>ADMIN nahi</b> — "
+                    f"Telegram admin ke bina channel posts bot ko bhejta hi nahi!")
+        priv = getattr(me, 'privileges', None)
+        can_post = getattr(priv, 'can_post_messages', None) if priv else None
+        if need_post and can_post is False:
+            return "⚠️ Bot admin hai par <b>Post Messages</b> permission OFF hai"
+        return "✅ Bot admin hai (post permission OK)"
+    except Exception as e:
+        return (f"❌ Bot is channel ko access nahi kar pa raha "
+                f"(<code>{_esc(str(e)[:90])}</code>) — bot ko channel mein <b>admin</b> banao")
+
+
+def _collect_urls(message: Message, text: str) -> tuple[str | None, str | None]:
+    """(text_url, button_url). text_url = plain text ya hidden hyperlink."""
+    text_url = _extract_url(text)
+    if not text_url:
+        ents = (message.entities or message.caption_entities or [])
+        for e in ents:
+            u = getattr(e, 'url', None)
+            if u and u.startswith('http'):
+                text_url = u
+                break
+    return text_url, _extract_new_format_url(message)
+
+
+def _fuzzy_candidates(text: str, anime_list: list, n: int = 3) -> list:
+    t = _normalize(text)
+    scored = []
+    for e in anime_list:
+        nm = _normalize(e.get('anime_name', ''))
+        if not nm:
+            continue
+        r = difflib.SequenceMatcher(None, nm, t[:max(len(nm) * 2, 40)]).find_longest_match(0, len(nm), 0, min(len(t), max(len(nm) * 2, 40)))
+        scored.append((r.size / len(nm), e.get('anime_name', '')))
+    scored.sort(reverse=True)
+    return [f"{nm} ({int(sc * 100)}%)" for sc, nm in scored[:n] if sc >= 0.4]
+
+
+async def _analyze_post(message: Message, text: str, anime_list: list) -> dict:
+    """
+    Post ko parse karke verdict banao. Koi side-effect nahi.
+    Returns dict: ok, fmt, url, eps, match_text, matched, checks[], reason, fix
+    """
+    res = {'ok': False, 'fmt': None, 'url': None, 'eps': None, 'match_text': text,
+           'matched': None, 'checks': [], 'reason': None, 'fix': None}
+    ck = res['checks']
+
+    if not text.strip():
+        res['reason'] = "Post mein text/caption nahi hai (sirf media)."
+        res['fix'] = "RTI post ke saath caption hona chahiye."
+        return res
+
+    text_url, btn_url = _collect_urls(message, text)
+    ep_text = _extract_episodes(text)
+    ck.append(("✅" if text_url else "➖", f"Link text mein: {'mila' if text_url else 'nahi'}"))
+    ck.append(("✅" if btn_url else "➖", f"Link button mein: {'mila' if btn_url else 'nahi'}"))
+    ck.append(("✅" if ep_text else "❌", f"Episode number: {f'{ep_text[0]}-{ep_text[1]}' if ep_text else 'nahi mila'}"))
+
+    url = ep_info = None
+    match_text = text
+    fmt = None
+    skip_reasons = []
+
+    # Format 1 — OLD
+    if text_url and ep_text:
+        sk = _old_format_should_skip(text, text_url)
+        if sk:
+            skip_reasons.append(sk)
+            ck.append(("❌", f"OLD format skip rule: {sk}"))
+        else:
+            url, ep_info, fmt = text_url, ep_text, "OLD"
+
+    # Format 2 — NEW template
+    if not (url and ep_info):
+        title_m = _NEW_FMT_TITLE_RE.search(text)
+        audio_m = _NEW_FMT_AUDIO_RE.search(text)
+        ep_m = _NEW_FMT_EP_RE.search(text)
+        if title_m or audio_m:
+            ck.append(("✅" if title_m else "❌", "Template 'Title:' line"))
+            ck.append(("✅" if audio_m else "❌", "Template 'Audio:' line"))
+        if title_m and audio_m and ep_m:
+            audio_line = audio_m.group(1)
+            if 'hindi' not in audio_line.lower():
+                skip_reasons.append(f"Audio mein Hindi nahi: {audio_line.strip()[:50]}")
+                ck.append(("❌", f"Audio line mein Hindi nahi ({audio_line.strip()[:40]})"))
+            elif _NEW_FMT_SUBBY_RE.search(text) and not _NEW_FMT_DUBBY_RE.search(text):
+                skip_reasons.append("Sub release hai (Dub By line nahi)")
+                ck.append(("❌", "'Sub By' hai, 'Dub By' nahi — subbed post skip hoti hai"))
+            else:
+                u = btn_url or text_url
+                if not u:
+                    skip_reasons.append("Post mein koi link nahi (na text, na button)")
+                    ck.append(("❌", "Download link nahi mila"))
+                else:
+                    s_ep = int(ep_m.group(1))
+                    e_ep = int(ep_m.group(2)) if ep_m.group(2) else s_ep
+                    url, ep_info, fmt = u, (s_ep, e_ep), "NEW"
+                    match_text = title_m.group(1).strip()
+
+    # Format 3 — Episode text + link sirf button mein (Title/Audio template ke bina)
+    if not (url and ep_info) and btn_url and ep_text:
+        sk = _old_format_should_skip(text, None)
+        if sk:
+            skip_reasons.append(sk)
+            ck.append(("❌", f"BTN format skip rule: {sk}"))
+        else:
+            url, ep_info, fmt = btn_url, ep_text, "BTN"
+
+    if not (url and ep_info):
+        if skip_reasons:
+            res['reason'] = "Post skip hui: " + "; ".join(skip_reasons)
+            res['fix'] = "Yeh bot ka rule hai (sirf Hindi DUB). Agar yeh post chahiye thi toh skip rule dekho."
+        elif not ep_text and not (text_url or btn_url):
+            res['reason'] = "Is post mein na episode number hai, na link — episode post nahi lagti."
+        elif not ep_text:
+            res['reason'] = "Link mila par <b>episode number</b> nahi mila (Episode/Ep X ya X-Y chahiye)."
+            res['fix'] = "Post text mein 'Episode 5' ya 'Ep 5-7' jaisa kuch hona chahiye."
+        else:
+            res['reason'] = "Episode number mila par <b>koi download link nahi</b> mila (na text, na hyperlink, na button)."
+            res['fix'] = "Post mein RTI ka link/Download button hona chahiye. Agar post forward ki hai toh button strip ho gaya ho sakta hai."
+        return res
+
+    res.update(url=url, eps=ep_info, fmt=fmt, match_text=match_text)
+
+    if not anime_list:
+        res['reason'] = "Is bot ke database mein <b>koi anime saved nahi</b> (list khaali)."
+        res['fix'] = ("Is bot ka MONGO_URI/OWNER_ID baaki bots se alag hai. "
+                      "/monitor_status se compare karo, ya /add_anime se anime add karo.")
+        return res
+
+    matched = _find_matching_anime(match_text + " " + url, anime_list)
+    if not matched:
+        cands = _fuzzy_candidates(match_text, anime_list)
+        res['reason'] = (f"Post ka naam saved anime se match nahi hua.\n"
+                         f"Post text: <code>{_esc(match_text.strip()[:90])}</code>")
+        res['fix'] = ("Saved anime ka naam post ke title mein <b>poora</b> hona chahiye "
+                      "(spelling/season suffix same). /list_anime se naam edit karo."
+                      + (f"\nSabse kareeb: {_esc(', '.join(cands))}" if cands else ""))
+        return res
+
+    res['matched'] = matched
+    res['ok'] = True
+    return res
+
+
+def _fmt_checks(res: dict) -> str:
+    return "\n".join(f"{ic} {_esc(tx)}" for ic, tx in res['checks'])
+
+
+def _set_monitor_buttons(chat_id: int) -> list:
+    return [
+        [InlineKeyboardButton("📡 Is channel ko Monitor banao", callback_data=f"mon_set_{chat_id}")],
+        [InlineKeyboardButton("📊 Monitor Status", callback_data="mon_status"),
+         InlineKeyboardButton("📋 Anime List", callback_data="mon_list")],
+    ]
+
+
+async def _build_verdict(client: Client, message: Message, res: dict, monitor_ch: int, is_monitor: bool) -> tuple[str, list]:
+    chat = message.chat
+    src_line = (f"📢 Source: <b>{_esc(chat.title)}</b> (<code>{chat.id}</code>)\n"
+                f"📡 Monitor: <code>{monitor_ch}</code> "
+                f"{'✅ same' if is_monitor else '❌ ALAG channel'}\n")
+    body = (f"{src_line}\n🧾 <b>Post:</b> <code>{_esc((message.text or message.caption or '')[:120])}</code>\n\n"
+            f"<b>Checks</b>\n{_fmt_checks(res)}\n")
+    if res['ok']:
+        s, e = res['eps']
+        head = (f"✅ <b>Detected!</b> ({res['fmt']} format)\n"
+                f"🎌 <b>{_esc(res['matched']['anime_name'])}</b> | Ep {s}-{e}\n")
+        up = await _bot_access_line(client, res['matched']['channel_id'])
+        body = head + body + f"\n📤 Upload channel (<code>{res['matched']['channel_id']}</code>): {up}"
+        if not is_monitor:
+            body = ("⚠️ <b>Yeh post monitor channel se nahi aayi — isliye PROCESS NAHI hogi.</b>\n"
+                    "Is channel ko monitor banana ho toh neeche button dabao.\n\n") + body
+    else:
+        body = (f"❌ <b>Detect nahi hua</b>\n\n<b>Wajah:</b> {res['reason']}\n"
+                + (f"\n💡 <b>Fix:</b> {res['fix']}\n" if res['fix'] else "") + "\n" + body)
+    acc = await _bot_access_line(client, chat.id, need_post=True)
+    body += f"\n🔐 Monitor channel access: {acc}"
+    return body[:4000], _set_monitor_buttons(chat.id)
+
+
+# Har channel post ko record karo (sirf yeh dekhne ke liye ki bot ko
+# kaunse channels ki posts mil rahi hain). Propagation nahi rokta.
+@Client.on_message(filters.channel, group=-10)
+async def _channel_seen_recorder(client: Client, message: Message):
+    try:
+        prev = _seen_channels.get(message.chat.id, {})
+        _seen_channels[message.chat.id] = {
+            'title': message.chat.title or str(message.chat.id),
+            'ts': time.time(),
+            'count': prev.get('count', 0) + 1,
+            'preview': (message.text or message.caption or '')[:50],
+        }
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────
 #  Monitor Channel Message Handler
 # ─────────────────────────────────────────────
-@Client.on_message(
-    filters.channel & (filters.text | filters.caption)
-)
-async def auto_monitor_handler(client: Client, message: Message):
-    """
-    Monitor channel pe message aaya → check karo.
-    RTI URL + episode info mila → process karo.
-
-    Do formats support karta hai:
-      1. OLD — "Episode X-Y Added! <url>" (url plain text mein)
-      2. NEW — Title/Genre/Audio/Dub template (url inline button mein,
-         sirf Hindi audio wale posts process hote hain)
-    """
+async def _handle_channel_post(client: Client, message: Message, edited: bool = False):
     monitor_ch = await _get_monitor_channel()
-    if not monitor_ch:
-        return
-
-    if message.chat.id != monitor_ch:
-        return
-
+    is_monitor = bool(monitor_ch) and message.chat.id == monitor_ch
     text = message.text or message.caption or ""
-    if not text:
+    key = (message.chat.id, message.id)
+
+    if edited:
+        # Sirf haal hi mein (10 min) edit hui, abhi tak process na hui post
+        if key in _processed_posts or (time.time() - message.date.timestamp()) > 600:
+            return
+
+    if not is_monitor:
+        # Doosre channel se episode-jaisi post + anime match → owner ko batao
+        if not text or not _EPISODE_HINT_RE.search(text) and not _extract_url(text):
+            return
+        anime_list = await _get_anime_list()
+        res = await _analyze_post(message, text, anime_list)
+        if not (res['ok'] or res['matched']):
+            return
+        now = time.time()
+        if now - _last_foreign_notice.get(message.chat.id, 0) < 120:
+            return
+        _last_foreign_notice[message.chat.id] = now
+        body, btns = await _build_verdict(client, message, res, monitor_ch, False)
+        await _notify_owner(client, body, btns)
         return
 
     LOGGER.info(f"[AutoMonitor] Message in monitor channel: {text[:100]}")
 
-    # ── Format 1: OLD — plain "Episode X-Y Added! <url>" ──
-    url = _extract_url(text)
-    ep_info = _extract_episodes(text) if url else None
-    match_text = text
-    fmt_label = "OLD"
-
-    if url and ep_info:
-        skip_reason = _old_format_should_skip(text, url)
-        if skip_reason:
-            LOGGER.info(f"[AutoMonitor] OLD-format post skip ({skip_reason})")
-            url, ep_info = None, None
-
-    if not (url and ep_info):
-        # ── Format 2: NEW — Title/Genre/Audio/Dub template ──
-        new_fmt = _extract_new_format_info(message, text)
-        if not new_fmt:
-            return
-        url, ep_info, match_text = new_fmt
-        fmt_label = "NEW"
-
-    start_ep, end_ep = ep_info
     anime_list = await _get_anime_list()
-    if not anime_list:
+    res = await _analyze_post(message, text, anime_list)
+
+    looks_like_ep = bool(text) and bool(_EPISODE_HINT_RE.search(text) or _extract_url(text))
+    if res['ok'] or looks_like_ep or await _get_notify_mode():
+        body, btns = await _build_verdict(client, message, res, monitor_ch, True)
+        await _notify_owner(client, body, btns)
+
+    if not res['ok']:
+        LOGGER.info(f"[AutoMonitor] NOT detected: {re.sub('<[^>]+>', '', res['reason'] or '')}")
         return
 
-    matched = _find_matching_anime(match_text + " " + url, anime_list)
-    if not matched:
-        LOGGER.info(f"[AutoMonitor] No anime match ({fmt_label} format) for: {match_text[:80]}")
+    if key in _processed_posts:
+        LOGGER.info("[AutoMonitor] duplicate post ignored")
         return
+    _processed_posts[key] = time.time()
+    if len(_processed_posts) > 500:
+        for k in sorted(_processed_posts, key=_processed_posts.get)[:200]:
+            _processed_posts.pop(k, None)
 
+    url = res['url']
+    ep_info = res['eps']
+    fmt_label = res['fmt']
+    matched = res['matched']
+    start_ep, end_ep = ep_info
     anime_name = matched['anime_name']
     channel_id = matched['channel_id']
     oid = await _owner_id()
@@ -1159,6 +1413,60 @@ async def auto_monitor_handler(client: Client, message: Message):
             LOGGER.error(f"[AutoMonitor] Schedule notification error: {e}")
     else:
         LOGGER.warning(f"[AutoMonitor] No episodes uploaded — schedule notification skipped.")
+
+
+
+
+@Client.on_message(filters.channel & (filters.text | filters.caption), group=-5)
+async def auto_monitor_handler(client: Client, message: Message):
+    try:
+        await _handle_channel_post(client, message)
+    except Exception as e:
+        LOGGER.error(f"[AutoMonitor] handler crash: {e}\n{traceback.format_exc()}")
+        await _notify_owner(
+            client,
+            f"💥 <b>AutoMonitor crash</b>\n<code>{_esc(type(e).__name__)}: {_esc(str(e)[:300])}</code>\n\n"
+            f"Agar yeh <i>PeerIdInvalid / ChatWriteForbidden</i> hai toh bot ko monitor channel mein "
+            f"<b>admin + Post Messages</b> permission do (status messages wahin post hote hain).",
+            _set_monitor_buttons(message.chat.id),
+        )
+
+
+@Client.on_edited_message(filters.channel & (filters.text | filters.caption), group=-5)
+async def auto_monitor_edit_handler(client: Client, message: Message):
+    try:
+        await _handle_channel_post(client, message, edited=True)
+    except Exception as e:
+        LOGGER.error(f"[AutoMonitor] edit handler crash: {e}")
+
+
+# ── Buttons: set monitor / status / list ──
+@Client.on_callback_query(filters.regex(r"^mon_(set_-?\d+|status|list|ok_-?\d+)$"))
+async def monitor_diag_callbacks(client: Client, cb: CallbackQuery):
+    if not _is_authorized(cb.from_user.id):
+        await cb.answer("Sirf owner/sudo.", show_alert=True)
+        return
+    data = cb.data
+    if data.startswith("mon_set_"):
+        ch_id = int(data[len("mon_set_"):])
+        title = str(ch_id)
+        try:
+            title = (await client.get_chat(ch_id)).title or title
+        except Exception:
+            title = _seen_channels.get(ch_id, {}).get('title', title)
+        await _save_monitor_channel(ch_id)
+        await cb.answer("Monitor channel set ho gaya ✅", show_alert=True)
+        await cb.message.reply(
+            f"✅ <b>Monitor Channel Set!</b>\n📢 <b>{_esc(title)}</b>\n🆔 <code>{ch_id}</code>\n\n"
+            f"Ab is channel pe post dobara daalo — verdict yahin DM mein aayega.",
+            parse_mode=ParseMode.HTML,
+        )
+    elif data == "mon_status":
+        await cb.answer()
+        await _send_status(client, cb.message)
+    elif data == "mon_list":
+        await cb.answer()
+        await _show_list_anime_panel(client, cb.message, cb.from_user.id, 0, True)
 
 
 # ─────────────────────────────────────────────
@@ -1369,10 +1677,10 @@ async def cmd_set_monitor(client: Client, message: Message):
     title = None
 
     # Method 1: Forwarded post reply
-    if message.reply_to_message and message.reply_to_message.forward_from_chat:
-        fwd = message.reply_to_message.forward_from_chat
-        channel_id = fwd.id
-        title = fwd.title
+    _fc = _fwd_chat(message.reply_to_message)
+    if _fc:
+        channel_id = _fc.id
+        title = _fc.title
 
     # Method 2: ID directly
     if channel_id is None:
@@ -1402,7 +1710,13 @@ async def cmd_set_monitor(client: Client, message: Message):
             f"{cur_text}\n\n"
             f"**Kaise set karein:**\n"
             f"Method 1 — Channel se koi post forward karo, phir reply mein `/set_monitor`\n"
-            f"Method 2 — `/set_monitor -100xxxxxxxxx`"
+            f"Method 2 — `/set_monitor -100xxxxxxxxx`\n"
+            f"Method 3 — Neeche button (jin channels ki posts bot ko mil rahi hain)",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton(f"📡 {v['title'][:30]}", callback_data=f"mon_set_{cid}")]
+                 for cid, v in sorted(_seen_channels.items(), key=lambda x: -x[1]['ts'])[:6]]
+                + [[InlineKeyboardButton("📊 Monitor Status", callback_data="mon_status")]]
+            ),
         )
         return
 
@@ -1657,8 +1971,8 @@ async def cmd_cancel_add_anime(client: Client, message: Message):
 async def _add_anime_step_channel(client: Client, message: Message, session: dict, user_id: int):
     channel_id = None
 
-    if message.forward_from_chat:
-        channel_id = message.forward_from_chat.id
+    if _fwd_chat(message):
+        channel_id = _fwd_chat(message).id
     else:
         text = (message.text or "").strip()
         try:
@@ -2585,37 +2899,124 @@ async def cmd_del_anime(client: Client, message: Message):
 # ─────────────────────────────────────────────
 #  /monitor_status
 # ─────────────────────────────────────────────
-@Client.on_message(filters.command("monitor_status") & filters.private)
-async def cmd_monitor_status(client: Client, message: Message):
-    if not _is_authorized(message.from_user.id):
-        return
-
+async def _send_status(client: Client, target):
     monitor_ch = await _get_monitor_channel()
     anime_list = await _get_anime_list()
+    oid = await _owner_id()
+    saved = None
+    try:
+        saved = (await db._get_user(oid)).get('monitor_channel_id') if oid else None
+    except Exception:
+        pass
+    src = "DB mein saved (/set_monitor)" if saved else "DEFAULT (code ka)"
+    try:
+        dbname = db.db.name
+    except Exception:
+        dbname = "?"
+    try:
+        me = await client.get_me()
+        uname = f"@{me.username}"
+    except Exception:
+        uname = "?"
 
     if monitor_ch:
         try:
             mc = await client.get_chat(monitor_ch)
             mc_text = f"✅ {_esc(mc.title)} (<code>{monitor_ch}</code>)"
-        except Exception:
-            mc_text = f"⚠️ ID set (<code>{monitor_ch}</code>) but access error"
+        except Exception as e:
+            mc_text = f"⚠️ <code>{monitor_ch}</code> — access error: <code>{_esc(str(e)[:80])}</code>"
+        access = await _bot_access_line(client, monitor_ch)
     else:
-        mc_text = "❌ Set nahi — use <code>/set_monitor</code>"
+        mc_text, access = "❌ Set nahi", "—"
 
-    await message.reply(
-        f"📊 <b>AutoMonitor Status</b>\n\n"
+    seen = _seen_channels.get(monitor_ch)
+    if seen:
+        ago = int(time.time() - seen['ts'])
+        seen_line = f"✅ Monitor channel ki <b>{seen['count']}</b> post mili, aakhri {ago}s pehle"
+    else:
+        seen_line = ("❌ Restart ke baad is channel ki <b>ek bhi post bot ko nahi mili</b> — "
+                     "bot admin nahi hai / galat channel ID")
+
+    others = [(cid, v) for cid, v in _seen_channels.items() if cid != monitor_ch]
+    others_txt = ""
+    btns = []
+    if others:
+        others.sort(key=lambda x: -x[1]['ts'])
+        others_txt = "\n\n📥 <b>Aur channels jinki posts bot ko mil rahi hain:</b>\n" + "\n".join(
+            f"• {_esc(v['title'])} (<code>{cid}</code>)" for cid, v in others[:5])
+        for cid, v in others[:4]:
+            btns.append([InlineKeyboardButton(f"📡 {v['title'][:28]} ko Monitor banao", callback_data=f"mon_set_{cid}")])
+    btns.append([InlineKeyboardButton("📋 Anime List", callback_data="mon_list")])
+
+    text = (
+        f"📊 <b>AutoMonitor Status</b> — {uname}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📡 Monitor Channel: {mc_text}\n"
+        f"📡 Monitor: {mc_text}\n"
+        f"   Source: {src}\n"
+        f"🔐 Access: {access}\n"
+        f"📨 Updates: {seen_line}\n"
         f"📺 Anime Count: <b>{len(anime_list)}</b>\n"
-        f"🎯 Target Qualities: <code>{' | '.join(TARGET_QUALITIES)}</code>\n"
-        f"⚡ Fast Poll: <b>{POLL_FAST_ATTEMPTS} × {POLL_INTERVAL_FAST}s</b> (first 5 min)\n"
-        f"🐢 Slow Poll: <b>{POLL_SLOW_ATTEMPTS} × {POLL_INTERVAL_SLOW}s</b> (next 20 min)\n"
-        f"⏰ Max Attempts: <b>{POLL_FAST_ATTEMPTS + POLL_SLOW_ATTEMPTS}</b> (~25 min total)\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📋 /list_anime\n"
-        f"➕ /add_anime",
-        parse_mode=ParseMode.HTML,
+        f"👤 Owner doc ID: <code>{oid}</code>\n"
+        f"🗄 Mongo DB: <code>{_esc(dbname)}</code>\n"
+        f"🎯 Qualities: <code>{' | '.join(TARGET_QUALITIES)}</code>\n"
+        f"⏰ Poll: {POLL_FAST_ATTEMPTS}×{POLL_INTERVAL_FAST}s + {POLL_SLOW_ATTEMPTS}×{POLL_INTERVAL_SLOW}s\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+        f"{others_txt}\n\n"
+        f"💡 Monitor channel pe post dobara daalo — verdict DM mein aayega.\n"
+        f"/check_post · /monitor_debug · /set_monitor · /list_anime"
     )
+    await target.reply(text, parse_mode=ParseMode.HTML,
+                       reply_markup=InlineKeyboardMarkup(btns), disable_web_page_preview=True)
+
+
+@Client.on_message(filters.command("monitor_status") & filters.private)
+async def cmd_monitor_status(client: Client, message: Message):
+    if not _is_authorized(message.from_user.id):
+        return
+    await _send_status(client, message)
+
+
+@Client.on_message(filters.command("monitor_debug") & filters.private)
+async def cmd_monitor_debug(client: Client, message: Message):
+    """/monitor_debug on|off — on = monitor channel ki HAR post ka verdict DM mein."""
+    if not _is_authorized(message.from_user.id):
+        return
+    parts = message.text.split()
+    oid = await _owner_id()
+    if len(parts) >= 2 and parts[1].lower() in ("on", "off") and oid:
+        val = parts[1].lower() == "on"
+        await db.col.update_one({'id': oid}, {'$set': {'monitor_debug_all': val}}, upsert=True)
+    cur = await _get_notify_mode()
+    await message.reply(
+        f"🐞 Debug mode: <b>{'ON (har post ka verdict)' if cur else 'OFF (sirf episode-jaisi posts ka)'}</b>\n"
+        f"Badalne ke liye: <code>/monitor_debug on</code> ya <code>off</code>",
+        parse_mode=ParseMode.HTML)
+
+
+@Client.on_message(filters.command("check_post") & filters.private)
+async def cmd_check_post(client: Client, message: Message):
+    """Kisi forwarded RTI post pe reply karke /check_post — dry-run verdict (kuch download nahi hota)."""
+    if not _is_authorized(message.from_user.id):
+        return
+    target = message.reply_to_message
+    if not target or not (target.text or target.caption):
+        await message.reply("RTI post ko yahan forward karo, phir us par reply karke <code>/check_post</code> likho.",
+                            parse_mode=ParseMode.HTML)
+        return
+    text = target.text or target.caption
+    res = await _analyze_post(target, text, await _get_anime_list())
+    monitor_ch = await _get_monitor_channel()
+    fc = _fwd_chat(target)
+    if res['ok']:
+        s, e = res['eps']
+        head = f"✅ <b>Detect ho jaati</b> ({res['fmt']}) — <b>{_esc(res['matched']['anime_name'])}</b> Ep {s}-{e}\n"
+    else:
+        head = f"❌ <b>Detect nahi hoti</b>\n<b>Wajah:</b> {res['reason']}\n" + (f"💡 {res['fix']}\n" if res['fix'] else "")
+    src = (f"\n📢 Forward source: <b>{_esc(fc.title)}</b> (<code>{fc.id}</code>) "
+           f"{'✅ monitor hai' if fc.id == monitor_ch else '❌ monitor channel ALAG hai'}") if fc else ""
+    btns = _set_monitor_buttons(fc.id) if fc else [[InlineKeyboardButton("📊 Monitor Status", callback_data="mon_status")]]
+    await message.reply(f"{head}\n<b>Checks</b>\n{_fmt_checks(res)}{src}\n📡 Monitor: <code>{monitor_ch}</code>",
+                        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(btns))
 
 
 # ─────────────────────────────────────────────
