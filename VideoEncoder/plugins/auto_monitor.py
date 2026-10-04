@@ -1029,6 +1029,16 @@ async def _get_notify_mode() -> bool:
     return bool(user.get('monitor_debug_all', False))
 
 
+async def _get_notify_level() -> str:
+    """'fail' (default: sirf detect-FAIL ka DM) | 'all' (success bhi) | 'off' (kuch nahi)."""
+    oid = await _owner_id()
+    if not oid:
+        return 'fail'
+    user = await db._get_user(oid)
+    lvl = user.get('monitor_notify_level', 'fail')
+    return lvl if lvl in ('fail', 'all', 'off') else 'fail'
+
+
 async def _notify_owner(client: Client, text: str, buttons=None):
     markup = InlineKeyboardMarkup(buttons) if buttons else None
     for uid in list(owner):
@@ -1260,8 +1270,12 @@ async def _handle_channel_post(client: Client, message: Message, edited: bool = 
         if key in _processed_posts or (time.time() - message.date.timestamp()) > 600:
             return
 
+    level = await _get_notify_level()
+
     if not is_monitor:
         # Doosre channel se episode-jaisi post + anime match → owner ko batao
+        if level == 'off':
+            return
         if not text or not _EPISODE_HINT_RE.search(text) and not _extract_url(text):
             return
         anime_list = await _get_anime_list()
@@ -1282,7 +1296,14 @@ async def _handle_channel_post(client: Client, message: Message, edited: bool = 
     res = await _analyze_post(message, text, anime_list)
 
     looks_like_ep = bool(text) and bool(_EPISODE_HINT_RE.search(text) or _extract_url(text))
-    if res['ok'] or looks_like_ep or await _get_notify_mode():
+    debug_all = await _get_notify_mode()
+    if level == 'off':
+        want_dm = False
+    elif res['ok']:
+        want_dm = (level == 'all')          # "Detected!" DM sirf 'all' mode mein
+    else:
+        want_dm = looks_like_ep or debug_all  # fail ka DM 'fail' + 'all' dono mein
+    if want_dm:
         body, btns = await _build_verdict(client, message, res, monitor_ch, True)
         await _notify_owner(client, body, btns)
 
@@ -2963,7 +2984,7 @@ async def _send_status(client: Client, target):
         f"━━━━━━━━━━━━━━━━━━━━"
         f"{others_txt}\n\n"
         f"💡 Monitor channel pe post dobara daalo — verdict DM mein aayega.\n"
-        f"/check_post · /monitor_debug · /set_monitor · /list_anime"
+        f"/check_post · /monitor_notify · /monitor_debug · /set_monitor · /list_anime"
     )
     await target.reply(text, parse_mode=ParseMode.HTML,
                        reply_markup=InlineKeyboardMarkup(btns), disable_web_page_preview=True)
@@ -2974,6 +2995,27 @@ async def cmd_monitor_status(client: Client, message: Message):
     if not _is_authorized(message.from_user.id):
         return
     await _send_status(client, message)
+
+
+@Client.on_message(filters.command("monitor_notify") & filters.private)
+async def cmd_monitor_notify(client: Client, message: Message):
+    """/monitor_notify fail|all|off — monitor verdict DMs kab aayein."""
+    if not _is_authorized(message.from_user.id):
+        return
+    parts = message.text.split()
+    oid = await _owner_id()
+    if len(parts) >= 2 and parts[1].lower() in ("fail", "all", "off") and oid:
+        await db.col.update_one({'id': oid}, {'$set': {'monitor_notify_level': parts[1].lower()}}, upsert=True)
+    cur = await _get_notify_level()
+    label = {'fail': 'FAIL — sirf detect NAHI hone par DM',
+             'all': 'ALL — detect hone par bhi DM',
+             'off': 'OFF — koi DM nahi'}[cur]
+    await message.reply(
+        f"🔔 Notify mode: <b>{label}</b>\n\n"
+        f"<code>/monitor_notify off</code> — DM bilkul band\n"
+        f"<code>/monitor_notify fail</code> — sirf problem hone par\n"
+        f"<code>/monitor_notify all</code> — har verdict",
+        parse_mode=ParseMode.HTML)
 
 
 @Client.on_message(filters.command("monitor_debug") & filters.private)
