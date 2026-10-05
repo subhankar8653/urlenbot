@@ -29,7 +29,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from bs4 import BeautifulSoup
 
-from .. import LOGGER, download_dir, app, log
+from .. import LOGGER, download_dir, app, log, owner, sudo_users
 from ..utils.helper import check_chat
 from ..utils.uploads.telegram import upload_video, _make_uploader_client
 from ..utils.encoding import get_duration, get_thumbnail, get_width_height, _add_thumb_username_band
@@ -949,6 +949,135 @@ class _OrderedGate:
             ev.set()
 
 
+# ── TURBO UPLOAD ────────────────────────────────────────────────────────
+# Pyrogram ka default save_file ek file ke liye 1 connection + 4 parallel parts
+# use karta hai => speed = 4 x 512KB / latency (Railway->Telegram me ~4-5 MB/s pe atak jati hai).
+# Yahan har file ke liye UPLOAD_SESSIONS connection x UPLOAD_WORKERS parts ek saath.
+# Koi bhi error aaye to automatic purane (original) tareeke pe fallback.
+_UP_SESSIONS = max(1, int(os.getenv("UPLOAD_SESSIONS", "3")))
+_UP_WORKERS = max(1, int(os.getenv("UPLOAD_WORKERS", "6")))
+_FAST_UPLOAD = os.getenv("FAST_UPLOAD", "1") != "0"
+_FAST_MIN = 10 * 1024 * 1024
+_FAST_MAX = 1900 * 1024 * 1024
+
+
+async def _fast_save_file(uc, path, progress=None, progress_args=()):
+    import inspect
+    import random
+    from pyrogram import raw
+    from pyrogram.session import Session
+    from pyrogram.errors import FloodWait
+
+    size = os.path.getsize(path)
+    part_size = 512 * 1024
+    total = (size + part_size - 1) // part_size
+    file_id = random.getrandbits(62)
+
+    dc_id = await uc.storage.dc_id()
+    auth_key = await uc.storage.auth_key()
+    test_mode = await uc.storage.test_mode()
+
+    sessions = []
+    tasks = []
+    try:
+        for _ in range(_UP_SESSIONS):
+            ss = Session(uc, dc_id, auth_key, test_mode, is_media=True)
+            await ss.start()
+            sessions.append(ss)
+
+        n_workers = len(sessions) * _UP_WORKERS
+        queue: asyncio.Queue = asyncio.Queue(maxsize=n_workers * 2)
+        state = {"bytes": 0, "last": 0.0}
+
+        async def _report(force=False):
+            if not progress:
+                return
+            now = time.time()
+            if not force and now - state["last"] < 0.4:
+                return
+            state["last"] = now
+            try:
+                r = progress(min(state["bytes"], size), size, *progress_args)
+                if inspect.isawaitable(r):
+                    await r
+            except Exception:
+                pass
+
+        async def producer():
+            with open(path, "rb") as f:
+                for idx in range(total):
+                    await queue.put((idx, f.read(part_size)))
+            for _ in range(n_workers):
+                await queue.put(None)
+
+        async def worker(ss):
+            while True:
+                item = await queue.get()
+                if item is None:
+                    return
+                idx, chunk = item
+                for attempt in range(4):
+                    try:
+                        await ss.invoke(raw.functions.upload.SaveBigFilePart(
+                            file_id=file_id, file_part=idx,
+                            file_total_parts=total, bytes=chunk))
+                        break
+                    except FloodWait as e:
+                        await asyncio.sleep(getattr(e, "value", 2) + 1)
+                    except Exception:
+                        if attempt == 3:
+                            raise
+                        await asyncio.sleep(1 + attempt)
+                state["bytes"] += len(chunk)
+                await _report()
+
+        tasks = [asyncio.ensure_future(producer())]
+        for ss in sessions:
+            for _ in range(_UP_WORKERS):
+                tasks.append(asyncio.ensure_future(worker(ss)))
+        await asyncio.gather(*tasks)
+        await _report(force=True)
+        return raw.types.InputFileBig(id=file_id, parts=total, name=os.path.basename(path))
+    except BaseException:
+        for t in tasks:
+            t.cancel()
+        raise
+    finally:
+        for ss in sessions:
+            try:
+                await ss.stop()
+            except Exception:
+                pass
+
+
+async def _prewarm_all_custompics(user_id: int):
+    """Swift page load / download ke dauran saari custom pics background me cache kar lo
+    (pehli file ka 4s thumbnail-intezaar khatam)."""
+    try:
+        ids = []
+        for uid in set(list(owner) + list(sudo_users) + [user_id]):
+            try:
+                pics = await db.get_all_custompics(uid) or {}
+                ids.extend(pics.values())
+                th = await db.get_thumbnail(uid)
+                if th:
+                    ids.append(th)
+            except Exception:
+                continue
+        seen = []
+        for fid in ids:
+            if fid in seen:
+                continue
+            seen.append(fid)
+            if len(seen) > 8:
+                break
+            t0 = time.time()
+            await _get_custom_thumb(fid, os.path.join(_THUMB_CACHE_DIR, f"pre_{len(seen)}.jpg"))
+            LOGGER.info(f"[Swift] custompic prewarm {len(seen)} {time.time() - t0:.1f}s")
+    except Exception as e:
+        LOGGER.warning(f"[Swift] custompic prewarm skipped: {e!r}")
+
+
 async def _preconnect_uploaders(user_id: int, n: int = 3):
     """
     EK shared uploader-client (user session) download chalte-chalte connect karo.
@@ -979,6 +1108,7 @@ async def _close_uploaders(ucs):
 
 _THUMB_LOCK = asyncio.Lock()
 _THUMB_CACHE: dict = {}   # file_id -> local path
+_THUMB_CACHE_DIR = os.path.join(download_dir, "_thumbcache")   # episode khatam hone par bhi bacha rahe
 
 
 async def _get_custom_thumb(file_id: str, dest_path: str):
@@ -987,6 +1117,7 @@ async def _get_custom_thumb(file_id: str, dest_path: str):
     Parallel uploads mein 3 download_media ek saath chalne se Telegram
     AUTH_BYTES_INVALID deta tha (thumb 'not found' + lamba stuck). Lock + retry se fix.
     """
+    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
     async with _THUMB_LOCK:
         cached = _THUMB_CACHE.get(file_id)
         if cached and os.path.isfile(cached) and os.path.getsize(cached) > 0:
@@ -1008,8 +1139,9 @@ async def _get_custom_thumb(file_id: str, dest_path: str):
                     except Exception:
                         pass
                 if got and os.path.isfile(got) and os.path.getsize(got) > 0:
-                    keep = os.path.join(os.path.dirname(dest_path), f"cache_{abs(hash(file_id))}.jpg")
+                    keep = os.path.join(_THUMB_CACHE_DIR, f"cache_{abs(hash(file_id))}.jpg")
                     try:
+                        os.makedirs(_THUMB_CACHE_DIR, exist_ok=True)
                         shutil.copyfile(got, keep)
                         _THUMB_CACHE[file_id] = keep
                     except Exception:
@@ -1188,30 +1320,47 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
         # wait hota hai: 360p -> 480p -> 720p -> 1080p. Send normal tareeke se
         # seedha target chat mein hota hai => cover/thumb bilkul pehle jaisa lagta hai.
         _reg_key = None
-        if gate is not None:
-            if uc is not None:
-                _reg = getattr(uc, "_gate_reg", None)
-                if _reg is None:
-                    _reg = {}
-                    uc._gate_reg = _reg
-                    _orig_save = uc.save_file
+        if uc is not None:
+            _reg = getattr(uc, "_gate_reg", None)
+            if _reg is None:
+                _reg = {}
+                uc._gate_reg = _reg
+                _orig_save = uc.save_file
 
-                    async def _save_then_wait(path, *a, **kw):
+                async def _save_then_wait(path, *a, **kw):
+                    ent = _reg.get(path) if isinstance(path, str) else None
+                    res = None
+                    # TURBO: multi-connection upload (fail ho to original)
+                    if (ent and _FAST_UPLOAD and not a
+                            and "file_id" not in kw and "file_part" not in kw
+                            and os.path.isfile(path)
+                            and _FAST_MIN <= os.path.getsize(path) <= _FAST_MAX):
+                        try:
+                            _t0 = time.time()
+                            res = await _fast_save_file(
+                                uc, path, kw.get("progress"), kw.get("progress_args", ()))
+                            _sz = os.path.getsize(path) / 1024 / 1024
+                            LOGGER.info(f"[Swift] TURBO upload {_sz:.0f}MB in {time.time() - _t0:.1f}s "
+                                        f"({_sz / max(time.time() - _t0, 0.1):.1f} MB/s)")
+                        except Exception as e:
+                            LOGGER.warning(f"[Swift] turbo upload failed ({e!r}) — normal upload par fallback")
+                            res = None
+                    if res is None:
                         res = await _orig_save(path, *a, **kw)
-                        ent = _reg.get(path) if isinstance(path, str) else None
-                        if ent:
-                            _g, _q, _m, _pf, _ql = ent
-                            try:
-                                await _m.edit(f"{_pf}⏳ **`{_ql}` upload ho gaya — order ka wait...**")
-                            except Exception:
-                                pass
-                            await _g.wait_turn(_q)
-                        return res
+                    if ent and ent[0] is not None:
+                        _g, _q, _m, _pf, _ql = ent
+                        try:
+                            await _m.edit(f"{_pf}⏳ **`{_ql}` upload ho gaya — order ka wait...**")
+                        except Exception:
+                            pass
+                        await _g.wait_turn(_q)
+                    return res
 
-                    uc.save_file = _save_then_wait
-                _reg_key = str(filepath)
-                _reg[_reg_key] = (gate, gate_q, msg, prefix, quality)
-            else:
+                uc.save_file = _save_then_wait
+            _reg_key = str(filepath)
+            _reg[_reg_key] = (gate, gate_q, msg, prefix, quality)
+        if gate is not None and uc is None:
+            if True:
                 # user-session nahi (bot fallback) => parallel possible nahi, order bachao
                 await gate.wait_turn(gate_q)
 
@@ -1604,6 +1753,7 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
 
     prog_task = asyncio.create_task(_progress_updater())
     _pre_task = None
+    asyncio.ensure_future(_prewarm_all_custompics(message.from_user.id))
     if _PARALLEL_UPLOAD and not encode:
         try:
             _pre_task = asyncio.ensure_future(_preconnect_uploaders(message.from_user.id, 3))
