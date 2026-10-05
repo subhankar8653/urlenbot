@@ -32,6 +32,11 @@ async def cleanup_cmd(_, message):
 async def health_cmd(_, message):
     used, limit = janitor.container_mem()
     free, pct = janitor.disk_stats()
+    b = janitor.mem_breakdown()
     await message.reply_text(
         f"<b>🩺 Health</b>\nRAM: {_hr(used)} / {_hr(limit)} ({used/limit*100:.0f}%)\n"
+        f"├ Bot (python): {_hr(b['python'])}\n"
+        f"├ Chrome: {_hr(b['chrome'])} ({b['chrome_procs']} proc)\n"
+        f"├ ffmpeg: {_hr(b['ffmpeg'])}\n"
+        f"└ File cache (ginti se bahar): {_hr(b['cache'])}\n"
         f"Disk free: {_hr(free)} (used {pct:.0f}%)\nBusy: {janitor.is_busy()}")
