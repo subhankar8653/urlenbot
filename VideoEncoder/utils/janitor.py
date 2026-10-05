@@ -30,15 +30,17 @@ from .. import app, data, download_dir, encode_dir, owner
 LOGGER = logging.getLogger(__name__)
 
 # ── Tunables (env se override ho sakte hain) ────────────────────────────
+from .. import profile as _prof
+
 CHECK_EVERY = int(os.getenv("JANITOR_INTERVAL", "180"))            # sec
-STALE_AFTER = int(os.getenv("JANITOR_STALE_MIN", "30")) * 60       # idle itne der => kachra
-LOW_DISK_GB = float(os.getenv("JANITOR_LOW_DISK_GB", "2.0"))       # isse kam free => aggressive
-LOW_DISK_PCT = float(os.getenv("JANITOR_LOW_DISK_PCT", "85"))
+STALE_AFTER = _prof.JANITOR_STALE_MIN * 60       # idle itne der => kachra
+LOW_DISK_GB = _prof.JANITOR_LOW_DISK_GB       # isse kam free => aggressive
+LOW_DISK_PCT = _prof.JANITOR_LOW_DISK_PCT
 AGGRESSIVE_IDLE = 180                                              # sec
-MEM_RESTART_PCT = float(os.getenv("JANITOR_MEM_RESTART_PCT", "65")) # container RAM %
-MAX_UPTIME_H = float(os.getenv("JANITOR_MAX_UPTIME_H", "24"))       # idle hone par refresh
+MEM_RESTART_PCT = _prof.JANITOR_MEM_RESTART_PCT # container RAM %
+MAX_UPTIME_H = _prof.JANITOR_MAX_UPTIME_H       # idle hone par refresh
 CHROME_MAX_AGE = 45 * 60
-CHROME_IDLE_AGE = 8 * 60          # bot idle ho to itne purane chrome bhi kill
+CHROME_IDLE_AGE = _prof.CHROME_IDLE_MIN * 60          # bot idle ho to itne purane chrome bhi kill
 IDLE_BEFORE_RESTART = 120                                          # sec continuous idle
 
 _idle_since = None
