@@ -35,10 +35,11 @@ STALE_AFTER = int(os.getenv("JANITOR_STALE_MIN", "30")) * 60       # idle itne d
 LOW_DISK_GB = float(os.getenv("JANITOR_LOW_DISK_GB", "2.0"))       # isse kam free => aggressive
 LOW_DISK_PCT = float(os.getenv("JANITOR_LOW_DISK_PCT", "85"))
 AGGRESSIVE_IDLE = 180                                              # sec
-MEM_RESTART_PCT = float(os.getenv("JANITOR_MEM_RESTART_PCT", "88")) # container RAM %
+MEM_RESTART_PCT = float(os.getenv("JANITOR_MEM_RESTART_PCT", "65")) # container RAM %
 MAX_UPTIME_H = float(os.getenv("JANITOR_MAX_UPTIME_H", "24"))       # idle hone par refresh
 CHROME_MAX_AGE = 45 * 60
-IDLE_BEFORE_RESTART = 600                                          # sec continuous idle
+CHROME_IDLE_AGE = 8 * 60          # bot idle ho to itne purane chrome bhi kill
+IDLE_BEFORE_RESTART = 120                                          # sec continuous idle
 
 _idle_since = None
 _started = False
@@ -108,25 +109,88 @@ def disk_stats():
         return 10**12, 0.0
 
 
-def container_mem():
-    """(used_bytes, limit_bytes) — Railway container ka asli limit (cgroup)."""
-    for cur, lim in (("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
-                     ("/sys/fs/cgroup/memory/memory.usage_in_bytes",
-                      "/sys/fs/cgroup/memory/memory.limit_in_bytes")):
+def _stat(key_v2: str, key_v1: str) -> int:
+    for f, key in (("/sys/fs/cgroup/memory.stat", key_v2),
+                   ("/sys/fs/cgroup/memory/memory.stat", key_v1)):
         try:
-            used = int(open(cur).read().strip())
-            raw = open(lim).read().strip()
-            limit = int(raw) if raw.isdigit() else psutil.virtual_memory().total
-            limit = min(limit, psutil.virtual_memory().total)
-            return used, limit
+            for line in open(f):
+                k, v = line.split()
+                if k == key:
+                    return int(v)
         except Exception:
             continue
+    return -1
+
+
+def _cache_bytes() -> int:
+    v = _stat("file", "total_cache")
+    return max(v, 0)
+
+
+def container_mem():
+    """(used_bytes, limit_bytes). 'used' = sirf anonymous RAM (python + chrome
+    + ffmpeg ki asli memory). Page-cache (download ki hui files) ginti mein
+    nahi — wo reclaimable hai aur galat restart karwata tha."""
+    try:
+        limit = psutil.virtual_memory().total
+        for lim in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+            try:
+                raw = open(lim).read().strip()
+                if raw.isdigit():
+                    limit = min(limit, int(raw))
+                    break
+            except Exception:
+                continue
+        anon = _stat("anon", "total_rss")
+        if anon >= 0:
+            return anon, limit
+    except Exception:
+        pass
     vm = psutil.virtual_memory()
     return vm.used, vm.total
 
 
+def mem_breakdown() -> dict:
+    """Kaun kitni RAM kha raha hai: bot (python), chrome, ffmpeg, cache."""
+    me = psutil.Process(os.getpid())
+    out = {"python": me.memory_info().rss, "chrome": 0, "ffmpeg": 0, "other": 0,
+           "chrome_procs": 0, "cache": _cache_bytes()}
+    try:
+        kids = me.children(recursive=True)
+    except Exception:
+        kids = []
+    for c in kids:
+        try:
+            n = (c.name() or "").lower()
+            rss = c.memory_info().rss
+            if "chrom" in n:
+                out["chrome"] += rss
+                out["chrome_procs"] += 1
+            elif "ffmpeg" in n:
+                out["ffmpeg"] += rss
+            else:
+                out["other"] += rss
+        except Exception:
+            pass
+    return out
+
+
+def _recent_file_activity(window: int = 300) -> bool:
+    """download/encode dir mein pichhle `window` sec mein kuch badla? => kaam chal raha hai."""
+    now = time.time()
+    for base in (download_dir, encode_dir):
+        try:
+            for name in os.listdir(base):
+                if now - _entry_mtime(os.path.join(base, name)) < window:
+                    return True
+        except OSError:
+            pass
+    return False
+
+
 def is_busy() -> bool:
-    """Koi bhi task chal raha hai? (queue, auto-upload, ffmpeg)"""
+    """Koi bhi kaam chal raha hai? (queue, auto-upload, Swift/Rti/Adh chrome
+    downloads, ffmpeg, mega, ya recent file activity)"""
     if data:
         return True
     try:
@@ -135,7 +199,9 @@ def is_busy() -> bool:
             return True
     except Exception:
         pass
-    return _proc_running(("ffmpeg", "megadl", "megatools"))
+    if _proc_running(("ffmpeg", "megadl", "megatools", "chrom")):
+        return True
+    return _recent_file_activity()
 
 
 # ── cleanup steps ───────────────────────────────────────────────────────
@@ -177,7 +243,7 @@ def clean_logs():
             pass
 
 
-def kill_orphan_browsers() -> int:
+def kill_orphan_browsers(max_age: int = CHROME_MAX_AGE) -> int:
     """Purane chrome/chromedriver kill + un-reaped chrome zombies saaf."""
     killed, now = 0, time.time()
     me = os.getpid()
@@ -193,7 +259,7 @@ def kill_orphan_browsers() -> int:
                     except (ChildProcessError, OSError):
                         pass
                 continue
-            if now - p.info["create_time"] > CHROME_MAX_AGE:
+            if now - p.info["create_time"] > max_age:
                 p.kill()
                 killed += 1
         except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -217,7 +283,7 @@ def run_cleanup(force: bool = False) -> dict:
     idle_limit = 60 if force else (AGGRESSIVE_IDLE if low else STALE_AFTER)
     freed = clean_dirs(idle_limit) + clean_tmp()
     clean_logs()
-    killed = kill_orphan_browsers()
+    killed = kill_orphan_browsers(CHROME_MAX_AGE if is_busy() else CHROME_IDLE_AGE)
     trim_memory()
     free2, pct2 = disk_stats()
     return {"freed": freed, "killed": killed, "free": free2, "pct": pct2, "low": low}
@@ -225,6 +291,9 @@ def run_cleanup(force: bool = False) -> dict:
 
 # ── soft restart ────────────────────────────────────────────────────────
 async def soft_restart(reason: str):
+    if is_busy():   # last-moment recheck — beech kaam mein kabhi restart nahi
+        LOGGER.info("[Janitor] restart skipped — bot busy")
+        return
     LOGGER.warning(f"[Janitor] Soft restart: {reason}")
     try:
         for uid in owner[:1]:
@@ -232,7 +301,7 @@ async def soft_restart(reason: str):
     except Exception:
         pass
     try:
-        await app.stop()
+        await asyncio.wait_for(app.stop(), timeout=10)
     except Exception:
         pass
     # purana sab saaf — naya process fresh disk par shuru ho
