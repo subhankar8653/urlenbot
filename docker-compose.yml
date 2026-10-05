@@ -1,0 +1,18 @@
+# VPS ke liye:  docker compose up -d --build
+# (Railway par yeh file use nahi hoti — wahan Dockerfile + railway.toml chalte hain)
+services:
+  bot:
+    build: .
+    container_name: urlenbot
+    restart: unless-stopped
+    init: true                 # zombie chrome/ffmpeg processes khud reap
+    shm_size: "2gb"            # chromium /dev/shm crash se bachne ke liye
+    env_file: config.env       # saare secrets yahin se (API_ID, BOT_TOKEN, MONGO_URI ...)
+    environment:
+      BOT_PROFILE: vps         # auto-detect bhi chalta, par yahan pakka kar diya
+      TZ: Asia/Kolkata
+    ulimits:
+      nofile: 65535            # bahut saare parallel connections ke liye
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "3" }
