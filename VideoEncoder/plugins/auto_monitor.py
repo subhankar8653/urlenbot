@@ -485,6 +485,8 @@ async def _episode_quality_poller(
             nonlocal _old_msgs_deleted_poll
             if idx > 0 and _poll_gate is None:
                 await _half_events_poll[idx - 1].wait()
+            elif _poll_gate is not None and idx > 0:
+                await asyncio.sleep(1.5 * idx)   # auth-export takraav se bachne ko
             if idx == 0 and not _old_msgs_deleted_poll:
                 _old_msgs_deleted_poll = True
                 await _delete_old_bot_msgs(channel_id)

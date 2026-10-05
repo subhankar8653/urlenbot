@@ -925,9 +925,10 @@ async def _get_custom_thumb(file_id: str, dest_path: str):
                 return dest_path
             except Exception:
                 pass
-        for attempt in range(3):
+        for attempt in range(2):
             try:
-                got = await app.download_media(file_id, file_name=dest_path)
+                got = await asyncio.wait_for(
+                    app.download_media(file_id, file_name=dest_path), timeout=25)
                 if got and str(got).endswith(".temp"):
                     fixed = str(got).replace(".temp", ".jpg")
                     try:
@@ -944,8 +945,8 @@ async def _get_custom_thumb(file_id: str, dest_path: str):
                         pass
                     return got
             except Exception as e:
-                LOGGER.warning(f"[Swift] custom thumb download attempt {attempt + 1}/3: {e}")
-                await asyncio.sleep(1.5 * (attempt + 1))
+                LOGGER.warning(f"[Swift] custom thumb download attempt {attempt + 1}/2: {e!r}")
+                await asyncio.sleep(1)
         return None
 
 
@@ -1006,6 +1007,7 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
 
         thumb = None
         custom_thumb_used = False
+        _t_prep = time.time()
 
         if custom_thumb_id:
             try:
@@ -1098,7 +1100,14 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
         # uploader_client=None hoga staggered flow mein — har file ka fresh uc
         # Staggered chain ensure karti hai ki ek time pe sirf ek upload active hai
         # isliye same session_string pe socket conflict nahi hoga
+        _t_conn = time.time()
+        try:
+            await msg.edit(f"{prefix}🔌 **`{quality}` upload connection ban raha hai...**")
+        except Exception:
+            pass
         uc = uploader_client if uploader_client is not None else await _make_uploader_client(message.from_user.id)
+        LOGGER.info(f"[Swift] {quality}: uploader connect {time.time() - _t_conn:.1f}s "
+                    f"(thumb+cover prep {_t_conn - _t_prep:.1f}s)")
         sent_msg = None
 
         # ── ORDERED RELEASE (parallel upload, ordered post) ──
@@ -1413,6 +1422,26 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
     # (pehle yeh 50% tha — poori doosri half bandwidth-shared, slow rehta tha;
     # ab sirf aakhri ~10% mein overlap hota hai)
 
+    # ── PREWARM: custom pic(s) EK baar, sequentially, upload shuru hone se PEHLE ──
+    # (3 files ek saath download karein to AUTH_BYTES_INVALID + lamba intezaar hota tha)
+    if _PARALLEL_UPLOAD and not encode and len(files) > 1:
+        try:
+            await msg.edit(f"{prefix}🖼 **Thumbnail ready ho raha hai...**")
+            _uid = message.from_user.id
+            _seen = set()
+            for fp in files:
+                _cp = await get_custompic_for_file(_uid, os.path.basename(fp))
+                _cp = _cp if _cp else await db.get_thumbnail(_uid)
+                if _cp and _cp not in _seen:
+                    _seen.add(_cp)
+                    _tp = os.path.join(dl_dir, "thumbs", f"warm_{len(_seen)}.jpg")
+                    os.makedirs(os.path.dirname(_tp), exist_ok=True)
+                    _t0 = time.time()
+                    await _get_custom_thumb(_cp, _tp)
+                    LOGGER.info(f"[Swift] thumb prewarm {time.time() - _t0:.1f}s")
+        except Exception as _e:
+            LOGGER.warning(f"[Swift] thumb prewarm skipped: {_e}")
+
     # Har file ke liye ek status message banao
     _dummy_msgs = {}
     for fp in files:
@@ -1448,6 +1477,10 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
         # Apni turn ka wait karo (pichli file _STAGGER_AT / 50% tak pahunche)
         if idx > 0 and _gate is None:
             await _half_events[idx - 1].wait()
+        elif _gate is not None and idx > 0:
+            # Sab EK SAATH chalte hain; bas har ek 1.5s peeche shuru hota hai taaki
+            # Telegram ke auth-export calls aapas mein na takrayein (AUTH_BYTES_INVALID)
+            await asyncio.sleep(1.5 * idx)
 
         um = _dummy_msgs.get(filepath, msg)
         _gq = _quality_from(os.path.basename(filepath))
