@@ -89,27 +89,22 @@ def memory_file(name=None, contents=None, *, bytes=True):
     return file
 
 # Check Folder
-if not os.path.isdir(download_dir):
-    os.makedirs(download_dir)
-else:
-    # Purani crashed/leftover session folders saaf karo — agar bot beech
-    # process (download/chrome session) mein crash ya redeploy hua tha,
-    # unke temp folders (swift_*, monitor_ep*, chrome ke disposable
-    # profile _chrome_tmp) disk pe reh gaye ho sakte hain. Fresh start pe
-    # hamesha inhe wipe karo, warna yeh gradually storage bharte rehte
-    # hain jab tak redeploy na ho (jo purane symptom ki wajah thi).
-    import glob as _glob
-    for _leftover in (
-        _glob.glob(os.path.join(download_dir, "swift_*"))
-        + _glob.glob(os.path.join(download_dir, "monitor_ep*"))
-        + [os.path.join(download_dir, "_chrome_tmp")]
-    ):
-        try:
-            if os.path.isdir(_leftover):
-                import shutil as _shutil
-                _shutil.rmtree(_leftover, ignore_errors=True)
-        except Exception:
-            pass
+import shutil as _shutil
+for _d in (download_dir, encode_dir):
+    # Fresh start (redeploy ya auto-refresh) pe dono folders poore saaf karo —
+    # purani crashed session ka kachra storage bharta tha.
+    if os.path.isdir(_d):
+        for _n in os.listdir(_d):
+            _p = os.path.join(_d, _n)
+            try:
+                if os.path.isdir(_p) and not os.path.islink(_p):
+                    _shutil.rmtree(_p, ignore_errors=True)
+                else:
+                    os.remove(_p)
+            except Exception:
+                pass
+    else:
+        os.makedirs(_d)
 if not os.path.isdir(encode_dir):
     os.makedirs(encode_dir)
 
@@ -118,13 +113,14 @@ if not os.path.isdir('VideoEncoder/utils/extras'):
 
 # the logging things
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     datefmt="%d-%b-%y %H:%M:%S",
     handlers=[
         RotatingFileHandler(
             'VideoEncoder/utils/extras/logs.txt',
-            backupCount=20,
+            maxBytes=5 * 1024 * 1024,   # pehle limit nahi thi -> log file disk bhar deti thi
+            backupCount=1,
             encoding='utf-8'
         ),
         logging.StreamHandler()

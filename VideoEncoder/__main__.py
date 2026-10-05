@@ -17,6 +17,8 @@ async def main():
     await load_caption_style_cache()
     from .utils.update_post_style import load_update_post_style_cache
     await load_update_post_style_cache()
+    from .utils.janitor import start_janitor
+    start_janitor()
     await app.send_message(chat_id=log, text=f'<b>Bot Started! @{(await app.get_me()).username}</b>')
     await idle()
     await app.stop()
