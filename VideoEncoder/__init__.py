@@ -8,6 +8,7 @@ from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
 from pyrogram import Client
+from . import profile as _prof
 
 # ── uvloop: faster asyncio event loop (pyrofork ke apne official docs bhi
 # isse "speedup" extra mein recommend karte hain — C-based libuv pe chalta
@@ -146,6 +147,7 @@ app = Client(
     # kurigram's own built-in, version-matched transfer code, so it's safe
     # to raise. Bumped 4 → 8 for faster downloads; push higher only if the
     # box stays stable (more RAM gets used per extra connection).
-    max_concurrent_transmissions=8,
-    workers=32,
+    max_concurrent_transmissions=_prof.PYRO_TRANSMISSIONS,
+    workers=_prof.PYRO_WORKERS,
     ipv6=False)
+LOGGER.info(f'[Profile] {_prof.summary()}')
