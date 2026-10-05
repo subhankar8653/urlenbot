@@ -66,7 +66,7 @@ async def _get_user_session(user_id: int):
     return user.get("user_session", None)
 
 
-async def _make_uploader_client(user_id: int):
+async def _make_uploader_client(user_id: int, max_transmissions: int = 8):
     session_str = await _get_user_session(user_id)
     if not session_str:
         return None
@@ -83,13 +83,15 @@ async def _make_uploader_client(user_id: int):
             # upload speed. Higher se deadlock/OOM risk badhta hai on a
             # tight-RAM box — agar bot restart/OOM hone lage to yeh pehla
             # value hai jise wapas 6 karna chahiye.
-            max_concurrent_transmissions=8,
+            max_concurrent_transmissions=max_transmissions,
             workers=32,
             sleep_threshold=60,
         )
         await uc.connect()
         return uc
-    except Exception:
+    except Exception as e:
+        # pehle yeh error chupchap nigal liya jata tha => bot fallback/serial upload
+        LOGGER.error(f"[Upload] uploader client connect FAILED: {e!r}")
         return None
 
 
