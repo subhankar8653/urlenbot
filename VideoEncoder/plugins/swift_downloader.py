@@ -601,7 +601,8 @@ def _fast_download_link(href: str, dl_dir: str, quality: str, referer: str, cook
 
 
 def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_filter: str = None,
-                         fast: bool = False, reuse_driver=None, progress: dict = None) -> dict:
+                         fast: bool = False, reuse_driver=None, progress: dict = None,
+                         on_file=None) -> dict:
     """
     Same Selenium session mein:
       1. Page visit karo — immediately download mat karo
@@ -773,6 +774,8 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
             # start karo — max 4 qualities x 8 threads = up to 32 connections
             # parallel, Chrome ke single-connection download se kaafi tez.
             active_dls = {}
+            # Pipeline upload ke liye: kaun-kaun si qualities aane wali hain (order-gate isse banta hai)
+            progress["expected"] = [l["quality"] for l in download_links[:4]]
             for lnk in download_links[:4]:  # max 4 qualities
                 q, href = lnk["quality"], lnk["href"]
                 dl = _fast_download_link(href, dl_dir, q, swift_url, cookie_header)
@@ -783,20 +786,39 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
                     fallback_links.append(lnk)
             progress["phase"] = "download"
 
-            for q, (dl, href) in active_dls.items():
-                try:
-                    dl.wait()
-                    if dl.isSuccessful():
-                        fpath = dl.get_dest()
-                        if fpath and os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
-                            fast_downloaded_files.append(fpath)
-                            qualities_clicked.append(q)
-                            LOGGER.info(f"[Swift] Fast-downloaded ({q}): {fpath}")
+            # Sab downloads ek saath chal rahe hain — jo bhi pehle khatam ho, usko TURANT
+            # report karo (on_file) taaki upload shuru ho jaye, baaki ka wait kiye bina.
+            pending = dict(active_dls)
+            while pending:
+                for q, (dl, href) in list(pending.items()):
+                    try:
+                        if not dl.isFinished():
                             continue
-                    LOGGER.warning(f"[Swift] Fast-download unsuccessful for {q}, falling back to browser")
-                except Exception as e:
-                    LOGGER.warning(f"[Swift] Fast-download error for {q}: {e}, falling back to browser")
-                fallback_links.append({"quality": q, "href": href})
+                    except Exception:
+                        continue
+                    pending.pop(q, None)
+                    ok = False
+                    try:
+                        if dl.isSuccessful():
+                            fpath = dl.get_dest()
+                            if fpath and os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
+                                fast_downloaded_files.append(fpath)
+                                qualities_clicked.append(q)
+                                LOGGER.info(f"[Swift] Fast-downloaded ({q}): {fpath}")
+                                ok = True
+                                if on_file:
+                                    try:
+                                        on_file(fpath, q)
+                                    except Exception as _cbe:
+                                        LOGGER.warning(f"[Swift] on_file cb error: {_cbe!r}")
+                        if not ok:
+                            LOGGER.warning(f"[Swift] Fast-download unsuccessful for {q}, falling back to browser")
+                    except Exception as e:
+                        LOGGER.warning(f"[Swift] Fast-download error for {q}: {e}, falling back to browser")
+                    if not ok:
+                        fallback_links.append({"quality": q, "href": href})
+                if pending:
+                    time.sleep(0.3)
 
             # Jo bhi fast-path mein fail hua, uske liye purana reliable
             # browser-download fallback (slower, but never breaks the feature).
@@ -824,10 +846,20 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
             LOGGER.info("[Swift] All qualities finished via fast multi-connection path — skipping poll.")
             result["files"] = fast_downloaded_files
         else:
+            _reported = set(fast_downloaded_files)
             while True:
                 done = _get_done_files(dl_dir)
                 in_prog = _in_progress(dl_dir)
                 elapsed = int(time.time() - start)
+
+                if on_file:
+                    for _f in done:
+                        if _f not in _reported:
+                            _reported.add(_f)
+                            try:
+                                on_file(_f, _quality_from(os.path.basename(_f)))
+                            except Exception as _cbe:
+                                LOGGER.warning(f"[Swift] on_file cb error: {_cbe!r}")
 
                 LOGGER.info(f"[Swift] Done={len(done)}, InProg={len(in_prog)}, Elapsed={elapsed}s")
 
@@ -890,6 +922,12 @@ class _OrderedGate:
     def __init__(self, qualities):
         self._order = sorted(set(qualities), key=lambda q: QUALITY_ORDER.get(q, 99))
         self._events = {q: asyncio.Event() for q in self._order}
+
+    def ensure(self, quality):
+        """Gate mein jo quality nahi thi (naam mismatch) use jod do."""
+        if quality not in self._events:
+            self._events[quality] = asyncio.Event()
+            self._order = sorted(self._events, key=lambda q: QUALITY_ORDER.get(q, 99))
 
     async def wait_turn(self, quality):
         for lower in self._order:
@@ -1316,6 +1354,153 @@ async def _reorder_if_needed(client, message, uploaded_results: list):
 # ─────────────────────────────────────────────
 #  Core command logic
 # ─────────────────────────────────────────────
+async def _pipeline_run(client, message, msg, prefix, swift_url, dl_dir, episode_label,
+                        fast, driver, progress, prog_task, pre_task):
+    """
+    PIPELINE MODE: har quality download hote hi turant upload shuru.
+      * 360p pehle download hua  -> uska upload start (720p/1080p ka wait nahi)
+      * 720p/1080p ka download khatam hote hi unka upload bhi start
+      * Delivery order phir bhi 360p -> 720p -> 1080p (OrderedGate)
+    """
+    loop = asyncio.get_event_loop()
+    file_q: asyncio.Queue = asyncio.Queue()
+
+    def _on_file(path, quality):           # download thread se aata hai
+        loop.call_soon_threadsafe(file_q.put_nowait, (path, quality))
+
+    scrape_fut = loop.run_in_executor(
+        None,
+        functools.partial(
+            _scrape_and_download, swift_url, dl_dir, None, None,
+            fast=fast, reuse_driver=driver, progress=progress, on_file=_on_file,
+        ),
+    )
+
+    tasks: dict = {}                       # path -> asyncio.Task
+    state = {"gate": None, "ucs": None}
+
+    async def _prepare():
+        if state["ucs"] is None:
+            ucs = []
+            if pre_task is not None:
+                try:
+                    ucs = [u for u in await asyncio.wait_for(pre_task, timeout=45) if u]
+                except Exception as e:
+                    LOGGER.warning(f"[Swift] preconnect wait failed: {e!r}")
+            state["ucs"] = ucs
+        if state["gate"] is None:
+            expected = list(progress.get("expected") or [])
+            if len(expected) > 1:
+                state["gate"] = _OrderedGate(expected)
+                LOGGER.info(f"[Swift] Pipeline upload ON, expected={expected}")
+
+    async def _one_upload(path):
+        q = _quality_from(os.path.basename(path))
+        gate = state["gate"]
+        if gate is not None:
+            gate.ensure(q)
+        try:
+            dm = await message.reply(f"{prefix}📤 **Uploading `{q}`...**")
+        except Exception:
+            dm = msg
+        try:
+            success, sent_msg, quality = await _upload_one_file(
+                client, message, dm, path, dl_dir, False,
+                on_half=asyncio.Event(),
+                uploader_client=(state["ucs"][0] if (gate is not None and state["ucs"]) else None),
+                label_prefix=episode_label,
+                gate=gate,
+            )
+        finally:
+            if gate is not None:
+                gate.done(q)
+        try:
+            if success and sent_msg:
+                await dm.delete()
+            else:
+                await dm.edit(f"❌ Upload failed: `{quality}`")
+        except Exception:
+            pass
+        return success, sent_msg, quality
+
+    async def _start(path):
+        if path in tasks:
+            return
+        await _prepare()
+        LOGGER.info(f"[Swift] ▶ upload start (download baaki ho sakta hai): {os.path.basename(path)}")
+        tasks[path] = asyncio.ensure_future(_one_upload(path))
+
+    # ── pump: jaise-jaise files ready hon, upload start karo ──
+    while True:
+        if scrape_fut.done() and file_q.empty():
+            break
+        try:
+            path, _q = await asyncio.wait_for(file_q.get(), timeout=0.5)
+        except asyncio.TimeoutError:
+            continue
+        await _start(path)
+
+    result = await scrape_fut
+    prog_task.cancel()
+    try:
+        await prog_task
+    except asyncio.CancelledError:
+        pass
+
+    # Jo file callback se miss ho gayi (safety) — ab start karo
+    for f in _sort_by_size(result.get("files", [])):
+        await _start(f)
+
+    gate = state["gate"]
+    if gate is not None:
+        # Jo quality kabhi aayi hi nahi (download fail) — uske peeche wale na atkein
+        started_q = {_quality_from(os.path.basename(p)) for p in tasks}
+        for q in list(gate._order):
+            if q not in started_q:
+                gate.done(q)
+
+    if not tasks:
+        await _close_uploaders(state["ucs"])
+        if pre_task is not None and state["ucs"] is None:
+            try:
+                await _close_uploaders([u for u in await asyncio.wait_for(pre_task, timeout=45) if u])
+            except Exception:
+                pass
+        if result["error"]:
+            await msg.edit(
+                f"{prefix}❌ **Failed!**\n\n"
+                f"Error: `{result['error']}`\n\n"
+                f"Railway logs mein `[Swift]` lines check karo."
+            )
+        else:
+            await msg.edit(f"{prefix}❌ **Koi file download nahi hui!**")
+        shutil.rmtree(dl_dir, ignore_errors=True)
+        return
+
+    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    await _close_uploaders(state["ucs"])
+
+    uploaded_results = []
+    for r in results:
+        if isinstance(r, Exception):
+            LOGGER.error(f"[Swift] Upload task exception: {r}")
+            continue
+        success, sent_msg, quality = r
+        if success:
+            uploaded_results.append((quality, sent_msg))
+
+    await _reorder_if_needed(client, message, uploaded_results)
+
+    expected_order = sorted([q for q, _ in uploaded_results], key=lambda q: QUALITY_ORDER.get(q, 99))
+    await msg.edit(
+        f"{prefix}🎉 **Complete!**\n\n"
+        f"✅ Uploaded : `{len(uploaded_results)}/{len(tasks)}`\n"
+        f"📊 `{' → '.join(expected_order) or 'N/A'}`"
+    )
+    shutil.rmtree(dl_dir, ignore_errors=True)
+    return uploaded_results
+
+
 async def _run_swift(client, message, swift_url: str, encode: bool, quality_filter: str = None,
                       episode_label: str = None, show_url: bool = True,
                       fast: bool = False, driver=None):
@@ -1416,6 +1601,12 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
             _pre_task = asyncio.ensure_future(_preconnect_uploaders(message.from_user.id, 3))
         except Exception:
             _pre_task = None
+    if _PARALLEL_UPLOAD and not encode and not quality_filter:
+        return await _pipeline_run(
+            client, message, msg, prefix, swift_url, dl_dir, episode_label,
+            fast, driver, progress, prog_task, _pre_task,
+        )
+
     async def _drop_pre():
         """Early-return par preconnected clients band karo (leak nahi)."""
         if _pre_task is not None:
