@@ -906,52 +906,46 @@ class _OrderedGate:
             ev.set()
 
 
-async def _deliver_staged(user_id, dest_chat, sent_msg, caption, cover,
-                          duration, width, height):
+_THUMB_LOCK = asyncio.Lock()
+_THUMB_CACHE: dict = {}   # file_id -> local path
+
+
+async def _get_custom_thumb(file_id: str, dest_path: str):
     """
-    Log channel pe upload ho chuki file ko destination chat tak pahunchao
-    (dobara upload nahi — sirf file_id se, isliye instant).
-    Cover preserve karne ke liye send_video(video=file_id, cover=...) use hota hai;
-    fail ho to copy_message fallback.
-    Returns: delivered Message ya None
+    Custom pic ko EK baar download karo, baaki files same copy use karein.
+    Parallel uploads mein 3 download_media ek saath chalne se Telegram
+    AUTH_BYTES_INVALID deta tha (thumb 'not found' + lamba stuck). Lock + retry se fix.
     """
-    from pyrogram.enums import ParseMode
-    from ..utils.uploads.telegram import _send_video_cover_safe
-
-    file_id = None
-    if getattr(sent_msg, "video", None):
-        file_id = sent_msg.video.file_id
-    elif getattr(sent_msg, "document", None):
-        file_id = sent_msg.document.file_id
-
-    if file_id:
-        uc = None
-        try:
-            uc = await _make_uploader_client(user_id)
-            send_fn = uc.send_video if uc else app.send_video
-            kwargs = dict(
-                chat_id=dest_chat, video=file_id, caption=caption,
-                parse_mode=ParseMode.HTML, duration=duration,
-                width=width, height=height, supports_streaming=True,
-            )
-            if cover:
-                kwargs["cover"] = cover
-            return await _send_video_cover_safe(send_fn, **kwargs)
-        except Exception as e:
-            LOGGER.warning(f"[Swift] Staged deliver (file_id) failed: {e} — copy_message try")
-        finally:
-            if uc:
-                try:
-                    await uc.disconnect()
-                except Exception:
-                    pass
-
-    try:
-        return await app.copy_message(
-            chat_id=dest_chat, from_chat_id=log, message_id=sent_msg.id,
-        )
-    except Exception as e:
-        LOGGER.error(f"[Swift] Staged deliver copy_message failed: {e}")
+    async with _THUMB_LOCK:
+        cached = _THUMB_CACHE.get(file_id)
+        if cached and os.path.isfile(cached) and os.path.getsize(cached) > 0:
+            try:
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                shutil.copyfile(cached, dest_path)
+                return dest_path
+            except Exception:
+                pass
+        for attempt in range(3):
+            try:
+                got = await app.download_media(file_id, file_name=dest_path)
+                if got and str(got).endswith(".temp"):
+                    fixed = str(got).replace(".temp", ".jpg")
+                    try:
+                        os.rename(got, fixed)
+                        got = fixed
+                    except Exception:
+                        pass
+                if got and os.path.isfile(got) and os.path.getsize(got) > 0:
+                    keep = os.path.join(os.path.dirname(dest_path), f"cache_{abs(hash(file_id))}.jpg")
+                    try:
+                        shutil.copyfile(got, keep)
+                        _THUMB_CACHE[file_id] = keep
+                    except Exception:
+                        pass
+                    return got
+            except Exception as e:
+                LOGGER.warning(f"[Swift] custom thumb download attempt {attempt + 1}/3: {e}")
+                await asyncio.sleep(1.5 * (attempt + 1))
         return None
 
 
@@ -972,7 +966,6 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
     fname_orig = os.path.basename(filepath)
     quality = _quality_from(fname_orig)
     gate_q = quality   # gate isi (rename se pehle wali) quality se bana hai
-    staged = gate is not None and not skip_forward and not encode
     size_mb = os.path.getsize(filepath) / (1024 * 1024)
     prefix = f"🎬 **{label_prefix}**\n" if label_prefix else ""
 
@@ -1022,7 +1015,8 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
                 os.makedirs(thumb_dir, exist_ok=True)
                 thumb_path = os.path.join(thumb_dir, f"thumb_{unique_id}.jpg")
 
-                downloaded = await app.download_media(custom_thumb_id, file_name=thumb_path)
+                await msg.edit(f"{prefix}🖼 **Thumbnail ready ho raha hai `{quality}`...**")
+                downloaded = await _get_custom_thumb(custom_thumb_id, thumb_path)
                 actual_path = downloaded if downloaded else thumb_path
 
                 if actual_path and actual_path.endswith(".temp"):
@@ -1107,6 +1101,31 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
         uc = uploader_client if uploader_client is not None else await _make_uploader_client(message.from_user.id)
         sent_msg = None
 
+        # ── ORDERED RELEASE (parallel upload, ordered post) ──
+        # File ke bytes sab qualities ke EK SAATH upload hote hain. Lekin message
+        # "send" hone se theek pehle (jab file 100% upload ho chuki) apni baari ka
+        # wait hota hai: 360p -> 480p -> 720p -> 1080p. Send normal tareeke se
+        # seedha target chat mein hota hai => cover/thumb bilkul pehle jaisa lagta hai.
+        if gate is not None:
+            if uc is not None and uploader_client is None:
+                _orig_save = uc.save_file
+                _vid_path = str(filepath)
+
+                async def _save_then_wait(path, *a, **kw):
+                    res = await _orig_save(path, *a, **kw)
+                    if isinstance(path, str) and path == _vid_path:
+                        try:
+                            await msg.edit(f"{prefix}⏳ **`{quality}` upload ho gaya — order ka wait...**")
+                        except Exception:
+                            pass
+                        await gate.wait_turn(gate_q)
+                    return res
+
+                uc.save_file = _save_then_wait
+            else:
+                # user-session nahi (bot fallback) => parallel possible nahi, order bachao
+                await gate.wait_turn(gate_q)
+
         # ── Staggered upload ke liye custom progress wrapper ──
         # on_half event tab fire hoga jab yeh file _STAGGER_AT (50%) upload ho
         # jaaye — isse next file ka upload shuru hoga (thumbnail conflict fix)
@@ -1131,9 +1150,11 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
                 uploader_client=uc,
                 progress=_progress_with_half,
                 progress_args=("📤 Uploading...", msg, c_time),
-                skip_forward=(skip_forward or staged),
+                skip_forward=skip_forward,
             )
         finally:
+            if gate is not None:
+                gate.done(gate_q)   # message send ho chuka (ya fail) — agli quality chale
             # Upload complete hone pe bhi event fire karo
             # (agar file bahut chhoti ho aur 50% progress callback nahi aaya)
             if on_half and not _half_fired:
@@ -1150,24 +1171,6 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
                 os.remove(thumb)
             except Exception:
                 pass
-
-        if staged:
-            # Log channel pe upload ho chuka — ab apni baari ka wait (360p -> 720p -> 1080p)
-            if sent_msg is None:
-                raise RuntimeError("log channel upload failed")
-            try:
-                await msg.edit(f"{prefix}⏳ **`{quality}` ready — order ka wait...**")
-            except Exception:
-                pass
-            await gate.wait_turn(gate_q)
-            delivered = await _deliver_staged(
-                user_id, message.chat.id, sent_msg, caption, cover,
-                duration, width, height,
-            )
-            if delivered is None:
-                raise RuntimeError("destination delivery failed")
-            gate.done(gate_q)
-            return True, delivered, quality
 
         return True, sent_msg, quality
 
