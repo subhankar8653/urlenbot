@@ -906,6 +906,38 @@ class _OrderedGate:
             ev.set()
 
 
+async def _preconnect_uploaders(user_id: int, n: int = 3):
+    """
+    n uploader-clients download chalte-chalte HI connect kar lo (parallel).
+    Pehle har file apna connection upload ke time banati thi — 720p/1080p
+    wahin ruk jati thi. Ab upload shuru hote hi connection ready milta hai.
+    """
+    async def _one(i):
+        t0 = time.time()
+        try:
+            uc = await asyncio.wait_for(_make_uploader_client(user_id), timeout=40)
+            LOGGER.info(f"[Swift] preconnect #{i + 1}: {'OK' if uc else 'NO SESSION'} {time.time() - t0:.1f}s")
+            return uc
+        except Exception as e:
+            LOGGER.warning(f"[Swift] preconnect #{i + 1} failed: {e!r}")
+            return None
+
+    res = []
+    for i in range(n):          # thoda gap — auth takraav se bachne ko
+        res.append(asyncio.ensure_future(_one(i)))
+        await asyncio.sleep(0.7)
+    return [await r for r in res]
+
+
+async def _close_uploaders(ucs):
+    for uc in ucs or []:
+        if uc:
+            try:
+                await uc.disconnect()
+            except Exception:
+                pass
+
+
 _THUMB_LOCK = asyncio.Lock()
 _THUMB_CACHE: dict = {}   # file_id -> local path
 
@@ -994,7 +1026,7 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
             return True, None, quality
 
         c_time = time.time()
-        duration = get_duration(filepath)
+        duration = await asyncio.to_thread(get_duration, filepath)
 
         user_id = message.from_user.id
 
@@ -1042,7 +1074,7 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
             band_text = await get_community_tag(user_id)
             thumb = await get_tmdb_thumbnail(filepath, dl_dir, band_text=band_text)
             if not thumb:
-                thumb = get_thumbnail(filepath, dl_dir, duration / 4 if duration else 0, band_text=band_text)
+                thumb = await asyncio.to_thread(get_thumbnail, filepath, dl_dir, duration / 4 if duration else 0, band_text=band_text)
             custom_thumb_used = False
 
         # Custom thumb (custompic keyword ya default /setpic) pe koi band NAHI
@@ -1073,7 +1105,7 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
 
         # cover (file_id) = video player background cover pic
         # thumb (local path) = gallery preview thumbnail
-        width, height = get_width_height(filepath)
+        width, height = await asyncio.to_thread(get_width_height, filepath)
 
         # ── GLOBAL caption style (/caption_style) ──
         # Pehle yahan hamesha hardcoded plain '<b>{fname}</b>' caption
@@ -1101,10 +1133,11 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
         # Staggered chain ensure karti hai ki ek time pe sirf ek upload active hai
         # isliye same session_string pe socket conflict nahi hoga
         _t_conn = time.time()
-        try:
-            await msg.edit(f"{prefix}🔌 **`{quality}` upload connection ban raha hai...**")
-        except Exception:
-            pass
+        if uploader_client is None:
+            try:
+                await msg.edit(f"{prefix}🔌 **`{quality}` upload connection ban raha hai...**")
+            except Exception:
+                pass
         uc = uploader_client if uploader_client is not None else await _make_uploader_client(message.from_user.id)
         LOGGER.info(f"[Swift] {quality}: uploader connect {time.time() - _t_conn:.1f}s "
                     f"(thumb+cover prep {_t_conn - _t_prep:.1f}s)")
@@ -1116,7 +1149,7 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
         # wait hota hai: 360p -> 480p -> 720p -> 1080p. Send normal tareeke se
         # seedha target chat mein hota hai => cover/thumb bilkul pehle jaisa lagta hai.
         if gate is not None:
-            if uc is not None and uploader_client is None:
+            if uc is not None:
                 _orig_save = uc.save_file
                 _vid_path = str(filepath)
 
@@ -1144,7 +1177,12 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
             nonlocal _half_fired
             from ..utils.display_progress import progress_for_pyrogram
             # Normal progress update
-            await progress_for_pyrogram(current, total, ud_type, prog_msg, start)
+            async def _safe_prog():
+                try:
+                    await progress_for_pyrogram(current, total, ud_type, prog_msg, start)
+                except Exception:
+                    pass
+            asyncio.ensure_future(_safe_prog())   # await nahi — edit/FloodWait upload ko block na kare
             # threshold check — sirf ek baar fire karo
             if not _half_fired and on_half and total > 0 and current >= total * _STAGGER_AT:
                 _half_fired = True
@@ -1363,6 +1401,20 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
             await asyncio.sleep(4 if fast else 5)
 
     prog_task = asyncio.create_task(_progress_updater())
+    _pre_task = None
+    if _PARALLEL_UPLOAD and not encode:
+        try:
+            _pre_task = asyncio.ensure_future(_preconnect_uploaders(message.from_user.id, 3))
+        except Exception:
+            _pre_task = None
+    async def _drop_pre():
+        """Early-return par preconnected clients band karo (leak nahi)."""
+        if _pre_task is not None:
+            try:
+                await _close_uploaders([u for u in await asyncio.wait_for(_pre_task, timeout=45) if u])
+            except Exception:
+                pass
+
     result = await loop.run_in_executor(
         None,
         functools.partial(
@@ -1377,6 +1429,7 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
         pass
 
     if result["error"] and not result["files"]:
+        await _drop_pre()
         await msg.edit(
             f"{prefix}❌ **Failed!**\n\n"
             f"Error: `{result['error']}`\n\n"
@@ -1386,6 +1439,7 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
 
     files = result["files"]
     if not files:
+        await _drop_pre()
         await msg.edit(f"{prefix}❌ **Koi file download nahi hui!**")
         return
 
@@ -1395,6 +1449,7 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
     if quality_filter:
         filtered = [f for f in files if _quality_from(os.path.basename(f)) == quality_filter.lower()]
         if not filtered:
+            await _drop_pre()
             available = [_quality_from(os.path.basename(f)) for f in files]
             await msg.edit(
                 f"{prefix}❌ **`{quality_filter}` nahi mili!**\n\n"
@@ -1441,6 +1496,15 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
                     LOGGER.info(f"[Swift] thumb prewarm {time.time() - _t0:.1f}s")
         except Exception as _e:
             LOGGER.warning(f"[Swift] thumb prewarm skipped: {_e}")
+
+    # Download ke dauran jo connections bane the wo lo
+    _ucs = []
+    if _pre_task is not None:
+        try:
+            _ucs = [u for u in await asyncio.wait_for(_pre_task, timeout=45) if u]
+        except Exception as _e:
+            LOGGER.warning(f"[Swift] preconnect wait failed: {_e!r}")
+            _ucs = []
 
     # Har file ke liye ek status message banao
     _dummy_msgs = {}
@@ -1489,7 +1553,7 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
             success, sent_msg, quality = await _upload_one_file(
                 client, message, um, filepath, dl_dir, encode,
                 on_half=_half_events[idx],
-                uploader_client=None,
+                uploader_client=(_ucs[idx] if (_gate is not None and idx < len(_ucs)) else None),
                 label_prefix=episode_label,
                 gate=_gate,
             )
@@ -1510,6 +1574,8 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
         *[_upload_task_staggered(fp, i) for i, fp in enumerate(files)],
         return_exceptions=True
     )
+
+    await _close_uploaders(_ucs)   # preconnected clients band
 
     # Results parse karo
     uploaded_results = []  # [(quality, sent_message), ...]

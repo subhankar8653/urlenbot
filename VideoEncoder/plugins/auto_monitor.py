@@ -459,6 +459,17 @@ async def _episode_quality_poller(
         except Exception:
             pass
 
+        # Parallel upload ke liye connections pehle se ready (3-4s, ek baar)
+        _poll_ucs = []
+        try:
+            from .swift_downloader import _preconnect_uploaders, _PARALLEL_UPLOAD as _PARALLEL_UPLOAD_AM
+            if _PARALLEL_UPLOAD_AM and not _bot_mode_active and len(new_files) > 1:
+                _uid_pc = proxy_msg.from_user.id
+                _poll_ucs = [u for u in await _preconnect_uploaders(_uid_pc, len(new_files)) if u]
+        except Exception as _pce:
+            LOGGER.warning(f"[AutoMonitor] preconnect failed: {_pce!r}")
+            _poll_ucs = []
+
         _dummy_msgs_poll = {}
         for fp in new_files:
             q = _quality_from(os.path.basename(fp))
@@ -498,6 +509,7 @@ async def _episode_quality_poller(
                     on_half=_half_events_poll[idx],
                     skip_forward=_bot_mode_active,
                     gate=_poll_gate,
+                    uploader_client=(_poll_ucs[idx] if (_poll_gate is not None and idx < len(_poll_ucs)) else None),
                 )
             finally:
                 if _poll_gate:
@@ -552,6 +564,12 @@ async def _episode_quality_poller(
             *[_poll_upload_task(fp, i) for i, fp in enumerate(new_files)],
             return_exceptions=True,
         )
+
+        try:
+            from .swift_downloader import _close_uploaders
+            await _close_uploaders(_poll_ucs)
+        except Exception:
+            pass
 
         for r in poll_results:
             if isinstance(r, Exception):
