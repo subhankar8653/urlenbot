@@ -591,7 +591,7 @@ def _fast_download_link(href: str, dl_dir: str, quality: str, referer: str, cook
         }
         if cookie_header:
             headers["Cookie"] = cookie_header
-        dl = SmartDL(href, dest, progress_bar=False, threads=8,
+        dl = SmartDL(href, dest, progress_bar=False, threads=_prof.DOWNLOAD_THREADS,
                      request_args={"headers": headers}, timeout=30)
         dl.start(blocking=False)
         return dl
@@ -954,8 +954,9 @@ class _OrderedGate:
 # use karta hai => speed = 4 x 512KB / latency (Railway->Telegram me ~4-5 MB/s pe atak jati hai).
 # Yahan har file ke liye UPLOAD_SESSIONS connection x UPLOAD_WORKERS parts ek saath.
 # Koi bhi error aaye to automatic purane (original) tareeke pe fallback.
-_UP_SESSIONS = max(1, int(os.getenv("UPLOAD_SESSIONS", "3")))
-_UP_WORKERS = max(1, int(os.getenv("UPLOAD_WORKERS", "6")))
+from .. import profile as _prof
+_UP_SESSIONS = max(1, _prof.UPLOAD_SESSIONS)
+_UP_WORKERS = max(1, _prof.UPLOAD_WORKERS)
 _FAST_UPLOAD = os.getenv("FAST_UPLOAD", "1") != "0"
 _FAST_MIN = 10 * 1024 * 1024
 _FAST_MAX = 1900 * 1024 * 1024
@@ -981,7 +982,8 @@ async def _fast_save_file(uc, path, progress=None, progress_args=()):
     tasks = []
     try:
         for _ in range(_UP_SESSIONS):
-            ss = Session(uc, dc_id, auth_key, test_mode, is_media=True)
+            ss = Session(client=uc, dc_id=dc_id, auth_key=auth_key,
+                         test_mode=test_mode, is_media=True)
             await ss.start()
             sessions.append(ss)
 
@@ -1089,7 +1091,7 @@ async def _preconnect_uploaders(user_id: int, n: int = 3):
     t0 = time.time()
     try:
         uc = await asyncio.wait_for(
-            _make_uploader_client(user_id, max_transmissions=8 * max(1, n)), timeout=40)
+            _make_uploader_client(user_id, max_transmissions=8), timeout=40)
     except Exception as e:
         LOGGER.warning(f"[Swift] shared uploader connect failed: {e!r}")
         return []

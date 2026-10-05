@@ -5,6 +5,7 @@ from pyrogram import Client, filters
 
 from .. import owner, sudo_users
 from ..utils import janitor
+from .. import profile as _prof
 
 
 def _hr(n):
@@ -35,7 +36,7 @@ async def health_cmd(_, message):
     free, pct = janitor.disk_stats()
     b = janitor.mem_breakdown()
     await message.reply_text(
-        f"<b>🩺 Health</b>\nRAM: {_hr(used)} / {_hr(limit)} ({used/limit*100:.0f}%)\n"
+        f"<b>🩺 Health</b>\nProfile: {_prof.summary()}\nRAM: {_hr(used)} / {_hr(limit)} ({used/limit*100:.0f}%)\n"
         f"├ Bot (python): {_hr(b['python'])}\n"
         f"├ Chrome: {_hr(b['chrome'])} ({b['chrome_procs']} proc)\n"
         f"├ ffmpeg: {_hr(b['ffmpeg'])}\n"
