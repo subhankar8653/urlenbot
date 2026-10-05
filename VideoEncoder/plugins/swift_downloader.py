@@ -872,10 +872,93 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
 # (max_concurrent_transmissions) mein lagaye hain.
 _STAGGER_AT = 0.50
 
+# ── FAST MODE: saari qualities EK SAATH upload (log channel pe), delivery ORDER mein ──
+# PARALLEL_UPLOAD=0 env dene par purana staggered (50%) tareeka wapas aa jata hai.
+_PARALLEL_UPLOAD = os.getenv("PARALLEL_UPLOAD", "1") != "0"
+_GATE_WAIT_MAX = 40 * 60   # deadlock-safety: itne der se zyada kisi ka wait nahi
+
+
+class _OrderedGate:
+    """
+    Traffic-signal: qualities hamesha 360p -> 480p -> 720p -> 1080p order mein
+    destination (channel / bot chat) tak pahunchengi, chahe upload kisi bhi
+    order mein khatam ho.
+      * 720p pehle upload ho gaya  -> wo log channel pe ruka rahega
+      * 360p aaya                  -> pehle 360p, phir turant 720p deliver
+    """
+
+    def __init__(self, qualities):
+        self._order = sorted(set(qualities), key=lambda q: QUALITY_ORDER.get(q, 99))
+        self._events = {q: asyncio.Event() for q in self._order}
+
+    async def wait_turn(self, quality):
+        for lower in self._order:
+            if lower == quality:
+                break
+            try:
+                await asyncio.wait_for(self._events[lower].wait(), _GATE_WAIT_MAX)
+            except asyncio.TimeoutError:
+                LOGGER.warning(f"[Swift] Gate timeout waiting for {lower} before {quality}")
+
+    def done(self, quality):
+        ev = self._events.get(quality)
+        if ev:
+            ev.set()
+
+
+async def _deliver_staged(user_id, dest_chat, sent_msg, caption, cover,
+                          duration, width, height):
+    """
+    Log channel pe upload ho chuki file ko destination chat tak pahunchao
+    (dobara upload nahi — sirf file_id se, isliye instant).
+    Cover preserve karne ke liye send_video(video=file_id, cover=...) use hota hai;
+    fail ho to copy_message fallback.
+    Returns: delivered Message ya None
+    """
+    from pyrogram.enums import ParseMode
+    from ..utils.uploads.telegram import _send_video_cover_safe
+
+    file_id = None
+    if getattr(sent_msg, "video", None):
+        file_id = sent_msg.video.file_id
+    elif getattr(sent_msg, "document", None):
+        file_id = sent_msg.document.file_id
+
+    if file_id:
+        uc = None
+        try:
+            uc = await _make_uploader_client(user_id)
+            send_fn = uc.send_video if uc else app.send_video
+            kwargs = dict(
+                chat_id=dest_chat, video=file_id, caption=caption,
+                parse_mode=ParseMode.HTML, duration=duration,
+                width=width, height=height, supports_streaming=True,
+            )
+            if cover:
+                kwargs["cover"] = cover
+            return await _send_video_cover_safe(send_fn, **kwargs)
+        except Exception as e:
+            LOGGER.warning(f"[Swift] Staged deliver (file_id) failed: {e} — copy_message try")
+        finally:
+            if uc:
+                try:
+                    await uc.disconnect()
+                except Exception:
+                    pass
+
+    try:
+        return await app.copy_message(
+            chat_id=dest_chat, from_chat_id=log, message_id=sent_msg.id,
+        )
+    except Exception as e:
+        LOGGER.error(f"[Swift] Staged deliver copy_message failed: {e}")
+        return None
+
 
 async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, encode: bool,
                            on_half: asyncio.Event = None, skip_forward: bool = False,
-                           uploader_client=None, label_prefix: str = ""):
+                           uploader_client=None, label_prefix: str = "",
+                           gate: "_OrderedGate" = None):
     """
     Ek file upload karo.
     Returns: (success: bool, sent_message: Message | None, quality: str)
@@ -888,6 +971,8 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
     """
     fname_orig = os.path.basename(filepath)
     quality = _quality_from(fname_orig)
+    gate_q = quality   # gate isi (rename se pehle wali) quality se bana hai
+    staged = gate is not None and not skip_forward and not encode
     size_mb = os.path.getsize(filepath) / (1024 * 1024)
     prefix = f"🎬 **{label_prefix}**\n" if label_prefix else ""
 
@@ -1046,7 +1131,7 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
                 uploader_client=uc,
                 progress=_progress_with_half,
                 progress_args=("📤 Uploading...", msg, c_time),
-                skip_forward=skip_forward,
+                skip_forward=(skip_forward or staged),
             )
         finally:
             # Upload complete hone pe bhi event fire karo
@@ -1066,10 +1151,30 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
             except Exception:
                 pass
 
+        if staged:
+            # Log channel pe upload ho chuka — ab apni baari ka wait (360p -> 720p -> 1080p)
+            if sent_msg is None:
+                raise RuntimeError("log channel upload failed")
+            try:
+                await msg.edit(f"{prefix}⏳ **`{quality}` ready — order ka wait...**")
+            except Exception:
+                pass
+            await gate.wait_turn(gate_q)
+            delivered = await _deliver_staged(
+                user_id, message.chat.id, sent_msg, caption, cover,
+                duration, width, height,
+            )
+            if delivered is None:
+                raise RuntimeError("destination delivery failed")
+            gate.done(gate_q)
+            return True, delivered, quality
+
         return True, sent_msg, quality
 
     except Exception as e:
         LOGGER.error(f"[Swift] Upload error ({quality}): {e}")
+        if gate:
+            gate.done(gate_q)   # fail hone par bhi baaki qualities atke nahi
         await message.reply(f"⚠️ Upload failed `{fname}`: `{e}`")
         return False, None, quality
 
@@ -1319,6 +1424,12 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
     # file[i+1] is event ka wait karega shuru hone se pehle
     _half_events = [asyncio.Event() for _ in files]
 
+    # FAST MODE: sab ek saath upload (log channel), delivery quality-order mein
+    _gate = None
+    if _PARALLEL_UPLOAD and not encode and len(files) > 1:
+        _gate = _OrderedGate([_quality_from(os.path.basename(f)) for f in files])
+        LOGGER.info(f"[Swift] Parallel upload ON: {len(files)} files")
+
     async def _upload_task_staggered(filepath, idx):
         """
         idx = 0  → immediately start
@@ -1332,17 +1443,23 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
         Alag uc = full bandwidth per file (shared uc bottleneck tha).
         """
         # Apni turn ka wait karo (pichli file _STAGGER_AT / 50% tak pahunche)
-        if idx > 0:
+        if idx > 0 and _gate is None:
             await _half_events[idx - 1].wait()
 
         um = _dummy_msgs.get(filepath, msg)
+        _gq = _quality_from(os.path.basename(filepath))
         # uploader_client=None → _upload_one_file ke andar fresh uc banega
-        success, sent_msg, quality = await _upload_one_file(
-            client, message, um, filepath, dl_dir, encode,
-            on_half=_half_events[idx],
-            uploader_client=None,
-            label_prefix=episode_label,
-        )
+        try:
+            success, sent_msg, quality = await _upload_one_file(
+                client, message, um, filepath, dl_dir, encode,
+                on_half=_half_events[idx],
+                uploader_client=None,
+                label_prefix=episode_label,
+                gate=_gate,
+            )
+        finally:
+            if _gate:
+                _gate.done(_gq)
         # sent_msg milne ke baad delete — user ko stuck na lage
         try:
             if success and sent_msg:

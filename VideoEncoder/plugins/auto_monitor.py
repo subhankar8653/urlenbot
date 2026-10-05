@@ -470,19 +470,36 @@ async def _episode_quality_poller(
 
         _half_events_poll = [asyncio.Event() for _ in new_files]
 
+        # FAST MODE (file mode): sab qualities EK SAATH upload -> log channel,
+        # delivery 360p -> 720p -> 1080p order mein. Bot mode purane tareeke pe
+        # (wahan 'Link Ready' msg_id+1 se milta hai, parallel mein mix ho jata).
+        from .swift_downloader import _PARALLEL_UPLOAD, _OrderedGate
+        _poll_gate = None
+        if _PARALLEL_UPLOAD and not _bot_mode_active and len(new_files) > 1:
+            _poll_gate = _OrderedGate([_quality_from(os.path.basename(f)) for f in new_files])
+            if not _old_msgs_deleted_poll:
+                _old_msgs_deleted_poll = True
+                await _delete_old_bot_msgs(channel_id)
+
         async def _poll_upload_task(filepath, idx):
             nonlocal _old_msgs_deleted_poll
-            if idx > 0:
+            if idx > 0 and _poll_gate is None:
                 await _half_events_poll[idx - 1].wait()
             if idx == 0 and not _old_msgs_deleted_poll:
                 _old_msgs_deleted_poll = True
                 await _delete_old_bot_msgs(channel_id)
             um = _dummy_msgs_poll.get(filepath, status_msg)
-            success, sent_msg, quality = await _upload_one_file(
-                client, proxy_msg, um, filepath, poll_dl_dir, encode=False,
-                on_half=_half_events_poll[idx],
-                skip_forward=_bot_mode_active,
-            )
+            _gq = _quality_from(os.path.basename(filepath))
+            try:
+                success, sent_msg, quality = await _upload_one_file(
+                    client, proxy_msg, um, filepath, poll_dl_dir, encode=False,
+                    on_half=_half_events_poll[idx],
+                    skip_forward=_bot_mode_active,
+                    gate=_poll_gate,
+                )
+            finally:
+                if _poll_gate:
+                    _poll_gate.done(_gq)
             try:
                 await um.delete()
             except Exception:
