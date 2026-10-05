@@ -908,25 +908,21 @@ class _OrderedGate:
 
 async def _preconnect_uploaders(user_id: int, n: int = 3):
     """
-    n uploader-clients download chalte-chalte HI connect kar lo (parallel).
-    Pehle har file apna connection upload ke time banati thi — 720p/1080p
-    wahin ruk jati thi. Ab upload shuru hote hi connection ready milta hai.
+    EK shared uploader-client (user session) download chalte-chalte connect karo.
+    Same session se 3 alag clients ek saath banane par Telegram connect reject
+    kar deta tha (720p/1080p bot-fallback + serial wait me fas jate the).
+    Ek client, n files ek saath: concurrency n*8 => har file ko poori speed.
+    Returns [uc] ya [].
     """
-    async def _one(i):
-        t0 = time.time()
-        try:
-            uc = await asyncio.wait_for(_make_uploader_client(user_id), timeout=40)
-            LOGGER.info(f"[Swift] preconnect #{i + 1}: {'OK' if uc else 'NO SESSION'} {time.time() - t0:.1f}s")
-            return uc
-        except Exception as e:
-            LOGGER.warning(f"[Swift] preconnect #{i + 1} failed: {e!r}")
-            return None
-
-    res = []
-    for i in range(n):          # thoda gap — auth takraav se bachne ko
-        res.append(asyncio.ensure_future(_one(i)))
-        await asyncio.sleep(0.7)
-    return [await r for r in res]
+    t0 = time.time()
+    try:
+        uc = await asyncio.wait_for(
+            _make_uploader_client(user_id, max_transmissions=8 * max(1, n)), timeout=40)
+    except Exception as e:
+        LOGGER.warning(f"[Swift] shared uploader connect failed: {e!r}")
+        return []
+    LOGGER.info(f"[Swift] shared uploader: {'OK' if uc else 'NO SESSION'} {time.time() - t0:.1f}s")
+    return [uc] if uc else []
 
 
 async def _close_uploaders(ucs):
@@ -1148,22 +1144,30 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
         # "send" hone se theek pehle (jab file 100% upload ho chuki) apni baari ka
         # wait hota hai: 360p -> 480p -> 720p -> 1080p. Send normal tareeke se
         # seedha target chat mein hota hai => cover/thumb bilkul pehle jaisa lagta hai.
+        _reg_key = None
         if gate is not None:
             if uc is not None:
-                _orig_save = uc.save_file
-                _vid_path = str(filepath)
+                _reg = getattr(uc, "_gate_reg", None)
+                if _reg is None:
+                    _reg = {}
+                    uc._gate_reg = _reg
+                    _orig_save = uc.save_file
 
-                async def _save_then_wait(path, *a, **kw):
-                    res = await _orig_save(path, *a, **kw)
-                    if isinstance(path, str) and path == _vid_path:
-                        try:
-                            await msg.edit(f"{prefix}⏳ **`{quality}` upload ho gaya — order ka wait...**")
-                        except Exception:
-                            pass
-                        await gate.wait_turn(gate_q)
-                    return res
+                    async def _save_then_wait(path, *a, **kw):
+                        res = await _orig_save(path, *a, **kw)
+                        ent = _reg.get(path) if isinstance(path, str) else None
+                        if ent:
+                            _g, _q, _m, _pf, _ql = ent
+                            try:
+                                await _m.edit(f"{_pf}⏳ **`{_ql}` upload ho gaya — order ka wait...**")
+                            except Exception:
+                                pass
+                            await _g.wait_turn(_q)
+                        return res
 
-                uc.save_file = _save_then_wait
+                    uc.save_file = _save_then_wait
+                _reg_key = str(filepath)
+                _reg[_reg_key] = (gate, gate_q, msg, prefix, quality)
             else:
                 # user-session nahi (bot fallback) => parallel possible nahi, order bachao
                 await gate.wait_turn(gate_q)
@@ -1200,6 +1204,11 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
                 skip_forward=skip_forward,
             )
         finally:
+            if _reg_key is not None:
+                try:
+                    uc._gate_reg.pop(_reg_key, None)
+                except Exception:
+                    pass
             if gate is not None:
                 gate.done(gate_q)   # message send ho chuka (ya fail) — agli quality chale
             # Upload complete hone pe bhi event fire karo
@@ -1544,7 +1553,7 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
         elif _gate is not None and idx > 0:
             # Sab EK SAATH chalte hain; bas har ek 1.5s peeche shuru hota hai taaki
             # Telegram ke auth-export calls aapas mein na takrayein (AUTH_BYTES_INVALID)
-            await asyncio.sleep(1.5 * idx)
+            await asyncio.sleep(0.3 * idx)
 
         um = _dummy_msgs.get(filepath, msg)
         _gq = _quality_from(os.path.basename(filepath))
@@ -1553,7 +1562,7 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
             success, sent_msg, quality = await _upload_one_file(
                 client, message, um, filepath, dl_dir, encode,
                 on_half=_half_events[idx],
-                uploader_client=(_ucs[idx] if (_gate is not None and idx < len(_ucs)) else None),
+                uploader_client=(_ucs[0] if (_gate is not None and _ucs) else None),
                 label_prefix=episode_label,
                 gate=_gate,
             )
