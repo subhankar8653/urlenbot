@@ -78,8 +78,49 @@ def _size(path: str) -> int:
         return 0
 
 
+def _drop_cache(path: str):
+    """File ka page-cache turant OS ko wapas (RAM metric ghatata hai)."""
+    try:
+        files = [path] if os.path.isfile(path) else [
+            os.path.join(r, f) for r, _d, fs in os.walk(path) for f in fs]
+        for f in files:
+            try:
+                fd = os.open(f, os.O_RDONLY)
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def drop_all_cache() -> int:
+    """Page-cache wapas OS ko. Returns: kitna cache kam hua (bytes).
+    1) bot ke folders + /tmp ki har file par fadvise(DONTNEED)
+    2) agar permission ho to kernel se seedha reclaim bhi maango."""
+    before = _cache_bytes()
+    for base in (download_dir, encode_dir, "/tmp"):
+        if base and os.path.isdir(base):
+            _drop_cache(base)
+    for path, val in (("/sys/fs/cgroup/memory.reclaim", "1G"),
+                      ("/proc/sys/vm/drop_caches", "1")):
+        try:
+            with open(path, "w") as f:
+                f.write(val)
+        except Exception:
+            pass
+    return max(before - _cache_bytes(), 0)
+
+
+def dir_size(base: str) -> int:
+    return _size(base) if base and os.path.isdir(base) else 0
+
+
 def _remove(path: str) -> int:
     sz = _size(path)
+    _drop_cache(path)
     try:
         if os.path.isdir(path) and not os.path.islink(path):
             shutil.rmtree(path, ignore_errors=True)
@@ -269,6 +310,7 @@ def kill_orphan_browsers(max_age: int = CHROME_MAX_AGE) -> int:
 
 def trim_memory():
     gc.collect()
+    drop_all_cache()
     try:
         import ctypes
         ctypes.CDLL("libc.so.6").malloc_trim(0)
@@ -281,6 +323,8 @@ def run_cleanup(force: bool = False) -> dict:
     free, pct = disk_stats()
     low = free < LOW_DISK_GB * 1024 ** 3 or pct > LOW_DISK_PCT
     idle_limit = 60 if force else (AGGRESSIVE_IDLE if low else STALE_AFTER)
+    if not force and not is_busy():
+        idle_limit = min(idle_limit, 600)   # bot khali hai => 10 min purana sab kachra
     freed = clean_dirs(idle_limit) + clean_tmp()
     clean_logs()
     killed = kill_orphan_browsers(CHROME_MAX_AGE if is_busy() else CHROME_IDLE_AGE)
@@ -349,9 +393,24 @@ async def janitor_loop():
             LOGGER.error(f"[Janitor] loop error: {e}")
 
 
+async def cache_loop():
+    """Har 60 sec: file cache saaf (RAM graph upar na chadhe)."""
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            await asyncio.sleep(60)
+            await loop.run_in_executor(None, drop_all_cache)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            LOGGER.error(f"[Janitor] cache loop error: {e}")
+
+
 def start_janitor():
     global _started
     if _started:
         return
     _started = True
-    asyncio.get_running_loop().create_task(janitor_loop())
+    loop = asyncio.get_running_loop()
+    loop.create_task(janitor_loop())
+    loop.create_task(cache_loop())
