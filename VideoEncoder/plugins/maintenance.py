@@ -23,9 +23,10 @@ async def cleanup_cmd(_, message):
     if janitor.is_busy():
         await message.reply_text("Task chal raha hai — sirf idle/purani files hatayi jayengi.")
     res = await asyncio.get_running_loop().run_in_executor(None, janitor.run_cleanup, True)
+    cache_now = janitor.mem_breakdown()["cache"]
     await message.reply_text(
         f"<b>🧹 Cleanup done</b>\nFreed: {_hr(res['freed'])}\n"
-        f"Chrome killed: {res['killed']}\nDisk free: {_hr(res['free'])} (used {res['pct']:.0f}%)")
+        f"Chrome killed: {res['killed']}\nFile cache ab: {_hr(cache_now)}\nDisk free: {_hr(res['free'])} (used {res['pct']:.0f}%)")
 
 
 @Client.on_message(filters.command(["health"]) & _auth)
@@ -39,4 +40,6 @@ async def health_cmd(_, message):
         f"├ Chrome: {_hr(b['chrome'])} ({b['chrome_procs']} proc)\n"
         f"├ ffmpeg: {_hr(b['ffmpeg'])}\n"
         f"└ File cache (ginti se bahar): {_hr(b['cache'])}\n"
+        f"Downloads folder: {_hr(janitor.dir_size(janitor.download_dir))}\n"
+        f"Encode folder: {_hr(janitor.dir_size(janitor.encode_dir))}\n"
         f"Disk free: {_hr(free)} (used {pct:.0f}%)\nBusy: {janitor.is_busy()}")
