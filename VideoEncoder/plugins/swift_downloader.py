@@ -847,6 +847,7 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
             result["files"] = fast_downloaded_files
         else:
             _reported = set(fast_downloaded_files)
+            _reported_q = {_quality_from(os.path.basename(_f)) for _f in fast_downloaded_files}
             while True:
                 done = _get_done_files(dl_dir)
                 in_prog = _in_progress(dl_dir)
@@ -854,10 +855,14 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
 
                 if on_file:
                     for _f in done:
-                        if _f not in _reported:
+                        _fq = _quality_from(os.path.basename(_f))
+                        # Upload shuru hote hi file RENAME ho jati hai => naye naam se
+                        # wahi file dobara "done" dikhti thi (double upload bug). Quality se dedupe.
+                        if _f not in _reported and _fq not in _reported_q:
                             _reported.add(_f)
+                            _reported_q.add(_fq)
                             try:
-                                on_file(_f, _quality_from(os.path.basename(_f)))
+                                on_file(_f, _fq)
                             except Exception as _cbe:
                                 LOGGER.warning(f"[Swift] on_file cb error: {_cbe!r}")
 
@@ -1423,9 +1428,13 @@ async def _pipeline_run(client, message, msg, prefix, swift_url, dl_dir, episode
             pass
         return success, sent_msg, quality
 
+    started_q = set()
+
     async def _start(path):
-        if path in tasks:
-            return
+        _sq = _quality_from(os.path.basename(path))
+        if path in tasks or _sq in started_q:
+            return          # same quality dobara upload nahi (rename ke baad naya naam aata hai)
+        started_q.add(_sq)
         await _prepare()
         LOGGER.info(f"[Swift] ▶ upload start (download baaki ho sakta hai): {os.path.basename(path)}")
         tasks[path] = asyncio.ensure_future(_one_upload(path))
@@ -1454,7 +1463,6 @@ async def _pipeline_run(client, message, msg, prefix, swift_url, dl_dir, episode
     gate = state["gate"]
     if gate is not None:
         # Jo quality kabhi aayi hi nahi (download fail) — uske peeche wale na atkein
-        started_q = {_quality_from(os.path.basename(p)) for p in tasks}
         for q in list(gate._order):
             if q not in started_q:
                 gate.done(q)
