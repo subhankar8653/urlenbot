@@ -13,8 +13,9 @@ from ..auto_caption import smart_caption, get_caption_data
 from .. import caption_style
 from ..community import get_community_tag
 from ..display_progress import progress_for_pyrogram
-from ..encoding import get_duration, get_thumbnail, get_width_height
-from ..thumb_source import get_tmdb_thumbnail
+from ..encoding import (get_duration, get_thumbnail, get_width_height,
+                        probe_media_async, get_thumbnail_async)
+from ..thumb_source import get_tmdb_thumbnail, fetch_custom_thumb
 from .. import turbo_upload   # noqa: F401  — import par Client.save_file turbo se patch ho jata hai
 
 
@@ -76,7 +77,7 @@ async def _get_user_session(user_id: int):
 # asli disconnect tab hota hai jab koi use na kar raha ho aur _SHARED_IDLE sec beet jayein.
 _SHARED = {}          # user_id -> dict(uc, refs, session, real_disconnect, idle)
 _SHARED_LOCKS = {}    # user_id -> asyncio.Lock
-_SHARED_IDLE = 120    # sec
+_SHARED_IDLE = int(os.getenv("UPLOADER_IDLE_CLOSE", "600"))    # sec — connected client agle upload ke liye ready rahe
 
 
 async def _really_close(ent):
@@ -153,6 +154,12 @@ async def _make_uploader_client(user_id: int, max_transmissions: int = 8):
         ent = {"uc": uc, "refs": 1, "session": session_str,
                "real_disconnect": uc.disconnect, "idle": None}
 
+        # Upload ke media sessions background mein abhi bana lo (file ka wait nahi karna padega)
+        try:
+            asyncio.ensure_future(turbo_upload.prewarm(uc))
+        except Exception:
+            pass
+
         async def _release():
             ent["refs"] = max(0, ent["refs"] - 1)
             if ent["refs"] == 0:
@@ -161,6 +168,17 @@ async def _make_uploader_client(user_id: int, max_transmissions: int = 8):
         uc.disconnect = _release                  # callers ka `await uc.disconnect()` = release
         _SHARED[user_id] = ent
         return uc
+
+
+async def prewarm_uploader(user_id: int):
+    """Download shuru hote hi bulao: user client connect + upload sessions taiyar.
+    Chupchap fail ho jaata hai; client release hote hi idle-timer chalu (_SHARED_IDLE)."""
+    try:
+        uc = await asyncio.wait_for(_make_uploader_client(user_id), timeout=40)
+        if uc is not None:
+            await uc.disconnect()      # sirf release — asli close idle ke baad
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────
@@ -243,24 +261,29 @@ async def _upload_via_user_then_forward(
             )
 
         # ── Log channel mein alag se bhejo (bina cover, file_id se — fast) ──
+        # Background mein: upload ka result/link turant milta hai, log post ka wait nahi.
         if resp:
-            try:
-                log_kwargs = {k: v for k, v in safe_kwargs.items()
-                              if k not in ("cover", "supports_streaming")}
-                if media_type == "video" and resp.video:
-                    await app.send_video(
-                        chat_id=log,
-                        video=resp.video.file_id,
-                        **log_kwargs,
-                    )
-                elif media_type == "doc" and resp.document:
-                    await app.send_document(
-                        chat_id=log,
-                        document=resp.document.file_id,
-                        **log_kwargs,
-                    )
-            except Exception:
-                pass  # Log fail hona main upload ko affect na kare
+            log_kwargs = {k: v for k, v in safe_kwargs.items()
+                          if k not in ("cover", "supports_streaming")}
+
+            async def _log_post():
+                try:
+                    if media_type == "video" and resp.video:
+                        await app.send_video(
+                            chat_id=log,
+                            video=resp.video.file_id,
+                            **log_kwargs,
+                        )
+                    elif media_type == "doc" and resp.document:
+                        await app.send_document(
+                            chat_id=log,
+                            document=resp.document.file_id,
+                            **log_kwargs,
+                        )
+                except Exception:
+                    pass  # Log fail hona main upload ko affect na kare
+
+            asyncio.ensure_future(_log_post())
 
         return resp
 
@@ -320,31 +343,14 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
     else:
         original_caption = raw_text or os.path.splitext(filename)[0]
 
-    user_blacklist = await db.get_blacklist(message.from_user.id)
-    caption_channel = await get_community_tag(message.from_user.id)
+    uid = message.from_user.id
+    user_blacklist = await db.get_blacklist(uid)
+    caption_channel = await get_community_tag(uid)
     caption = smart_caption(original_caption, new_file, resolution, channel=caption_channel, blacklist=user_blacklist)
-    caption = await apply_swap(caption, message.from_user.id)
+    caption = await apply_swap(caption, uid)
 
-    # ── GLOBAL caption style (/caption_style) ──
-    # Jo bhi style select hai (default ya koi bhi styled template), wahi
-    # yahan bhi lagta hai — /upload, /url (manual + auto), sab isi function
-    # (upload_to_tg) se guzarte hain, isliye yeh ek hi jagah fix sabhi
-    # jagah caption style consistent bana deta hai.
-    style_id = caption_style.get_current_style_id()
-    if style_id == caption_style.DEFAULT_STYLE_ID:
-        bold_caption = f'<b>{caption}</b>'
-    else:
-        try:
-            cap_data = get_caption_data(
-                original_caption, new_file, resolution,
-                channel=caption_channel, blacklist=user_blacklist,
-            )
-            cap_data["genres"] = await caption_style.lookup_genres(cap_data["anime_name"])
-            bold_caption = caption_style.render_caption_html(style_id, cap_data)
-            bold_caption = await apply_swap(bold_caption, message.from_user.id)
-        except Exception as e:
-            LOGGER.warning(f"[CaptionStyle] Styled caption build failed, falling back to default: {e}")
-            bold_caption = f'<b>{caption}</b>'
+    # Styled caption + rename ke liye PURANA path (anime-info isi se nikalta hai) yaad rakho
+    src_path_for_caption = new_file
 
     new_filename = build_filename(caption)
     new_path = os.path.join(os.path.dirname(new_file), new_filename)
@@ -355,26 +361,64 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
     except Exception:
         pass
 
-    duration = get_duration(new_file)
+    # ── SPEED: neeche ke saare kaam ab EK SAATH chalte hain (pehle ek ke baad ek) ──
+    #   uploader client connect  |  ffprobe (duration+w+h, 1 call)  |
+    #   thumbnail (custom cache / TMDB cache / ffmpeg)  |  styled caption (genre lookup)
+    custom_thumb = await db.get_thumbnail(uid)
+    uc_task = asyncio.ensure_future(_make_uploader_client(uid))
+    probe_task = asyncio.ensure_future(probe_media_async(new_file))
 
-    custom_thumb = await db.get_thumbnail(message.from_user.id)
-    if custom_thumb:
-        thumb = await app.download_media(
-            custom_thumb,
-            file_name=os.path.join(download_dir, str(time.time()) + ".jpg")
-        )
-    else:
-        band_text = await get_community_tag(message.from_user.id)
-        thumb = await get_tmdb_thumbnail(new_file, download_dir, band_text=band_text)
-        if not thumb:
-            thumb = get_thumbnail(new_file, download_dir, duration / 4, band_text=band_text)
+    async def _bold_caption():
+        # GLOBAL caption style (/caption_style) — /upload, /url (manual + auto), sab isi
+        # function (upload_to_tg) se guzarte hain, isliye ek hi jagah fix sabhi jagah lagta hai.
+        style_id = caption_style.get_current_style_id()
+        if style_id == caption_style.DEFAULT_STYLE_ID:
+            return f'<b>{caption}</b>'
+        try:
+            cap_data = get_caption_data(
+                original_caption, src_path_for_caption, resolution,
+                channel=caption_channel, blacklist=user_blacklist,
+            )
+            cap_data["genres"] = await caption_style.lookup_genres(cap_data["anime_name"])
+            out = caption_style.render_caption_html(style_id, cap_data)
+            return await apply_swap(out, uid)
+        except Exception as e:
+            LOGGER.warning(f"[CaptionStyle] Styled caption build failed, falling back to default: {e}")
+            return f'<b>{caption}</b>'
 
-    width, height = get_width_height(new_file)
+    async def _dl_thumb(fid, path):
+        return await app.download_media(fid, file_name=path)
 
-    uc = await _make_uploader_client(message.from_user.id)
+    async def _prepare_thumb():
+        if custom_thumb:
+            t = await fetch_custom_thumb(custom_thumb, download_dir, _dl_thumb)
+            if t:
+                return t
+        band_text = await get_community_tag(uid)
+        t = await get_tmdb_thumbnail(new_file, download_dir, band_text=band_text)
+        if not t:
+            pr = await probe_task
+            t = await get_thumbnail_async(new_file, download_dir,
+                                          (pr.get("duration") or 0) / 4, band_text=band_text)
+        return t
 
+    uc = None
     try:
-        if await db.get_upload_as_doc(message.from_user.id) is True:
+        thumb, probe, bold_caption = await asyncio.gather(
+            _prepare_thumb(), probe_task, _bold_caption())
+    except BaseException:
+        uc_task.cancel()
+        raise
+    uc = await uc_task
+
+    duration = int(probe.get("duration") or 0)
+    width = probe.get("width") or 1280
+    height = probe.get("height") or 720
+
+    _resp = None
+    _cover = custom_thumb if custom_thumb else None
+    try:
+        if await db.get_upload_as_doc(uid) is True:
             link = await upload_doc(
                 message, msg, c_time, bold_caption, new_file, new_filename,
                 uploader_client=uc
@@ -383,7 +427,6 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
             # cover = custom_thumb FILE_ID (DB se mila Telegram file_id) —
             # Local path nahi, file_id chahiye cover ke liye (aiogram bot ki tarah)
             # thumb (local path) = gallery preview; cover (file_id) = video player background
-            _cover = custom_thumb if custom_thumb else None
             _resp = await upload_video(
                 message, msg, new_file, bold_caption,
                 c_time, thumb, duration, width, height,
@@ -399,7 +442,7 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
             except Exception:
                 pass
 
-    if custom_thumb and thumb and os.path.isfile(thumb):
+    if thumb and os.path.isfile(thumb):
         try:
             os.remove(thumb)
         except Exception:
@@ -410,7 +453,7 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
     if link:
         try:
             await _upload_to_user_channels(
-                user_id=message.from_user.id,
+                user_id=uid,
                 new_file=new_file,
                 caption=bold_caption,
                 user_message=link,
@@ -419,6 +462,7 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
                 height=height,
                 filename=new_filename,
                 cover=_cover,
+                src_msg=_resp,
             )
         except Exception as e:
             # Channel upload fail ho toh main upload ko affect na kare
@@ -651,6 +695,7 @@ async def _upload_to_user_channels(
     height: int,
     filename: str,
     cover=None,            # ← cover pic file_id (Telegram) — video player background
+    src_msg=None,          # ← abhi upload hua Message (copy fast-path ke liye)
 ):
     """
     User ke linked channels mein file upload karo.
@@ -666,67 +711,78 @@ async def _upload_to_user_channels(
         print("[Channel Upload] File not found on disk, skipping.")
         return
 
-    for ch in channels:
-        channel_id = ch.get('channel_id')
-        languages = ch.get('languages', 'All')
-        channel_title = ch.get('channel_title', str(channel_id))
+    # ── SPEED ──────────────────────────────────────────────────────────────────────
+    # Pehle: har channel ke liye (1) thumbnail dobara (TMDB + ffmpeg) aur (2) poori file
+    # bot se dobara upload (bandwidth + minutes). Ab:
+    #   * jis channel pe audio-filter nahi aur custom cover nahi => server-side COPY
+    #     (copy_message): zero upload, ek second se kam. Fail ho to purana re-upload path.
+    #   * thumbnail sirf tab banta hai jab re-upload ki zaroorat pade, aur SIRF EK BAAR.
+    _thumb_box = {"path": None, "made": False}
 
-        if not channel_id:
-            continue
+    async def _get_thumb_once():
+        if _thumb_box["made"]:
+            return _thumb_box["path"]
+        _thumb_box["made"] = True
+        custom = await db.get_thumbnail(user_id)
+        if custom:
+            async def _dl(fid, path):
+                return await app.download_media(fid, file_name=path)
+            _thumb_box["path"] = await fetch_custom_thumb(custom, download_dir, _dl)
+        if not _thumb_box["path"]:
+            band_text = await get_community_tag(user_id)
+            t = await get_tmdb_thumbnail(new_file, download_dir, band_text=band_text)
+            if not t:
+                t = await get_thumbnail_async(new_file, download_dir, duration / 4, band_text=band_text)
+            _thumb_box["path"] = t
+        return _thumb_box["path"]
 
-        try:
-            # Custom thumbnail check karo
-            custom_thumb = await db.get_thumbnail(user_id)
-            thumb = None
-            if custom_thumb:
-                thumb = await app.download_media(
-                    custom_thumb,
-                    file_name=os.path.join(download_dir, f"ch_thumb_{int(time.time())}.jpg")
-                )
-            else:
-                band_text = await get_community_tag(user_id)
-                thumb = await get_tmdb_thumbnail(new_file, download_dir, band_text=band_text)
-                if not thumb:
-                    thumb = get_thumbnail(new_file, download_dir, duration / 4, band_text=band_text)
+    try:
+        for idx, ch in enumerate(channels):
+            channel_id = ch.get('channel_id')
+            languages = ch.get('languages', 'All')
+            channel_title = ch.get('channel_title', str(channel_id))
 
-            needs_filter = languages.strip().lower() != 'all'
+            if not channel_id:
+                continue
 
-            if needs_filter:
-                # ── Audio filter lagao aur direct upload karo ──
-                print(f"[Channel Upload] Filtering audio ({languages}) for {channel_title}")
-                filtered_file = await _filter_audio_tracks(
-                    new_file, languages, os.path.dirname(new_file)
-                )
+            try:
+                needs_filter = languages.strip().lower() != 'all'
 
-                await app.send_video(
-                    chat_id=channel_id,
-                    video=filtered_file,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    duration=duration,
-                    width=width,
-                    height=height,
-                    thumb=thumb,
-                    cover=cover,
-                    supports_streaming=True,
-                )
-
-                # Filtered file cleanup karo (original nahi)
-                if filtered_file != new_file and os.path.isfile(filtered_file):
+                # ── FAST PATH: server-side copy (no re-upload) ──
+                if (not needs_filter and not cover and src_msg is not None
+                        and getattr(src_msg, "id", None)):
                     try:
-                        os.remove(filtered_file)
-                    except Exception:
-                        pass
+                        await app.copy_message(
+                            chat_id=channel_id,
+                            from_chat_id=src_msg.chat.id,
+                            message_id=src_msg.id,
+                            caption=caption,
+                            parse_mode=ParseMode.HTML,
+                        )
+                        print(f"[Channel Upload] ⚡ Copied (no re-upload): {channel_title}")
+                        await asyncio.sleep(1)   # flood wait se bachne ke liye
+                        continue
+                    except (ChannelInvalid, ChannelPrivate, ChatIdInvalid, PeerIdInvalid):
+                        raise
+                    except Exception as e:
+                        print(f"[Channel Upload] copy failed for {channel_title} ({e}) — re-upload pe fallback")
 
-            else:
-                # ── No filter → Log channel se forward karo (fast) ──
-                print(f"[Channel Upload] Forwarding to {channel_title}")
-                try:
-                    # Log channel mein message dhundho aur forward karo
-                    # Pehle direct upload try karo (safe method)
+                if not os.path.isfile(new_file):
+                    print(f"[Channel Upload] File missing, skip {channel_title}")
+                    continue
+
+                thumb = await _get_thumb_once()
+
+                if needs_filter:
+                    # ── Audio filter lagao aur direct upload karo ──
+                    print(f"[Channel Upload] Filtering audio ({languages}) for {channel_title}")
+                    filtered_file = await _filter_audio_tracks(
+                        new_file, languages, os.path.dirname(new_file)
+                    )
+
                     await app.send_video(
                         chat_id=channel_id,
-                        video=new_file,
+                        video=filtered_file,
                         caption=caption,
                         parse_mode=ParseMode.HTML,
                         duration=duration,
@@ -736,20 +792,43 @@ async def _upload_to_user_channels(
                         cover=cover,
                         supports_streaming=True,
                     )
-                except Exception as e:
-                    print(f"[Channel Upload] Direct upload failed for {channel_title}: {e}")
 
-            # Thumb cleanup
-            if thumb and os.path.isfile(thumb) and 'ch_thumb_' in thumb:
-                try:
-                    os.remove(thumb)
-                except Exception:
-                    pass
+                    # Filtered file cleanup karo (original nahi)
+                    if filtered_file != new_file and os.path.isfile(filtered_file):
+                        try:
+                            os.remove(filtered_file)
+                        except Exception:
+                            pass
 
-            print(f"[Channel Upload] ✅ Done: {channel_title}")
-            await asyncio.sleep(2)  # Flood wait se bachne ke liye
+                else:
+                    print(f"[Channel Upload] Uploading to {channel_title}")
+                    try:
+                        await app.send_video(
+                            chat_id=channel_id,
+                            video=new_file,
+                            caption=caption,
+                            parse_mode=ParseMode.HTML,
+                            duration=duration,
+                            width=width,
+                            height=height,
+                            thumb=thumb,
+                            cover=cover,
+                            supports_streaming=True,
+                        )
+                    except Exception as e:
+                        print(f"[Channel Upload] Direct upload failed for {channel_title}: {e}")
 
-        except (ChannelInvalid, ChannelPrivate, ChatIdInvalid, PeerIdInvalid) as e:
-            print(f"[Channel Upload] ❌ Invalid channel {channel_title}: {e}")
-        except Exception as e:
-            print(f"[Channel Upload] ❌ Error for {channel_title}: {e}")
+                print(f"[Channel Upload] ✅ Done: {channel_title}")
+                await asyncio.sleep(2)  # Flood wait se bachne ke liye
+
+            except (ChannelInvalid, ChannelPrivate, ChatIdInvalid, PeerIdInvalid) as e:
+                print(f"[Channel Upload] ❌ Invalid channel {channel_title}: {e}")
+            except Exception as e:
+                print(f"[Channel Upload] ❌ Error for {channel_title}: {e}")
+    finally:
+        t = _thumb_box["path"]
+        if t and os.path.isfile(t):
+            try:
+                os.remove(t)
+            except Exception:
+                pass
