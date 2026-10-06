@@ -165,6 +165,7 @@ _T = {
         JANITOR_STALE_MIN=20, JANITOR_LOW_DISK_GB=1.0, JANITOR_LOW_DISK_PCT=85.0,
         JANITOR_MEM_RESTART_PCT=70.0, JANITOR_MAX_UPTIME_H=12.0, CHROME_IDLE_MIN=5,
         UP_START=6, UP_MAX=16, UP_PER_FILE_MIN=2, UP_IDLE_CLOSE=45,
+        DL_CONN_MAX=12,
     ),
     "small": dict(
         UPLOAD_SESSIONS=3, UPLOAD_WORKERS=6, DOWNLOAD_THREADS=8,
@@ -172,6 +173,7 @@ _T = {
         JANITOR_STALE_MIN=30, JANITOR_LOW_DISK_GB=2.0, JANITOR_LOW_DISK_PCT=85.0,
         JANITOR_MEM_RESTART_PCT=65.0, JANITOR_MAX_UPTIME_H=24.0, CHROME_IDLE_MIN=8,
         UP_START=12, UP_MAX=32, UP_PER_FILE_MIN=3, UP_IDLE_CLOSE=60,
+        DL_CONN_MAX=24,
     ),
     "mid": dict(
         UPLOAD_SESSIONS=4, UPLOAD_WORKERS=8, DOWNLOAD_THREADS=12,
@@ -179,6 +181,7 @@ _T = {
         JANITOR_STALE_MIN=90, JANITOR_LOW_DISK_GB=5.0, JANITOR_LOW_DISK_PCT=88.0,
         JANITOR_MEM_RESTART_PCT=80.0, JANITOR_MAX_UPTIME_H=72.0, CHROME_IDLE_MIN=10,
         UP_START=20, UP_MAX=56, UP_PER_FILE_MIN=4, UP_IDLE_CLOSE=90,
+        DL_CONN_MAX=40,
     ),
     "big": dict(
         UPLOAD_SESSIONS=4, UPLOAD_WORKERS=8, DOWNLOAD_THREADS=16,
@@ -186,6 +189,7 @@ _T = {
         JANITOR_STALE_MIN=180, JANITOR_LOW_DISK_GB=10.0, JANITOR_LOW_DISK_PCT=90.0,
         JANITOR_MEM_RESTART_PCT=85.0, JANITOR_MAX_UPTIME_H=168.0, CHROME_IDLE_MIN=15,
         UP_START=32, UP_MAX=96, UP_PER_FILE_MIN=4, UP_IDLE_CLOSE=120,
+        DL_CONN_MAX=64,
     ),
 }[TIER]
 
@@ -210,8 +214,11 @@ UP_START = min(UP_MAX, max(2, _env_int("UPLOAD_INFLIGHT_START", _T["UP_START"]))
 UP_PER_FILE_MIN = max(1, _env_int("UPLOAD_PER_FILE_MIN", _T["UP_PER_FILE_MIN"]))
 UP_IDLE_CLOSE = max(10, _env_int("UPLOAD_IDLE_CLOSE", _T["UP_IDLE_CLOSE"]))   # sec
 
+# Download engine (turbo_download.py): saari files milake itne parallel connection se zyada nahi
+DL_CONN_MAX = max(2, _env_int("DOWNLOAD_CONN_MAX", _T["DL_CONN_MAX"]))
+
 
 def summary():
     return (f"{PLATFORM.upper()}/{TIER} | {CPUS_F:.1f} CPU | {RAM_GB:.1f}GB RAM | "
             f"upload sessions {UPLOAD_SESSIONS}, window {UP_START}-{UP_MAX} parts | "
-            f"dl-threads {DOWNLOAD_THREADS}")
+            f"dl-threads {DOWNLOAD_THREADS}, dl-conn-max {DL_CONN_MAX}")
