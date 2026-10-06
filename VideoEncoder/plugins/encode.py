@@ -7,6 +7,7 @@ from pyrogram import Client, filters
 from .. import data, video_mimetype
 from ..utils.database.add_user import AddUserToDatabase
 from ..utils.helper import check_chat
+from ..utils import prefetch
 from ..utils.tasks import handle_tasks
 from .encode_mode import get_encode_mode
 
@@ -29,6 +30,7 @@ async def encode_video(app, message):
         await handle_tasks(message, 'tg')
     else:
         await message.reply("📔 Waiting for queue...")
+        prefetch.schedule_next()
     await asyncio.sleep(1)
 
 @Client.on_message(filters.command('af'))
@@ -109,4 +111,5 @@ async def auto_encode(app, message):
         await handle_tasks(message, 'tg')
     else:
         await message.reply("📔 Added to queue...")
+        prefetch.schedule_next()
     await asyncio.sleep(1)
