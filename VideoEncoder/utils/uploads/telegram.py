@@ -15,6 +15,7 @@ from ..community import get_community_tag
 from ..display_progress import progress_for_pyrogram
 from ..encoding import get_duration, get_thumbnail, get_width_height
 from ..thumb_source import get_tmdb_thumbnail
+from .. import turbo_upload   # noqa: F401  — import par Client.save_file turbo se patch ho jata hai
 
 
 # ─────────────────────────────────────────────
@@ -66,33 +67,100 @@ async def _get_user_session(user_id: int):
     return user.get("user_session", None)
 
 
+# ── SHARED uploader client ──────────────────────────────────────────────
+# Pehle har file ke liye naya Client (+ naya connect, + naye sessions) banta tha.
+# Same session_string se kai Client ek saath => Telegram connect reject karta tha =>
+# file bot-fallback pe girti thi (slow, ~500 KB/s). Ab user ke liye EK hi client
+# banta hai; saari parallel files usi ko share karti hain. Callers pehle jaisa hi
+# `await uc.disconnect()` karte hain — woh ab sirf "release" hai (refcount);
+# asli disconnect tab hota hai jab koi use na kar raha ho aur _SHARED_IDLE sec beet jayein.
+_SHARED = {}          # user_id -> dict(uc, refs, session, real_disconnect, idle)
+_SHARED_LOCKS = {}    # user_id -> asyncio.Lock
+_SHARED_IDLE = 120    # sec
+
+
+async def _really_close(ent):
+    if ent.get("idle"):
+        ent["idle"].cancel()
+        ent["idle"] = None
+    uc = ent["uc"]
+    try:
+        await turbo_upload.close_pool(uc)
+    except Exception:
+        pass
+    try:
+        await ent["real_disconnect"]()
+    except Exception:
+        pass
+
+
+def _schedule_idle_close(user_id, ent):
+    if ent.get("idle"):
+        ent["idle"].cancel()
+
+    async def _later():
+        try:
+            await asyncio.sleep(_SHARED_IDLE)
+        except asyncio.CancelledError:
+            return
+        if ent["refs"] <= 0 and _SHARED.get(user_id) is ent:
+            _SHARED.pop(user_id, None)
+            await _really_close(ent)
+
+    ent["idle"] = asyncio.ensure_future(_later())
+
+
 async def _make_uploader_client(user_id: int, max_transmissions: int = 8):
     session_str = await _get_user_session(user_id)
     if not session_str:
         return None
-    try:
-        uc = Client(
-            "uploader_user",
-            session_string=session_str,
-            api_id=api_id,
-            api_hash=api_hash,
-            in_memory=True,
-            # Was 4 (deadlock-safety fix from an old 20 value), then 6.
-            # App's main client runs stable at 8 (see VideoEncoder/__init__.py)
-            # — bumped this per-file uploader client to match, for max
-            # upload speed. Higher se deadlock/OOM risk badhta hai on a
-            # tight-RAM box — agar bot restart/OOM hone lage to yeh pehla
-            # value hai jise wapas 6 karna chahiye.
-            max_concurrent_transmissions=max_transmissions,
-            workers=32,
-            sleep_threshold=60,
-        )
-        await uc.connect()
+
+    lock = _SHARED_LOCKS.get(user_id)
+    if lock is None:
+        lock = _SHARED_LOCKS[user_id] = asyncio.Lock()
+
+    async with lock:
+        ent = _SHARED.get(user_id)
+        if ent and ent["session"] == session_str and getattr(ent["uc"], "is_connected", False):
+            ent["refs"] += 1
+            if ent.get("idle"):
+                ent["idle"].cancel()
+                ent["idle"] = None
+            return ent["uc"]
+        if ent:                                   # purana/toota hua client — saaf karo
+            _SHARED.pop(user_id, None)
+            await _really_close(ent)
+
+        try:
+            uc = Client(
+                "uploader_user",
+                session_string=session_str,
+                api_id=api_id,
+                api_hash=api_hash,
+                in_memory=True,
+                # Upload ab turbo_upload.py ke apne session pool se hota hai; yeh value
+                # sirf pyrogram ke original fallback path (save_file) ke liye hai.
+                max_concurrent_transmissions=max(max_transmissions, 8),
+                workers=32,
+                sleep_threshold=60,
+            )
+            await uc.connect()
+        except Exception as e:
+            # pehle yeh error chupchap nigal liya jata tha => bot fallback/serial upload
+            LOGGER.error(f"[Upload] uploader client connect FAILED: {e!r}")
+            return None
+
+        ent = {"uc": uc, "refs": 1, "session": session_str,
+               "real_disconnect": uc.disconnect, "idle": None}
+
+        async def _release():
+            ent["refs"] = max(0, ent["refs"] - 1)
+            if ent["refs"] == 0:
+                _schedule_idle_close(user_id, ent)
+
+        uc.disconnect = _release                  # callers ka `await uc.disconnect()` = release
+        _SHARED[user_id] = ent
         return uc
-    except Exception as e:
-        # pehle yeh error chupchap nigal liya jata tha => bot fallback/serial upload
-        LOGGER.error(f"[Upload] uploader client connect FAILED: {e!r}")
-        return None
 
 
 # ─────────────────────────────────────────────
