@@ -57,7 +57,8 @@ async def check_chat(message, chat):
 
 async def handle_url(url, filepath, msg):
     from .. import profile as _prof
-    downloader = SmartDL(url, filepath, progress_bar=False, threads=_prof.DOWNLOAD_THREADS)
+    from .turbo_download import TurboDL
+    downloader = TurboDL(url, filepath, progress_bar=False, threads=_prof.DOWNLOAD_THREADS)
     downloader.start(blocking=False)
     while not downloader.isFinished():
         await progress_for_url(downloader, msg)

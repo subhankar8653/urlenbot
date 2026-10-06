@@ -344,6 +344,7 @@ class _Pool:
         self.active = 0
         self.idle_handle = None
         self.growing = False
+        self.hold_until = 0.0      # prewarm ke baad itni der tak sessions band mat karo
 
     def want(self):
         n = math.ceil(GOV.limit / PER_SESSION)
@@ -419,12 +420,19 @@ class _Pool:
         self.active = max(0, self.active - 1)
         if self.active == 0 and not self.idle_handle:
             loop = asyncio.get_running_loop()
+            delay = max(_prof.UP_IDLE_CLOSE, self.hold_until - time.time())
             self.idle_handle = loop.call_later(
-                _prof.UP_IDLE_CLOSE, lambda: asyncio.ensure_future(self._idle_close()))
+                delay, lambda: asyncio.ensure_future(self._idle_close()))
 
     async def _idle_close(self):
         self.idle_handle = None
         if self.active == 0:
+            left = self.hold_until - time.time()
+            if left > 1:      # prewarm hold abhi baaki hai — thodi der baad dobara dekho
+                loop = asyncio.get_running_loop()
+                self.idle_handle = loop.call_later(
+                    left, lambda: asyncio.ensure_future(self._idle_close()))
+                return
             await self.close()
 
 
@@ -443,6 +451,28 @@ async def close_pool(client):
         if pool.idle_handle:
             pool.idle_handle.cancel()
         await pool.close()
+
+
+async def prewarm(client, hold=600):
+    """
+    Download chal raha ho tab hi upload ke media sessions bana lo (parallel connect), aur
+    `hold` sec tak band mat karo. Pehli file ka "connection ban raha hai" wait khatam.
+    Kuch bhi fail ho to chupchap return (upload khud sessions bana lega).
+    """
+    if not ENABLED or client is None or not BREAKER.allowed():
+        return False
+    try:
+        pool = _pool_for(client)
+        pool.hold_until = max(pool.hold_until, time.time() + hold)
+        pool.begin()
+        try:
+            await asyncio.wait_for(pool.ensure(), timeout=40)
+        finally:
+            pool.end()
+        return True
+    except Exception as e:
+        LOGGER.debug(f"[Turbo] prewarm skipped: {e!r}")
+        return False
 
 
 # ════════════════════════════════════════════════════════════════════════

@@ -14,9 +14,11 @@ hain (future use ke liye), bas fetch_anime_details() unhe ab call nahi
 karta.
 """
 
+import asyncio
 import logging
 import os
 import re
+import time
 from difflib import SequenceMatcher
 from typing import Optional
 
@@ -58,6 +60,10 @@ query ($search: String) {
 
 _client: Optional[httpx.AsyncClient] = None
 
+_DETAILS_TTL = 600.0
+_DETAILS_CACHE = {}       # normalized title -> (ts, details)
+_DETAILS_INFLIGHT = {}    # normalized title -> Future
+
 
 def is_configured() -> bool:
     # AniList fallback removed — ab sirf TMDB, isliye key hona zaroori hai.
@@ -71,6 +77,8 @@ async def _get_client() -> httpx.AsyncClient:
             timeout=_TIMEOUT,
             follow_redirects=True,
             headers={"User-Agent": "urlenbot/1.0"},
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10,
+                                keepalive_expiry=60.0),
         )
     return _client
 
@@ -437,7 +445,45 @@ async def fetch_anime_details(anime_name: str):
     TMDB pe match na mile toh None (AniList fallback jaan-boojh kar
     hata diya gaya hai — sirf TMDB use hota hai).
     """
-    return await _fetch_from_tmdb(anime_name)
+    key = _normalize_title(anime_name or "")
+    if not key:
+        return await _fetch_from_tmdb(anime_name)
+
+    # ── Cache + in-flight dedupe ──────────────────────────────────────────────
+    # 4 qualities ek saath upload hoti hain aur har ek caption-genre + thumbnail ke
+    # liye yahi call karti thi => ek hi anime ke liye 8-10 TMDB search. Ab pehla call
+    # network jaata hai, baaki usi ka result (ya cache) lete hain. Sirf SUCCESS cache
+    # hota hai (10 min); fail/None cache nahi hota, to retry turant ho sakta hai.
+    now = time.time()
+    hit = _DETAILS_CACHE.get(key)
+    if hit and now - hit[0] < _DETAILS_TTL:
+        return dict(hit[1])
+    fut = _DETAILS_INFLIGHT.get(key)
+    if fut is not None:
+        try:
+            res = await asyncio.shield(fut)
+            return dict(res) if res else res
+        except Exception:
+            return None
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    _DETAILS_INFLIGHT[key] = fut
+    try:
+        res = await _fetch_from_tmdb(anime_name)
+        if res:
+            if len(_DETAILS_CACHE) >= 256:
+                _DETAILS_CACHE.pop(next(iter(_DETAILS_CACHE)), None)
+            _DETAILS_CACHE[key] = (time.time(), dict(res))
+        if not fut.done():
+            fut.set_result(res)
+        return dict(res) if res else res
+    except BaseException as e:
+        if not fut.done():
+            fut.set_exception(e if isinstance(e, Exception) else RuntimeError("cancelled"))
+            fut.exception()          # "never retrieved" warning na aaye
+        raise
+    finally:
+        _DETAILS_INFLIGHT.pop(key, None)
 
 
 async def download_image(url: str, dest_path: str) -> bool:

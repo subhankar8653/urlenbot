@@ -856,55 +856,120 @@ def get_thumbnail(in_filename, path, ttl, band_text=None):
     ye use hoga. Warna DEFAULT_THUMB_BAND_TEXT ('@SBANIME') fallback hai.
     Caller /community-aware value pass kare toh yaha ke liye
     utils.community.get_community_tag(user_id) use karo.
+
+    SPEED: -noaccurate_seek => nearest keyframe pe seedha kood jaata hai (frame decode
+    karke exact second tak nahi jaata), -an/-sn/-dn => audio/subs/data streams skip,
+    -vf scale => bada (1080p/4K) frame PIL mein decode+band+save nahi karna padta.
+    Thumbnail ka kaam sirf preview hai, isliye exact second ki zaroorat nahi.
     """
-    out_filename = os.path.join(path, str(time.time()) + ".jpg")
+    out_filename = os.path.join(path, f"{time.time_ns()}.jpg")
     try:
-        subprocess.run([
-            'ffmpeg', '-hide_banner', '-loglevel', 'error',
-            '-ss', str(ttl), '-i', in_filename, '-vframes', '1', '-y', out_filename
-        ], check=True, capture_output=True)
-        if not os.path.isfile(out_filename):
-            return None
-        _add_thumb_username_band(out_filename, text=band_text or DEFAULT_THUMB_BAND_TEXT)
-        return out_filename
-    except Exception as e:
-        LOGGER.warning(f"Thumbnail failed: {e}")
+        ttl = max(0.0, float(ttl or 0))
+    except Exception:
+        ttl = 0.0
+    base_cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin']
+    attempts = (
+        # 1) fast: keyframe seek + chhota frame
+        base_cmd + ['-noaccurate_seek', '-ss', f"{ttl:.2f}", '-i', in_filename,
+                    '-an', '-sn', '-dn', '-vframes', '1',
+                    '-vf', "scale='min(1280,iw)':-2", '-q:v', '3', '-y', out_filename],
+        # 2) safe: purana accurate-seek tareeka (agar fast wala frame na de paaye)
+        base_cmd + ['-ss', f"{ttl:.2f}", '-i', in_filename, '-an', '-sn', '-dn',
+                    '-vframes', '1', '-y', out_filename],
+        # 3) bilkul shuru ka frame (ttl file se bada nikla to)
+        base_cmd + ['-i', in_filename, '-an', '-sn', '-dn', '-vframes', '1', '-y', out_filename],
+    )
+    for cmd in attempts:
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+            if os.path.isfile(out_filename) and os.path.getsize(out_filename) > 0:
+                _add_thumb_username_band(out_filename, text=band_text or DEFAULT_THUMB_BAND_TEXT)
+                return out_filename
+        except Exception as e:
+            LOGGER.warning(f"Thumbnail attempt failed: {e}")
+        try:
+            if os.path.isfile(out_filename):
+                os.remove(out_filename)
+        except Exception:
+            pass
+    return None
+
+
+# ── Probe cache: ek hi ffprobe call se duration + width + height ─────────────────
+# Pehle get_duration() aur get_width_height() alag-alag ffprobe chalate the (har ek
+# badi file pe seconds) aur 4 qualities pe 8 baar. Ab ek call, aur (path, size, mtime)
+# pe cache — rename ke baad bhi (size+mtime same) naya probe nahi chalta.
+_PROBE_CACHE = {}
+_PROBE_MAX = 64
+
+
+def _probe_key(filepath):
+    try:
+        st = os.stat(filepath)
+        return (st.st_size, int(st.st_mtime))
+    except OSError:
         return None
 
 
-def get_duration(filepath):
+def probe_media(filepath):
+    """-> dict(duration:int, width:int|None, height:int|None). Sync (thread mein chalao)."""
+    key = _probe_key(filepath)
+    if key is not None:
+        hit = _PROBE_CACHE.get(key)
+        if hit is not None:
+            return dict(hit)
+    out = {"duration": 0, "width": None, "height": None}
     try:
-        output = subprocess.check_output([
-            'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1', filepath
-        ]).decode('utf-8').strip()
-        return int(float(output))
+        raw = subprocess.check_output([
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height:format=duration',
+            '-of', 'json', filepath
+        ], stderr=subprocess.DEVNULL, timeout=60).decode('utf-8', 'ignore')
+        j = json.loads(raw or '{}')
+        st0 = (j.get('streams') or [{}])[0]
+        if st0.get('width') and st0.get('height'):
+            out["width"], out["height"] = int(st0['width']), int(st0['height'])
+        d = (j.get('format') or {}).get('duration')
+        if d not in (None, 'N/A', ''):
+            out["duration"] = int(float(d))
     except Exception:
+        pass
+    # ffprobe fail / adhura => hachoir fallback (purane behaviour jaisa)
+    if not out["duration"] or not out["width"]:
         try:
-            metadata = extractMetadata(createParser(filepath))
-            if metadata and metadata.has("duration"):
-                return metadata.get('duration').seconds
+            md = extractMetadata(createParser(filepath))
+            if md:
+                if not out["duration"] and md.has("duration"):
+                    out["duration"] = md.get('duration').seconds
+                if not out["width"] and md.has("width") and md.has("height"):
+                    out["width"], out["height"] = md.get("width"), md.get("height")
         except Exception:
             pass
-    return 0
+    if key is not None and (out["duration"] or out["width"]):
+        if len(_PROBE_CACHE) >= _PROBE_MAX:
+            _PROBE_CACHE.pop(next(iter(_PROBE_CACHE)), None)
+        _PROBE_CACHE[key] = dict(out)
+    return out
+
+
+def get_duration(filepath):
+    return int(probe_media(filepath).get("duration") or 0)
 
 
 def get_width_height(filepath):
-    try:
-        output = subprocess.check_output([
-            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-            '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', filepath
-        ]).decode('utf-8').strip()
-        width, height = map(int, output.split('x'))
-        return width, height
-    except Exception:
-        try:
-            metadata = extractMetadata(createParser(filepath))
-            if metadata and metadata.has("width") and metadata.has("height"):
-                return metadata.get("width"), metadata.get("height")
-        except Exception:
-            pass
+    p = probe_media(filepath)
+    if p.get("width") and p.get("height"):
+        return p["width"], p["height"]
     return (1280, 720)
+
+
+async def probe_media_async(filepath):
+    """Event loop ko block kiye bina probe (thread mein)."""
+    return await asyncio.to_thread(probe_media, filepath)
+
+
+async def get_thumbnail_async(in_filename, path, ttl, band_text=None):
+    return await asyncio.to_thread(get_thumbnail, in_filename, path, ttl, band_text)
 
 
 async def media_info(saved_file_path):
