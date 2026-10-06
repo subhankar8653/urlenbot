@@ -32,12 +32,13 @@ from bs4 import BeautifulSoup
 from .. import LOGGER, download_dir, app, log, owner, sudo_users
 from ..utils.helper import check_chat
 from ..utils.uploads.telegram import upload_video, _make_uploader_client
-from ..utils.encoding import get_duration, get_thumbnail, get_width_height, _add_thumb_username_band
+from ..utils.encoding import (get_duration, get_thumbnail, get_width_height, _add_thumb_username_band,
+                              probe_media_async, get_thumbnail_async)
 from ..utils.auto_caption import build_auto_caption, get_caption_data
 from ..utils import caption_style
 from ..utils.community import get_community_tag
 from ..utils.database.access_db import db
-from ..utils.thumb_source import get_tmdb_thumbnail
+from ..utils.thumb_source import get_tmdb_thumbnail, prefetch_thumb, cached_cover_id
 from ..plugins.custompic import get_custompic_for_file
 
 try:
@@ -577,7 +578,7 @@ def _fast_download_link(href: str, dl_dir: str, quality: str, referer: str, cook
     couldn't even start (caller falls back to the old browser-download path).
     """
     try:
-        from pySmartDL import SmartDL
+        from ..utils.turbo_download import TurboDL
         from urllib.parse import urlparse, unquote
         name = unquote(os.path.basename(urlparse(href).path))
         if not name or "." not in name:
@@ -591,7 +592,9 @@ def _fast_download_link(href: str, dl_dir: str, quality: str, referer: str, cook
         }
         if cookie_header:
             headers["Cookie"] = cookie_header
-        dl = SmartDL(href, dest, progress_bar=False, threads=_prof.DOWNLOAD_THREADS,
+        # TurboDL = work-stealing chunks + direct pwrite (combine nahi) + global conn budget;
+        # dikkat aaye to khud pySmartDL pe fallback — API bilkul SmartDL jaisi.
+        dl = TurboDL(href, dest, progress_bar=False, threads=_prof.DOWNLOAD_THREADS,
                      request_args={"headers": headers}, timeout=30)
         dl.start(blocking=False)
         return dl
@@ -1072,6 +1075,51 @@ async def _get_custom_thumb(file_id: str, dest_path: str):
         return None
 
 
+async def _send_cover_photo(path):
+    """Auto-thumb ko log channel pe photo bhejke uska file_id (cover) lo."""
+    sent = await app.send_photo(log, photo=path)
+    return sent.photo.file_id
+
+
+async def _prefetch_thumb_for(dest_path: str, user_id: int, dl_dir: str):
+    """Download chal raha ho tab hi anime ka poster + band + cover file_id taiyar kar do
+    (agar user ka custom thumb/custompic nahi hai). Upload ke time wait zero."""
+    try:
+        fname = os.path.basename(dest_path)
+        if await get_custompic_for_file(user_id, fname) or await db.get_thumbnail(user_id):
+            return
+        band_text = await get_community_tag(user_id)
+        prefetch_thumb(dest_path, dl_dir, band_text, cover_sender=_send_cover_photo)
+    except Exception as e:
+        LOGGER.debug(f"[Swift] thumb prefetch skipped: {e!r}")
+
+
+def _nb_edit(msg, text):
+    """Status edit ko upload ke raaste se hata do: network round-trip / FloodWait ka wait nahi,
+    aur edit fail ho to bhi upload nahi rukta."""
+    async def _go():
+        try:
+            await msg.edit(text)
+        except Exception:
+            pass
+    try:
+        asyncio.ensure_future(_go())
+    except Exception:
+        pass
+
+
+async def _drop_uc_task(t):
+    """Cancel/error par parallel bana uploader client leak na ho (refcount release)."""
+    if t is None:
+        return
+    try:
+        u = await asyncio.wait_for(t, timeout=45)
+        if u:
+            await u.disconnect()
+    except BaseException:
+        pass
+
+
 async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, encode: bool,
                            on_half: asyncio.Event = None, skip_forward: bool = False,
                            uploader_client=None, label_prefix: str = "",
@@ -1092,17 +1140,11 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
     size_mb = os.path.getsize(filepath) / (1024 * 1024)
     prefix = f"🎬 **{label_prefix}**\n" if label_prefix else ""
 
-    await msg.edit(
-        f"{prefix}🔄 **Renaming `{quality}`...**\n"
-        f"📁 `{fname_orig}`\n"
-        f"💾 `{size_mb:.1f} MB`"
-    )
-
     filepath = await _auto_rename(filepath, dl_dir, user_id=message.from_user.id)
     fname = os.path.basename(filepath)
     quality = _quality_from(fname)
 
-    await msg.edit(
+    _nb_edit(msg,
         f"{prefix}📤 **Uploading `{quality}`...**\n"
         f"📁 `{fname}`\n"
         f"💾 `{size_mb:.1f} MB`"
@@ -1116,121 +1158,115 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
             return True, None, quality
 
         c_time = time.time()
-        duration = await asyncio.to_thread(get_duration, filepath)
-
         user_id = message.from_user.id
-
-        # Pehle keyword-based custompic dhundo, phir default thumbnail fallback
-        fname_for_thumb = os.path.basename(filepath)
-        custompic_id = await get_custompic_for_file(user_id, fname_for_thumb)
-        custom_thumb_id = custompic_id if custompic_id else await db.get_thumbnail(user_id)
-        if custompic_id:
-            LOGGER.info(f"[Swift] Using custompic for '{fname_for_thumb}'")
-
-        thumb = None
-        custom_thumb_used = False
         _t_prep = time.time()
 
-        if custom_thumb_id:
-            try:
-                import random
-                unique_id = f"{int(time.time())}_{random.randint(1000,9999)}"
-                thumb_dir = os.path.join(dl_dir, "thumbs")
-                os.makedirs(thumb_dir, exist_ok=True)
-                thumb_path = os.path.join(thumb_dir, f"thumb_{unique_id}.jpg")
+        # ── SPEED: sab prep EK SAATH (pehle ek ke baad ek: ffprobe x2, thumb, cover upload,
+        #    genre lookup, phir client connect). Ab: probe | thumb+cover | caption | connect ──
+        probe_task = asyncio.ensure_future(probe_media_async(filepath))
+        uc_task = None if uploader_client is not None else asyncio.ensure_future(
+            _make_uploader_client(user_id))
 
-                await msg.edit(f"{prefix}🖼 **Thumbnail ready ho raha hai `{quality}`...**")
-                downloaded = await _get_custom_thumb(custom_thumb_id, thumb_path)
-                actual_path = downloaded if downloaded else thumb_path
+        async def _thumb_and_cover():
+            fname_for_thumb = os.path.basename(filepath)
+            # Pehle keyword-based custompic dhundo, phir default thumbnail fallback
+            custompic_id = await get_custompic_for_file(user_id, fname_for_thumb)
+            custom_thumb_id = custompic_id if custompic_id else await db.get_thumbnail(user_id)
+            if custompic_id:
+                LOGGER.info(f"[Swift] Using custompic for '{fname_for_thumb}'")
 
-                if actual_path and actual_path.endswith(".temp"):
-                    renamed = actual_path.replace(".temp", ".jpg")
-                    try:
-                        os.rename(actual_path, renamed)
-                        actual_path = renamed
-                    except Exception:
-                        pass
-
-                if actual_path and os.path.isfile(actual_path) and os.path.getsize(actual_path) > 0:
-                    thumb = actual_path
-                    custom_thumb_used = True
-                    LOGGER.info(f"[Swift] Custom thumb ready: {actual_path}")
-                else:
-                    LOGGER.warning(f"[Swift] Custom thumb not found, using auto-thumb")
-            except Exception as e:
-                LOGGER.warning(f"[Swift] Thumb download error: {e}, using auto-thumb")
-
-        if not thumb:
-            band_text = await get_community_tag(user_id)
-            thumb = await get_tmdb_thumbnail(filepath, dl_dir, band_text=band_text)
-            if not thumb:
-                thumb = await asyncio.to_thread(get_thumbnail, filepath, dl_dir, duration / 4 if duration else 0, band_text=band_text)
+            thumb = None
             custom_thumb_used = False
 
-        # Custom thumb (custompic keyword ya default /setpic) pe koi band NAHI
-        # lagta — user ne khud jo pic set ki hai wahi as-is (bina kisi red
-        # @Sbanime band ke) use hoti hai.
-        #
-        # Cover (high-quality video-player background) DONO cases mein lagna
-        # chahiye — chahe custom /setpic ho ya API se auto-fetched poster/frame
-        # ho. Telegram ka `thumb=` param hamesha ~320px tak compress ho jaata
-        # hai (platform limit) — isliye sirf thumb pe bharosa karne se
-        # thumbnail/player-background dhundhla (low quality) dikhta hai.
-        # `cover` alag se full-resolution photo ke roop mein bhejte hain taaki
-        # dono jagah — gallery thumbnail aur player cover — sharp dikhe.
-        cover = None
-        if custom_thumb_id and custom_thumb_used:
-            # User ne jo pic set ki thi wahi as-is (unbanded, full quality) cover hai
-            cover = custom_thumb_id
-        elif thumb and os.path.isfile(thumb):
-            # Auto-fetched (TMDB/AniList poster ya ffmpeg-frame, already banded)
-            # local file ko full-res photo ke roop mein log channel pe silently
-            # bhejke uska file_id cover ke liye use karo.
-            try:
-                _sent_cover = await app.send_photo(log, photo=thumb)
-                cover = _sent_cover.photo.file_id
-            except Exception as e:
-                LOGGER.warning(f"[Swift] Auto-thumb cover upload failed: {e}")
-                cover = None
+            if custom_thumb_id:
+                try:
+                    import random
+                    unique_id = f"{int(time.time())}_{random.randint(1000,9999)}"
+                    thumb_dir = os.path.join(dl_dir, "thumbs")
+                    os.makedirs(thumb_dir, exist_ok=True)
+                    thumb_path = os.path.join(thumb_dir, f"thumb_{unique_id}.jpg")
 
-        # cover (file_id) = video player background cover pic
-        # thumb (local path) = gallery preview thumbnail
-        width, height = await asyncio.to_thread(get_width_height, filepath)
+                    downloaded = await _get_custom_thumb(custom_thumb_id, thumb_path)
+                    actual_path = downloaded if downloaded else thumb_path
 
-        # ── GLOBAL caption style (/caption_style) ──
-        # Pehle yahan hamesha hardcoded plain '<b>{fname}</b>' caption
-        # banta tha — /Rtic, RTI auto-monitor, aur /bot_upload (run_episode_rti)
-        # sab isi function (_upload_one_file) se video upload karte hain, isliye
-        # yeh asli channel-post caption hai jo viewers dekhte hain. Ab selected
-        # style yahan bhi lagti hai.
-        style_id = caption_style.get_current_style_id()
-        if style_id == caption_style.DEFAULT_STYLE_ID:
-            caption = f"<b>{fname}</b>"
-        else:
+                    if actual_path and actual_path.endswith(".temp"):
+                        renamed = actual_path.replace(".temp", ".jpg")
+                        try:
+                            os.rename(actual_path, renamed)
+                            actual_path = renamed
+                        except Exception:
+                            pass
+
+                    if actual_path and os.path.isfile(actual_path) and os.path.getsize(actual_path) > 0:
+                        thumb = actual_path
+                        custom_thumb_used = True
+                        LOGGER.info(f"[Swift] Custom thumb ready: {actual_path}")
+                    else:
+                        LOGGER.warning(f"[Swift] Custom thumb not found, using auto-thumb")
+                except Exception as e:
+                    LOGGER.warning(f"[Swift] Thumb download error: {e}, using auto-thumb")
+
+            if not thumb:
+                band_text = await get_community_tag(user_id)
+                thumb = await get_tmdb_thumbnail(filepath, dl_dir, band_text=band_text)
+                if not thumb:
+                    _pr = await probe_task
+                    _dur = _pr.get("duration") or 0
+                    thumb = await get_thumbnail_async(filepath, dl_dir, _dur / 4 if _dur else 0,
+                                                      band_text=band_text)
+                custom_thumb_used = False
+
+            # Custom thumb (custompic keyword ya default /setpic) pe koi band NAHI
+            # lagta — user ne khud jo pic set ki hai wahi as-is use hoti hai.
+            #
+            # Cover (high-quality video-player background) DONO cases mein lagna
+            # chahiye — Telegram ka `thumb=` ~320px tak compress ho jaata hai, isliye
+            # `cover` alag se full-resolution photo ke roop mein bhejte hain.
+            cover = None
+            if custom_thumb_id and custom_thumb_used:
+                cover = custom_thumb_id
+            elif thumb and os.path.isfile(thumb):
+                # Same poster (hash) pe Telegram pe dobara send_photo nahi — cached file_id
+                cover = await cached_cover_id(thumb, _send_cover_photo)
+                if cover is None:
+                    LOGGER.warning("[Swift] Auto-thumb cover upload failed")
+            return thumb, custom_thumb_used, cover
+
+        async def _build_caption():
+            # ── GLOBAL caption style (/caption_style) ──
+            # Yahi asli channel-post caption hai (/Rtic, RTI auto-monitor, /bot_upload).
+            style_id = caption_style.get_current_style_id()
+            if style_id == caption_style.DEFAULT_STYLE_ID:
+                return f"<b>{fname}</b>"
             try:
                 _channel = await get_community_tag(user_id)
                 cap_data = get_caption_data(None, filepath, channel=_channel)
                 cap_data["quality"] = quality  # is file ki exact quality (already known)
                 cap_data["genres"] = await caption_style.lookup_genres(cap_data["anime_name"])
-                caption = caption_style.render_caption_html(style_id, cap_data)
+                return caption_style.render_caption_html(style_id, cap_data)
             except Exception as e:
                 LOGGER.warning(f"[CaptionStyle] Swift styled caption failed, fallback to default: {e}")
-                caption = f"<b>{fname}</b>"
+                return f"<b>{fname}</b>"
+
+        try:
+            (thumb, custom_thumb_used, cover), probe, caption = await asyncio.gather(
+                _thumb_and_cover(), probe_task, _build_caption())
+        except Exception:
+            await _drop_uc_task(uc_task)
+            raise
+
+        duration = int(probe.get("duration") or 0)
+        width = probe.get("width") or 1280
+        height = probe.get("height") or 720
 
         disk_fname = os.path.basename(filepath)
 
         # uploader_client=None hoga staggered flow mein — har file ka fresh uc
-        # Staggered chain ensure karti hai ki ek time pe sirf ek upload active hai
-        # isliye same session_string pe socket conflict nahi hoga
+        # (ab shared client: connect parallel ho chuka, yahan sirf result lena hai)
         _t_conn = time.time()
-        if uploader_client is None:
-            try:
-                await msg.edit(f"{prefix}🔌 **`{quality}` upload connection ban raha hai...**")
-            except Exception:
-                pass
-        uc = uploader_client if uploader_client is not None else await _make_uploader_client(message.from_user.id)
-        LOGGER.info(f"[Swift] {quality}: uploader connect {time.time() - _t_conn:.1f}s "
-                    f"(thumb+cover prep {_t_conn - _t_prep:.1f}s)")
+        uc = uploader_client if uploader_client is not None else await uc_task
+        LOGGER.info(f"[Swift] {quality}: prep {_t_conn - _t_prep:.1f}s "
+                    f"(probe+thumb+cover+caption parallel), uploader wait {time.time() - _t_conn:.1f}s")
         sent_msg = None
 
         # ── ORDERED RELEASE (parallel upload, ordered post) ──
@@ -1601,7 +1637,19 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
     async def _progress_updater():
         start = time.time()
         last_bytes, last_t = 0, start
+        _prefetched = False
         while True:
+            if not _prefetched:
+                for _d in list(progress.get("dls", {}).values()):
+                    try:
+                        _dest = _d.get_dest()
+                    except Exception:
+                        _dest = None
+                    if _dest:
+                        _prefetched = True
+                        asyncio.ensure_future(
+                            _prefetch_thumb_for(_dest, message.from_user.id, dl_dir))
+                        break
             done = _get_done_files(dl_dir)
             in_prog = _in_progress(dl_dir)
             elapsed = int(time.time() - start)

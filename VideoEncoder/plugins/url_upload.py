@@ -108,6 +108,14 @@ async def url_upload_cmd(bot: Client, message: Message):
 
     msg = await message.reply("<b>💠 Downloading...</b>")
 
+    # Download chalte-chalte Telegram upload connection + sessions taiyar (pehle upload ke
+    # time "connection ban raha hai" ka wait aata tha). Fail ho to chupchap ignore.
+    try:
+        from ..utils.uploads.telegram import prewarm_uploader
+        asyncio.ensure_future(prewarm_uploader(message.from_user.id))
+    except Exception:
+        pass
+
     try:
         filepath = await _download_url(url, custom_name, msg, message)
     except Exception as e:
@@ -2067,9 +2075,11 @@ async def _download_url(url: str, filename: str, msg: Message, orig_message: Mes
     headers = _default_stream_headers(url, cookie_header=cookie_header)
 
     try:
-        from pySmartDL import SmartDL
+        from ..utils.turbo_download import TurboDL
         from ..utils.display_progress import progress_for_url
-        downloader = SmartDL(
+        # TurboDL: work-stealing chunks, direct pwrite (combine step nahi), global connection
+        # budget; kuch bhi dikkat ho to khud pySmartDL pe fallback (same API).
+        downloader = TurboDL(
             url, filepath, progress_bar=False, threads=10,
             request_args={"headers": headers},
         )
