@@ -25,10 +25,14 @@ RUN apt-get update && \
 ENV CHROME_BIN=/usr/bin/chromium
 ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
 
-COPY . .
+ENV PYTHONUNBUFFERED=1
 
+# Pehle sirf requirements => code badalne par pip layer cache se aati hai (rebuild fast)
+COPY requirements.txt .
 # Python dependencies (pip upgrade skip — hash mismatch issue)
 RUN pip3 install --no-cache-dir -r requirements.txt
+
+COPY . .
 
 # Run the bot
 CMD ["python3", "-m", "VideoEncoder"]
