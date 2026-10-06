@@ -166,6 +166,7 @@ _T = {
         JANITOR_MEM_RESTART_PCT=70.0, JANITOR_MAX_UPTIME_H=12.0, CHROME_IDLE_MIN=5,
         UP_START=6, UP_MAX=16, UP_PER_FILE_MIN=2, UP_IDLE_CLOSE=45,
         DL_CONN_MAX=12,
+        TG_DL_CONN=4, TG_DL_PIPE=1, ENC_MAX_SEG=2, ENC_GB_PER_SEG=0.0, PREFETCH=0,
     ),
     "small": dict(
         UPLOAD_SESSIONS=3, UPLOAD_WORKERS=6, DOWNLOAD_THREADS=8,
@@ -174,6 +175,7 @@ _T = {
         JANITOR_MEM_RESTART_PCT=65.0, JANITOR_MAX_UPTIME_H=24.0, CHROME_IDLE_MIN=8,
         UP_START=12, UP_MAX=32, UP_PER_FILE_MIN=3, UP_IDLE_CLOSE=60,
         DL_CONN_MAX=24,
+        TG_DL_CONN=8, TG_DL_PIPE=2, ENC_MAX_SEG=4, ENC_GB_PER_SEG=0.0, PREFETCH=0,
     ),
     "mid": dict(
         UPLOAD_SESSIONS=4, UPLOAD_WORKERS=8, DOWNLOAD_THREADS=12,
@@ -182,6 +184,7 @@ _T = {
         JANITOR_MEM_RESTART_PCT=80.0, JANITOR_MAX_UPTIME_H=72.0, CHROME_IDLE_MIN=10,
         UP_START=20, UP_MAX=56, UP_PER_FILE_MIN=4, UP_IDLE_CLOSE=90,
         DL_CONN_MAX=40,
+        TG_DL_CONN=12, TG_DL_PIPE=2, ENC_MAX_SEG=6, ENC_GB_PER_SEG=0.0, PREFETCH=1,
     ),
     "big": dict(
         UPLOAD_SESSIONS=4, UPLOAD_WORKERS=8, DOWNLOAD_THREADS=16,
@@ -190,6 +193,7 @@ _T = {
         JANITOR_MEM_RESTART_PCT=85.0, JANITOR_MAX_UPTIME_H=168.0, CHROME_IDLE_MIN=15,
         UP_START=32, UP_MAX=96, UP_PER_FILE_MIN=4, UP_IDLE_CLOSE=120,
         DL_CONN_MAX=64,
+        TG_DL_CONN=16, TG_DL_PIPE=3, ENC_MAX_SEG=8, ENC_GB_PER_SEG=0.0, PREFETCH=1,
     ),
 }[TIER]
 
@@ -218,7 +222,24 @@ UP_IDLE_CLOSE = max(10, _env_int("UPLOAD_IDLE_CLOSE", _T["UP_IDLE_CLOSE"]))   # 
 DL_CONN_MAX = max(2, _env_int("DOWNLOAD_CONN_MAX", _T["DL_CONN_MAX"]))
 
 
+# Telegram se video download (fast_download.py)
+#   TG_DL_CONN : ek file ke liye parallel MTProto connections
+#   TG_DL_PIPE : har connection par ek saath kitne GetFile request in-flight (latency chhupata hai)
+TG_DL_CONN = max(1, _env_int("TG_DL_CONNECTIONS", _T["TG_DL_CONN"]))
+TG_DL_PIPE = max(1, _env_int("TG_DL_PIPELINE", _T["TG_DL_PIPE"]))
+
+# Encode (encoding.py): parallel segments ki upper limit.
+# Asli segment count = min(CPU, RAM-limit, ENC_MAX_SEG). ENC_GB_PER_SEG=0 => auto (x264 ~0.6GB, x265 ~1.2GB)
+ENC_MAX_SEG = max(2, _env_int("ENCODE_MAX_SEGMENTS", _T["ENC_MAX_SEG"]))
+ENC_GB_PER_SEG = _env_float("ENCODE_GB_PER_SEGMENT", _T["ENC_GB_PER_SEG"])
+ENC_NICE = _env_int("ENCODE_NICE", 5)          # ffmpeg thoda low priority => bot/upload/download atke nahi
+
+# Pipeline: encode chalte waqt queue ki agli Telegram file background mein download kar lo
+PREFETCH = bool(_env_int("PREFETCH_NEXT", _T["PREFETCH"]))
+
+
 def summary():
     return (f"{PLATFORM.upper()}/{TIER} | {CPUS_F:.1f} CPU | {RAM_GB:.1f}GB RAM | "
             f"upload sessions {UPLOAD_SESSIONS}, window {UP_START}-{UP_MAX} parts | "
-            f"dl-threads {DOWNLOAD_THREADS}, dl-conn-max {DL_CONN_MAX}")
+            f"dl-threads {DOWNLOAD_THREADS}, dl-conn-max {DL_CONN_MAX} | "
+            f"tg-dl {TG_DL_CONN}x{TG_DL_PIPE} | enc-seg-max {ENC_MAX_SEG} | prefetch {int(PREFETCH)}")
