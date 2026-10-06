@@ -201,7 +201,10 @@ def delete_downloads():
                 os.remove(path)
             except PermissionError:
                 pass
+    from . import prefetch as _pf
     for files in os.listdir(dir2):
+        if _pf.is_protected(files):      # agli file ka chal raha prefetch mat udao
+            continue
         path = os.path.join(dir2, files)
         try:
             shutil.rmtree(path)

@@ -18,9 +18,13 @@ from .uploads.drive.download import Downloader
 from .encoding import get_media_streams
 from ..video_utils.audio_selector import AudioSelect
 from .fast_download import fast_download
+from . import prefetch
 
 
 async def on_task_complete():
+    # Agla item (data[1]) ka prefetch rakho, baaki sab hata do
+    prefetch.reset()
+    prefetch.drop_unneeded(data[1] if len(data) > 1 else None)
     delete_downloads()
     if not data:
         return
@@ -90,6 +94,7 @@ async def tg_task(message, msg):
     if not filepath:
         await msg.edit("Download failed or no file found.")
         return
+    prefetch.mark_downloaded()          # encode chalte waqt agli file download hoti rahe
     await msg.edit('Encoding...')
     await handle_encode(filepath, message, msg)
 
@@ -100,6 +105,7 @@ async def af_task(message, msg):
         await msg.edit("Download failed or no file found.")
         return
 
+    prefetch.mark_downloaded()
     streams = get_media_streams(filepath)
     if not streams:
         await msg.edit("Could not retrieve media streams.")
@@ -120,6 +126,7 @@ async def url_task(message, msg):
     filepath = await handle_download_url(message, msg, False)
     if not filepath:
         return
+    prefetch.mark_downloaded()
     await msg.edit_text("Encoding...")
     await handle_encode(filepath, message, msg)
 
@@ -226,28 +233,17 @@ async def handle_tg_down(message, msg, mode='no_reply'):
     """Multi-threaded fast download"""
     c_time = time.time()
 
-    # Target message determine karo
-    target_msg = message
-    if message.reply_to_message and (message.reply_to_message.video or message.reply_to_message.document):
-        target_msg = message.reply_to_message
-    elif message.video or message.document:
-        target_msg = message
-    elif mode == 'reply' and message.reply_to_message:
-        target_msg = message.reply_to_message
-    else:
-        if not (message.reply_to_message and (message.reply_to_message.video or message.reply_to_message.document)):
-            return None
-        target_msg = message.reply_to_message
-
-    # Filename determine karo
-    if target_msg.video:
-        fname = target_msg.video.file_name or f"video_{int(time.time())}.mp4"
-    elif target_msg.document:
-        fname = target_msg.document.file_name or f"file_{int(time.time())}"
-    else:
-        fname = f"file_{int(time.time())}"
+    # Target message + filename (prefetch.resolve_target mein same logic)
+    target_msg, fname = prefetch.resolve_target(message, mode)
+    if not target_msg:
+        return None
 
     file_path = os.path.join(download_dir, fname)
+
+    # Agar yeh file pichle encode ke dauraan pehle hi download ho chuki hai
+    got = await prefetch.take(message, msg, file_path)
+    if got:
+        return got
 
     # Fast multi-threaded download use karo
     path = await fast_download(

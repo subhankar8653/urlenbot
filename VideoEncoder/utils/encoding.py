@@ -11,6 +11,7 @@ from hachoir.parser import createParser
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .. import LOGGER, download_dir, encode_dir
+from .. import profile as _prof
 from .database.access_db import db
 from .display_progress import TimeFormatter
 
@@ -41,6 +42,25 @@ def get_available_cpus():
     except Exception:
         pass
     return os.cpu_count() or 2
+
+
+def _low_prio():
+    """ffmpeg ko thoda low priority (nice) => poora CPU use hota hai, par bot ka Telegram
+    I/O, upload aur prefetch download atakte nahi. Windows par None."""
+    n = _prof.ENC_NICE
+    if os.name != 'posix' or n <= 0:
+        return None
+    return lambda: os.nice(n)
+
+
+def plan_segments(cpu_count, x265):
+    """(n_segments, threads_per_segment). Limit = CPU, RAM aur tier ki max.
+    Pehle sirf min(cpu, 6) tha: 8 core par 6 seg x 1 thread = 2 core idle,
+    aur RAM check bilkul nahi tha (x265 6 segment = OOM risk)."""
+    per_seg = _prof.ENC_GB_PER_SEG or (1.2 if x265 else 0.6)
+    ram_cap = max(1, int((_prof.RAM_GB * 0.6) / per_seg))       # 60% RAM encode ke liye
+    n = max(1, min(cpu_count, ram_cap, _prof.ENC_MAX_SEG))
+    return n, max(1, cpu_count // n)
 
 
 def get_codec(filepath, channel='v:0'):
@@ -151,6 +171,11 @@ async def _should_parallel_encode(filepath, message, audio_map):
     if cpu_count < 2:
         LOGGER.info("Parallel encode skipped: only 1 CPU core available.")
         return False
+    if not await db.get_fast_encode(uid):
+        n_seg, _ = plan_segments(cpu_count, await db.get_hevc(uid))
+        if n_seg < 2:
+            LOGGER.info("Parallel encode skipped: RAM/CPU limit ke hisaab se 2 segment nahi ban sakte.")
+            return False
     video_i = get_codec(filepath, channel='v:0')
     if video_i == []:
         LOGGER.info("Parallel encode skipped: could not detect a video stream.")
@@ -199,17 +224,17 @@ async def parallel_encode(filepath, message, msg, audio_map=None):
     duration = get_duration(filepath)
     cpu_count = get_available_cpus()
     fast = await db.get_fast_encode(uid)
+    x265_pre = await db.get_hevc(uid)
     if fast:
         # Fast Encode mode: always exactly 2 segments (>=30s videos), no
         # matter how many cores are actually free — keeps behavior fixed
         # and predictable on low-resource hosts.
         n_segments = min(cpu_count, 2)
+        threads_per_seg = max(1, cpu_count // max(1, n_segments))
     else:
-        # Segments run all-at-once, in parallel — so segment count is bounded
-        # by available CPU cores, not by video length. Capped at 6 so the
-        # host doesn't split into pointlessly tiny chunks or run out of RAM
-        # running too many encoders at once.
-        n_segments = min(cpu_count, 6)
+        # CPU + RAM + tier ke hisaab se segments (saare cores bharne ke liye
+        # extra threads per segment). Details: plan_segments().
+        n_segments, threads_per_seg = plan_segments(cpu_count, x265_pre)
     if n_segments < 2 or duration < 1:
         return None
 
@@ -266,8 +291,7 @@ async def parallel_encode(filepath, message, msg, audio_map=None):
         watermark += (',subtitles=VideoEncoder/utils/extras/watermark.ass'
                       if watermark else '-vf subtitles=VideoEncoder/utils/extras/watermark.ass')
 
-    # Split CPU budget fairly across the segments running at the same time
-    threads_per_seg = max(1, cpu_count // n_segments)
+    # threads_per_seg upar plan_segments() se aa chuka hai
     x265_speed_params = []
     if x265:
         params = (
@@ -316,7 +340,8 @@ async def parallel_encode(filepath, message, msg, audio_map=None):
     procs = []
     for cmd in seg_cmds:
         proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            preexec_fn=_low_prio()
         )
         procs.append(proc)
 
@@ -573,7 +598,8 @@ async def _monitor_parallel_progress(procs, progress_paths, lengths, msg, messag
             with open(progress_paths[i], 'w'):
                 pass
             retry_procs[i] = await asyncio.create_subprocess_exec(
-                *seg_cmds[i], stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+                *seg_cmds[i], stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+                preexec_fn=_low_prio()
             )
         retry_results = await asyncio.gather(*[p.wait() for p in retry_procs.values()])
         still_failed = [i for i, rc in zip(retry_procs.keys(), retry_results) if rc != 0]
@@ -616,8 +642,9 @@ async def _encode_single(filepath, message, msg, audio_map=None):
     else:
         LOGGER.info(filepath)
 
-    # Railway pe kitne vCPU milte hain
-    cpu_count = os.cpu_count() or 2
+    # Container/VPS ko asli kitne CPU mile (cgroup-aware). os.cpu_count() host ke
+    # saare cores dikhata tha => x265 pools/threads oversubscribe hokar slow hota tha.
+    cpu_count = get_available_cpus()
 
     # HEVC / H264
     x265 = await db.get_hevc(message.from_user.id)
@@ -801,7 +828,8 @@ async def _encode_single(filepath, message, msg, audio_map=None):
     proc = await asyncio.create_subprocess_exec(
         *command,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.PIPE,
+        preexec_fn=_low_prio()
     )
     await handle_progress(proc, msg, message, filepath)
     stdout, stderr = await proc.communicate()

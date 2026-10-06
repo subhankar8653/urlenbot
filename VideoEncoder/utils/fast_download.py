@@ -26,13 +26,17 @@ from pyrogram.file_id import FileId, FileType
 from pyrogram.session import Auth, Session
 from pyrogram.types import Message
 
+from .. import profile as _prof
+
 log = logging.getLogger(__name__)
 
 # 1 MB — Telegram ka standard upload.GetFile chunk limit (non-premium safe)
 CHUNK_SIZE = 1024 * 1024
 # Kitne parallel MTProto connections ek file pe (RAM/CPU/bandwidth ke hisaab
 # se conservative default; zaroorat pade to badha sakte ho)
-DEFAULT_CONNECTIONS = 6
+DEFAULT_CONNECTIONS = _prof.TG_DL_CONN     # tier ke hisaab se (profile.py / env TG_DL_CONNECTIONS)
+PIPELINE = _prof.TG_DL_PIPE                # har connection par in-flight requests
+HARD_MAX_CONNECTIONS = 32
 MAX_RETRIES_PER_CHUNK = 3
 
 
@@ -85,12 +89,9 @@ async def _new_media_session(client: Client, dc_id: int) -> Session:
 
 async def _download_worker(session: Session, location, fd, queue: asyncio.Queue,
                            progress_state: dict, lock: asyncio.Lock):
-    """Pulls chunk indices from a SHARED queue (work-stealing) instead of a
-    static pre-assigned list. This way, if one session hits a FloodWait or
-    a slow patch, the other sessions simply pick up more chunks from the
-    queue instead of finishing early and sitting idle — keeps all N
-    connections busy right up to the last chunk, so speed doesn't taper
-    off near the end of the file."""
+    """Shared queue se chunk uthata hai (work-stealing). Ek session par PIPELINE
+    workers chalte hain => ek hi connection par kai GetFile request ek saath
+    in-flight rehte hain, isse network latency (RTT) ka wait nahi hota."""
     while True:
         try:
             idx = queue.get_nowait()
@@ -109,16 +110,17 @@ async def _download_worker(session: Session, location, fd, queue: asyncio.Queue,
             except Exception:
                 attempt += 1
                 if attempt >= MAX_RETRIES_PER_CHUNK:
-                    # Put it back so another (possibly healthier) session
-                    # can retry it, rather than killing the whole download.
-                    await queue.put(idx)
+                    # Chunk wapas queue mein, taaki doosra (healthy) worker retry kare
+                    queue.put_nowait(idx)
                     raise
                 await asyncio.sleep(min(0.5 * (2 ** attempt), 4))
 
         if isinstance(r, raw.types.upload.File) and r.bytes:
-            os.pwrite(fd, r.bytes, offset)
+            # disk write thread mein — event loop (Telegram I/O) kabhi block nahi hota
+            await asyncio.to_thread(os.pwrite, fd, r.bytes, offset)
             async with lock:
                 progress_state['done'] += len(r.bytes)
+                progress_state['chunks'].add(idx)
 
 
 async def _parallel_download(client: Client, media, file_name: str,
@@ -130,19 +132,25 @@ async def _parallel_download(client: Client, media, file_name: str,
         raise ValueError("Unknown file size, can't chunk it.")
 
     total_chunks = math.ceil(file_size / CHUNK_SIZE)
-    n_conn = max(1, min(connections, total_chunks, 8))
+    n_conn = max(1, min(connections, total_chunks, HARD_MAX_CONNECTIONS))
     location = _get_location(file_id_obj)
 
     sessions = []
     try:
-        for _ in range(n_conn):
-            sessions.append(await _new_media_session(client, file_id_obj.dc_id))
+        # Saare sessions EK SAATH banao (pehle ek-ek karke bante the => start mein 5-15 sec waste)
+        made = await asyncio.gather(
+            *[_new_media_session(client, file_id_obj.dc_id) for _ in range(n_conn)],
+            return_exceptions=True)
+        sessions = [m for m in made if isinstance(m, Session)]
+        if not sessions:
+            raise RuntimeError(f"media sessions nahi ban paaye: {made[0]!r}")
+        n_conn = len(sessions)
 
         fd = os.open(file_name, os.O_CREAT | os.O_RDWR | os.O_TRUNC)
         try:
             os.ftruncate(fd, file_size)
 
-            progress_state = {'done': 0}
+            progress_state = {'done': 0, 'chunks': set()}
             lock = asyncio.Lock()
             stop_reporting = asyncio.Event()
 
@@ -164,10 +172,16 @@ async def _parallel_download(client: Client, media, file_name: str,
                 queue.put_nowait(i)
 
             try:
-                await asyncio.gather(*[
-                    _download_worker(sessions[i], location, fd, queue, progress_state, lock)
-                    for i in range(n_conn)
-                ])
+                results = await asyncio.gather(*[
+                    _download_worker(sessions[i % n_conn], location, fd, queue, progress_state, lock)
+                    for i in range(n_conn * PIPELINE)
+                ], return_exceptions=True)
+                # Koi worker mara bhi ho to baaki ne uska chunk utha liya hota hai; yahan
+                # sirf poori file ka verify karo, adhoori file kabhi "success" na maani jaye.
+                if len(progress_state['chunks']) < total_chunks:
+                    errs = [r for r in results if isinstance(r, Exception)]
+                    raise RuntimeError(
+                        f"{total_chunks - len(progress_state['chunks'])} chunk reh gaye: {errs[:1]!r}")
             finally:
                 stop_reporting.set()
                 try:
