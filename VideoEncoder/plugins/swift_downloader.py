@@ -950,10 +950,9 @@ class _OrderedGate:
 
 
 # ── TURBO UPLOAD ────────────────────────────────────────────────────────
-# Pyrogram ka default save_file ek file ke liye 1 connection + 4 parallel parts
-# use karta hai => speed = 4 x 512KB / latency (Railway->Telegram me ~4-5 MB/s pe atak jati hai).
-# Yahan har file ke liye UPLOAD_SESSIONS connection x UPLOAD_WORKERS parts ek saath.
-# Koi bhi error aaye to automatic purane (original) tareeke pe fallback.
+# Ab yeh engine utils/turbo_upload.py mein hai (saari uploads ke liye ek shared window,
+# fair-share, session pool, host-aware). Neeche ke _UP_* / _FAST_* sirf compatibility ke liye.
+# Koi bhi error aaye to automatic original pyrogram upload pe fallback.
 from .. import profile as _prof
 _UP_SESSIONS = max(1, _prof.UPLOAD_SESSIONS)
 _UP_WORKERS = max(1, _prof.UPLOAD_WORKERS)
@@ -963,93 +962,11 @@ _FAST_MAX = 1900 * 1024 * 1024
 
 
 async def _fast_save_file(uc, path, progress=None, progress_args=()):
-    import inspect
-    import random
-    from pyrogram import raw
-    from pyrogram.session import Session
-    from pyrogram.errors import FloodWait
-
-    size = os.path.getsize(path)
-    part_size = 512 * 1024
-    total = (size + part_size - 1) // part_size
-    file_id = random.getrandbits(62)
-
-    dc_id = await uc.storage.dc_id()
-    auth_key = await uc.storage.auth_key()
-    test_mode = await uc.storage.test_mode()
-
-    sessions = []
-    tasks = []
-    try:
-        for _ in range(_UP_SESSIONS):
-            ss = Session(client=uc, dc_id=dc_id, auth_key=auth_key,
-                         test_mode=test_mode, is_media=True)
-            await ss.start()
-            sessions.append(ss)
-
-        n_workers = len(sessions) * _UP_WORKERS
-        queue: asyncio.Queue = asyncio.Queue(maxsize=n_workers * 2)
-        state = {"bytes": 0, "last": 0.0}
-
-        async def _report(force=False):
-            if not progress:
-                return
-            now = time.time()
-            if not force and now - state["last"] < 0.4:
-                return
-            state["last"] = now
-            try:
-                r = progress(min(state["bytes"], size), size, *progress_args)
-                if inspect.isawaitable(r):
-                    await r
-            except Exception:
-                pass
-
-        async def producer():
-            with open(path, "rb") as f:
-                for idx in range(total):
-                    await queue.put((idx, f.read(part_size)))
-            for _ in range(n_workers):
-                await queue.put(None)
-
-        async def worker(ss):
-            while True:
-                item = await queue.get()
-                if item is None:
-                    return
-                idx, chunk = item
-                for attempt in range(4):
-                    try:
-                        await ss.invoke(raw.functions.upload.SaveBigFilePart(
-                            file_id=file_id, file_part=idx,
-                            file_total_parts=total, bytes=chunk))
-                        break
-                    except FloodWait as e:
-                        await asyncio.sleep(getattr(e, "value", 2) + 1)
-                    except Exception:
-                        if attempt == 3:
-                            raise
-                        await asyncio.sleep(1 + attempt)
-                state["bytes"] += len(chunk)
-                await _report()
-
-        tasks = [asyncio.ensure_future(producer())]
-        for ss in sessions:
-            for _ in range(_UP_WORKERS):
-                tasks.append(asyncio.ensure_future(worker(ss)))
-        await asyncio.gather(*tasks)
-        await _report(force=True)
-        return raw.types.InputFileBig(id=file_id, parts=total, name=os.path.basename(path))
-    except BaseException:
-        for t in tasks:
-            t.cancel()
-        raise
-    finally:
-        for ss in sessions:
-            try:
-                await ss.stop()
-            except Exception:
-                pass
+    """Purana per-file sessions x workers uploader hata diya — ab saari uploads ek hi shared
+    engine (utils/turbo_upload.py) se jaati hain jo global window + fair-share se chalta hai.
+    (Yeh shim sirf purane callers ke liye hai; Client.save_file already turbo-patched hai.)"""
+    from ..utils.turbo_upload import turbo_save_file
+    return await turbo_save_file(uc, path, progress, progress_args)
 
 
 async def _prewarm_all_custompics(user_id: int):
@@ -1331,22 +1248,7 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
 
                 async def _save_then_wait(path, *a, **kw):
                     ent = _reg.get(path) if isinstance(path, str) else None
-                    res = None
-                    # TURBO: multi-connection upload (fail ho to original)
-                    if (ent and _FAST_UPLOAD and not a
-                            and "file_id" not in kw and "file_part" not in kw
-                            and os.path.isfile(path)
-                            and _FAST_MIN <= os.path.getsize(path) <= _FAST_MAX):
-                        try:
-                            _t0 = time.time()
-                            res = await _fast_save_file(
-                                uc, path, kw.get("progress"), kw.get("progress_args", ()))
-                            _sz = os.path.getsize(path) / 1024 / 1024
-                            LOGGER.info(f"[Swift] TURBO upload {_sz:.0f}MB in {time.time() - _t0:.1f}s "
-                                        f"({_sz / max(time.time() - _t0, 0.1):.1f} MB/s)")
-                        except Exception as e:
-                            LOGGER.warning(f"[Swift] turbo upload failed ({e!r}) — normal upload par fallback")
-                            res = None
+                    res = None   # turbo + fallback Client.save_file ke andar hi hai (utils/turbo_upload.py)
                     if res is None:
                         res = await _orig_save(path, *a, **kw)
                     if ent and ent[0] is not None:

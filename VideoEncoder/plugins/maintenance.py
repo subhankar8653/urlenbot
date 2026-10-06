@@ -4,7 +4,7 @@ import asyncio
 from pyrogram import Client, filters
 
 from .. import owner, sudo_users
-from ..utils import janitor
+from ..utils import janitor, turbo_upload
 from .. import profile as _prof
 
 
@@ -35,8 +35,12 @@ async def health_cmd(_, message):
     used, limit = janitor.container_mem()
     free, pct = janitor.disk_stats()
     b = janitor.mem_breakdown()
+    t = turbo_upload.stats()
+    turbo_line = (f"Upload: {'ON' if t['enabled'] else 'OFF (fallback)'} | "
+                  f"{_hr(t['speed'])}/s | window {t['window']:.0f}/{t['max']:.0f} | "
+                  f"files {t['uploads']} | losses {t['losses']}\n")
     await message.reply_text(
-        f"<b>🩺 Health</b>\nProfile: {_prof.summary()}\nRAM: {_hr(used)} / {_hr(limit)} ({used/limit*100:.0f}%)\n"
+        f"<b>🩺 Health</b>\nProfile: {_prof.summary()}\n{turbo_line}RAM: {_hr(used)} / {_hr(limit)} ({used/limit*100:.0f}%)\n"
         f"├ Bot (python): {_hr(b['python'])}\n"
         f"├ Chrome: {_hr(b['chrome'])} ({b['chrome_procs']} proc)\n"
         f"├ ffmpeg: {_hr(b['ffmpeg'])}\n"
