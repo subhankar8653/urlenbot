@@ -15,6 +15,7 @@ Ek "Job" = ek poora process (e.g. /rti ya /anime ka season download+upload).
                        - card mein "Cancelled" dikhta hai
 """
 
+import re
 import asyncio
 import contextvars
 import gc
@@ -56,8 +57,14 @@ def track_task(task):
     return task
 
 
+_URL_RE = re.compile(r"https?://\S+")
+
+
 def _compact(text: str, drop=()) -> str:
-    lines = [l.rstrip() for l in (text or "").splitlines() if l.strip()]
+    # Card mein koi link / file ka naam nahi — sirf progress (chain reaction rokne ke liye)
+    text = _URL_RE.sub("", text or "")
+    drop = tuple(drop) + ("📁",)
+    lines = [l.rstrip() for l in text.splitlines() if l.strip()]
     if drop:
         lines = [l for l in lines if not any(d in l for d in drop)]
     return "\n".join(lines[:MAX_LINES])
