@@ -87,6 +87,75 @@ _SKIP_PATH = re.compile(
 )
 
 
+# ───────────────────────── button label ─────────────────────────
+_LANG_CUT = re.compile(
+    r"\s*[–—:|-]?\s*\b(episodes?|hindi|english|tamil|telugu|dual|multi|dubbed|dub|subbed|sub|download|hd)\b.*$",
+    re.I,
+)
+
+
+def make_label(title: str) -> str:
+    """
+    'Naruto Shippuden Season 06 – Episodes Hindi Dubbed Download HD'
+        -> 'S06 Hindi Dub Naruto Shippuden'
+    'Finding Nemo (2003) Movie Hindi Dubbed Download'
+        -> 'Hindi Dub Finding Nemo (2003) Movie'
+    Format: Season • Language • Dub/Sub • Name • (Movie)
+    """
+    t = _clean(title)
+    low = t.lower()
+
+    # season
+    m = re.search(r"\bseason\s*0*(\d+)", t, re.I)
+    season = int(m.group(1)) if m else None
+
+    # movie?
+    has_year = bool(re.search(r"\(\d{4}\)", t))
+    is_movie = bool(re.search(r"\bmovie\b", low)) or (
+        has_year and season is None and "episode" not in low
+    )
+
+    # language
+    langs = []
+    for key, name in (("hindi", "Hindi"), ("english", "English"), ("tamil", "Tamil"),
+                      ("telugu", "Telugu"), ("japanese", "Japanese")):
+        if re.search(rf"\b{key}\b", low):
+            langs.append(name)
+    if re.search(r"\bdual\s*audio\b", low):
+        langs.append("Dual Audio")
+    if re.search(r"\bmulti[\s-]*audio\b", low):
+        langs.append("Multi Audio")
+
+    # dub / sub
+    kind = ""
+    if re.search(r"\bdubbed\b|\bdub\b", low):
+        kind = "Dub"
+    elif re.search(r"\bsubbed\b|\bsub\b|\bsubtitles?\b|\besub\b", low):
+        kind = "Sub"
+    lang = " ".join(langs[:3])
+    if kind:
+        lang = f"{lang} {kind}".strip()
+
+    # name
+    name = re.sub(r"\bseason\s*0*\d+", "", t, flags=re.I)
+    name = re.sub(r"\bmovie\b", "", name, flags=re.I)
+    name = re.sub(r"\s{2,}", " ", name).strip()
+    cut = _LANG_CUT.sub("", name).strip(" –—:|-")
+    name = cut if cut else name.strip(" –—:|-")
+
+    parts = []
+    if season is not None:
+        parts.append(f"S{season:02d}")
+    elif not is_movie:
+        parts.append("S01")
+    if lang:
+        parts.append(lang)
+    parts.append(name)
+    if is_movie:
+        parts.append("Movie")
+    return " ".join(parts)
+
+
 # ───────────────────────── parsing ─────────────────────────
 def _same_site(href: str) -> bool:
     return _host(href) == SITE_HOST
@@ -125,7 +194,7 @@ def parse_results(page_html: str, base_url: str):
         if href in seen:
             continue
         seen.add(href)
-        results.append({"title": title, "url": href})
+        results.append({"title": title, "url": href, "label": make_label(title)})
 
     next_url = None
     nxt = soup.select_one("a.next.page-numbers, a.next, a[rel=next], .nav-links a.next")
@@ -302,7 +371,7 @@ class AnimeSearch:
         res, nxt = self.pages[self.cur]
         rows = []
         for i, r in enumerate(res):
-            t = r["title"]
+            t = r.get("label") or r["title"]
             t = t if len(t) <= 60 else t[:57] + "..."
             rows.append([InlineKeyboardButton(t, callback_data=f"anime_r_{self.sid}_{i}")])
         nav = []
