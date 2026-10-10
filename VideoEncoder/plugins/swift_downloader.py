@@ -2012,7 +2012,11 @@ async def swift_command(client: Client, message: Message):
         if re.match(r"^\d{3,4}p$", candidate):
             quality_filter = candidate
 
-    await _run_swift(client, message, swift_url, encode=False, quality_filter=quality_filter)
+    # Ek hi card message + ❌ Cancel button
+    await job_ctl.run_with_card(
+        message, "Swift",
+        lambda: _run_swift(client, message, swift_url, encode=False, quality_filter=quality_filter),
+    )
 
 
 @Client.on_message(filters.command("swiftencode"))

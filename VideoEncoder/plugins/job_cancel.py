@@ -4,7 +4,7 @@ import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import CallbackQuery
 
-from .. import LOGGER
+from .. import LOGGER, owner, sudo_users
 from ..utils import job_ctl
 
 
@@ -16,7 +16,7 @@ async def job_cancel_cb(client: Client, cb: CallbackQuery):
         if not job:
             await cb.answer("Ye process pehle hi khatam / cancel ho chuka hai.", show_alert=True)
             return
-        if cb.from_user.id != job.owner:
+        if cb.from_user.id != job.owner and cb.from_user.id not in (set(sudo_users or []) | set(owner or [])):
             await cb.answer("❌ Ye tumhara process nahi hai.", show_alert=True)
             return
         await cb.answer("🛑 Cancel ho raha hai... cache saaf kar raha hoon")

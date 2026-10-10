@@ -56,6 +56,7 @@ from pyrogram.types import (
 
 from .. import LOGGER, download_dir
 from ..utils.helper import check_chat
+from ..utils import job_ctl
 from ..utils.database.access_db import db
 from .rti_downloader import (
     SELENIUM_OK,
@@ -879,9 +880,7 @@ async def _process_toono_item(client, message, item: dict, status_msg, index: in
                 )
             except Exception:
                 pass
-            codedew_url, debug_lines, driver = await loop.run_in_executor(
-                None, get_codedew_link, item["watch_url"], True
-            )
+            codedew_url, debug_lines, driver = await job_ctl.run_in_thread(get_codedew_link, item["watch_url"], True)
 
         if not codedew_url:
             # Telegram message mein last kuch debug lines dikhao — taaki
@@ -903,7 +902,7 @@ async def _process_toono_item(client, message, item: dict, status_msg, index: in
 
         # Link mil gaya — agle episode ka link abhi se background mein nikalna shuru
         if TOONO_PREFETCH and next_item is not None and pf is not None:
-            fut = loop.run_in_executor(None, get_codedew_link, next_item["watch_url"], False)
+            fut = job_ctl.run_in_thread(get_codedew_link, next_item["watch_url"], False)
             fut.add_done_callback(_swallow_future)
             pf["fut"] = fut
 
@@ -912,8 +911,9 @@ async def _process_toono_item(client, message, item: dict, status_msg, index: in
             f"⬇️ Ab download shuru ho raha hai..."
         )
         from .swift_downloader import _run_swift
+        _lbl = None if job_ctl.CURRENT.get() is not None else ep_label
         uploaded_results = await _run_swift(
-            client, message, codedew_url, encode=False, episode_label=ep_label, show_url=False,
+            client, message, codedew_url, encode=False, episode_label=_lbl, show_url=False,
             fast=True, driver=driver,
         )
         driver = None  # ownership _run_swift -> _scrape_and_download ko chali gayi (wahi kill karta hai)
@@ -927,12 +927,11 @@ async def _process_toono_item(client, message, item: dict, status_msg, index: in
                 await status_msg.edit(f"🔁 **{ep_label}** — naya link nikal raha hoon (retry)...")
             except Exception:
                 pass
-            codedew_url, debug_lines, driver = await loop.run_in_executor(
-                None, get_codedew_link, item["watch_url"], True
-            )
+            codedew_url, debug_lines, driver = await job_ctl.run_in_thread(get_codedew_link, item["watch_url"], True)
             if codedew_url:
                 uploaded_results = await _run_swift(
-                    client, message, codedew_url, encode=False, episode_label=ep_label,
+                    client, message, codedew_url, encode=False,
+                    episode_label=(None if job_ctl.CURRENT.get() is not None else ep_label),
                     show_url=False, fast=True, driver=driver,
                 )
                 driver = None
@@ -960,33 +959,64 @@ async def _process_toono_item(client, message, item: dict, status_msg, index: in
 
 
 async def _download_toono_items(client, status_msg, orig_message, sess: "ToonoSelector", idxs: list):
+    """
+    Toono items line by line. Poora process EK card message mein + ❌ Cancel button.
+    """
     total = len(idxs)
-    all_ok = True
+    job = job_ctl.Job(status_msg, orig_message.from_user.id, title=(sess.title or "Toono")[:55])
+    state = {"ok": 0, "last": "ok"}
     pf = {}
-    for i, idx in enumerate(idxs, 1):
-        item = sess.items[idx]
-        next_item = sess.items[idxs[i]] if i < total else None
-        prefetched = pf.pop("fut", None)
-        result = await _process_toono_item(
-            client, orig_message, item, status_msg, i, total, sess=sess,
-            prefetched=prefetched, next_item=next_item, pf=pf,
-        )
-        if result != "ok":
-            all_ok = False
-            break
-        if i < total:
-            await asyncio.sleep(1)
 
-    # Sirf success (all_ok) pe status_msg delete karo — error/fail message
-    # ko turant delete karne se pehle wala bug tha: "Link Fail" / "Upload
-    # Error" wala message ek fatak dikhta tha phir turant gayab ho jaata
-    # tha, isliye pata hi nahi chalta tha kya error aaya. Ab error hone pe
-    # message wahi rehta hai taaki error text padh sako.
-    if all_ok:
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
+    async def _body():
+        stage = job.slot("stage", order=0)
+        for i, idx in enumerate(idxs, 1):
+            item = sess.items[idx]
+            next_item = sess.items[idxs[i]] if i < total else None
+            prefetched = pf.pop("fut", None)
+            job.header = f"📺 **S{item['season']}E{item['num']:02d}** • `{i}/{total}`"
+            job.reset_slots(keep=("stage",))
+            result = await _process_toono_item(
+                client, orig_message, item, stage, i, total, sess=sess,
+                prefetched=prefetched, next_item=next_item, pf=pf,
+            )
+            state["last"] = result
+            if result != "ok":
+                break
+            state["ok"] += 1
+            job.done_eps.append(f"S{item['season']}E{item['num']:02d}")
+            if i < total:
+                await asyncio.sleep(1)
+
+    async def _drop_prefetch():
+        fut = pf.pop("fut", None)
+        if fut is not None:
+            try:
+                _c, _d, drv = await asyncio.wait_for(fut, timeout=30)
+                if drv is not None:
+                    await job_ctl.run_in_thread(_kill_driver_tree, drv)
+            except BaseException:
+                pass
+    job.cleanups.append(_drop_prefetch)
+
+    try:
+        await job.run(_body)
+    except Exception as e:
+        LOGGER.error(f"[Toono] _download_toono_items error: {e}")
+        state["last"] = "error"
+        job.slot("stage", order=0).text = f"❌ `{str(e)[:150]}`"
+
+    if job.cancelled:
+        return
+    job.reset_slots(keep=("stage",))
+    if state["last"] == "ok":
+        await job.finish(
+            f"🎉 **Complete!** — {job.title}\n\n"
+            f"✅ `{state['ok']}/{total}` upload ho gaye\n"
+            f"📋 {' '.join(job.done_eps[-12:])}"
+        )
+    else:
+        job.finished = False
+        await job.finish(job.render() + f"\n\n⛔ Process band ho gaya (`{state['ok']}/{total}` complete).")
 
 
 # ─────────────────────────────────────────────

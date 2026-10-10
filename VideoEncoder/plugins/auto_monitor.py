@@ -33,6 +33,7 @@ Commands:
 """
 
 import asyncio
+import functools
 import glob
 import html
 import logging
@@ -46,6 +47,7 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 from pyrogram.enums import ParseMode
 
 from .. import LOGGER, app, owner, sudo_users, download_dir, log
+from ..utils import job_ctl
 from ..utils.database.access_db import db
 from ..utils.anime_api import fetch_anime_details
 from ..utils.helper import check_chat
@@ -348,13 +350,22 @@ async def _episode_quality_poller(
     else:
         proxy_msg = _ProxyMsg(log_message, owner_id, channel_id)
 
-    status_msg = await log_message.reply(
+    _job = job_ctl.CURRENT.get()
+    status_msg = await job_ctl.stage_msg(
+        log_message,
         f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
         f"⏳ Swift page scan ho raha hai..."
     )
 
     mark_active, unmark_active, should_stop, _, _, _, _ = _get_upload_control_fns()
     mark_active(anime_name, episode_num, status_msg)
+    if _job is not None:
+        async def _unmark_on_cancel(_a=anime_name, _e=episode_num):
+            try:
+                unmark_active(_a, _e)
+            except Exception:
+                pass
+        _job.cleanups.append(_unmark_on_cancel)
 
     async def _mark_cancelled():
         try:
@@ -414,9 +425,17 @@ async def _episode_quality_poller(
         poll_dl_dir = os.path.join(download_dir, poll_session_id)
         os.makedirs(poll_dl_dir, exist_ok=True)
 
+        _poll_prog = {"phase": "scan", "dls": {}}
+        if _job is not None:
+            _job.dirs.add(poll_dl_dir)
+            _poll_prog["cancel"] = _job.cancel_ev
+            _poll_prog["job"] = _job
+            _job.progresses.append(_poll_prog)
         try:
             poll_result = await loop.run_in_executor(
-                None, _scrape_and_download, swift_url, poll_dl_dir, None, None
+                None, functools.partial(
+                    _scrape_and_download, swift_url, poll_dl_dir, None, None, progress=_poll_prog
+                )
             )
         except Exception as e:
             LOGGER.error(f"[AutoMonitor] Poll Ep {episode_num} attempt {poll_attempt} error: {e}")
@@ -466,6 +485,9 @@ async def _episode_quality_poller(
             if _PARALLEL_UPLOAD_AM and not _bot_mode_active and len(new_files) > 1:
                 _uid_pc = proxy_msg.from_user.id
                 _poll_ucs = [u for u in await _preconnect_uploaders(_uid_pc, len(new_files)) if u]
+                if _job is not None and _poll_ucs:
+                    from .swift_downloader import _close_uploaders as _cu
+                    _job.cleanups.append(functools.partial(_cu, _poll_ucs))
         except Exception as _pce:
             LOGGER.warning(f"[AutoMonitor] preconnect failed: {_pce!r}")
             _poll_ucs = []
@@ -474,7 +496,8 @@ async def _episode_quality_poller(
         for fp in new_files:
             q = _quality_from(os.path.basename(fp))
             try:
-                dm = await log_message.reply(f"📤 **Uploading `{q}`** — Ep `{episode_num}`...")
+                from .swift_downloader import _new_status as _ns
+                dm = await _ns(log_message, f"📤 **Uploading `{q}`** — Ep `{episode_num}`...", q)
                 _dummy_msgs_poll[fp] = dm
             except Exception:
                 _dummy_msgs_poll[fp] = status_msg
@@ -905,7 +928,7 @@ async def _get_swift_url_for_episode(page_url: str, episode_num: int, status_msg
     except Exception:
         pass
 
-    wmq_link, _ = await loop.run_in_executor(None, get_watchmult_link, page_url, episode_num)
+    wmq_link, _ = await job_ctl.run_in_thread(get_watchmult_link, page_url, episode_num)
     if not wmq_link:
         return None
 
@@ -917,7 +940,7 @@ async def _get_swift_url_for_episode(page_url: str, episode_num: int, status_msg
     except Exception:
         pass
 
-    argon_link = await loop.run_in_executor(None, get_argon_link, wmq_link)
+    argon_link = await job_ctl.run_in_thread(get_argon_link, wmq_link)
     if not argon_link:
         return None
 
@@ -1297,6 +1320,19 @@ async def _channel_seen_recorder(client: Client, message: Message):
 #  Monitor Channel Message Handler
 # ─────────────────────────────────────────────
 async def _handle_channel_post(client: Client, message: Message, edited: bool = False):
+    """Wrapper: processing ek card message + ❌ Cancel button ke saath (card tabhi banta hai jab kuch dikhana ho)."""
+    try:
+        _oid = await _owner_id()
+    except Exception:
+        _oid = None
+    await job_ctl.run_with_card(
+        message, "AutoMonitor",
+        lambda: _handle_channel_post_impl(client, message, edited),
+        owner_id=_oid or 0,
+    )
+
+
+async def _handle_channel_post_impl(client: Client, message: Message, edited: bool = False):
     monitor_ch = await _get_monitor_channel()
     is_monitor = bool(monitor_ch) and message.chat.id == monitor_ch
     text = message.text or message.caption or ""
@@ -1392,7 +1428,12 @@ async def _handle_channel_post(client: Client, message: Message, edited: bool = 
             continue
 
         # Swift URL nikalo
-        prep_msg = await message.reply(
+        _jb = job_ctl.CURRENT.get()
+        if _jb is not None:
+            _jb.header = f"📺 **Ep {ep_num}** • `{i}/{total}`"
+            _jb.reset_slots(keep=("stage",))
+        prep_msg = await job_ctl.stage_msg(
+            message,
             f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{ep_num}/{end_ep}`\n\n"
             f"🔍 Swift URL nikaal raha hoon..."
         )
@@ -1455,6 +1496,8 @@ async def _handle_channel_post(client: Client, message: Message, edited: bool = 
         )
         if ep_uploaded:
             any_ep_uploaded = True
+            if _jb is not None:
+                _jb.done_eps.append(f"EP{ep_num:02d}")
 
         # Episodes ke beech thoda gap
         if not is_last:
@@ -1551,6 +1594,11 @@ async def cmd_rtic(client: Client, message: Message):
     c = await check_chat(message, chat="Sudo")
     if not c:
         return
+    # Ek card message + ❌ Cancel button (card tabhi banta hai jab kuch dikhana ho)
+    await job_ctl.run_with_card(message, "Rtic", lambda: _cmd_rtic_impl(client, message))
+
+
+async def _cmd_rtic_impl(client: Client, message: Message):
 
     get_latest_episode = _get_rti_latest_fn()
 
@@ -1579,7 +1627,7 @@ async def cmd_rtic(client: Client, message: Message):
 
     # ── Episode range decide karo (waisa hi jaisa /rti) ──
     if len(parts) == 2:
-        prep = await message.reply("🔍 Latest episode detect ho raha hai...")
+        prep = await job_ctl.stage_msg(message, "🔍 Latest episode detect ho raha hai...")
         loop = asyncio.get_event_loop()
         latest_ep, page_title = await loop.run_in_executor(None, get_latest_episode, page_url)
         if not latest_ep:
@@ -1602,7 +1650,7 @@ async def cmd_rtic(client: Client, message: Message):
         if end_ep - start_ep > 50:
             await message.reply("❌ Max 50 episodes ek baar mein.")
             return
-        prep = await message.reply(f"🔍 `{page_url.split('//')[-1].split('/')[0]}` se anime naam nikal raha hoon...")
+        prep = await job_ctl.stage_msg(message, f"🔍 `{page_url.split('//')[-1].split('/')[0]}` se anime naam nikal raha hoon...")
         loop = asyncio.get_event_loop()
         _, page_title = await loop.run_in_executor(None, get_latest_episode, page_url)
 
@@ -1652,7 +1700,12 @@ async def cmd_rtic(client: Client, message: Message):
             await message.reply(f"⏭️ **Skipped** — `{anime_name}` {ep_lbl} (cancel request).")
             continue
 
-        find_msg = await message.reply(
+        _jb = job_ctl.CURRENT.get()
+        if _jb is not None:
+            _jb.header = f"📺 **{ep_lbl}** • `{i}/{total}`"
+            _jb.reset_slots(keep=("stage",))
+        find_msg = await job_ctl.stage_msg(
+            message,
             f"🎌 **Rtic** | `{anime_name}` | {ep_lbl}\n\n"
             f"🔍 Swift URL nikaal raha hoon..."
         )
@@ -1707,6 +1760,8 @@ async def cmd_rtic(client: Client, message: Message):
         )
         if ep_uploaded:
             any_ep_uploaded = True
+            if _jb is not None:
+                _jb.done_eps.append(ep_lbl.replace(" ", ""))
 
         if not is_last:
             await asyncio.sleep(3)
