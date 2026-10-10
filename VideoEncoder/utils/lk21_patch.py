@@ -6,9 +6,12 @@ if not hasattr(re, "sre_parse"):
     import re._parser
     re.sre_parse = re._parser
 
-def safe_urlparse(url):
+def safe_urlparse(url, *args, **kwargs):
+    # FIX: urljoin/urlunparse etc. urlparse(url, scheme, allow_fragments) ke
+    # saath call karte hain — pehle sirf 1 arg leta tha => "takes 1 positional
+    # argument but 3 were given". Ab saare args original ko forward hote hain.
     try:
-        return urllib.parse._urlparse(url)
+        return urllib.parse._urlparse(url, *args, **kwargs)
     except Exception:
         return urllib.parse._urlparse("http://invalid")
 
