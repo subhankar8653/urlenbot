@@ -46,6 +46,45 @@ IDLE_BEFORE_RESTART = 120                                          # sec continu
 _idle_since = None
 _started = False
 
+# ── Restart guard (FIX: baar-baar restart loop) ─────────────────────────
+# Bug tha: os.execv process ko replace karta hai par PID SAME rehta hai,
+# isliye psutil create_time() kabhi reset nahi hota tha => uptime hamesha
+# limit se zyada => har ~6 min mein "routine refresh" restart.
+# Fix: apna boot-time env mein rakho (execv ke baad bhi bacha rehta hai),
+# aur restart ke beech minimum gap (cooldown) lagao.
+_BOOT_ENV = "JANITOR_BOOT_TS"
+_LAST_RESTART_ENV = "JANITOR_LAST_RESTART_TS"
+ROUTINE_MIN_UPTIME_H = max(MAX_UPTIME_H, 24.0)          # routine refresh kabhi 24h se pehle nahi
+ROUTINE_COOLDOWN_H = 24.0                               # routine refresh din mein max 1 baar
+EMERGENCY_COOLDOWN_H = float(os.getenv("JANITOR_EMERGENCY_COOLDOWN_H", "6"))  # RAM/disk restart gap
+ROUTINE_REFRESH_ENABLED = os.getenv("JANITOR_ROUTINE_REFRESH", "1") not in ("0", "false", "False", "no")
+
+
+def _boot_ts() -> float:
+    """Bot ka asli start time (execv-restart ke baad bhi sahi)."""
+    try:
+        v = os.environ.get(_BOOT_ENV)
+        if v:
+            return float(v)
+    except ValueError:
+        pass
+    ts = time.time()
+    os.environ[_BOOT_ENV] = str(ts)
+    return ts
+
+
+def _hours_since_last_restart() -> float:
+    try:
+        v = os.environ.get(_LAST_RESTART_ENV)
+        if v:
+            return (time.time() - float(v)) / 3600
+    except ValueError:
+        pass
+    return 1e9   # kabhi restart nahi hua
+
+
+_boot_ts()   # import par hi boot time lock kar do
+
 
 # ── helpers ─────────────────────────────────────────────────────────────
 def _entry_mtime(path: str) -> float:
@@ -341,6 +380,8 @@ async def soft_restart(reason: str):
         LOGGER.info("[Janitor] restart skipped — bot busy")
         return
     LOGGER.warning(f"[Janitor] Soft restart: {reason}")
+    # execv ke baad bhi yaad rahe ki abhi restart hua tha (cooldown ke liye)
+    os.environ[_LAST_RESTART_ENV] = str(time.time())
     try:
         for uid in owner[:1]:
             await app.send_message(uid, f"<b>♻️ Auto-refresh:</b> {reason}\nBot 5 sec mein wapas aa raha hai.")
@@ -381,13 +422,18 @@ async def janitor_loop():
             used, limit = container_mem()
             mem_pct = used / limit * 100 if limit else 0
             free, pct = disk_stats()
-            uptime_h = (time.time() - psutil.Process(os.getpid()).create_time()) / 3600
+            uptime_h = (time.time() - _boot_ts()) / 3600
+            since_restart_h = _hours_since_last_restart()
 
-            if mem_pct > MEM_RESTART_PCT:
+            # Emergency restarts (RAM / disk) — par cooldown ke saath, spam nahi
+            if since_restart_h >= EMERGENCY_COOLDOWN_H and mem_pct > MEM_RESTART_PCT:
                 await soft_restart(f"RAM {mem_pct:.0f}% (idle) — memory refresh")
-            elif free < 1 * 1024 ** 3:
+            elif since_restart_h >= EMERGENCY_COOLDOWN_H and free < 1 * 1024 ** 3:
                 await soft_restart("Disk almost full — cleanup restart")
-            elif uptime_h > MAX_UPTIME_H:
+            # Routine refresh — sirf 24h+ uptime par, aur din mein max 1 baar
+            elif (ROUTINE_REFRESH_ENABLED
+                  and uptime_h > ROUTINE_MIN_UPTIME_H
+                  and since_restart_h >= ROUTINE_COOLDOWN_H):
                 await soft_restart(f"{uptime_h:.0f}h uptime — routine refresh")
         except asyncio.CancelledError:
             raise
