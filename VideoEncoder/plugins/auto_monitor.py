@@ -353,7 +353,7 @@ async def _episode_quality_poller(
     _job = job_ctl.CURRENT.get()
     status_msg = await job_ctl.stage_msg(
         log_message,
-        f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
+        f"🎌 **AutoMonitor** | Ep `{episode_num}`\n\n"
         f"⏳ Swift page scan ho raha hai..."
     )
 
@@ -370,7 +370,7 @@ async def _episode_quality_poller(
     async def _mark_cancelled():
         try:
             await status_msg.edit(
-                f"🛑 **Cancelled!** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                f"🛑 **Cancelled!** | Ep `{episode_num}`\n\n"
                 f"User ne is episode ka process rok diya."
             )
         except Exception:
@@ -413,7 +413,7 @@ async def _episode_quality_poller(
 
         try:
             await status_msg.edit(
-                f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                f"🎌 **AutoMonitor** | Ep `{episode_num}`\n\n"
                 f"🔄 Poll `{poll_attempt}` {phase_lbl} | Elapsed: `{elapsed_min}m`\n"
                 f"🎯 Baki: `{' | '.join(sorted(remaining))}`\n"
                 f"⏳ Swift page scan ho raha hai..."
@@ -471,7 +471,7 @@ async def _episode_quality_poller(
         qualities_found = [_quality_from(os.path.basename(f)) for f in new_files]
         try:
             await status_msg.edit(
-                f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                f"🎌 **AutoMonitor** | Ep `{episode_num}`\n\n"
                 f"✅ Mili: `{' | '.join(qualities_found)}`\n"
                 f"📤 Upload ho raha hai..."
             )
@@ -616,7 +616,7 @@ async def _episode_quality_poller(
     if not remaining:
         try:
             await status_msg.edit(
-                f"🎉 **Complete!** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                f"🎉 **Complete!** | Ep `{episode_num}`\n\n"
                 f"✅ Uploaded: `{' → '.join(uploaded_qualities)}`\n"
                 f"⏱️ Time: `{poll_elapsed}m`"
             )
@@ -626,7 +626,7 @@ async def _episode_quality_poller(
         missing_str = ' | '.join(sorted(remaining))
         try:
             await status_msg.edit(
-                f"⚠️ **Incomplete!** | `{anime_name}` | Ep `{episode_num}`\n\n"
+                f"⚠️ **Incomplete!** | Ep `{episode_num}`\n\n"
                 f"❌ Timeout ke baad bhi nahi mili: `{missing_str}`\n"
                 f"✅ Jo mili: `{' | '.join(uploaded_qualities) or '—'}`\n\n"
                 f"RTI pe manually check karo."
@@ -1338,6 +1338,10 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
     text = message.text or message.caption or ""
     key = (message.chat.id, message.id)
 
+    # Bot ka apna progress card (chain reaction rokne ke liye) — ignore
+    if "━━━━━━━━━━━━━━" in text or text.lstrip().startswith(("🎌 AutoMonitor", "🎌 Rtic", "🛑 Cancelled", "🛑 Season Upload Cancelled")):
+        return
+
     if edited:
         # Sirf haal hi mein (10 min) edit hui, abhi tak process na hui post
         if key in _processed_posts or (time.time() - message.date.timestamp()) > 600:
@@ -1418,13 +1422,13 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
         if is_season_cancelled(anime_name):
             consume_season_cancel(anime_name)
             await message.reply(
-                f"🛑 **Season Upload Cancelled!** | `{anime_name}`\n\n"
+                f"🛑 **Season Upload Cancelled!**\n\n"
                 f"Baaki queued episodes (`{ep_num}`-`{end_ep}`) skip kar diye gaye."
             )
             break
         if is_episode_cancelled(anime_name, ep_num):
             consume_episode_cancel(anime_name, ep_num)
-            await message.reply(f"⏭️ **Skipped** — `{anime_name}` Ep `{ep_num}` (cancel request).")
+            await message.reply(f"⏭️ **Skipped** — Ep `{ep_num}` (cancel request).")
             continue
 
         # Swift URL nikalo
@@ -1434,7 +1438,7 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
             _jb.reset_slots(keep=("stage",))
         prep_msg = await job_ctl.stage_msg(
             message,
-            f"🎌 **AutoMonitor** | `{anime_name}` | Ep `{ep_num}/{end_ep}`\n\n"
+            f"🎌 **AutoMonitor** | Ep `{ep_num}/{end_ep}`\n\n"
             f"🔍 Swift URL nikaal raha hoon..."
         )
 
@@ -1454,7 +1458,7 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
             # Last attempt ke baad fail → bahar niklo
             if swift_attempt == SWIFT_MAX_ATTEMPTS:
                 await prep_msg.edit(
-                    f"❌ **AutoMonitor** | `{anime_name}` | Ep `{ep_num}`\n\n"
+                    f"❌ **AutoMonitor** | Ep `{ep_num}`\n\n"
                     f"⏱️ {SWIFT_MAX_ATTEMPTS} attempts (~25 min) ke baad bhi\n"
                     f"Swift URL nahi mila. RTI pe manually check karo."
                 )
@@ -1467,7 +1471,7 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
             remaining_attempts = SWIFT_MAX_ATTEMPTS - swift_attempt
             try:
                 await prep_msg.edit(
-                    f"⏳ **AutoMonitor** | `{anime_name}` | Ep `{ep_num}`\n\n"
+                    f"⏳ **AutoMonitor** | Ep `{ep_num}`\n\n"
                     f"🔄 Attempt `{swift_attempt}/{SWIFT_MAX_ATTEMPTS}` {phase_lbl} — Swift URL nahi mila\n"
                     f"⏰ `{interval}s` baad retry... ({remaining_attempts} attempts left)"
                 )
@@ -1480,9 +1484,8 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
             continue
 
         await prep_msg.edit(
-            f"✅ **AutoMonitor** | `{anime_name}` | Ep `{ep_num}`\n\n"
-            f"Swift URL mila! Quality poller shuru...\n"
-            f"`{swift_url}`"
+            f"✅ **AutoMonitor** | Ep `{ep_num}`\n\n"
+            f"Swift URL mila! Quality poller shuru..."
         )
 
         # Episode fully complete hone ke baad hi agli episode shuru karo (sequential)
@@ -1691,13 +1694,13 @@ async def _cmd_rtic_impl(client: Client, message: Message):
         if is_season_cancelled(anime_name):
             consume_season_cancel(anime_name)
             await message.reply(
-                f"🛑 **Season Upload Cancelled!** | `{anime_name}`\n\n"
+                f"🛑 **Season Upload Cancelled!**\n\n"
                 f"Baaki queued episodes skip kar diye gaye."
             )
             break
         if is_episode_cancelled(anime_name, ep_num):
             consume_episode_cancel(anime_name, ep_num)
-            await message.reply(f"⏭️ **Skipped** — `{anime_name}` {ep_lbl} (cancel request).")
+            await message.reply(f"⏭️ **Skipped** — {ep_lbl} (cancel request).")
             continue
 
         _jb = job_ctl.CURRENT.get()
@@ -1706,7 +1709,7 @@ async def _cmd_rtic_impl(client: Client, message: Message):
             _jb.reset_slots(keep=("stage",))
         find_msg = await job_ctl.stage_msg(
             message,
-            f"🎌 **Rtic** | `{anime_name}` | {ep_lbl}\n\n"
+            f"🎌 **Rtic** | {ep_lbl}\n\n"
             f"🔍 Swift URL nikaal raha hoon..."
         )
 
@@ -1722,7 +1725,7 @@ async def _cmd_rtic_impl(client: Client, message: Message):
 
             if swift_attempt == SWIFT_MAX_ATTEMPTS:
                 await find_msg.edit(
-                    f"❌ **Rtic** | `{anime_name}` | {ep_lbl}\n\n"
+                    f"❌ **Rtic** | {ep_lbl}\n\n"
                     f"⏱️ {SWIFT_MAX_ATTEMPTS} attempts (~25 min) ke baad bhi\n"
                     f"link nahi mila. RTI pe manually check karo."
                 )
@@ -1734,7 +1737,7 @@ async def _cmd_rtic_impl(client: Client, message: Message):
             remaining_attempts = SWIFT_MAX_ATTEMPTS - swift_attempt
             try:
                 await find_msg.edit(
-                    f"⏳ **Rtic** | `{anime_name}` | {ep_lbl}\n\n"
+                    f"⏳ **Rtic** | {ep_lbl}\n\n"
                     f"🔄 Attempt `{swift_attempt}/{SWIFT_MAX_ATTEMPTS}` {phase_lbl} — link nahi mila\n"
                     f"⏰ `{interval}s` baad retry... ({remaining_attempts} attempts left)"
                 )
