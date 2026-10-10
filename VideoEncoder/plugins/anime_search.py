@@ -94,39 +94,29 @@ _LANG_CUT = re.compile(
 )
 
 
-def make_label(title: str) -> str:
-    """
-    'Naruto Shippuden Season 06 – Episodes Hindi Dubbed Download HD'
-        -> 'S06 Hindi Dub Naruto Shippuden'
-    'Finding Nemo (2003) Movie Hindi Dubbed Download'
-        -> 'Hindi Dub Finding Nemo (2003) Movie'
-    Format: Season • Language • Dub/Sub • Name • (Movie)
-    """
+def label_parts(title: str):
+    """-> (label, season_no, name, is_movie)"""
     t = _clean(title)
     low = t.lower()
 
-    # season
     m = re.search(r"\bseason\s*0*(\d+)", t, re.I)
     season = int(m.group(1)) if m else None
 
-    # movie?
     has_year = bool(re.search(r"\(\d{4}\)", t))
     is_movie = bool(re.search(r"\bmovie\b", low)) or (
         has_year and season is None and "episode" not in low
     )
 
-    # language
     langs = []
-    for key, name in (("hindi", "Hindi"), ("english", "English"), ("tamil", "Tamil"),
-                      ("telugu", "Telugu"), ("japanese", "Japanese")):
+    for key, nm in (("hindi", "Hindi"), ("english", "English"), ("tamil", "Tamil"),
+                    ("telugu", "Telugu"), ("japanese", "Japanese")):
         if re.search(rf"\b{key}\b", low):
-            langs.append(name)
+            langs.append(nm)
     if re.search(r"\bdual\s*audio\b", low):
         langs.append("Dual Audio")
     if re.search(r"\bmulti[\s-]*audio\b", low):
         langs.append("Multi Audio")
 
-    # dub / sub
     kind = ""
     if re.search(r"\bdubbed\b|\bdub\b", low):
         kind = "Dub"
@@ -136,7 +126,6 @@ def make_label(title: str) -> str:
     if kind:
         lang = f"{lang} {kind}".strip()
 
-    # name
     name = re.sub(r"\bseason\s*0*\d+", "", t, flags=re.I)
     name = re.sub(r"\bmovie\b", "", name, flags=re.I)
     name = re.sub(r"\s{2,}", " ", name).strip()
@@ -144,16 +133,40 @@ def make_label(title: str) -> str:
     name = cut if cut else name.strip(" –—:|-")
 
     parts = []
-    if season is not None:
-        parts.append(f"S{season:02d}")
-    elif not is_movie:
-        parts.append("S01")
-    if lang:
-        parts.append(lang)
-    parts.append(name)
     if is_movie:
-        parts.append("Movie")
-    return " ".join(parts)
+        parts.append("[Movie]")                       # movie: S01 nahi, seedha Movie
+    else:
+        parts.append(f"[S{(season if season is not None else 1):02d}]")
+    if lang:
+        parts.append(f"[{lang}]")
+    parts.append(name)
+    return " ".join(parts), (season if season is not None else (0 if is_movie else 1)), name, is_movie
+
+
+def make_label(title: str) -> str:
+    """
+    'Naruto Shippuden Season 06 – Episodes Hindi Dubbed Download HD'
+        -> '[S06] [Hindi Dub] Naruto Shippuden'
+    'Finding Nemo (2003) Movie Hindi Dubbed Download'
+        -> '[Movie] [Hindi Dub] Finding Nemo (2003)'
+    """
+    return label_parts(title)[0]
+
+
+def sort_results(results: list) -> list:
+    """Ek anime ke saare seasons saath-saath, S01 -> S02 -> S03 order mein.
+    Anime ka order wahi rehta hai jo site ne diya (pehla dikha pehle)."""
+    order, groups = [], {}
+    for r in results:
+        key = r["name"].lower()
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(r)
+    out = []
+    for key in order:
+        out.extend(sorted(groups[key], key=lambda x: (x["season"], x["title"])))
+    return out
 
 
 # ───────────────────────── parsing ─────────────────────────
@@ -194,7 +207,11 @@ def parse_results(page_html: str, base_url: str):
         if href in seen:
             continue
         seen.add(href)
-        results.append({"title": title, "url": href, "label": make_label(title)})
+        label, season_no, name, is_movie = label_parts(title)
+        results.append({"title": title, "url": href, "label": label,
+                        "season": season_no, "name": name, "movie": is_movie})
+
+    results = sort_results(results)
 
     next_url = None
     nxt = soup.select_one("a.next.page-numbers, a.next, a[rel=next], .nav-links a.next")
