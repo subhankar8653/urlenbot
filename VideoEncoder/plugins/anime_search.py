@@ -24,7 +24,8 @@ import html as _html
 import re
 import time
 import uuid
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import quote_plus
+import traceback
 
 import requests
 from bs4 import BeautifulSoup
@@ -43,7 +44,37 @@ from . import rti_downloader as rti
 import os
 
 SITE = os.getenv("ANIME_SITE", "https://www.rareanimes.mov").rstrip("/")
-SITE_HOST = urlparse(SITE).netloc.replace("www.", "")
+
+
+def _host(u: str) -> str:
+    # urllib.parse.urlparse pe project mein global monkey-patch hai (lk21_patch),
+    # isliye yahan apna simple regex helper use karte hain.
+    m = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://([^/?#]+)", u or "")
+    return (m.group(1) if m else "").lower().replace("www.", "")
+
+
+def _path(u: str) -> str:
+    m = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/?#]+([^?#]*)", u or "")
+    return m.group(1) if m else ""
+
+
+def _join(base: str, href: str) -> str:
+    href = (href or "").strip()
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", href):
+        return href
+    m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*://[^/?#]+)(/[^?#]*)?", base)
+    root = m.group(1) if m else SITE
+    if href.startswith("//"):
+        return root.split("://")[0] + ":" + href
+    if href.startswith("/"):
+        return root + href
+    if href.startswith("?"):
+        return root + (m.group(2) or "/" if m else "/") + href
+    cur = (m.group(2) or "/") if m else "/"
+    return root + cur.rsplit("/", 1)[0] + "/" + href
+
+
+SITE_HOST = _host(SITE)
 
 SESSIONS = {}
 SESSION_TIMEOUT = 3600
@@ -58,7 +89,7 @@ _SKIP_PATH = re.compile(
 
 # ───────────────────────── parsing ─────────────────────────
 def _same_site(href: str) -> bool:
-    return urlparse(href).netloc.replace("www.", "") == SITE_HOST
+    return _host(href) == SITE_HOST
 
 
 def _clean(t: str) -> str:
@@ -84,11 +115,11 @@ def parse_results(page_html: str, base_url: str):
 
     results, seen = [], set()
     for a in anchors:
-        href = urljoin(base_url, a.get("href", ""))
+        href = _join(base_url, a.get("href", ""))
         title = _clean(a.get_text(" ", strip=True))
         if not title or not _same_site(href):
             continue
-        path = urlparse(href).path
+        path = _path(href)
         if path in ("", "/") or _SKIP_PATH.search(path) or "?s=" in href:
             continue
         if href in seen:
@@ -104,7 +135,7 @@ def parse_results(page_html: str, base_url: str):
                 nxt = a
                 break
     if nxt and nxt.get("href"):
-        next_url = urljoin(base_url, nxt["href"])
+        next_url = _join(base_url, nxt["href"])
     return results, next_url
 
 
@@ -209,17 +240,41 @@ def _selenium_search(query: str):
 
 
 def search_anime(query: str):
-    """-> (results, next_url)"""
+    """-> (results, next_url). Fail hone par poori wajah ke saath error uthata hai."""
     url = f"{SITE}/?s={quote_plus(query)}"
+    notes = []
+
+    # 1) Fast path: seedha search URL
     try:
-        results, nxt = parse_results(_fetch_requests(url), url)
+        page_html = _fetch_requests(url)
+        results, nxt = parse_results(page_html, url)
         if results:
             return results, nxt
+        title = BeautifulSoup(page_html, "html.parser").title
+        notes.append(
+            f"[requests] page aaya ({len(page_html)} bytes, title="
+            f"{_clean(title.get_text()) if title else 'none'}) par 0 result parse hue"
+        )
     except Exception as e:
-        LOGGER.info(f"[Anime] requests search fail ({e}) — selenium fallback")
+        notes.append(f"[requests] {type(e).__name__}: {str(e)[:200]}")
+        LOGGER.warning(f"[Anime] requests fail: {e}")
 
-    cur_url, page_html = _selenium_search(query)
-    return parse_results(page_html, cur_url)
+    # 2) Fallback: Selenium click-flow
+    try:
+        cur_url, page_html = _selenium_search(query)
+        results, nxt = parse_results(page_html, cur_url)
+        if results:
+            return results, nxt
+        notes.append(f"[selenium] url={cur_url} par 0 result parse hue ({len(page_html)} bytes)")
+    except Exception as e:
+        notes.append(f"[selenium] {type(e).__name__}: {str(e)[:200]}")
+        LOGGER.error(f"[Anime] selenium fail:\n{traceback.format_exc()}")
+
+    raise SearchError("\n".join(notes))
+
+
+class SearchError(Exception):
+    pass
 
 
 # ───────────────────────── session / UI ─────────────────────────
@@ -273,6 +328,11 @@ def _prune():
         SESSIONS.pop(k, None)
 
 
+def _short(e, n=900) -> str:
+    t = f"{type(e).__name__}: {e}" if not isinstance(e, SearchError) else str(e)
+    return t[:n]
+
+
 # ───────────────────────── handlers ─────────────────────────
 @Client.on_message(filters.command("anime"))
 async def anime_command(client: Client, message: Message):
@@ -298,8 +358,12 @@ async def anime_command(client: Client, message: Message):
     try:
         results, nxt = await loop.run_in_executor(None, search_anime, query)
     except Exception as e:
-        LOGGER.error(f"[Anime] search error: {e}")
-        await status.edit(f"❌ Search fail: `{str(e)[:100]}`")
+        LOGGER.error(f"[Anime] search error:\n{traceback.format_exc()}")
+        await status.edit(
+            f"❌ **Search fail** — `{query}`\n"
+            f"🔗 {SITE}/?s={quote_plus(query)}\n\n"
+            f"**Wajah:**\n```\n{_short(e)}\n```"
+        )
         return
 
     if not results:
@@ -358,8 +422,8 @@ async def anime_callback(client: Client, cb: CallbackQuery):
                 page_html = await loop.run_in_executor(None, fetch_page, nxt)
                 results, n2 = parse_results(page_html, nxt)
             except Exception as e:
-                LOGGER.error(f"[Anime] next page error: {e}")
-                await cb.message.reply(f"❌ Next page nahi khula: `{str(e)[:100]}`")
+                LOGGER.error(f"[Anime] next page error:\n{traceback.format_exc()}")
+                await cb.message.reply(f"❌ **Next page nahi khula**\n🔗 {nxt}\n```\n{_short(e)}\n```")
                 return
             if not results:
                 await cb.message.reply("❌ Next page pe kuch nahi mila.")
@@ -378,8 +442,8 @@ async def anime_callback(client: Client, cb: CallbackQuery):
             try:
                 data = await loop.run_in_executor(None, rti.discover_items, item["url"])
             except Exception as e:
-                LOGGER.error(f"[Anime] discover error: {e}")
-                await status.edit(f"❌ Page load nahi hua: `{str(e)[:100]}`")
+                LOGGER.error(f"[Anime] discover error:\n{traceback.format_exc()}")
+                await status.edit(f"❌ **Page load nahi hua**\n🔗 {item['url']}\n```\n{_short(e)}\n```")
                 return
             if not data["items"]:
                 await status.edit("❌ Is page pe koi episode/movie link nahi mila.")
@@ -400,8 +464,8 @@ async def anime_callback(client: Client, cb: CallbackQuery):
 
         await cb.answer()
     except Exception as e:
-        LOGGER.error(f"[Anime] callback error: {e}")
+        LOGGER.error(f"[Anime] callback error:\n{traceback.format_exc()}")
         try:
-            await cb.answer("❌ Error, dubara try karo.", show_alert=True)
+            await cb.answer(f"❌ {_short(e, 180)}", show_alert=True)
         except Exception:
             pass
