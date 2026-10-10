@@ -77,7 +77,7 @@ ITEM_PATTERNS = [
 
 # ─────────────────────────────────────────────
 #  NEW: RTI ka apna "Channel Upload" toggle — per user save hota hai.
-#  ON hone pe har successful upload us user ke pehle se /addchannel se
+#  ON hone pe har successful upload us anime ke /add_anime wale channel pe (pehle /addchannel se)
 #  add kiye gaye channel pe bhi copy ho jaata hai. Default OFF.
 #
 #  ("Update Post" toggle iske bilkul alag hai — woh RTISelector session
@@ -348,7 +348,8 @@ class RTISelector:
             mark = "✅ " if 0 in self.selected else "🎬 "
             rows.append([(f"{mark}Movie", f"rti_ep_{sid}_0")])
         else:
-            rows.append([(f"🏝️ SEASON {self.season:02d}", f"rti_noop_{sid}")])
+            ep_count = sum(1 for it in self.items if it.get("kind") == "EP") or len(self.items)
+            rows.append([(f"🏝️ SEASON {self.season:02d} • ⬇️ Download All ({ep_count})", f"rti_season_{sid}")])
 
             row = []
             for idx, item in self.page_items():
@@ -662,7 +663,7 @@ def argon_to_swift(argon_url: str):
 #  Step 4: Download + Sequential upload
 # ─────────────────────────────────────────────
 async def _run_rti_swift(client, message: Message, swift_url: str, status_msg, ep_num: int, total_eps: int,
-                          sess: "RTISelector" = None):
+                          sess: "RTISelector" = None, page_url: str = ""):
     from .swift_downloader import _run_swift
     ep_label = "Movie" if ep_num == 0 else f"Ep {ep_num}/{total_eps}"
     # /swift wala exact flow use karo — download + queued messages + sequential upload
@@ -671,7 +672,7 @@ async def _run_rti_swift(client, message: Message, swift_url: str, status_msg, e
     uploaded_results = await _run_swift(
         client, message, swift_url, encode=False, episode_label=ep_label, show_url=False
     )
-    await _forward_to_channel_if_enabled(client, message, uploaded_results)
+    await _forward_to_channel_if_enabled(client, message, uploaded_results, sess=sess, page_url=page_url)
     await _send_update_post_if_enabled(client, sess, ep_num, uploaded_results)
     return True
 
@@ -699,10 +700,23 @@ async def _send_update_post_if_enabled(client, sess: "RTISelector", ep_num: int,
         LOGGER.error(f"[RTI] Update post error: {e}")
 
 
-async def _forward_to_channel_if_enabled(client, message: Message, uploaded_results):
+async def _find_add_anime_channel(title: str, page_url: str = ""):
     """
-    "📤 Channel Upload" toggle ON hai to har uploaded quality ko user ke
-    pehle se /addchannel se add kiye gaye channel pe bhi copy kar do.
+    /add_anime list mein se is anime ka channel dhundo (Rtic jaisa hi matching).
+    -> (anime_entry | None, anime_list)
+    """
+    from .auto_monitor import _get_anime_list, _find_matching_anime
+    anime_list = await _get_anime_list()
+    if not anime_list:
+        return None, []
+    return _find_matching_anime(f"{title} {page_url}", anime_list), anime_list
+
+
+async def _forward_to_channel_if_enabled(client, message: Message, uploaded_results, sess: "RTISelector" = None,
+                                         page_url: str = ""):
+    """
+    "📤 Channel Upload" toggle ON hai to har uploaded quality ko /add_anime se
+    add kiye gaye us anime ke channel pe copy kar do (anime ka naam match karke).
     Bot chat mein upload waise hi normal rehta hai — yeh sirf ek extra copy hai.
     """
     if not uploaded_results:
@@ -712,12 +726,22 @@ async def _forward_to_channel_if_enabled(client, message: Message, uploaded_resu
         enabled = await _get_rti_channel_upload(user_id)
         if not enabled:
             return
-        channels = await db.get_channels(user_id)
-        if not channels:
+        m_title = sess.title if sess else ""
+        m_url = sess.page_url if sess else page_url
+        if not (m_title or m_url):
             return
-        target_id = channels[0].get("channel_id")
-        if not target_id:
+        entry, anime_list = await _find_add_anime_channel(m_title, m_url)
+        if not entry or not entry.get("channel_id"):
+            try:
+                await message.reply(
+                    f"⚠️ **Channel upload skip** — `{(m_title or m_url)[:60]}`\n"
+                    f"Ye anime `/add_anime` list mein nahi mila, isliye channel pe nahi bheja.\n"
+                    f"Pehle `/add_anime` se add karo."
+                )
+            except Exception:
+                pass
             return
+        target_id = entry["channel_id"]
         for _quality, sent_msg in uploaded_results:
             try:
                 await client.copy_message(
@@ -725,8 +749,13 @@ async def _forward_to_channel_if_enabled(client, message: Message, uploaded_resu
                 )
             except Exception as e:
                 LOGGER.error(f"[RTI] Channel copy error: {e}")
+                try:
+                    await message.reply(f"❌ Channel copy fail (`{target_id}`): `{str(e)[:150]}`")
+                except Exception:
+                    pass
     except Exception as e:
         LOGGER.error(f"[RTI] _forward_to_channel_if_enabled error: {e}")
+
 
 async def _process_episode(client, message, page_url, episode_num, total_episodes, status_msg):
     """
@@ -812,7 +841,7 @@ async def _process_episode(client, message, page_url, episode_num, total_episode
             f"✅ **{ep_label}/{total_episodes} — Link mil gaya**\n\n"
             f"⬇️ Ab download shuru ho raha hai..."
         )
-        await _run_rti_swift(client, message, swift_url, status_msg, ep_num=episode_num, total_eps=total_episodes)
+        await _run_rti_swift(client, message, swift_url, status_msg, ep_num=episode_num, total_eps=total_episodes, page_url=page_url)
         return "ok"
     except Exception as e:
         LOGGER.error(f"[RTI] {ep_label} download/upload error: {e}")
@@ -936,6 +965,30 @@ async def rti_callback_handler(client: Client, cb: CallbackQuery):
             await cb.answer()
             return
 
+        if action == "season":
+            # SEASON button: us season ke saare episode apne aap select ho kar
+            # line by line (ek ke baad ek) download+upload honge — bilkul
+            # "/rti <url> 1 N" ki tarah.
+            idxs = [i for i, it in enumerate(sess.items) if it.get("kind") == "EP"]
+            if not idxs:
+                idxs = list(range(len(sess.items)))
+            idxs.sort(key=lambda i: (sess.items[i].get("num") or 0, i))
+            if not idxs:
+                await cb.answer("Is season mein koi episode nahi mila.", show_alert=True)
+                return
+            RTI_SESSIONS.pop(sid, None)
+            await cb.answer(f"⬇️ Season {sess.season}: {len(idxs)} episodes shuru...")
+            status_msg = cb.message
+            try:
+                await status_msg.edit(
+                    f"🎌 **Season {sess.season:02d}** — `{len(idxs)}` episodes line by line "
+                    f"(Ep {sess.items[idxs[0]].get('num')} → Ep {sess.items[idxs[-1]].get('num')})..."
+                )
+            except Exception:
+                pass
+            await _download_items(client, status_msg, sess.orig_message, sess, idxs)
+            return
+
         if action == "close":
             RTI_SESSIONS.pop(sid, None)
             await cb.answer()
@@ -967,13 +1020,20 @@ async def rti_callback_handler(client: Client, cb: CallbackQuery):
             new_val = not sess.channel_toggle
             if new_val:
                 try:
-                    channels = await db.get_channels(sess.orig_message.from_user.id)
+                    entry, anime_list = await _find_add_anime_channel(sess.title, sess.page_url)
                 except Exception as e:
-                    LOGGER.error(f"[RTI] channel lookup error: {e}")
-                    channels = []
-                if not channels:
+                    LOGGER.error(f"[RTI] add_anime lookup error: {e}")
+                    entry, anime_list = None, []
+                if not anime_list:
                     await cb.answer(
-                        "❌ Pehle /addchannel se ek channel add karo!", show_alert=True
+                        "❌ Pehle /add_anime se anime + channel add karo!", show_alert=True
+                    )
+                    return
+                if not entry:
+                    await cb.answer(
+                        f"❌ '{sess.title[:50]}' /add_anime list mein nahi hai.\n"
+                        f"Pehle /add_anime se is anime ko add karo.",
+                        show_alert=True,
                     )
                     return
             await _set_rti_channel_upload(sess.orig_message.from_user.id, new_val)
