@@ -516,7 +516,7 @@ async def cmd_end_message(client: Client, message: Message):
         "schedule_on", "schedule_off", "schedule_status",
         # encode / download commands
         "swift", "swiftdl", "swiftencode", "url", "mega", "meganow",
-        "rti", "dl", "ddl", "batch", "af",
+        "rti", "anime", "dl", "ddl", "batch", "af",
         # start / help / system
         "start", "help", "stats", "status", "clean", "restart", "update",
         "queue", "clear", "exec", "sh", "logs",

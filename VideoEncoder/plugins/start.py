@@ -56,6 +56,7 @@ async def help_message(app, message):
 - /stats - cpu stats
 
 For Sudo:
+- /anime <name> - RareAnimes search + /rti
 - /exec - Execute Python
 - /sh - Execute Shell
 - /vupload - video upload
