@@ -8,6 +8,8 @@ from .. import LOGGER
 from . import (direct_link_generator, display_progress, encoding, helper,
                settings, tasks)
 
+from . import btn_color   # noqa: E402 — coloured inline buttons (Bot API style hook)
+
 LOGGER.info('Imported Utils!')
 
 sauce = '''<b>VideoEncoder - a telegram bot for compressing/encoding videos in h264 format.</b>
