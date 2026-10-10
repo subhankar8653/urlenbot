@@ -225,7 +225,7 @@ async def _apply(token, chat_id, msg_id, markup):
 async def _worker(key):
     try:
         while key in _pending:
-            await asyncio.sleep(0.35)           # tez-tez edits ko collapse karo (latest hi lagega)
+            await asyncio.sleep(0.08)           # tez-tez sends ko collapse karo (latest hi lagega)
             token, markup = _pending.pop(key)
             await _apply(token, key[0], key[1], markup)
     finally:
@@ -241,6 +241,121 @@ def _enqueue(token, chat_id, msg_id, markup):
     if key not in _running:
         _running.add(key)
         asyncio.ensure_future(_worker(key))
+
+
+# ───────────────────────── FLICKER-FREE EDIT (single Bot API call) ─────────────────────────
+# Do-step tareeka (pehle Pyrogram edit -> colour hat jaata hai -> phir colour wapas) blink karta
+# tha. Isliye EDIT ko hi seedha Bot API se, colour ke saath, ek hi call mein bhejte hain; phir
+# Pyrogram ko chahiye hone wala result (edited Message) MTProto GetMessages se bana dete hain.
+# Kuch bhi gadbad ho to purane do-step tareeke par fallback (kabhi edit fail nahi hota).
+_ENT_SIMPLE = {
+    "MessageEntityBold": "bold", "MessageEntityItalic": "italic", "MessageEntityUnderline": "underline",
+    "MessageEntityStrike": "strikethrough", "MessageEntitySpoiler": "spoiler", "MessageEntityCode": "code",
+    "MessageEntityMention": "mention", "MessageEntityHashtag": "hashtag", "MessageEntityCashtag": "cashtag",
+    "MessageEntityBotCommand": "bot_command", "MessageEntityUrl": "url", "MessageEntityEmail": "email",
+    "MessageEntityPhone": "phone_number", "MessageEntityBankCard": "bank_card_number",
+}
+
+
+def entities_to_botapi(ents):
+    out = []
+    for e in ents or []:
+        n = type(e).__name__
+        d = {"offset": e.offset, "length": e.length}
+        if n in _ENT_SIMPLE:
+            d["type"] = _ENT_SIMPLE[n]
+        elif n == "MessageEntityPre":
+            d["type"] = "pre"
+            if getattr(e, "language", None):
+                d["language"] = e.language
+        elif n == "MessageEntityTextUrl":
+            d["type"] = "text_link"
+            d["url"] = e.url
+        elif n == "MessageEntityMentionName":
+            d["type"] = "text_mention"
+            d["user"] = {"id": e.user_id}
+        elif n == "MessageEntityBlockquote":
+            d["type"] = "expandable_blockquote" if getattr(e, "collapsed", False) else "blockquote"
+        elif n == "MessageEntityCustomEmoji":
+            d["type"] = "custom_emoji"
+            d["custom_emoji_id"] = str(e.document_id)
+        elif n == "MessageEntityUnknown":
+            continue
+        else:
+            raise _Unsupported(n)
+        out.append(d)
+    return out
+
+
+async def _fetch_edited_updates(client, query, orig_invoke):
+    """Bot API se edit ho chuke message ko MTProto se uthakar Pyrogram ke expected 'Updates' mein lapeto."""
+    from pyrogram import raw
+    peer = query.peer
+    is_channel = type(peer).__name__ == "InputPeerChannel"
+    ids = [raw.types.InputMessageID(id=query.id)]
+    if is_channel:
+        r = await orig_invoke(client, raw.functions.channels.GetMessages(
+            channel=raw.types.InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash), id=ids))
+    else:
+        r = await orig_invoke(client, raw.functions.messages.GetMessages(id=ids))
+    msgs = [m for m in getattr(r, "messages", []) if type(m).__name__ == "Message" and m.id == query.id]
+    if not msgs:
+        return None
+    upd_cls = raw.types.UpdateEditChannelMessage if is_channel else raw.types.UpdateEditMessage
+    upd = upd_cls(message=msgs[0], pts=0, pts_count=0)
+    return raw.types.Updates(updates=[upd], users=r.users, chats=r.chats, date=0, seq=0)
+
+
+async def _try_botapi_edit(client, query, token, orig_invoke):
+    """
+    Returns raw Updates (Pyrogram ke liye) agar Bot API edit success, warna None (-> purana tareeka).
+    """
+    rm = getattr(query, "reply_markup", None)
+    if rm is None or type(rm).__name__ != "ReplyInlineMarkup":
+        return None
+    if getattr(query, "media", None) is not None or getattr(query, "schedule_date", None):
+        return None
+    chat_id = _input_peer_chat_id(query.peer)
+    if chat_id is None or not getattr(query, "id", None):
+        return None
+    try:
+        markup = markup_to_botapi(rm)
+        ents = entities_to_botapi(getattr(query, "entities", None))
+    except _Unsupported:
+        return None
+    if markup is None:
+        return None
+
+    text = getattr(query, "message", None)
+    base = {"chat_id": chat_id, "message_id": query.id, "reply_markup": markup}
+    if text is None:
+        method, payload = "editMessageReplyMarkup", base
+    else:
+        method = "editMessageText"
+        payload = dict(base, text=text)
+        if ents:
+            payload["entities"] = ents
+        if getattr(query, "no_webpage", False):
+            payload["link_preview_options"] = {"is_disabled": True}
+
+    try:
+        code, js = await _post(token, method, payload)
+        if code != 200 and "no text in the message" in str(js.get("description", "")) and text is not None:
+            payload = dict(base, caption=text)
+            if ents:
+                payload["caption_entities"] = ents
+            code, js = await _post(token, "editMessageCaption", payload)
+    except Exception as e:
+        LOGGER.debug(f"[BtnColor] botapi edit net error: {e!r}")
+        return None
+    if code != 200:
+        return None                             # not modified / koi bhi error -> purana raasta (sahi exception wahi dega)
+
+    try:
+        return await _fetch_edited_updates(client, query, orig_invoke)
+    except Exception as e:
+        LOGGER.debug(f"[BtnColor] fetch edited msg fail: {e!r}")
+        return None
 
 
 # ───────────────────────── install hook ─────────────────────────
@@ -277,6 +392,16 @@ def install():
         _orig = Client.invoke
 
         async def invoke(self, query, *args, **kwargs):
+            if ENABLED and type(query).__name__ == "EditMessage":
+                token = getattr(self, "bot_token", None) or os.getenv("BOT_TOKEN", "")
+                if token:
+                    try:
+                        res = await _try_botapi_edit(self, query, token, _orig)
+                    except Exception as e:
+                        LOGGER.debug(f"[BtnColor] flicker-free edit error: {e!r}")
+                        res = None
+                    if res is not None:
+                        return res              # ek hi call, colour kabhi gaya hi nahi
             result = await _orig(self, query, *args, **kwargs)
             try:
                 _after_invoke(self, query, result)
