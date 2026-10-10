@@ -29,6 +29,7 @@ from pyrogram.types import (
 
 from .. import LOGGER, download_dir, app
 from ..utils.helper import check_chat
+from ..utils import job_ctl
 from ..utils.database.access_db import db
 
 try:
@@ -518,6 +519,7 @@ def _make_selenium_driver():
     driver.set_page_load_timeout(40)
     # Cleanup ke liye profile_dir ko driver pe hi attach kar do
     driver._suhani_profile_dir = profile_dir
+    job_ctl.register_driver(driver)      # cancel pe band ho sake
     return driver
 
 
@@ -669,8 +671,9 @@ async def _run_rti_swift(client, message: Message, swift_url: str, status_msg, e
     # /swift wala exact flow use karo — download + queued messages + sequential upload
     # show_url=False: DM mein swift_url kabhi nahi dikhega, sirf status (downloading/
     # uploading/quality/episode) — episode_label se pata chalega kaunsa episode chal raha hai
+    _lbl = None if job_ctl.CURRENT.get() is not None else ep_label
     uploaded_results = await _run_swift(
-        client, message, swift_url, encode=False, episode_label=ep_label, show_url=False
+        client, message, swift_url, encode=False, episode_label=_lbl, show_url=False
     )
     await _forward_to_channel_if_enabled(client, message, uploaded_results, sess=sess, page_url=page_url)
     await _send_update_post_if_enabled(client, sess, ep_num, uploaded_results)
@@ -788,7 +791,7 @@ async def _process_episode(client, message, page_url, episode_num, total_episode
         except Exception:
             pass
 
-        wmq_link, _ = await loop.run_in_executor(None, get_watchmult_link, page_url, episode_num)
+        wmq_link, _ = await job_ctl.run_in_thread(get_watchmult_link, page_url, episode_num)
 
         if wmq_link:
             # Step 2: Argon link
@@ -800,7 +803,7 @@ async def _process_episode(client, message, page_url, episode_num, total_episode
             except Exception:
                 pass
 
-            argon_link = await loop.run_in_executor(None, get_argon_link, wmq_link)
+            argon_link = await job_ctl.run_in_thread(get_argon_link, wmq_link)
 
             if argon_link:
                 # Step 3: Swift URL
@@ -879,7 +882,7 @@ async def _process_cached_item(client, message, item, status_msg, index, total, 
         except Exception:
             pass
 
-        argon_link = await loop.run_in_executor(None, get_argon_link, wmq_link)
+        argon_link = await job_ctl.run_in_thread(get_argon_link, wmq_link)
         if argon_link:
             swift_url = argon_to_swift(argon_link)
             if swift_url:
@@ -931,19 +934,52 @@ async def _process_cached_item(client, message, item, status_msg, index, total, 
 
 
 async def _download_items(client, status_msg, orig_message, sess: "RTISelector", idxs: list):
+    """
+    Selected items ko line by line download+upload karo.
+    Poora process EK hi card message mein dikhta hai (status_msg), uske neeche
+    "❌ Cancel" button — dabane par sab ruk jata hai aur cache delete ho jata hai.
+    """
     total = len(idxs)
-    for i, idx in enumerate(idxs, 1):
-        item = sess.items[idx]
-        result = await _process_cached_item(client, orig_message, item, status_msg, i, total, sess=sess)
-        if result != "ok":
-            break
-        if i < total:
-            await asyncio.sleep(3)
+    job = job_ctl.Job(status_msg, orig_message.from_user.id, title=(sess.title or "RTI")[:55])
+    state = {"ok": 0, "last": "ok"}
+
+    async def _body():
+        stage = job.slot("stage", order=0)
+        for i, idx in enumerate(idxs, 1):
+            item = sess.items[idx]
+            job.header = f"📺 **{item['label']}** • `{i}/{total}`"
+            job.reset_slots(keep=("stage",))
+            await stage.edit(f"🔍 `{item['label']}` ka link nikal raha hoon...")
+            result = await _process_cached_item(client, orig_message, item, stage, i, total, sess=sess)
+            state["last"] = result
+            if result != "ok":
+                break
+            state["ok"] += 1
+            job.done_eps.append(item["label"])
+            if i < total:
+                await asyncio.sleep(3)
 
     try:
-        await status_msg.delete()
-    except Exception:
-        pass
+        await job.run(_body)
+    except Exception as e:
+        LOGGER.error(f"[RTI] _download_items error: {e}")
+        state["last"] = "error"
+        stage = job.slot("stage", order=0)
+        stage.text = f"❌ `{str(e)[:150]}`"
+
+    if job.cancelled:
+        return                      # cancel() ne card final kar diya
+    job.reset_slots(keep=("stage",))
+    if state["last"] == "ok":
+        await job.finish(
+            f"🎉 **Complete!** — {job.title}\n\n"
+            f"✅ `{state['ok']}/{total}` upload ho gaye\n"
+            f"📋 {' '.join(job.done_eps[-12:])}"
+        )
+    else:
+        job.finished = False
+        body = job.render()
+        await job.finish(body + f"\n\n⛔ Process band ho gaya (`{state['ok']}/{total}` complete).")
 
 
 # ─────────────────────────────────────────────
@@ -1204,26 +1240,45 @@ async def rti_command(client: Client, message: Message):
         f"⏳ Starting..."
     )
 
-    success_count = 0
-    for i, ep_num in enumerate(episode_list, 1):
-        result = await _process_episode(
-            client, message, page_url,
-            episode_num=ep_num,
-            total_episodes=total_eps,
-            status_msg=status_msg,
-        )
+    job = job_ctl.Job(status_msg, message.from_user.id, title=f"RTI Ep {start_ep}-{end_ep}")
+    state = {"ok": 0, "last": "ok"}
 
-        if result == "ok":
-            success_count += 1
-        else:
-            # "retry" ya "error" — dono cases mein HARD STOP
-            LOGGER.warning(f"[RTI] Ep {ep_num} failed ({result}). Stopping range.")
-            break
-
-        if i < total_eps:
-            await asyncio.sleep(3)
+    async def _range_body():
+        stage = job.slot("stage", order=0)
+        for i, ep_num in enumerate(episode_list, 1):
+            job.header = f"📺 **Ep {ep_num}** • `{i}/{total_eps}`"
+            job.reset_slots(keep=("stage",))
+            result = await _process_episode(
+                client, message, page_url,
+                episode_num=ep_num,
+                total_episodes=total_eps,
+                status_msg=stage,
+            )
+            state["last"] = result
+            if result != "ok":
+                # "retry" ya "error" — dono cases mein HARD STOP
+                LOGGER.warning(f"[RTI] Ep {ep_num} failed ({result}). Stopping range.")
+                break
+            state["ok"] += 1
+            job.done_eps.append(f"EP{ep_num:02d}")
+            if i < total_eps:
+                await asyncio.sleep(3)
 
     try:
-        await status_msg.delete()
-    except Exception:
-        pass
+        await job.run(_range_body)
+    except Exception as e:
+        LOGGER.error(f"[RTI] range error: {e}")
+        state["last"] = "error"
+        job.slot("stage", order=0).text = f"❌ `{str(e)[:150]}`"
+
+    if job.cancelled:
+        return
+    job.reset_slots(keep=("stage",))
+    if state["last"] == "ok":
+        await job.finish(
+            f"🎉 **Complete!** — Ep {start_ep}-{end_ep}\n\n"
+            f"✅ `{state['ok']}/{total_eps}` upload ho gaye"
+        )
+    else:
+        job.finished = False
+        await job.finish(job.render() + f"\n\n⛔ Process band ho gaya (`{state['ok']}/{total_eps}` complete).")

@@ -36,6 +36,7 @@ from ..utils.encoding import (get_duration, get_thumbnail, get_width_height, _ad
                               probe_media_async, get_thumbnail_async)
 from ..utils.auto_caption import build_auto_caption, get_caption_data
 from ..utils import caption_style
+from ..utils import job_ctl
 from ..utils.community import get_community_tag
 from ..utils.database.access_db import db
 from ..utils.thumb_source import get_tmdb_thumbnail, prefetch_thumb, cached_cover_id
@@ -55,6 +56,32 @@ except ImportError:
 #  Quality sort order (small → large)
 # ─────────────────────────────────────────────
 QUALITY_ORDER = {"360p": 0, "480p": 1, "720p": 2, "1080p": 3, "2160p": 4, "unknown": 99}
+
+
+async def _new_status(message, text: str, quality: str = None):
+    """
+    Job (single-card) active ho to nayi message ke bajaye card ka ek 'slot' do,
+    warna purane tareeke se alag message bhejo (/swift, /toono, auto-monitor).
+    """
+    job = job_ctl.CURRENT.get()
+    if job is not None and quality:
+        sl = job.slot(f"up_{quality}", order=20 + QUALITY_ORDER.get(quality, 9), label=quality)
+        await sl.edit(text)
+        return sl
+    return await message.reply(text)
+
+
+async def _drop_pre_task(pre_task):
+    """Cancel par preconnected uploader clients band karo."""
+    try:
+        ucs = [u for u in await asyncio.wait_for(pre_task, timeout=15) if u]
+        for u in ucs:
+            try:
+                await u.disconnect()
+            except Exception:
+                pass
+    except BaseException:
+        pass
 
 
 def _sort_by_size(files: list) -> list:
@@ -647,6 +674,9 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
                 _kill_driver_tree(reuse_driver)
         if driver is None:
             driver = _make_driver(dl_dir, fast=fast)
+        _jb = progress.get("job")
+        if _jb is not None:
+            _jb.drivers.append(driver)
         LOGGER.info(f"[Swift] Opening: {swift_url}")
 
         # Page load with retry — renderer timeout se bachne ke liye
@@ -793,6 +823,8 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
             # report karo (on_file) taaki upload shuru ho jaye, baaki ka wait kiye bina.
             pending = dict(active_dls)
             while pending:
+                if (progress.get("cancel") is not None) and progress["cancel"].is_set():
+                    raise RuntimeError("cancelled")
                 for q, (dl, href) in list(pending.items()):
                     try:
                         if not dl.isFinished():
@@ -852,6 +884,8 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
             _reported = set(fast_downloaded_files)
             _reported_q = {_quality_from(os.path.basename(_f)) for _f in fast_downloaded_files}
             while True:
+                if (progress.get("cancel") is not None) and progress["cancel"].is_set():
+                    raise RuntimeError("cancelled")
                 done = _get_done_files(dl_dir)
                 in_prog = _in_progress(dl_dir)
                 elapsed = int(time.time() - start)
@@ -1366,7 +1400,13 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
         LOGGER.error(f"[Swift] Upload error ({quality}): {e}")
         if gate:
             gate.done(gate_q)   # fail hone par bhi baaki qualities atke nahi
-        await message.reply(f"⚠️ Upload failed `{fname}`: `{e}`")
+        if job_ctl.CURRENT.get() is not None:
+            try:
+                await msg.edit(f"⚠️ Upload failed `{quality}`: `{str(e)[:120]}`")
+            except Exception:
+                pass
+        else:
+            await message.reply(f"⚠️ Upload failed `{fname}`: `{e}`")
         return False, None, quality
 
 
@@ -1482,6 +1522,9 @@ async def _pipeline_run(client, message, msg, prefix, swift_url, dl_dir, episode
                 except Exception as e:
                     LOGGER.warning(f"[Swift] preconnect wait failed: {e!r}")
             state["ucs"] = ucs
+            _jb2 = job_ctl.CURRENT.get()
+            if _jb2 is not None and ucs:
+                _jb2.cleanups.append(functools.partial(_close_uploaders, ucs))
         if state["gate"] is None:
             expected = list(progress.get("expected") or [])
             if len(expected) > 1:
@@ -1494,7 +1537,7 @@ async def _pipeline_run(client, message, msg, prefix, swift_url, dl_dir, episode
         if gate is not None:
             gate.ensure(q)
         try:
-            dm = await message.reply(f"{prefix}📤 **Uploading `{q}`...**")
+            dm = await _new_status(message, f"{prefix}📤 **Uploading `{q}`...**", q)
         except Exception:
             dm = msg
         try:
@@ -1526,7 +1569,7 @@ async def _pipeline_run(client, message, msg, prefix, swift_url, dl_dir, episode
         started_q.add(_sq)
         await _prepare()
         LOGGER.info(f"[Swift] ▶ upload start (download baaki ho sakta hai): {os.path.basename(path)}")
-        tasks[path] = asyncio.ensure_future(_one_upload(path))
+        tasks[path] = job_ctl.track_task(asyncio.ensure_future(_one_upload(path)))
 
     # ── pump: jaise-jaise files ready hon, upload start karo ──
     while True:
@@ -1618,7 +1661,12 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
     prefix = f"🎬 **{episode_label}**\n\n" if episode_label else ""
     filter_text = f" | Filter: `{quality_filter}`" if quality_filter else ""
 
-    if show_url:
+    _job = job_ctl.CURRENT.get()
+    if _job is not None:
+        _job.dirs.add(dl_dir)
+        msg = _job.slot("dl", order=10, label="download")
+        await msg.edit(f"{prefix}🔍 **Fetching...**\nPage open ho raha hai (360p ka wait, max 20s)")
+    elif show_url:
         msg = await message.reply(
             f"{prefix}🔗 **Swift Downloader v7**\n\n"
             f"🌐 `{swift_url}`{filter_text}\n\n"
@@ -1633,6 +1681,10 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
     loop = asyncio.get_event_loop()
 
     progress = {"phase": "scan", "dls": {}}
+    if _job is not None:
+        progress["cancel"] = _job.cancel_ev
+        progress["job"] = _job
+        _job.progresses.append(progress)
 
     async def _progress_updater():
         start = time.time()
@@ -1704,11 +1756,15 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
             await asyncio.sleep(4 if fast else 5)
 
     prog_task = asyncio.create_task(_progress_updater())
+    if _job is not None:
+        _job.tasks.add(prog_task)
     _pre_task = None
     asyncio.ensure_future(_prewarm_all_custompics(message.from_user.id))
     if _PARALLEL_UPLOAD and not encode:
         try:
             _pre_task = asyncio.ensure_future(_preconnect_uploaders(message.from_user.id, 3))
+            if _job is not None:
+                _job.cleanups.append(functools.partial(_drop_pre_task, _pre_task))
         except Exception:
             _pre_task = None
     if _PARALLEL_UPLOAD and not encode and not quality_filter:
@@ -1821,7 +1877,7 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
     for fp in files:
         q = _quality_from(os.path.basename(fp))
         try:
-            dm = await message.reply(f"{prefix}📤 **Uploading `{q}`...**")
+            dm = await _new_status(message, f"{prefix}📤 **Uploading `{q}`...**", q)
             _dummy_msgs[fp] = dm
         except Exception:
             _dummy_msgs[fp] = msg  # fallback
@@ -1881,7 +1937,8 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
         return success, sent_msg, quality
 
     results = await asyncio.gather(
-        *[_upload_task_staggered(fp, i) for i, fp in enumerate(files)],
+        *[job_ctl.track_task(asyncio.ensure_future(_upload_task_staggered(fp, i)))
+          for i, fp in enumerate(files)],
         return_exceptions=True
     )
 
