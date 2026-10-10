@@ -88,7 +88,10 @@ class Slot:
     edit_text = edit
 
     async def delete(self, *args, **kwargs):
-        self.done = True
+        if self.key.startswith("up_"):
+            self.done = True          # upload ho gaya -> ek line "✅ 360p upload ho gaya"
+        else:
+            self.text = ""            # stage/download wala hissa saaf
         self.job.touch()
         return True
 
@@ -99,9 +102,16 @@ class Slot:
 
 
 class Job:
-    def __init__(self, card, owner_id: int, title: str):
+    def __init__(self, card, owner_id: int, title: str, factory=None):
+        """
+        card    : jis message ko edit karna hai (ya None)
+        factory : async (text, markup) -> Message. card=None ho to PEHLI baar kuch
+                  dikhane ki zaroorat padne par hi message banta hai (tab tak validation
+                  errors wagairah normal reply ban kar aate hain, khali card nahi banta).
+        """
         self.id = uuid.uuid4().hex[:8]
         self.card = card
+        self._factory = factory
         self.owner = owner_id
         self.title = title
         self.header = ""
@@ -188,6 +198,14 @@ class Job:
         async with self._lock:
             if self.finished or self.cancelled:
                 return
+            if self.card is None:
+                if self._factory is None:
+                    return
+                try:
+                    self.card = await self._factory(self.render(), self.markup())
+                except Exception as e:
+                    LOGGER.error(f"[Job] card create error: {e}")
+                return
             await self._safe_edit(self.render(), self.markup())
 
     async def _safe_edit(self, text, markup):
@@ -207,7 +225,6 @@ class Job:
         """coro_fn: bina-argument async callable. Cancel hone par None return."""
         token = CURRENT.set(self)
         JOBS[self.id] = self
-        self.touch(force=True)
         self.task = asyncio.ensure_future(coro_fn())
         try:
             return await self.task
@@ -229,8 +246,9 @@ class Job:
         if self.cancelled:
             return
         self.finished = True
-        async with self._lock:
-            await self._safe_edit(text[:3900], None)
+        if self.card is not None:
+            async with self._lock:
+                await self._safe_edit(text[:3900], None)
         self._rm_dirs()
 
     def _rm_dirs(self):
@@ -301,12 +319,61 @@ class Job:
 
         # 6) card
         done = " ".join(self.done_eps[-8:]) if self.done_eps else "—"
+        text = (
+            f"🛑 **Cancelled** — {self.title}\n\n"
+            f"✅ Pehle complete hue: {done}\n"
+            f"🧹 Download/upload cache delete kar diya gaya."
+        )
         try:
-            await self.card.edit(
-                f"🛑 **Cancelled** — {self.title}\n\n"
-                f"✅ Pehle complete hue: {done}\n"
-                f"🧹 Download/upload cache delete kar diya gaya.",
-                reply_markup=None,
-            )
+            if self.card is not None:
+                await self.card.edit(text, reply_markup=None)
+            elif self._factory is not None:
+                self.card = await self._factory(text, None)
         except Exception:
             pass
+
+
+async def stage_msg(message, text: str):
+    """Job active ho to card ka 'stage' hissa, warna normal reply (purana behaviour)."""
+    job = CURRENT.get()
+    if job is not None:
+        sl = job.slot("stage", order=0)
+        await sl.edit(text)
+        return sl
+    return await message.reply(text)
+
+
+async def run_with_card(message, title: str, impl, owner_id: int = None):
+    """
+    impl (bina-argument async callable) ko ek Job ke andar chalao: ek hi card message
+    + "❌ Cancel" button. Returns (job, impl_result).
+    """
+    async def _factory(text, markup):
+        return await message.reply(text, reply_markup=markup)
+
+    if owner_id is None:
+        owner_id = message.from_user.id if getattr(message, "from_user", None) else 0
+    job = Job(None, owner_id, title, factory=_factory)
+    box = {}
+
+    async def _b():
+        box["v"] = await impl()
+
+    failed = False
+    try:
+        await job.run(_b)
+    except Exception as e:
+        failed = True
+        LOGGER.error(f"[Job] {title} error: {e}")
+        job.slot("stage", order=0).text = f"❌ `{str(e)[:150]}`"
+
+    if job.cancelled:
+        return job, None
+    if job.card is not None or job.slots:
+        job.reset_slots(keep=[k for k, sl in job.slots.items() if sl.text or sl.done] or ("stage",))
+        # stage tabhi dikhao jab baaki kuch na ho ya error ho
+        others = [k for k in job.slots if k != "stage"]
+        if others and not failed:
+            job.slots.pop("stage", None)
+        await job.finish(job.render() + ("\n\n⛔ Error se ruka." if failed else "\n\n🏁 Process khatam."))
+    return job, box.get("v")
