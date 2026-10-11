@@ -964,6 +964,7 @@ async def _download_toono_items(client, status_msg, orig_message, sess: "ToonoSe
     """
     total = len(idxs)
     job = job_ctl.Job(status_msg, orig_message.from_user.id, title=(sess.title or "Toono")[:55])
+    job.quota_count = total
     state = {"ok": 0, "last": "ok"}
     pf = {}
 

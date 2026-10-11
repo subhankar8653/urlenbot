@@ -2016,6 +2016,7 @@ async def swift_command(client: Client, message: Message):
     await job_ctl.run_with_card(
         message, "Swift",
         lambda: _run_swift(client, message, swift_url, encode=False, quality_filter=quality_filter),
+        quota_count=1,
     )
 
 

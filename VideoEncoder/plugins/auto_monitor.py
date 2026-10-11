@@ -1417,6 +1417,9 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
 
     total = end_ep - start_ep + 1
 
+    # Quota: 1 episode = single (2 ek saath), 2+ = multi (akela). Jagah nahi to queue.
+    await job_ctl.acquire_quota(total)
+
     # Shared flag — pehle episode ke 360p pe True hoga, baaki skip karenge
     update_post_sent = [False]
     # Track karo ki kam se kam ek episode successfully upload hua ya nahi
@@ -1683,6 +1686,10 @@ async def _cmd_rtic_impl(client: Client, message: Message):
     oid = await _owner_id()
 
     total = end_ep - start_ep + 1
+
+    # Quota: 1 episode = single (2 ek saath), 2+ = multi (akela). Jagah nahi to queue.
+    await job_ctl.acquire_quota(total)
+
     ep_label_range = "Movie" if (start_ep == 0 and end_ep == 0) else f"Ep {start_ep}-{end_ep}"
     await prep.edit(
         f"✅ **Matched:** `{anime_name}`\n"

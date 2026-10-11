@@ -950,6 +950,7 @@ async def _download_items(client, status_msg, orig_message, sess: "RTISelector",
     """
     total = len(idxs)
     job = job_ctl.Job(status_msg, orig_message.from_user.id, title=(sess.title or "RTI")[:55])
+    job.quota_count = total
     state = {"ok": 0, "last": "ok"}
 
     # ── Channel Upload ON → bilkul /Rtic wala engine ──
@@ -1345,6 +1346,7 @@ async def rti_command(client: Client, message: Message):
     )
 
     job = job_ctl.Job(status_msg, message.from_user.id, title=f"RTI Ep {start_ep}-{end_ep}")
+    job.quota_count = total_eps
     state = {"ok": 0, "last": "ok"}
 
     async def _range_body():
