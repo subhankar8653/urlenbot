@@ -1975,7 +1975,7 @@ def _details_card_text(session: dict) -> str:
     season = session.get("season")
     breakdown = session.get("season_breakdown", "")
     genres = session.get("genres") or "—"
-    season_line = f"📚 Season-wise: _{breakdown}_\n" if breakdown else ""
+    season_line = f"📚 Season-wise: __{breakdown}__\n" if breakdown else ""
     eps_label = f"{total or '—'} (Season {season})" if season else f"{total or '—'}"
     if session.get("tmdb_ok", True):
         head = "✨ **Details mil gaye!** ✨\n"
@@ -1990,9 +1990,9 @@ def _details_card_text(session: dict) -> str:
         f"📡 Status: **{status_str}**\n"
         f"🎬 Total Episodes: **{eps_label}**\n"
         f"{season_line}"
-        f"🎭 Genres: _{genres}_\n"
+        f"🎭 Genres: __{genres}__\n"
         f"🖼 Poster: {'✅ (16:9 banner)' if session.get('image') else '❌ nahi mila'}\n\n"
-        f"_Kuch galat ho toh ✏️ Edit dabao, sahi ho toh ✅ Done._"
+        f"__Kuch galat ho toh ✏️ Edit dabao, sahi ho toh ✅ Done.__"
     )
 
 

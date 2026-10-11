@@ -45,21 +45,19 @@ _MENU_TEXT = (
     "━━━━━━━━━━━━━━━━━━━━\n\n"
     "Neeche se ek category choose karo — uske andar ki saari settings "
     "wahin khul jaayengi.\n\n"
-    "> ℹ️ _Yeh sab settings poore bot ke liye hain (sabke liye same lagengi)._"
+    "> ℹ️ __Yeh sab settings poore bot ke liye hain (sabke liye same lagengi).__"
 )
 
 # (key, button title, category title, description, [(button label, section)])
 _CATEGORIES = [
     ("caption", "✍️ Caption & Post",
      "✍️ **Caption & Post Edit**",
-     "_Video aur channel post kaisa dikhega, uski settings_",
+     "_Video caption aur Main Channel Post ka look_",
      [
          ("🎬 Video Caption (upload hote waqt)", "caption_style"),
-         ("🖌 Update-Post Caption (channel post ki caption)", "update_post_style"),
-         ("🔗 Post ke Niche waali Link Line", "how_to_get_link"),
-         ("🔘 \"Kaise Dekhein\" / \"Join\" Buttons", "update_post_button"),
-         ("📋 Saved Anime Posts (list/edit)", "update_post_list"),
-         ("📢 Update Channels (kahan post jaata hai)", "update_channels"),
+         ("🖌 Main Channel Post Caption", "update_post_style"),
+         ("🔗 Main Channel Post Link Line", "how_to_get_link"),
+         ("🔘 Main Channel Post Buttons", "update_post_button"),
      ]),
     ("thumb", "🖼 Thumbnail",
      "🖼 **Thumbnail Edit**",
@@ -69,11 +67,12 @@ _CATEGORIES = [
          ("🖼 Keyword-wise Thumbnail", "custompic"),
      ]),
     ("monitor", "🤖 Auto Monitor",
-     "🤖 **Auto Monitor & Channels**",
-     "_Anime auto-detect, upload channels, kaunsa anime kahan jaata hai_",
+     "🤖 **Auto Monitor & Main Channel Post**",
+     "_Anime auto-detect, aur Main Channel Post (kaunsa anime post hoga, kahan post hoga)_",
      [
          ("🤖 Auto-Monitor Anime List", "auto_monitor"),
-         ("📡 Channel ↔ Anime Link", "channel_upload"),
+         ("📋 Main Channel Post Anime List", "update_post_list"),
+         ("📢 Main Channel Post Channels", "update_channels"),
      ]),
     ("filename", "✂️ Filename",
      "✂️ **Filename Settings**",
@@ -125,7 +124,7 @@ def _category_text(key: str) -> str:
     return (
         f"{title}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"{desc}\n\n"
+        f"__{desc.strip('_')}__\n\n"
         f"Jo setting change karni hai uska button tap karo 👇"
     )
 
@@ -234,7 +233,7 @@ async def customise_callback(client: Client, cb: CallbackQuery):
         await _save_button_defaults({"kaise_dekhein": None, "join_backup": None})
         text = (
             "🗑️ **Dono default buttons remove kar diye!**\n\n"
-            "Ab se update posts pe • ᴋᴀɪꜱᴇ ᴅᴇᴋʜᴇɪɴ • / • ᴊᴏɪɴ ʙᴀᴄᴋᴜᴘ • "
+            "Ab se Main Channel Post pe • ᴋᴀɪꜱᴇ ᴅᴇᴋʜᴇɪɴ • / • ᴊᴏɪɴ ʙᴀᴄᴋᴜᴘ • "
             "buttons nahi lagenge.\n"
             "Dobara set karna ho toh isi menu se ya `/update_post_button` "
             "se kar sakte ho."
@@ -312,7 +311,7 @@ async def _open_section(client: Client, cb: CallbackQuery, section: str):
                 f"• ᴊᴏɪɴ ʙᴀᴄᴋᴜᴘ •: `{current.get('join_backup') or '—'}`\n"
             )
         text = (
-            f"🔘 **Update-Post Buttons**\n\n"
+            f"🔘 **Main Channel Post Buttons**\n\n"
             f"**Step 1/2 — • ᴋᴀɪꜱᴇ ᴅᴇᴋʜᴇɪɴ • ka link reply karke bhejo:**\n"
             f"{cur_line}\n"
             "**Example:** `https://t.me/+xxxxxxxxxx`\n"
@@ -332,7 +331,7 @@ async def _open_section(client: Client, cb: CallbackQuery, section: str):
         post_map = await _get_post_map()
         if not post_map:
             text = (
-                "📋 **Update-Post List**\n\n"
+                "📋 **Main Channel Post — Anime List**\n\n"
                 "📭 Koi anime post entry save nahi hai.\n\n"
                 "Add karne ke liye: `/update_post`\n\n"
                 "⚠️ **Note:** Sirf yahan registered anime ka hi update "
@@ -353,13 +352,13 @@ async def _open_section(client: Client, cb: CallbackQuery, section: str):
         status = "🟢 ON" if toggle else "🔴 OFF"
         if not channels:
             text = (
-                f"📢 **Update Channels**\n\n"
-                f"📭 Koi update channel add nahi hai.\n\n"
+                f"📢 **Main Channel Post — Channels**\n\n"
+                f"📭 Koi Main Channel Post channel add nahi hai.\n\n"
                 f"Posting Status: **{status}**\n\n"
                 f"Add karne ke liye: `/update_channel [channel_id]`"
             )
         else:
-            text = f"📢 **Update Channels ({len(channels)})** | Posting: **{status}**\n\n"
+            text = f"📢 **Main Channel Post — Channels ({len(channels)})** | Posting: **{status}**\n\n"
             for i, ch in enumerate(channels, 1):
                 text += f"`{i}.` **{ch.get('channel_title', 'Unknown')}**\n"
                 text += f"    🆔 `{ch.get('channel_id')}`\n\n"

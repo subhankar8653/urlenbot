@@ -30,12 +30,12 @@ def _status_text() -> str:
     style_id = update_post_style.get_current_style_id()
     name = update_post_style.STYLES.get(style_id, {}).get("name", style_id)
     return (
-        "🎨 **Update-Post Style** <i>(bot-wide)</i>\n"
+        "🎨 **Main Channel Post Caption Style** <i>(bot-wide)</i>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Current: **{name}**\n\n"
         "Neeche se koi bhi style tap karo — pehle uska preview dikhega, "
         "phir chaaho toh apply kar sakte ho.\n\n"
-        "> ℹ️ _Yeh style update channel pe jaane waale har post pe lagega._"
+        "> ℹ️ _Yeh style Main Channel Post pe jaane waale har post pe lagega._"
     )
 
 

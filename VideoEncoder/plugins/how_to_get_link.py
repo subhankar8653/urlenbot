@@ -39,12 +39,12 @@ async def _status_text() -> str:
     current = await update_post_style.get_how_to_get_link()
     if current:
         return (
-            f"🔗 **How to get link — abhi set hai:**\n`{current}`\n\n"
+            f"🔗 **Main Channel Post — Link Line (abhi set hai):**\n`{current}`\n\n"
             "Neeche se update ya remove kar sakte ho 👇"
         )
     return (
-        "📭 **How to get link** abhi set nahi hai.\n\n"
-        "_Set hone ke baad, styled update-posts (`/update_post_style` ke "
+        "📭 **Main Channel Post — Link Line** abhi set nahi hai.\n\n"
+        "_Set hone ke baad, styled Main Channel Posts (`/update_post_style` ke "
         "1-10 waale styles) ke neeche ek clickable_ **➥ ʜᴏᴡ ᴛᴏ ɢᴇᴛ ʟɪɴᴋ** "
         "_line add ho jaayegi. \"Default\" style mein nahi aati._\n\n"
         "Neeche se set kar sakte ho 👇"
