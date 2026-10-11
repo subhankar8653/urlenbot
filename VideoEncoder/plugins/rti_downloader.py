@@ -692,9 +692,18 @@ async def _send_update_post_if_enabled(client, sess: "RTISelector", ep_num: int,
         return
     try:
         from .update_channel import send_update_post
+        # RareAnimes ka page-title ("... Hindi Dubbed Episodes Download HD") update_post_map
+        # ke naam se match nahi hota tha — isliye /add_anime list wala asli naam use karo.
+        _post_name = sess.title
+        try:
+            _ent, _ = await _find_add_anime_channel(sess.title, sess.page_url)
+            if _ent and _ent.get("anime_name"):
+                _post_name = _ent["anime_name"]
+        except Exception:
+            pass
         await send_update_post(
             client,
-            anime_name=sess.title,
+            anime_name=_post_name,
             season=sess.season,
             episode=ep_num if ep_num else None,
             force=True,
@@ -943,7 +952,102 @@ async def _download_items(client, status_msg, orig_message, sess: "RTISelector",
     job = job_ctl.Job(status_msg, orig_message.from_user.id, title=(sess.title or "RTI")[:55])
     state = {"ok": 0, "last": "ok"}
 
+    # ── Channel Upload ON → bilkul /Rtic wala engine ──
+    # (channel pe seedha upload, cover/thumbnail, bot-mode post, update post,
+    #  schedule notification). Anime /add_anime list mein milna zaruri hai.
+    rtic_entry = None
+    if sess.channel_toggle:
+        try:
+            rtic_entry, _al = await _find_add_anime_channel(sess.title, sess.page_url)
+        except Exception as e:
+            LOGGER.error(f"[RTI] add_anime lookup error: {e}")
+        if rtic_entry and not rtic_entry.get("channel_id"):
+            rtic_entry = None
+        if not rtic_entry:
+            try:
+                await orig_message.reply(
+                    "⚠️ **Channel upload skip** — ye anime `/add_anime` list mein nahi mila, "
+                    "isliye normal (bot chat) upload hoga."
+                )
+            except Exception:
+                pass
+
+    async def _rtic_body():
+        from .auto_monitor import (
+            _episode_quality_poller, _get_swift_url_for_episode,
+            _get_schedule_fn, _owner_id,
+        )
+        stage = job.slot("stage", order=0)
+        anime_name = rtic_entry["anime_name"]
+        channel_id = rtic_entry["channel_id"]
+        oid = (await _owner_id()) or orig_message.from_user.id
+        nums = [0 if sess.items[i]["kind"] == "MOVIE" else (sess.items[i]["num"] or 0) for i in idxs]
+        start_ep, end_ep = nums[0], max(nums)
+        update_post_sent = [False]
+        up_mode = "force" if sess.update_toggle else "off"
+        any_uploaded = False
+
+        FAST, SLOW = 10, 20
+        MAX_ATT = FAST + SLOW
+        for i, idx in enumerate(idxs, 1):
+            item = sess.items[idx]
+            ep_num = nums[i - 1]
+            job.header = f"📺 **{item['label']}** • `{i}/{total}`"
+            job.reset_slots(keep=("stage",))
+            await stage.edit(f"🎌 **{item['label']}**\n\n🔍 Swift URL nikaal raha hoon...")
+
+            swift_url = None
+            for att in range(1, MAX_ATT + 1):
+                swift_url = await _get_swift_url_for_episode(
+                    sess.page_url, ep_num, stage, wmq_link=item["wmq_link"]
+                )
+                if swift_url:
+                    break
+                if att == MAX_ATT:
+                    await stage.edit(
+                        f"❌ **{item['label']}**\n\n"
+                        f"⏱️ {MAX_ATT} attempts (~25 min) ke baad bhi link nahi mila."
+                    )
+                    break
+                interval = 30 if att <= FAST else 60
+                await stage.edit(
+                    f"⏳ **{item['label']}**\n\n"
+                    f"🔄 Attempt `{att}/{MAX_ATT}` — link nahi mila\n"
+                    f"⏰ `{interval}s` baad retry... ({MAX_ATT - att} attempts left)"
+                )
+                await asyncio.sleep(interval)
+
+            if not swift_url:
+                state["last"] = "retry"
+                break
+
+            ok = await _episode_quality_poller(
+                client, orig_message, swift_url,
+                ep_num, anime_name, channel_id, oid,
+                matched_entry=rtic_entry,
+                start_ep=start_ep, end_ep=end_ep,
+                update_post_sent=update_post_sent,
+                update_post_mode=up_mode,
+            )
+            if not ok:
+                state["last"] = "error"
+                break
+            any_uploaded = True
+            state["ok"] += 1
+            job.done_eps.append(item["label"])
+            if i < total:
+                await asyncio.sleep(3)
+
+        if any_uploaded:
+            try:
+                await _get_schedule_fn()(client, channel_id, anime_name, end_ep)
+            except Exception as e:
+                LOGGER.error(f"[RTI] Schedule notification error: {e}")
+
     async def _body():
+        if rtic_entry:
+            await _rtic_body()
+            return
         stage = job.slot("stage", order=0)
         for i, idx in enumerate(idxs, 1):
             item = sess.items[idx]

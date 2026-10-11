@@ -271,8 +271,12 @@ async def _episode_quality_poller(
     start_ep: int = None,
     end_ep: int = None,
     update_post_sent: list = None,
+    update_post_mode: str = "auto",
 ) -> bool:
     """
+    update_post_mode: "auto" (global /updatechannel toggle follow kare — /Rtic aur
+                      auto-monitor), "force" (toggle ignore, hamesha bhejo — /rti
+                      selector ka Update Post ON), "off" (kabhi na bhejo).
     Swift URL milne ke baad:
       - 1 Chrome session → teeno downloads parallel shuru
       - Jaise hi koi file complete ho → uska upload ready
@@ -554,10 +558,12 @@ async def _episode_quality_poller(
                         except Exception:
                             pass
                         _ep_end = end_ep if end_ep else episode_num
-                        await send_update_post(
-                            client, anime_name=anime_name, season=_season,
-                            episode_start=episode_num, episode_end=_ep_end,
-                        )
+                        if update_post_mode != "off":
+                            await send_update_post(
+                                client, anime_name=anime_name, season=_season,
+                                episode_start=episode_num, episode_end=_ep_end,
+                                force=(update_post_mode == "force"),
+                            )
                         if update_post_sent is not None:
                             update_post_sent[0] = True
                     except Exception as _ue:
@@ -916,21 +922,23 @@ async def _forward_to_anime_channel(client: Client, sent_msg, channel_id: int, a
 # ─────────────────────────────────────────────
 #  Episode ko RTI se Swift URL tak le jaao
 # ─────────────────────────────────────────────
-async def _get_swift_url_for_episode(page_url: str, episode_num: int, status_msg) -> str | None:
+async def _get_swift_url_for_episode(page_url: str, episode_num: int, status_msg,
+                                     wmq_link: str = None) -> str | None:
     get_watchmult_link, get_argon_link, argon_to_swift = _get_rti_fns()
     loop = asyncio.get_event_loop()
 
-    try:
-        await status_msg.edit(
-            f"{status_msg.text.split(chr(10))[0]}\n\n"
-            f"🔍 Ep `{episode_num}` — WatchMultQuality link..."
-        )
-    except Exception:
-        pass
-
-    wmq_link, _ = await job_ctl.run_in_thread(get_watchmult_link, page_url, episode_num)
     if not wmq_link:
-        return None
+        try:
+            await status_msg.edit(
+                f"{status_msg.text.split(chr(10))[0]}\n\n"
+                f"🔍 Ep `{episode_num}` — WatchMultQuality link..."
+            )
+        except Exception:
+            pass
+
+        wmq_link, _ = await job_ctl.run_in_thread(get_watchmult_link, page_url, episode_num)
+        if not wmq_link:
+            return None
 
     try:
         await status_msg.edit(
@@ -1914,6 +1922,9 @@ async def _register_setpic_from_url(user_id: int, keyword: str, image_url: str) 
 
 def _apply_fetched_details(session: dict, fetched: dict | None):
     """TMDB se fetch hue details session mein bhar do (ya empty defaults)."""
+    session["tmdb_ok"] = bool(fetched)
+    session["status"] = (fetched or {}).get("status") or ""
+    session["source"] = (fetched or {}).get("source") or "TMDB"
     if fetched:
         session["audio"] = fetched.get("audio", "Hindi ORG")
         session["genres"] = fetched.get("genres", "")
@@ -1953,6 +1964,145 @@ def _fetch_summary_text(fetched: dict | None) -> str:
         f"{season_line}"
         f"🎭 Genres: _{fetched.get('genres') or '—'}_\n"
         f"🖼 Poster: {'✅ (16:9 banner)' if fetched.get('image') else '❌ nahi mila'}"
+    )
+
+
+def _details_card_text(session: dict) -> str:
+    """Session ke CURRENT details (TMDB ya user-edited) ka summary card."""
+    name = session.get("anime_name") or "—"
+    status_str = session.get("status") or "—"
+    total = session.get("total_eps") or 0
+    season = session.get("season")
+    breakdown = session.get("season_breakdown", "")
+    genres = session.get("genres") or "—"
+    season_line = f"📚 Season-wise: _{breakdown}_\n" if breakdown else ""
+    eps_label = f"{total or '—'} (Season {season})" if season else f"{total or '—'}"
+    if session.get("tmdb_ok", True):
+        head = "✨ **Details mil gaye!** ✨\n"
+    else:
+        head = "⚠️ **TMDB pe match nahi mila** — ✏️ Edit se khud bharo\n"
+    if session.get("details_edited"):
+        head = "✏️ **Details (edited)** ✏️\n"
+    return (
+        f"{head}"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📺 {session.get('source') or 'TMDB'} Match: **{name}**\n"
+        f"📡 Status: **{status_str}**\n"
+        f"🎬 Total Episodes: **{eps_label}**\n"
+        f"{season_line}"
+        f"🎭 Genres: _{genres}_\n"
+        f"🖼 Poster: {'✅ (16:9 banner)' if session.get('image') else '❌ nahi mila'}\n\n"
+        f"_Kuch galat ho toh ✏️ Edit dabao, sahi ho toh ✅ Done._"
+    )
+
+
+def _details_confirm_kb(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Edit", callback_data=f"aa_det_edit_{user_id}"),
+            InlineKeyboardButton("✅ Done", callback_data=f"aa_det_done_{user_id}"),
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"aa_cancel_{user_id}")],
+    ])
+
+
+def _details_edit_kb(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📺 Name", callback_data=f"aa_det_f_name_{user_id}"),
+            InlineKeyboardButton("📡 Status", callback_data=f"aa_det_f_status_{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("🎬 Total Eps", callback_data=f"aa_det_f_eps_{user_id}"),
+            InlineKeyboardButton("🏝 Season", callback_data=f"aa_det_f_season_{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("📚 Season-wise", callback_data=f"aa_det_f_breakdown_{user_id}"),
+            InlineKeyboardButton("🎭 Genres", callback_data=f"aa_det_f_genres_{user_id}"),
+        ],
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"aa_det_back_{user_id}")],
+    ])
+
+
+_DET_FIELD_PROMPTS = {
+    "name":      ("📺 Anime ka naam", "Poora sahi naam bhejo."),
+    "status":    ("📡 Status", "Jaise `Ongoing` ya `Finished`."),
+    "eps":       ("🎬 Total Episodes", "Sirf number bhejo, jaise `24`."),
+    "season":    ("🏝 Season", "Season number bhejo, jaise `2`. (Season hatane ke liye `-`)"),
+    "breakdown": ("📚 Season-wise", "Jaise `S1: 12 eps, S2: 12 eps`. (Khali karne ke liye `-`)"),
+    "genres":    ("🎭 Genres", "Jaise `Action, Comedy, Fantasy`. (Khali karne ke liye `-`)"),
+}
+
+
+async def _show_details_confirm(event, session: dict, user_id: int, edit: bool = True):
+    """Details card + [✏️ Edit] [✅ Done]. edit=True ho to usi message ko edit karo."""
+    session["step"] = "details_confirm"
+    _add_anime_sessions[user_id] = session
+    text = _details_card_text(session)
+    kb = _details_confirm_kb(user_id)
+    if edit:
+        try:
+            await event.edit(text, reply_markup=kb)
+            return
+        except Exception as e:
+            if "MESSAGE_NOT_MODIFIED" in str(e):
+                return
+    await event.reply(text, reply_markup=kb)
+
+
+async def _add_anime_step_details_edit(client: Client, message: Message, session: dict, user_id: int):
+    """User ne ✏️ Edit mein se koi field choose kiya tha — ab uski nayi value text mein aayi."""
+    field = session.get("edit_field")
+    raw = (message.text or "").strip()
+    if not field or not raw:
+        await message.reply("⚠️ Value text mein bhejo.")
+        return
+    clear = raw in ("-", "none", "None", "NONE")
+
+    if field == "name":
+        if clear:
+            await message.reply("⚠️ Naam khali nahi ho sakta.")
+            return
+        session["anime_name"] = raw
+    elif field == "status":
+        session["status"] = "" if clear else raw
+    elif field == "eps":
+        try:
+            n = int(raw)
+            if n < 0:
+                raise ValueError
+        except ValueError:
+            await message.reply("⚠️ Sirf number do, jaise `24`.")
+            return
+        session["total_eps"] = n
+    elif field == "season":
+        if clear:
+            session["season"] = None
+        else:
+            try:
+                n = int(raw)
+                if n <= 0:
+                    raise ValueError
+            except ValueError:
+                await message.reply("⚠️ Season ke liye number do, jaise `2` (hatane ke liye `-`).")
+                return
+            session["season"] = n
+    elif field == "breakdown":
+        session["season_breakdown"] = "" if clear else raw
+    elif field == "genres":
+        session["genres"] = "" if clear else raw
+    else:
+        await message.reply("⚠️ Ye field edit nahi ho sakta.")
+        return
+
+    session["details_edited"] = True
+    session.pop("edit_field", None)
+    session["step"] = "details_menu"
+    _add_anime_sessions[user_id] = session
+    await message.reply(
+        _details_card_text(session).rsplit("\n\n", 1)[0] +
+        "\n\n✏️ **Aur kuch edit karna hai?** Field choose karo, ya ⬅️ Back.",
+        reply_markup=_details_edit_kb(user_id),
     )
 
 
@@ -2156,15 +2306,8 @@ async def _add_anime_step_name_manual(client: Client, message: Message, session:
         LOGGER.warning(f"[AddAnime] fetch_anime_details error: {e}")
 
     _apply_fetched_details(session, fetched)
-
-    try:
-        await status_msg.edit(_fetch_summary_text(fetched))
-    except Exception:
-        pass
-
-    session["step"] = "image_choice"
-    _add_anime_sessions[user_id] = session
-    await _show_image_choice(message, session, user_id)
+    # Edit / Done — user galat details yahin sahi kar sakta hai
+    await _show_details_confirm(status_msg, session, user_id, edit=True)
 
 
 async def _add_anime_step_interval(client: Client, message: Message, session: dict, user_id: int):
@@ -2407,14 +2550,73 @@ async def add_anime_callbacks(client: Client, cb: CallbackQuery):
 
         _apply_fetched_details(session, fetched)
         session["anime_name"] = fetched["matched_name"]
-        session["step"] = "image_choice"
-        _add_anime_sessions[owner_id] = session
 
-        try:
-            await cb.message.edit(_fetch_summary_text(fetched))
-        except Exception:
-            pass
-        await _show_image_choice(cb.message, session, owner_id)
+        # Edit / Done — user galat details yahin sahi kar sakta hai
+        await _show_details_confirm(cb.message, session, owner_id, edit=True)
+        return
+
+    # ── aa_det_* : TMDB details ka Edit / Done ──
+    if data.startswith("aa_det_"):
+        sub = parts[2]          # edit | done | back | f
+        if session.get("step") not in ("details_confirm", "details_menu", "details_edit"):
+            await cb.answer("⚠️ Ye step ab active nahi hai.", show_alert=True)
+            return
+
+        if sub == "edit":
+            session["step"] = "details_menu"
+            _add_anime_sessions[owner_id] = session
+            await cb.answer()
+            try:
+                await cb.message.edit(
+                    _details_card_text(session).rsplit("\n\n", 1)[0] +
+                    "\n\n✏️ **Kya edit karna hai?** Field choose karo.",
+                    reply_markup=_details_edit_kb(owner_id),
+                )
+            except Exception:
+                pass
+            return
+
+        if sub == "back":
+            await cb.answer()
+            await _show_details_confirm(cb.message, session, owner_id, edit=True)
+            return
+
+        if sub == "f":
+            field = parts[3]
+            if field not in _DET_FIELD_PROMPTS:
+                await cb.answer()
+                return
+            session["edit_field"] = field
+            session["step"] = "details_edit"
+            _add_anime_sessions[owner_id] = session
+            label, hint = _DET_FIELD_PROMPTS[field]
+            await cb.answer()
+            try:
+                await cb.message.edit(
+                    f"**✏️ {label} edit karo**\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"{hint}\n\n"
+                    f"_Cancel karna ho toh `/cancel_add_anime` bhejo._"
+                )
+            except Exception:
+                pass
+            return
+
+        if sub == "done":
+            session.pop("edit_field", None)
+            session["step"] = "image_choice"
+            _add_anime_sessions[owner_id] = session
+            await cb.answer("✅ Details save ho gaye")
+            try:
+                await cb.message.edit(
+                    _details_card_text(session).rsplit("\n\n", 1)[0] + "\n\n✅ **Details confirmed.**"
+                )
+            except Exception:
+                pass
+            await _show_image_choice(cb.message, session, owner_id)
+            return
+
+        await cb.answer()
         return
 
     # ── aa_img_auto_<uid> / aa_img_custom_<uid> ──
@@ -2612,6 +2814,9 @@ async def add_anime_flow_router(client: Client, message: Message):
     if step == "link_manual":
         await _add_anime_step_link(client, message, session, user_id)
         raise StopPropagation
+    if step == "details_edit":
+        await _add_anime_step_details_edit(client, message, session, user_id)
+        raise StopPropagation
     if step in ("image_custom", "video_pic"):
         # Photos yahan nahi — dedicated add_anime_photo_input (upar) handle
         # karta hai. Sirf stray text ko yahan nudge karo.
@@ -2622,8 +2827,8 @@ async def add_anime_flow_router(client: Client, message: Message):
             )
             raise StopPropagation
         raise ContinuePropagation
-    if step in ("await_start", "name_choice", "image_choice", "dub_choice",
-                "interval_choice", "link_choice"):
+    if step in ("await_start", "name_choice", "details_confirm", "details_menu",
+                "image_choice", "dub_choice", "interval_choice", "link_choice"):
         if message.text:
             await message.reply("⬆️ Upar diye gaye buttons mein se ek option choose karo.")
         raise StopPropagation
