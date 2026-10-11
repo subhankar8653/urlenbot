@@ -253,6 +253,142 @@ def _old_format_should_skip(text: str, url: str | None) -> str | None:
 
 
 # ─────────────────────────────────────────────
+#  Season intro + Border  (channel post decoration)
+#  ─────────────────────────────────────────────
+#  Season ke pehle episode (Ep 1) se pehle:
+#     TMDB details post  →  border  →  season sticker
+#  Har episode ki SAARI qualities upload hone ke baad:  border
+#  Border (/border) aur season stickers (/season_sticker) wahi hain jo
+#  /bot_upload use karta hai — set nahi hain to chupchap skip hota hai.
+# ─────────────────────────────────────────────
+def _season_hint_from_text(*texts) -> int | None:
+    """Post/page title se season number nikalo (\"Season 2\", \"2nd Season\", \"S2\")."""
+    for t in texts:
+        if not t:
+            continue
+        m = (re.search(r'\bseason\s*0*(\d{1,2})\b', t, re.IGNORECASE)
+             or re.search(r'\b(\d{1,2})(?:st|nd|rd|th)\s+season\b', t, re.IGNORECASE)
+             or re.search(r'\bS0*(\d{1,2})(?:\s*E\d+)?\b', t))
+        if m:
+            try:
+                n = int(m.group(1))
+                if 0 < n < 50:
+                    return n
+            except ValueError:
+                pass
+    return None
+
+
+async def _get_deco():
+    """(border, season_stickers) — owner/sudo users mein se jis ne set kiya ho."""
+    from .. import owner as _O, sudo_users as _S
+    border, stickers = None, []
+    seen = set()
+    for uid in list(_O) + list(_S):
+        if uid in seen:
+            continue
+        seen.add(uid)
+        try:
+            if border is None:
+                border = await db.get_bot_border(uid)
+            if not stickers:
+                stickers = await db.get_season_stickers(uid) or []
+        except Exception:
+            continue
+    return border, stickers
+
+
+async def _send_deco_item(client: Client, chat_id: int, item: dict):
+    if (item or {}).get("type") == "sticker":
+        await client.send_sticker(chat_id, item["file_id"])
+    else:
+        await client.send_photo(chat_id, item["file_id"])
+
+
+async def _send_border(client: Client, channel_id: int):
+    try:
+        border, _ = await _get_deco()
+        if border:
+            await _send_deco_item(client, channel_id, border)
+    except Exception as e:
+        LOGGER.error(f"[Deco] Border send failed: {e}")
+
+
+async def _send_season_intro(client: Client, channel_id: int, anime_name: str, season: int):
+    """TMDB details post → border → season sticker (is order mein)."""
+    from ..utils.anime_api import fetch_season_post_info
+    entry = {}
+    try:
+        from .update_channel import _get_post_map
+        pm = await _get_post_map()
+        entry = pm.get(anime_name.lower().strip()) or {}
+        if not entry:
+            nk = _normalize(anime_name)
+            for k, v in pm.items():
+                if _normalize(k) == nk:
+                    entry = v
+                    break
+    except Exception:
+        entry = {}
+
+    info = None
+    try:
+        info = await fetch_season_post_info(anime_name, season)
+    except Exception as e:
+        LOGGER.warning(f"[Deco] season info fetch failed: {e}")
+    info = info or {}
+
+    name = entry.get("display_name") or info.get("title") or anime_name
+    genres = entry.get("genres") or info.get("genres") or ""
+    lines = [f"🎬 <b>{html.escape(name)}</b> — Season {season}", ""]
+    if info.get("status"):
+        lines.append(f"📡 <b>Status:</b> {html.escape(info['status'])}")
+    if info.get("season_eps"):
+        lines.append(f"🎞 <b>Episodes:</b> {info['season_eps']}")
+    if info.get("year"):
+        lines.append(f"📅 <b>Year:</b> {html.escape(str(info['year']))}")
+    if info.get("rating"):
+        lines.append(f"⭐ <b>Rating:</b> {info['rating']}/10")
+    if genres:
+        lines.append(f"🎭 <b>Genres:</b> {html.escape(genres)}")
+    if entry.get("audio"):
+        lines.append(f"🎙 <b>Audio:</b> {html.escape(entry['audio'])}")
+    ov = (info.get("overview") or "").strip()
+    if ov:
+        if len(ov) > 380:
+            ov = ov[:377].rstrip() + "..."
+        lines += ["", f"📖 {html.escape(ov)}"]
+    caption = "\n".join(lines)[:1000]
+
+    image = entry.get("image") or info.get("image") or info.get("poster")
+    try:
+        if image:
+            try:
+                await client.send_photo(channel_id, image, caption=caption, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                LOGGER.warning(f"[Deco] details photo failed ({e}); text bhej raha hoon")
+                await client.send_message(channel_id, caption, parse_mode=ParseMode.HTML)
+        else:
+            await client.send_message(channel_id, caption, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        LOGGER.error(f"[Deco] details post failed: {e}")
+
+    border, stickers = await _get_deco()
+    if border:
+        try:
+            await _send_deco_item(client, channel_id, border)
+        except Exception as e:
+            LOGGER.error(f"[Deco] intro border failed: {e}")
+    if 1 <= season <= len(stickers):
+        try:
+            await _send_deco_item(client, channel_id, stickers[season - 1])
+        except Exception as e:
+            LOGGER.error(f"[Deco] season sticker failed: {e}")
+    else:
+        LOGGER.info(f"[Deco] Season {season} ka sticker set nahi ({len(stickers)} saved) — skip")
+
+
+# ─────────────────────────────────────────────
 #  Core: AutoMonitor Swift Runner
 #
 #  Swift URL milne ke baad — bilkul /swift ki
@@ -272,6 +408,8 @@ async def _episode_quality_poller(
     end_ep: int = None,
     update_post_sent: list = None,
     update_post_mode: str = "auto",
+    season_intro: list = None,
+    season_hint: int = None,
 ) -> bool:
     """
     update_post_mode: "auto" (global /updatechannel toggle follow kare — /Rtic aur
@@ -472,6 +610,27 @@ async def _episode_quality_poller(
             unmark_active(anime_name, episode_num)
             return False
 
+        # Season ka pehla episode: details post → border → season sticker
+        # (kisi bhi quality ke upload se PEHLE, sirf ek baar per batch)
+        if (season_intro is not None and not season_intro[0]
+                and start_ep == 1 and episode_num == 1):
+            season_intro[0] = True
+            try:
+                from ..utils.auto_caption import extract_anime_info as _eai_s
+                _sn = None
+                try:
+                    _, _sn, _ = _eai_s(os.path.basename(new_files[0]), {})
+                except Exception:
+                    _sn = None
+                try:
+                    _sn = int(_sn) if _sn else None
+                except (TypeError, ValueError):
+                    _sn = None
+                _sn = _sn or season_hint or 1
+                await _send_season_intro(client, channel_id, anime_name, _sn)
+            except Exception as _ie:
+                LOGGER.error(f"[Deco] season intro error: {_ie}")
+
         qualities_found = [_quality_from(os.path.basename(f)) for f in new_files]
         try:
             await status_msg.edit(
@@ -642,6 +801,9 @@ async def _episode_quality_poller(
 
     LOGGER.info(f"[AutoMonitor] Ep {episode_num}: done in {poll_elapsed}m — {uploaded_qualities}")
     unmark_active(anime_name, episode_num)
+    if uploaded_qualities:
+        # Episode ki saari qualities ke baad border line
+        await _send_border(client, channel_id)
     return len(uploaded_qualities) > 0
 
 
@@ -1422,6 +1584,8 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
 
     # Shared flag — pehle episode ke 360p pe True hoga, baaki skip karenge
     update_post_sent = [False]
+    season_intro_state = [False]
+    season_hint = _season_hint_from_text(text)
     # Track karo ki kam se kam ek episode successfully upload hua ya nahi
     any_ep_uploaded = False
 
@@ -1507,6 +1671,8 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
             start_ep=start_ep,
             end_ep=end_ep,
             update_post_sent=update_post_sent,
+            season_intro=season_intro_state,
+            season_hint=season_hint,
         )
         if ep_uploaded:
             any_ep_uploaded = True
@@ -1698,6 +1864,8 @@ async def _cmd_rtic_impl(client: Client, message: Message):
     )
 
     update_post_sent = [False]
+    season_intro_state = [False]
+    season_hint = _season_hint_from_text(page_title, page_url)
     any_ep_uploaded = False
 
     for i, ep_num in enumerate(range(start_ep, end_ep + 1), 1):
@@ -1775,6 +1943,8 @@ async def _cmd_rtic_impl(client: Client, message: Message):
             start_ep=start_ep,
             end_ep=end_ep,
             update_post_sent=update_post_sent,
+            season_intro=season_intro_state,
+            season_hint=season_hint,
         )
         if ep_uploaded:
             any_ep_uploaded = True

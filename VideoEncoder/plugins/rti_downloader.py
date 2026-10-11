@@ -985,6 +985,9 @@ async def _download_items(client, status_msg, orig_message, sess: "RTISelector",
         nums = [0 if sess.items[i]["kind"] == "MOVIE" else (sess.items[i]["num"] or 0) for i in idxs]
         start_ep, end_ep = nums[0], max(nums)
         update_post_sent = [False]
+        # Season intro sirf tab jab selection Ep 1 (EP kind) se shuru ho
+        _first = sess.items[idxs[0]]
+        season_intro_state = [not (_first["kind"] == "EP" and nums[0] == 1)]
         up_mode = "force" if sess.update_toggle else "off"
         any_uploaded = False
 
@@ -1029,6 +1032,8 @@ async def _download_items(client, status_msg, orig_message, sess: "RTISelector",
                 start_ep=start_ep, end_ep=end_ep,
                 update_post_sent=update_post_sent,
                 update_post_mode=up_mode,
+                season_intro=season_intro_state,
+                season_hint=sess.season,
             )
             if not ok:
                 state["last"] = "error"
