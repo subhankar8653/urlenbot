@@ -28,6 +28,8 @@ Flow:
   ❌ Close              -> hub message delete
 """
 
+import contextvars
+
 from pyrogram import Client, filters
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -41,114 +43,116 @@ def _is_auth(user_id: int) -> bool:
 _MENU_TEXT = (
     "🛠 **Customise Menu**\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
-    "Jo bhi setting change karni hai, uska button neeche tap karo.\n"
-    "Har button ke saath ek chhoti si line hai jo bata degi ki woh "
-    "**kahan** use hota hai — koi command yaad rakhne ki zaroorat "
-    "nahi.\n\n"
-    "**✍️ 1. Caption & Post Look**\n"
-    "_Video/post kaisa dikhega, uski settings_\n\n"
-    "**🤖 2. Auto-Monitor & Channels**\n"
-    "_Anime auto-detect, upload channels, kaunsa anime kahan jaata hai_\n\n"
-    "**✂️ 3. Filename & Thumbnail**\n"
-    "_Filename ke text replace/hide, keyword se thumbnail_\n\n"
-    "**⏰ 4. Cleanup & Schedule**\n"
-    "_Purane messages hatana, next-episode message, end message_\n\n"
-    "**⚙️ 5. Other Settings**\n"
-    "_Baaki chhoti settings (community/brand naam waghera)_\n\n"
+    "Neeche se ek category choose karo — uske andar ki saari settings "
+    "wahin khul jaayengi.\n\n"
     "> ℹ️ _Yeh sab settings poore bot ke liye hain (sabke liye same lagengi)._"
 )
 
+# (key, button title, category title, description, [(button label, section)])
+_CATEGORIES = [
+    ("caption", "✍️ Caption & Post",
+     "✍️ **Caption & Post Edit**",
+     "_Video aur channel post kaisa dikhega, uski settings_",
+     [
+         ("🎬 Video Caption (upload hote waqt)", "caption_style"),
+         ("🖌 Update-Post Caption (channel post ki caption)", "update_post_style"),
+         ("🔗 Post ke Niche waali Link Line", "how_to_get_link"),
+         ("🔘 \"Kaise Dekhein\" / \"Join\" Buttons", "update_post_button"),
+         ("📋 Saved Anime Posts (list/edit)", "update_post_list"),
+         ("📢 Update Channels (kahan post jaata hai)", "update_channels"),
+     ]),
+    ("thumb", "🖼 Thumbnail",
+     "🖼 **Thumbnail Edit**",
+     "_Video thumbnail ka design aur keyword-wise thumbnail_",
+     [
+         ("🖼 Thumbnail Band Design", "setpic_style"),
+         ("🖼 Keyword-wise Thumbnail", "custompic"),
+     ]),
+    ("monitor", "🤖 Auto Monitor",
+     "🤖 **Auto Monitor & Channels**",
+     "_Anime auto-detect, upload channels, kaunsa anime kahan jaata hai_",
+     [
+         ("🤖 Auto-Monitor Anime List", "auto_monitor"),
+         ("📡 Channel ↔ Anime Link", "channel_upload"),
+     ]),
+    ("filename", "✂️ Filename",
+     "✂️ **Filename Settings**",
+     "_Filename ke text replace / hide_",
+     [
+         ("🔄 Filename Text Replace", "swap_rules"),
+         ("🚫 Filename Banned Words", "blacklist"),
+     ]),
+    ("cleanup", "⏰ Cleanup & Schedule",
+     "⏰ **Cleanup & Schedule**",
+     "_Purane messages hatana, next-episode message, end message_",
+     [
+         ("🗑 Auto-Delete Old Messages", "delete_message"),
+         ("📅 Next-Episode / End Message", "schedule"),
+         ("🏁 Upload Extras (end template/stickers)", "bot_upload_extras"),
+     ]),
+    ("other", "⚙️ Other Settings",
+     "⚙️ **Other Settings**",
+     "_Baaki chhoti settings (metadata, community/brand naam)_",
+     [
+         ("🏷 Metadata & URL Settings", "url_settings"),
+         ("👥 Community / Brand Naam", "community"),
+     ]),
+]
 
-def _section_header(title: str) -> InlineKeyboardButton:
-    # Sirf ek visual divider — tap karne se kuch nahi hota.
-    return InlineKeyboardButton(title, callback_data="cmz:noop")
+_CAT_BY_KEY = {c[0]: c for c in _CATEGORIES}
+_CAT_OF_SECTION = {sec: c[0] for c in _CATEGORIES for _, sec in c[4]}
+
+# Abhi kaunsa section khula hai — taaki uska "🔙 <Category>" button ban sake
+_CUR_SECTION: contextvars.ContextVar = contextvars.ContextVar("cmz_cur_section", default=None)
 
 
 def _menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [_section_header("✍️ ── Caption & Post Look ──")],
-        [InlineKeyboardButton(
-            "🎬 Video Caption (upload hote waqt)",
-            callback_data="cmz:open:caption_style",
-        )],
-        [InlineKeyboardButton(
-            "🖌 Update-Post Caption (channel post ki caption)",
-            callback_data="cmz:open:update_post_style",
-        )],
-        [InlineKeyboardButton(
-            "🖼 Thumbnail Band Design",
-            callback_data="cmz:open:setpic_style",
-        )],
-        [InlineKeyboardButton(
-            "🔗 Post ke Niche waali Link Line",
-            callback_data="cmz:open:how_to_get_link",
-        )],
-        [InlineKeyboardButton(
-            "🔘 \"Kaise Dekhein\" / \"Join\" Buttons",
-            callback_data="cmz:open:update_post_button",
-        )],
-        [InlineKeyboardButton(
-            "📋 Saved Anime Posts (list/edit)",
-            callback_data="cmz:open:update_post_list",
-        )],
-        [InlineKeyboardButton(
-            "📢 Update Channels (kahan post jaata hai)",
-            callback_data="cmz:open:update_channels",
-        )],
+    """Main hub — sirf category buttons (2 columns)."""
+    rows, row = [], []
+    for key, btn_title, *_ in _CATEGORIES:
+        row.append(InlineKeyboardButton(btn_title, callback_data=f"cmz:cat:{key}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("❌ Close", callback_data="cmz:close")])
+    return InlineKeyboardMarkup(rows)
 
-        [_section_header("🤖 ── Auto-Monitor & Channels ──")],
-        [InlineKeyboardButton(
-            "🤖 Auto-Monitor Anime List",
-            callback_data="cmz:open:auto_monitor",
-        )],
-        [InlineKeyboardButton(
-            "📡 Channel ↔ Anime Link",
-            callback_data="cmz:open:channel_upload",
-        )],
 
-        [_section_header("✂️ ── Filename & Thumbnail ──")],
-        [InlineKeyboardButton(
-            "🔄 Filename Text Replace",
-            callback_data="cmz:open:swap_rules",
-        )],
-        [InlineKeyboardButton(
-            "🚫 Filename Banned Words",
-            callback_data="cmz:open:blacklist",
-        )],
-        [InlineKeyboardButton(
-            "🖼 Keyword-wise Thumbnail",
-            callback_data="cmz:open:custompic",
-        )],
+def _category_text(key: str) -> str:
+    _, _, title, desc, items = _CAT_BY_KEY[key]
+    return (
+        f"{title}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{desc}\n\n"
+        f"Jo setting change karni hai uska button tap karo 👇"
+    )
 
-        [_section_header("⏰ ── Cleanup & Schedule ──")],
-        [InlineKeyboardButton(
-            "🗑 Auto-Delete Old Messages",
-            callback_data="cmz:open:delete_message",
-        )],
-        [InlineKeyboardButton(
-            "📅 Next-Episode / End Message",
-            callback_data="cmz:open:schedule",
-        )],
-        [InlineKeyboardButton(
-            "🏁 Upload Extras (end template/stickers)",
-            callback_data="cmz:open:bot_upload_extras",
-        )],
 
-        [_section_header("⚙️ ── Other Settings ──")],
-        [InlineKeyboardButton(
-            "🏷 Metadata & URL Settings",
-            callback_data="cmz:open:url_settings",
-        )],
-        [InlineKeyboardButton(
-            "👥 Community / Brand Naam",
-            callback_data="cmz:open:community",
-        )],
-        [InlineKeyboardButton("❌ Close", callback_data="cmz:close")],
+def _category_keyboard(key: str) -> InlineKeyboardMarkup:
+    items = _CAT_BY_KEY[key][4]
+    rows = [
+        [InlineKeyboardButton(label, callback_data=f"cmz:open:{section}")]
+        for label, section in items
+    ]
+    rows.append([
+        InlineKeyboardButton("🔙 Customise Menu", callback_data="cmz:menu"),
+        InlineKeyboardButton("❌ Close", callback_data="cmz:close"),
     ])
+    return InlineKeyboardMarkup(rows)
 
 
 def _back_row() -> list:
-    return [InlineKeyboardButton("🔙 Customise Menu", callback_data="cmz:menu")]
+    """Section ke andar: pehle us category pe wapas, saath mein main menu."""
+    cat = _CAT_OF_SECTION.get(_CUR_SECTION.get())
+    row = []
+    if cat:
+        row.append(InlineKeyboardButton("🔙 Back", callback_data=f"cmz:cat:{cat}"))
+        row.append(InlineKeyboardButton("🏠 Menu", callback_data="cmz:menu"))
+    else:
+        row.append(InlineKeyboardButton("🔙 Customise Menu", callback_data="cmz:menu"))
+    return row
 
 
 def with_customise_back(markup) -> InlineKeyboardMarkup:
@@ -194,6 +198,15 @@ async def customise_callback(client: Client, cb: CallbackQuery):
     if action == "menu":
         await cb.answer()
         await _safe_edit(client, cb, _MENU_TEXT, _menu_keyboard())
+        return
+
+    if action == "cat":
+        key = parts[2] if len(parts) > 2 else ""
+        if key not in _CAT_BY_KEY:
+            await cb.answer()
+            return
+        await cb.answer()
+        await _safe_edit(client, cb, _category_text(key), _category_keyboard(key))
         return
 
     if action == "close":
@@ -263,6 +276,7 @@ async def customise_callback(client: Client, cb: CallbackQuery):
 
 async def _open_section(client: Client, cb: CallbackQuery, section: str):
     user_id = cb.from_user.id
+    _CUR_SECTION.set(section)
 
     if section == "caption_style":
         from . import caption_style as mod
