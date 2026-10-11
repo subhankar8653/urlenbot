@@ -325,6 +325,60 @@ async def _fetch_from_tmdb(anime_name: str) -> Optional[dict]:
     }
 
 
+async def fetch_season_post_info(anime_name: str, season: int = None) -> Optional[dict]:
+    """
+    Season-intro "details post" ke liye TMDB info (auto-upload ke season start pe).
+
+      {title, year, rating, genres, status, overview, season, season_eps, image, poster}
+
+    TMDB key na ho ya match na mile to None.
+    """
+    if not TMDB_API_KEY:
+        return None
+    cleaned = _clean_anime_query(anime_name)
+    query = cleaned if cleaned else anime_name
+    media_type, result = await _tmdb_search(query)
+    if not result and query.lower() != anime_name.lower():
+        media_type, result = await _tmdb_search(anime_name)
+    if not result:
+        return None
+
+    details = await _tmdb_details(media_type, result.get("id")) or result
+    is_tv = media_type == "tv"
+    title = (details.get("name") if is_tv else details.get("title")) or anime_name
+    status = _TMDB_STATUS_MAP.get(details.get("status") or "", "")
+    genres = ", ".join(g.get("name", "") for g in (details.get("genres") or []) if g.get("name"))
+    overview = (details.get("overview") or "").strip()
+    year = ((details.get("first_air_date") if is_tv else details.get("release_date")) or "")[:4]
+    rating = details.get("vote_average") or 0
+    season_eps = 0 if is_tv else 1
+
+    poster_path = details.get("poster_path")
+    if is_tv and season:
+        for sn in (details.get("seasons") or []):
+            if sn.get("season_number") == season:
+                season_eps = sn.get("episode_count") or 0
+                if (sn.get("overview") or "").strip():
+                    overview = sn["overview"].strip()
+                if sn.get("air_date"):
+                    year = sn["air_date"][:4]
+                if sn.get("poster_path"):
+                    poster_path = sn["poster_path"]
+                break
+
+    images = details.get("images") or {}
+    image = _pick_best_backdrop(images.get("backdrops") or [])
+    if not image and details.get("backdrop_path"):
+        image = f"{TMDB_IMAGE_BASE}{details['backdrop_path']}"
+    poster = f"{TMDB_IMAGE_BASE}{poster_path}" if poster_path else ""
+
+    return {
+        "title": title, "year": year, "rating": round(float(rating), 1) if rating else 0,
+        "genres": genres, "status": status, "overview": overview,
+        "season": season, "season_eps": season_eps, "image": image, "poster": poster,
+    }
+
+
 # ---------------------------------------------------------------------------
 # AniList (fallback)
 # ---------------------------------------------------------------------------
