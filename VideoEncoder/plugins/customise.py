@@ -74,6 +74,13 @@ _CATEGORIES = [
          ("📋 Main Channel Post Anime List", "update_post_list"),
          ("📢 Main Channel Post Channels", "update_channels"),
      ]),
+    ("deco", "🎟 Border & Stickers",
+     "🎟 **Border & Season Stickers**",
+     "_Episode ke baad ki border line aur season ke sticker — add / edit / delete_",
+     [
+         ("🖼 Border Line", "border_panel"),
+         ("🎟 Season Stickers", "season_panel"),
+     ]),
     ("filename", "✂️ Filename",
      "✂️ **Filename Settings**",
      "_Filename ke text replace / hide_",
@@ -194,6 +201,15 @@ async def customise_callback(client: Client, cb: CallbackQuery):
     parts = cb.data.split(":")
     action = parts[1]
 
+    if action in ("menu", "cat", "open", "close"):
+        from .deco_panel import clear_session as _deco_clear
+        _deco_clear(cb.from_user.id)
+
+    if action == "deco":
+        from .deco_panel import handle as _deco_handle
+        await _deco_handle(client, cb, parts[2:])
+        return
+
     if action == "menu":
         await cb.answer()
         await _safe_edit(client, cb, _MENU_TEXT, _menu_keyboard())
@@ -276,6 +292,16 @@ async def customise_callback(client: Client, cb: CallbackQuery):
 async def _open_section(client: Client, cb: CallbackQuery, section: str):
     user_id = cb.from_user.id
     _CUR_SECTION.set(section)
+
+    if section == "border_panel":
+        from .deco_panel import render_border
+        await render_border(client, cb)
+        return
+
+    if section == "season_panel":
+        from .deco_panel import render_season
+        await render_season(client, cb)
+        return
 
     if section == "caption_style":
         from . import caption_style as mod

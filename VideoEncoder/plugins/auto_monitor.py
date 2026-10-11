@@ -379,7 +379,7 @@ async def _send_season_intro(client: Client, channel_id: int, anime_name: str, s
             await _send_deco_item(client, channel_id, border)
         except Exception as e:
             LOGGER.error(f"[Deco] intro border failed: {e}")
-    if 1 <= season <= len(stickers):
+    if 1 <= season <= len(stickers) and (stickers[season - 1] or {}).get("file_id"):
         try:
             await _send_deco_item(client, channel_id, stickers[season - 1])
         except Exception as e:
