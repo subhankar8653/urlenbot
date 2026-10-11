@@ -136,6 +136,35 @@ class Job:
         self._last = 0.0
         self._timer = None
         self._lock = asyncio.Lock()
+        # Quota system (utils/quota.py)
+        self.quota_count = None      # set ho to run() shuru karne se pehle quota leta hai
+        self._quota_ticket = None
+
+    # ── quota ──
+    async def _quota_wait_text(self, pos, reason):
+        if self.finished or self.cancelled:
+            return
+        await self.slot("stage", order=0).edit(
+            f"⏳ **Quota mein hai** — queue #{pos}\n"
+            f"{reason}\n"
+            f"Apni baari aane par apne aap shuru ho jaayega."
+        )
+
+    async def acquire_quota(self, count):
+        """1 episode = single, 2+ = multi. Jagah milne tak yahin wait."""
+        if self._quota_ticket is not None:
+            return
+        from . import quota
+        t = await quota.acquire(quota.kind_for(count), self._quota_wait_text)
+        self._quota_ticket = t
+        if t.waited and not (self.finished or self.cancelled):
+            await self.slot("stage", order=0).edit("▶️ Quota mil gaya — shuru ho raha hai...")
+
+    def _release_quota(self):
+        t, self._quota_ticket = self._quota_ticket, None
+        if t is not None:
+            from . import quota
+            quota.release(t)
 
     # ── slots ──
     def slot(self, key, order=50, label="") -> Slot:
@@ -232,7 +261,12 @@ class Job:
         """coro_fn: bina-argument async callable. Cancel hone par None return."""
         token = CURRENT.set(self)
         JOBS[self.id] = self
-        self.task = asyncio.ensure_future(coro_fn())
+        async def _guarded():
+            if self.quota_count:
+                await self.acquire_quota(self.quota_count)
+            return await coro_fn()
+
+        self.task = asyncio.ensure_future(_guarded())
         try:
             return await self.task
         except asyncio.CancelledError:
@@ -240,6 +274,7 @@ class Job:
                 return None
             raise
         finally:
+            self._release_quota()
             CURRENT.reset(token)
             JOBS.pop(self.id, None)
             if self._timer:
@@ -350,7 +385,14 @@ async def stage_msg(message, text: str):
     return await message.reply(text)
 
 
-async def run_with_card(message, title: str, impl, owner_id: int = None):
+async def acquire_quota(count):
+    """Current job ke liye quota lo (job ke andar se). Job nahi hai to kuch nahi."""
+    job = CURRENT.get()
+    if job is not None:
+        await job.acquire_quota(count)
+
+
+async def run_with_card(message, title: str, impl, owner_id: int = None, quota_count: int = None):
     """
     impl (bina-argument async callable) ko ek Job ke andar chalao: ek hi card message
     + "❌ Cancel" button. Returns (job, impl_result).
@@ -361,6 +403,7 @@ async def run_with_card(message, title: str, impl, owner_id: int = None):
     if owner_id is None:
         owner_id = message.from_user.id if getattr(message, "from_user", None) else 0
     job = Job(None, owner_id, title, factory=_factory)
+    job.quota_count = quota_count
     box = {}
 
     async def _b():
