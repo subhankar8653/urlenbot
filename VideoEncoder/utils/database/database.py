@@ -623,6 +623,12 @@ class Database:
             upsert=True,
         )
 
+    async def clear_bot_border(self, user_id: int):
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$unset': {'bot_border': ''}},
+        )
+
     async def get_bot_border(self, user_id: int):
         user = await self._get_user(user_id)
         return user.get('bot_border')
