@@ -3150,7 +3150,10 @@ async def _show_list_anime_panel(client: Client, event, user_id: int, page: int,
             f"📋 Koi anime registered nahi hai!\n\n"
             f"Add karo: <code>/add_anime</code>"
         )
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="closeMeh")]])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Customise Menu", callback_data="cmz:menu")],
+            [InlineKeyboardButton("❌ Close", callback_data="closeMeh")],
+        ])
         if is_new:
             await event.reply(text, reply_markup=kb, parse_mode=ParseMode.HTML)
         else:
@@ -3183,14 +3186,15 @@ async def _show_list_anime_panel(client: Client, event, user_id: int, page: int,
     if page < total_pages - 1:
         nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"alist_page_{page + 1}_{user_id}"))
     rows.append(nav_row)
+    rows.append([InlineKeyboardButton("🔙 Customise Menu", callback_data="cmz:menu")])
     rows.append([InlineKeyboardButton("❌ Close", callback_data="closeMeh")])
 
     kb = InlineKeyboardMarkup(rows)
     text = (
         f"📡 <b>Monitor:</b> {mc_text}\n\n"
         f"📋 <b>Registered Anime ({total})</b>\n"
-        f"<i>Kisi bhi anime pe tap karke full detail dekho.</i>\n\n"
-        f"🗑️ Remove: <code>/del_anime &lt;number&gt;</code>"
+        f"<i>Kisi bhi anime pe tap karke detail dekho ya delete karo.</i>\n\n"
+        f"➕ Naya anime: <code>/add_anime</code>"
     )
 
     if is_new:
@@ -3226,10 +3230,10 @@ async def _show_anime_detail(client: Client, event, user_id: int, idx: int, page
         f"<b>Name:</b> <code>{name}</code>\n"
         f"<b>Channel:</b> <code>{ch_title}</code> (<code>{ch_id}</code>)\n"
         f"<b>Hashtag:</b> <code>{hashtag}</code>\n"
-        f"<b>Link:</b> <code>{link}</code>\n\n"
-        f"🗑️ Remove: <code>/del_anime {idx + 1}</code>"
+        f"<b>Link:</b> <code>{link}</code>"
     )
     kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑️ Delete Anime", callback_data=f"alist_del_{idx}_{user_id}_{page}")],
         [InlineKeyboardButton("⬅️ Back", callback_data=f"alist_back_{page}_{user_id}")],
     ])
 
@@ -3299,6 +3303,66 @@ async def anime_list_panel_callbacks(client: Client, cb: CallbackQuery):
             return
         await cb.answer()
         await _show_anime_detail(client, cb.message, owner_id, idx, page)
+        return
+
+    # ── alist_del_<idx>_<uid>_<page> — delete ka confirm screen ──
+    if data.startswith("alist_del_"):
+        parts = data.split("_")
+        try:
+            idx = int(parts[2])
+            owner_id = int(parts[3])
+            page = int(parts[4]) if len(parts) > 4 else 0
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+        if user_id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+        anime_list = await _get_anime_list()
+        if idx < 0 or idx >= len(anime_list):
+            await cb.answer("❌ Anime nahi mila!", show_alert=True)
+            await _show_list_anime_panel(client, cb.message, owner_id, page, is_new=False)
+            return
+        entry = anime_list[idx]
+        await cb.answer()
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Haan, delete", callback_data=f"alist_delok_{idx}_{owner_id}_{page}"),
+            InlineKeyboardButton("❌ Nahi", callback_data=f"alist_open_{idx}_{owner_id}_{page}"),
+        ]])
+        try:
+            await cb.message.edit(
+                f"🗑️ <b>Anime delete kar du?</b>\n\n"
+                f"📺 {_esc(entry.get('anime_name'))}\n"
+                f"📢 {_esc(entry.get('channel_title'))}\n\n"
+                f"Iske baad is anime ke naye episodes auto-upload nahi honge.",
+                reply_markup=kb, parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            LOGGER.warning(f"[AutoMonitor] alist_del confirm edit error: {e}")
+        return
+
+    # ── alist_delok_<idx>_<uid>_<page> — asli delete ──
+    if data.startswith("alist_delok_"):
+        parts = data.split("_")
+        try:
+            idx = int(parts[2])
+            owner_id = int(parts[3])
+            page = int(parts[4]) if len(parts) > 4 else 0
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+        if user_id != owner_id:
+            await cb.answer("❌ Ye tumhara nahi hai!", show_alert=True)
+            return
+        anime_list = await _get_anime_list()
+        if idx < 0 or idx >= len(anime_list):
+            await cb.answer("❌ Anime pehle hi hat chuka hai.", show_alert=True)
+        else:
+            removed = anime_list.pop(idx)
+            await _save_anime_list(anime_list)
+            LOGGER.info(f"[AutoMonitor] Anime deleted via panel: {removed.get('anime_name')}")
+            await cb.answer("🗑️ Delete ho gaya")
+        await _show_list_anime_panel(client, cb.message, owner_id, page, is_new=False)
         return
 
     # ── alist_back_<page>_<uid> ──

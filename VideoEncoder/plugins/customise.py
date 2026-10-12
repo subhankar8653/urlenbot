@@ -204,8 +204,15 @@ async def customise_callback(client: Client, cb: CallbackQuery):
     if action in ("menu", "cat", "open", "close"):
         from .deco_panel import clear_session as _deco_clear
         from .post_buttons_panel import clear_session as _pb_clear
+        from .update_channels_panel import clear_session as _uc_clear
         _deco_clear(cb.from_user.id)
         _pb_clear(cb.from_user.id)
+        _uc_clear(cb.from_user.id)
+
+    if action == "uc":
+        from .update_channels_panel import handle as _uc_handle
+        await _uc_handle(client, cb, parts[2:])
+        return
 
     if action == "pb":
         from .post_buttons_panel import handle as _pb_handle
@@ -357,55 +364,16 @@ async def _open_section(client: Client, cb: CallbackQuery, section: str):
         return
 
     if section == "update_channels":
-        from .update_channel import _get_update_channels, _get_update_toggle
-        channels = await _get_update_channels()
-        toggle = await _get_update_toggle()
-        status = "🟢 ON" if toggle else "🔴 OFF"
-        if not channels:
-            text = (
-                f"📢 **Main Channel Post — Channels**\n\n"
-                f"📭 Koi Main Channel Post channel add nahi hai.\n\n"
-                f"Posting Status: **{status}**\n\n"
-                f"Add karne ke liye: `/update_channel [channel_id]`"
-            )
-        else:
-            text = f"📢 **Main Channel Post — Channels ({len(channels)})** | Posting: **{status}**\n\n"
-            for i, ch in enumerate(channels, 1):
-                text += f"`{i}.` **{ch.get('channel_title', 'Unknown')}**\n"
-                text += f"    🆔 `{ch.get('channel_id')}`\n\n"
-            text += "💡 Add: `/update_channel [channel_id]`\n"
-            text += "💡 Remove: `/delete_update_channel [channel_id]`\n"
-            text += "💡 Toggle: `/updatechannel on` | `/updatechannel off`"
-        await _safe_edit(client, cb, text, InlineKeyboardMarkup([_back_row()]))
+        from .update_channels_panel import render_main as _uc_main
+        await _uc_main(client, cb)
         return
 
     # ── 🤖 Auto-Monitor & Anime List ──
     if section == "auto_monitor":
-        from .auto_monitor import _get_anime_list, _get_monitor_channel
-        channel = await _get_monitor_channel()
-        anime_list = await _get_anime_list()
-        text = (
-            "🤖 **Auto-Monitor & Anime List**\n\n"
-            "RTI (source) channel pe jab bhi \"Episode X-Y Added\" type ka "
-            "post aata hai, bot use automatically detect karke, anime "
-            "match karke, saari qualities download + upload kar deta hai — "
-            "manually kuch karne ki zaroorat nahi.\n\n"
-            f"📡 **Monitor Channel ID:** `{channel}`\n"
-            f"📺 **Saved Anime:** `{len(anime_list)}`\n\n"
-            "**Commands:**\n"
-            "• `/add_anime` — button-driven flow se naya anime add karo "
-            "(channel, naam, poster, audio, interval, sab ek saath)\n"
-            "• `/list_anime` — saare saved anime dekho/edit karo (niche "
-            "button se bhi khul jayega)\n"
-            "• `/del_anime` — kisi anime ko list se hatao\n"
-            "• `/set_monitor <channel_id>` — RTI source channel badlo\n"
-            "• `/monitor_status` — abhi monitor kya kar raha hai, live dekho"
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 Open Anime List", callback_data="cmz:analist")],
-            _back_row(),
-        ])
-        await _safe_edit(client, cb, text, kb)
+        # Seedha anime list panel (har anime ek button → detail → delete)
+        from .auto_monitor import _show_list_anime_panel
+        await cb.answer()
+        await _show_list_anime_panel(client, cb.message, user_id, page=0, is_new=False)
         return
 
     # ── 📡 Auto Channel Upload ──
