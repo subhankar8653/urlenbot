@@ -31,7 +31,7 @@ nahi).
 
 import logging
 
-from .caption_style import _utf16_len, _build_entities
+from .caption_style import _utf16_len, _build_entities, _handles_brackets
 
 LOGGER = logging.getLogger(__name__)
 
@@ -173,6 +173,23 @@ def _u_style10(d: dict) -> dict:
     return {"lines": lines, "quote": set(), "italic": set()}
 
 
+def _u_style11(d: dict) -> dict:
+    lines = [
+        f"🤍{d['anime_name']}",
+        "╭━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"┣🌙Season :- {d['season']:02d}",
+        f"┣🔥Episodes :- {d['episode']}",
+        f"┣✨Quality :- {d['quality']}",
+        f"┣🎶Language :- {d['audio']}",
+        f"┣👀Genre :- {d['genres']}",
+        "╰━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    handles = _handles_brackets(d.get("main_channel", ""), spaced=True)
+    if handles:
+        lines.append(f"💜𝐏ᴏᴡᴇʀᴇᴅ 𝐁ʏ : {handles}")
+    return {"lines": lines, "quote": set(), "italic": set(), "bold": False}
+
+
 STYLES = {
     "default":  {"name": "⚪ Default"},
     "style1":   {"name": "1️⃣ Star Box",          "render": _u_style1},
@@ -185,10 +202,11 @@ STYLES = {
     "style8":   {"name": "8️⃣ Sparkle Dotted",    "render": _u_style8},
     "style9":   {"name": "9️⃣ Double Border",     "render": _u_style9},
     "style10":  {"name": "🔟 Minimal Rule",       "render": _u_style10},
+    "style11":  {"name": "🆕 Powered By Card",    "render": _u_style11},
 }
 
 STYLE_ORDER = ["style1", "style2", "style3", "style4", "style5",
-               "style6", "style7", "style8", "style9", "style10"]
+               "style6", "style7", "style8", "style9", "style10", "style11"]
 
 PREVIEW_DATA = {
     "anime_name": "Grand Blue",
@@ -197,6 +215,7 @@ PREVIEW_DATA = {
     "quality": "360p, 720p, 1080p",
     "audio": "Hindi",
     "genres": "Animation, Comedy",
+    "main_channel": "@ANIME_DEKHLE @KYAMI_ANIMES_INDIA",
 }
 
 
@@ -250,7 +269,8 @@ def render_update_caption_entities(style_id: str, data: dict) -> tuple:
         return text, [{"type": "bold", "offset": 0, "length": _utf16_len(text)}]
     try:
         result = style["render"](data)
-        text, entities = _build_entities(result["lines"], result["quote"], result["italic"])
+        text, entities = _build_entities(result["lines"], result["quote"], result["italic"],
+                                         bold=result.get("bold", True))
 
         link_url = (data.get("how_to_get_link_url") or "").strip()
         if link_url:

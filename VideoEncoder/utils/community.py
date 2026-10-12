@@ -25,20 +25,43 @@ from .database.access_db import db
 DEFAULT_COMMUNITY = "sbanime"
 
 
-async def get_community_name(user_id=None) -> str:
-    """Raw community name, lowercase. Default: 'sbanime'. (Global — user_id ignored.)"""
+MAX_COMMUNITY_NAMES = 2
+
+
+def parse_names(raw) -> list:
+    """\"@a, B\" / \"a b\" -> ['a', 'b'] (lowercase, @ hata ke, unique, max 2)."""
+    out = []
+    for tok in (raw or "").replace(",", " ").split():
+        tok = tok.strip().lstrip("@").lower()
+        if tok and tok not in out:
+            out.append(tok)
+    return out[:MAX_COMMUNITY_NAMES]
+
+
+async def get_community_names(user_id=None) -> list:
+    """1 ya 2 community naam (lowercase list). Kuch set nahi to ['sbanime']."""
     try:
-        name = await db.get_community()
+        raw = await db.get_community_raw()
     except Exception:
-        name = None
-    name = (name or DEFAULT_COMMUNITY).strip().lower()
-    return name or DEFAULT_COMMUNITY
+        raw = None
+    return parse_names(raw) or [DEFAULT_COMMUNITY]
 
 
-async def get_community_tag(user_id=None) -> str:
-    """@-prefixed uppercase tag — caption/thumbnail band ke liye. e.g. '@BOBANIME'."""
-    name = await get_community_name()
-    return f"@{name.upper()}"
+async def get_community_name(user_id=None) -> str:
+    """PEHLA community naam, lowercase. Default: 'sbanime'. (Global — user_id ignored.)"""
+    return (await get_community_names())[0]
+
+
+async def get_community_tag(user_id=None, all_names: bool = False) -> str:
+    """@-prefixed uppercase tag — caption/thumbnail band ke liye. e.g. '@BOBANIME'.
+
+    all_names=False (default): sirf PEHLA naam (thumbnail band, metadata ke liye).
+    all_names=True: saare naam space se jode hue — '@A @B' (caption / post ke
+    "Main Channel" / "Powered By" line ke liye: 1 set hai to 1, 2 hain to 2)."""
+    names = await get_community_names()
+    if not all_names:
+        names = names[:1]
+    return " ".join(f"@{n.upper()}" for n in names)
 
 
 async def get_community_title(user_id=None) -> str:

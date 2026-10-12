@@ -186,6 +186,28 @@ def _t_style10(d: dict) -> dict:
     return {"lines": lines, "quote": {6}, "italic": set()}
 
 
+def _handles_brackets(main_channel: str, spaced: bool = False) -> str:
+    """'@A @B' -> '[@a] [@b]' (spaced=True: '[ @a ][ @b ]'). 1 naam ho to 1, 2 ho to 2."""
+    hs = [h.lower() for h in (main_channel or "").replace(",", " ").split() if h.strip()]
+    if not hs:
+        return ""
+    return "".join(f"[ {h} ]" for h in hs) if spaced else " ".join(f"[{h}]" for h in hs)
+
+
+def _t_style11(d: dict) -> dict:
+    lines = [
+        f"🎬 𝐀𝐧𝐢𝐦𝐞 𝐍𝐚𝐦𝐞 : {str(d['anime_name']).upper()}",
+        "",
+        f"‣ 𝐄𝐩𝐢𝐬𝐨𝐝𝐞: {d['episode']:02d}",
+        f"‣ 𝐐𝐮𝐚𝐥𝐢𝐭𝐲: {d['quality']}",
+        f"‣ 𝐒𝐞𝐚𝐬𝐨𝐧: {d['season']:02d}",
+        "──────────────────────",
+        "⭐️ 𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 :",
+        _handles_brackets(d.get("main_channel", "")),
+    ]
+    return {"lines": lines, "quote": set(), "italic": set(), "bold": False}
+
+
 STYLES = {
     "default":  {"name": "⚪ Default", "render": _t_default},
     "style1":   {"name": "1️⃣ Star Box",          "render": _t_style1},
@@ -198,10 +220,11 @@ STYLES = {
     "style8":   {"name": "8️⃣ Sparkle Dotted",    "render": _t_style8},
     "style9":   {"name": "9️⃣ Double Border",     "render": _t_style9},
     "style10":  {"name": "🔟 Minimal Rule",       "render": _t_style10},
+    "style11":  {"name": "🆕 Powered By Card",    "render": _t_style11},
 }
 
 STYLE_ORDER = ["style1", "style2", "style3", "style4", "style5",
-               "style6", "style7", "style8", "style9", "style10"]
+               "style6", "style7", "style8", "style9", "style10", "style11"]
 
 PREVIEW_DATA = {
     "anime_name": "I Became a Legend after My 10 Year-Long Last Stand",
@@ -229,12 +252,12 @@ def render_caption(style_id: str, data: dict) -> str:
         return _t_default(data)
 
 
-def _build_entities(lines: list, quote_idxs: set, italic_idxs: set) -> tuple:
+def _build_entities(lines: list, quote_idxs: set, italic_idxs: set, bold: bool = True) -> tuple:
     """lines ko '\\n' se jod ke text banao, aur bold (poora text) +
     blockquote/italic (jo line-indices di gayi hain unpe) entities compute
     karo. Offsets UTF-16 code units mein hote hain (Bot API requirement)."""
     text = "\n".join(lines)
-    entities = [{"type": "bold", "offset": 0, "length": _utf16_len(text)}]
+    entities = [{"type": "bold", "offset": 0, "length": _utf16_len(text)}] if bold else []
     offset = 0
     for i, line in enumerate(lines):
         line_len = _utf16_len(line)
@@ -260,7 +283,8 @@ def render_caption_entities(style_id: str, data: dict) -> tuple:
         return text, [{"type": "bold", "offset": 0, "length": _utf16_len(text)}]
     try:
         result = style["render"](data)
-        return _build_entities(result["lines"], result["quote"], result["italic"])
+        return _build_entities(result["lines"], result["quote"], result["italic"],
+                               bold=result.get("bold", True))
     except Exception as e:
         LOGGER.warning(f"[CaptionStyle] Entity render failed for '{style_id}': {e}")
         text = _t_default(data)
@@ -291,7 +315,7 @@ def render_caption_html(style_id: str, data: dict) -> str:
                 esc = f"<blockquote>{esc}</blockquote>"
             html_lines.append(esc)
         body = "\n".join(html_lines)
-        return f"<b>{body}</b>"
+        return f"<b>{body}</b>" if result.get("bold", True) else body
     except Exception as e:
         LOGGER.warning(f"[CaptionStyle] HTML render failed for '{style_id}': {e}")
         return f"<b>{_html.escape(_t_default(data))}</b>"
