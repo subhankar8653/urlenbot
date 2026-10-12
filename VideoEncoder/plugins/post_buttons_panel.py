@@ -32,6 +32,18 @@ _BTNS = {
     "backup": ("🔴", "Join Backup",      "• ᴊᴏɪɴ ʙᴀᴄᴋᴜᴘ •",       "join_backup"),
 }
 _MAX_TEXT = 60
+_DEFAULT_STYLE = {"watch": "success", "kaise": "primary", "backup": "danger"}
+_COLOURS = {                      # style value → (emoji, naam)
+    "success": ("🟢", "Green"),
+    "primary": ("🔵", "Blue"),
+    "danger":  ("🔴", "Red"),
+    "none":    ("⚪", "Off (no colour)"),
+}
+_PRESET_TEXT = "Episode [E] Added"
+_PLACEHOLDER_HELP = (
+    "Placeholders: `[E]` = episode (02 ya 02-03), `[S]` = season, `[L]` = language.\n"
+    "Example: `Episode [E] Added` → `Episode 02-03 Added`"
+)
 
 
 def clear_session(user_id: int):
@@ -74,7 +86,14 @@ async def _state(btn: str) -> dict:
         "url": url,
         "url_label": url_label,
         "enabled": cfg.get("enabled", True),
+        "style": cfg.get("style") or _DEFAULT_STYLE[btn],
     }
+
+
+def _preview(text: str) -> str:
+    """Naam ka sample preview ([E]/[S]/[L] bhar ke)."""
+    from .update_channel import _fill_button_text
+    return _fill_button_text(text, "02-03", 2, "Hindi Dub")
 
 
 async def _edit(client: Client, cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup):
@@ -98,7 +117,8 @@ async def render_main(client: Client, cb: CallbackQuery):
     for key, (emoji, label, _, _) in _BTNS.items():
         st = await _state(key)
         status = "✅" if (st["enabled"] and (st["url"] or key == "watch")) else "🗑 band"
-        lines.append(f"{emoji} **{label}** — {status}\n    naam: `{st['text']}`\n    link: {st['url_label']}")
+        col = _COLOURS.get(st["style"], _COLOURS["none"])[0]
+        lines.append(f"{emoji} **{label}** — {status}\n    naam: `{st['text']}`\n    link: {st['url_label']}\n    colour: {col}")
     text = (
         "🔘 **Main Channel Post Buttons**\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -122,18 +142,32 @@ async def _render_btn(client: Client, cb: CallbackQuery, btn: str, note: str = "
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Status: **{'✅ Post mein dikhega' if shown else '🗑 Delete / band'}**\n"
         f"Naam: `{st['text']}`\n"
-        f"Link: {st['url_label']}"
+        + (f"Post mein dikhega: `{_preview(st['text'])}`\n" if "[" in st['text'] else "")
+        + f"Link: {st['url_label']}\n"
+        f"Colour: {_COLOURS.get(st['style'], _COLOURS['none'])[0]} "
+        f"{_COLOURS.get(st['style'], _COLOURS['none'])[1]}"
         + (f"\n\n{note}" if note else "")
     )
+    cur = st["style"]
+    colour_row = [
+        InlineKeyboardButton(
+            ("✅" if cur == key else emo),
+            callback_data=f"cmz:pb:col:{btn}:{key}",
+        )
+        for key, (emo, _n) in _COLOURS.items()
+    ]
     rows = [[
         InlineKeyboardButton("✏️ Edit Name", callback_data=f"cmz:pb:name:{btn}"),
         InlineKeyboardButton("🔗 Edit URL", callback_data=f"cmz:pb:url:{btn}"),
-    ]]
+    ],
+        [InlineKeyboardButton("📌 Preset: Episode [E] Added", callback_data=f"cmz:pb:preset:{btn}")],
+        [InlineKeyboardButton("🎨", callback_data="cmz:noop")] + colour_row,
+    ]
     if st["enabled"]:
         rows.append([InlineKeyboardButton("🗑 Delete Button", callback_data=f"cmz:pb:del:{btn}")])
     else:
         rows.append([InlineKeyboardButton("♻️ Restore Button", callback_data=f"cmz:pb:restore:{btn}")])
-    rows.append([InlineKeyboardButton("↩️ Naam / URL Default pe", callback_data=f"cmz:pb:reset:{btn}")])
+    rows.append([InlineKeyboardButton("↩️ Naam / URL / Colour Default pe", callback_data=f"cmz:pb:reset:{btn}")])
     rows.append(_back("update_post_button", "⬅️ Buttons"))
     await _edit(client, cb, text, InlineKeyboardMarkup(rows))
 
@@ -176,6 +210,22 @@ async def handle(client: Client, cb: CallbackQuery, args: list):
         await _render_btn(client, cb, btn)
         return
 
+    if sub == "col":
+        val = args[2] if len(args) > 2 else ""
+        if val not in _COLOURS:
+            await cb.answer()
+            return
+        await _patch_cfg(btn, style=val)
+        await cb.answer(f"{_COLOURS[val][0]} {_COLOURS[val][1]}")
+        await _render_btn(client, cb, btn)
+        return
+
+    if sub == "preset":
+        await _patch_cfg(btn, text=_PRESET_TEXT, enabled=None)
+        await cb.answer("📌 Preset lag gaya")
+        await _render_btn(client, cb, btn)
+        return
+
     if sub in ("name", "url"):
         _SESS[cb.from_user.id] = {"btn": btn, "field": "text" if sub == "name" else "url"}
         await cb.answer()
@@ -184,7 +234,8 @@ async def handle(client: Client, cb: CallbackQuery, args: list):
                 f"**✏️ {label} — naya naam bhejo**\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"Button par ye text dikhega (max {_MAX_TEXT} akshar).\n"
-                f"Default: `{default_text}`"
+                f"Default: `{default_text}`\n\n"
+                f"{_PLACEHOLDER_HELP}"
             )
         else:
             extra = (
@@ -215,7 +266,7 @@ async def handle(client: Client, cb: CallbackQuery, args: list):
         return
 
     if sub == "reset":
-        await _patch_cfg(btn, text=None, enabled=None, **({"url": None} if dkey is None else {}))
+        await _patch_cfg(btn, text=None, enabled=None, style=None, **({"url": None} if dkey is None else {}))
         await cb.answer("↩️ Default pe aa gaya")
         await _render_btn(client, cb, btn)
         return
@@ -249,7 +300,11 @@ async def pb_text_input(client: Client, message: Message):
                 raise StopPropagation
             await _patch_cfg(btn, text=raw, enabled=None)
             _SESS.pop(uid, None)
-            await message.reply(f"✅ **{label}** ka naam ab: `{raw}`", reply_markup=back_kb)
+            await message.reply(
+                f"✅ **{label}** ka naam ab: `{raw}`"
+                + (f"\nPost mein dikhega: `{_preview(raw)}`" if "[" in raw else ""),
+                reply_markup=back_kb,
+            )
         else:
             low = raw.lower()
             if dkey is None and low == "auto":

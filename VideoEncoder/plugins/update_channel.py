@@ -234,6 +234,40 @@ async def _save_button_cfg(cfg: dict):
     )
 
 
+_BTN_STYLES = ("success", "primary", "danger")     # green / blue / red (Bot API button "style")
+
+
+def _btn_style(entry: dict, default: str):
+    """cfg ka colour: success/primary/danger, 'none' = colour OFF (None), warna default."""
+    v = (entry or {}).get("style")
+    if v == "none":
+        return None
+    return v if v in _BTN_STYLES else default
+
+
+def _ep_plain(episode, episode_start, episode_end) -> str:
+    """Button naam ke [E] ke liye: single -> '11', range -> '02-03'."""
+    def f(n):
+        return f"{n:02d}" if n < 100 else str(n)
+    if episode_start and episode_end and episode_start != episode_end:
+        return f"{f(episode_start)}-{f(episode_end)}"
+    if episode_start:
+        return f(episode_start)
+    if episode:
+        return f(episode)
+    return "—"
+
+
+def _fill_button_text(tpl: str, ep: str, season, audio: str) -> str:
+    """Button naam ke placeholders: [E]=episode(s), [S]=season, [L]=language/audio."""
+    import re as _re
+    s = f"{int(season):02d}" if season else "01"
+    out = _re.sub(r"\[E\]", lambda m: ep, tpl, flags=_re.IGNORECASE)
+    out = _re.sub(r"\[S\]", lambda m: s, out, flags=_re.IGNORECASE)
+    out = _re.sub(r"\[L\]", lambda m: (audio or "—"), out, flags=_re.IGNORECASE)
+    return out
+
+
 async def _save_button_defaults(data: dict):
     await db.col2.update_one(
         {'id': 'update_post_button_defaults'},
@@ -437,28 +471,28 @@ async def send_update_post(
     _k = btn_cfg.get("kaise") or {}
     _b = btn_cfg.get("backup") or {}
 
+    _ep_btn = _ep_plain(episode, episode_start, episode_end)
+
+    def _mk(entry, default_text, url, default_style):
+        b = {
+            "text": _fill_button_text(entry.get("text") or default_text, _ep_btn, season, audio),
+            "url": url,
+        }
+        st = _btn_style(entry, default_style)
+        if st:
+            b["style"] = st
+        return b
+
     row1 = []
     watch_url = _w.get("url") or invite_link
     if watch_url and _w.get("enabled", True):
-        row1.append({
-            "text": _w.get("text") or "⎙ ᴡᴀᴛᴄʜ & ᴅᴏᴡɴʟᴏᴀᴅ ⎙",
-            "url": watch_url,
-            "style": _WATCH_DL_STYLE[0],
-        })
+        row1.append(_mk(_w, "⎙ ᴡᴀᴛᴄʜ & ᴅᴏᴡɴʟᴏᴀᴅ ⎙", watch_url, _WATCH_DL_STYLE[0]))
 
     row2 = []
     if kaise_url and _k.get("enabled", True):
-        row2.append({
-            "text": _k.get("text") or "• ᴋᴀɪꜱᴇ ᴅᴇᴋʜᴇɪɴ •",
-            "url": kaise_url,
-            "style": _KAISE_STYLE[0],
-        })
+        row2.append(_mk(_k, "• ᴋᴀɪꜱᴇ ᴅᴇᴋʜᴇɪɴ •", kaise_url, _KAISE_STYLE[0]))
     if backup_url and _b.get("enabled", True):
-        row2.append({
-            "text": _b.get("text") or "• ᴊᴏɪɴ ʙᴀᴄᴋᴜᴘ •",
-            "url": backup_url,
-            "style": _BACKUP_STYLE[0],
-        })
+        row2.append(_mk(_b, "• ᴊᴏɪɴ ʙᴀᴄᴋᴜᴘ •", backup_url, _BACKUP_STYLE[0]))
 
     keyboard_rows = [r for r in [row1, row2] if r]
     reply_markup = {"inline_keyboard": keyboard_rows} if keyboard_rows else {"inline_keyboard": []}
