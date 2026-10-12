@@ -345,7 +345,7 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
 
     uid = message.from_user.id
     user_blacklist = await db.get_blacklist(uid)
-    caption_channel = await get_community_tag(uid)
+    caption_channel = await get_community_tag(uid, all_names=True)
     caption = smart_caption(original_caption, new_file, resolution, channel=caption_channel, blacklist=user_blacklist)
     caption = await apply_swap(caption, uid)
 
