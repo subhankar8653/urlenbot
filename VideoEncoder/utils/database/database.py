@@ -344,11 +344,20 @@ class Database:
     async def set_community(self, name):
         await self.col2.update_one({'id': 'community'}, {'$set': {'name': name}}, upsert=True)
 
-    async def get_community(self):
+    async def get_community_raw(self):
+        """Poora saved string — 1 ya 2 naam space se alag (\"a b\")."""
         doc = await self.col2.find_one({'id': 'community'})
         if not doc:
             return None
         return doc.get('name') or None
+
+    async def get_community(self):
+        """PEHLA community naam (purane readers — metadata title — ke liye)."""
+        raw = await self.get_community_raw()
+        if not raw:
+            return None
+        parts = raw.replace(',', ' ').split()
+        return parts[0] if parts else None
 
     # Thumbnail Band Style — /setpic_style command se set hota hai.
     # GLOBAL (bot-wide) setting hai, community branding ki tarah — jo bhi
