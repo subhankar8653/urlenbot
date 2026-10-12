@@ -15,7 +15,7 @@ from pyrogram.types import Message
 
 from .. import owner, sudo_users
 from ..utils.database.access_db import db
-from ..utils.community import DEFAULT_COMMUNITY, get_community_name
+from ..utils.community import DEFAULT_COMMUNITY, get_community_names, parse_names, MAX_COMMUNITY_NAMES
 
 
 def _is_auth(user_id: int) -> bool:
@@ -25,16 +25,14 @@ def _is_auth(user_id: int) -> bool:
 @Client.on_message(filters.command("community"))
 async def set_community(client: Client, message: Message):
     if len(message.command) < 2:
-        current = await get_community_name()
+        current = " ".join(f"@{n}" for n in await get_community_names())
         await message.reply(
             f"⚙️ <b>Community Branding</b> <i>(bot-wide)</i>\n\n"
             f"Current: <code>{current}</code>\n\n"
-            f"Usage: <code>/community &lt;name&gt;</code>\n"
-            f"Example: <code>/community bobanime</code>\n\n"
-            f"Set karne ke baad thumbnail band, auto-caption tag aur "
-            f"metadata title mein <code>{DEFAULT_COMMUNITY}</code> ki jagah "
-            f"tumhara diya hua naam <b>sabhi uploads</b> mein (manual + "
-            f"auto-monitor) use hoga.\n\n"
+            f"Usage: <code>/community &lt;name&gt;</code> ya 2 naam:\n"
+            f"<code>/community @anime_dekhle @kyami_animes_india</code>\n\n"
+            f"1 naam set hai to caption/post mein 1 username dikhega, 2 hain to "
+            f"dono dikhenge. Thumbnail band aur metadata title mein pehla naam use hota hai.\n\n"
             f"Reset karne ke liye: <code>/communityclear</code>",
         )
         return
@@ -43,22 +41,27 @@ async def set_community(client: Client, message: Message):
         await message.reply("❌ Sirf owner/sudo hi community naam badal sakte hain (yeh bot-wide setting hai).")
         return
 
-    name = message.command[1].strip().lstrip("@")
-    if not name or not name.replace("_", "").isalnum():
+    raw_args = message.command[1:]
+    if len(raw_args) > MAX_COMMUNITY_NAMES:
+        await message.reply(f"❌ Zyada se zyada {MAX_COMMUNITY_NAMES} usernames allowed hain.")
+        return
+    names = parse_names(" ".join(raw_args))
+    if (not names or len(names) != len({a.strip().lstrip('@').lower() for a in raw_args})
+            or any(not n.replace("_", "").isalnum() for n in names)):
         await message.reply(
-            "❌ Sahi naam do (sirf letters/numbers/underscore).\n"
-            "Example: <code>/community bobanime</code>"
+            "❌ Sahi naam do (sirf letters/numbers/underscore, har naam alag).\n"
+            "Example: <code>/community @anime_dekhle @kyami_animes_india</code>"
         )
         return
 
-    name = name.lower()
-    await db.set_community(name)
+    await db.set_community(" ".join(names))
+    shown = " ".join(f"@{n}" for n in names)
     await message.reply(
-        f"✅ <b>Community set:</b> <code>{name}</code> <i>(bot-wide, sabke liye)</i>\n\n"
-        f"Ab thumbnail band, auto-caption tag aur metadata title mein "
-        f"<code>{DEFAULT_COMMUNITY}</code> ki jagah <code>@{name.upper()}</code> "
-        f"(ya <code>{name.capitalize()}</code>) — manual aur auto-monitor "
-        f"dono uploads mein — use hoga."
+        f"✅ <b>Community set:</b> <code>{shown}</code> <i>(bot-wide, sabke liye)</i>\n\n"
+        f"Ab caption / post ki \"Powered By\" / \"Main Channel\" line mein "
+        f"{'ye username' if len(names) == 1 else 'ye dono usernames'} aayenge. "
+        f"Thumbnail band aur metadata title mein <code>@{names[0].upper()}</code> "
+        f"use hoga — manual aur auto-monitor dono uploads mein."
     )
 
 

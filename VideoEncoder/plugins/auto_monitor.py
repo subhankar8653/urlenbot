@@ -942,7 +942,7 @@ class _BotModePostManager:
         quality_str = ", ".join(quality_list) if quality_list else "—"
         genres = await self._lookup_genres()
         try:
-            main_channel = await get_community_tag()
+            main_channel = await get_community_tag(all_names=True)
         except Exception:
             main_channel = "@SBANIME"
 

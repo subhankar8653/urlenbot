@@ -2375,7 +2375,7 @@ async def _do_upload(bot: Client, filepath: str, message: Message, msg: Message,
         # Warna agar user ne /setres 480 set kiya hua hai toh 1080p video bhi
         # "480p" caption ke saath upload hogi — jo GALAT hai.
         user_blacklist = await db.get_blacklist(message.from_user.id)
-        caption_channel = await get_community_tag(message.from_user.id)
+        caption_channel = await get_community_tag(message.from_user.id, all_names=True)
         caption = smart_caption(
             original_caption=os.path.basename(filepath),
             filepath=filepath,

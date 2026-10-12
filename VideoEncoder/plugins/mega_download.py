@@ -201,7 +201,7 @@ async def mega_handler(client: Client, message: Message):
     fname = os.path.basename(filepath)
     size_mb = os.path.getsize(filepath) / (1024 * 1024)
     resolution = 'OG'
-    channel = await get_community_tag(message.from_user.id)
+    channel = await get_community_tag(message.from_user.id, all_names=True)
     caption = build_auto_caption(filepath, resolution=resolution, channel=channel)
     proper_filename = re.sub(r'[<>:"/\\|?*]', '', caption).strip()
 
@@ -273,7 +273,7 @@ async def meganow_handler(client: Client, message: Message):
     fname = os.path.basename(filepath)
     size_mb = os.path.getsize(filepath) / (1024 * 1024)
     resolution = 'OG'
-    channel = await get_community_tag(message.from_user.id)
+    channel = await get_community_tag(message.from_user.id, all_names=True)
     caption = build_auto_caption(filepath, resolution=resolution, channel=channel)
     proper_filename = re.sub(r'[<>:"/\\|?*]', '', caption).strip()
 

@@ -203,7 +203,14 @@ async def customise_callback(client: Client, cb: CallbackQuery):
 
     if action in ("menu", "cat", "open", "close"):
         from .deco_panel import clear_session as _deco_clear
+        from .post_buttons_panel import clear_session as _pb_clear
         _deco_clear(cb.from_user.id)
+        _pb_clear(cb.from_user.id)
+
+    if action == "pb":
+        from .post_buttons_panel import handle as _pb_handle
+        await _pb_handle(client, cb, parts[2:])
+        return
 
     if action == "deco":
         from .deco_panel import handle as _deco_handle
@@ -326,30 +333,8 @@ async def _open_section(client: Client, cb: CallbackQuery, section: str):
         return
 
     if section == "update_post_button":
-        from .update_channel import _get_button_defaults, _update_post_button_sessions
-        _update_post_button_sessions[user_id] = {"step": "kaise_dekhein"}
-        current = await _get_button_defaults()
-        cur_line = ""
-        if current.get("kaise_dekhein") or current.get("join_backup"):
-            cur_line = (
-                f"\n**Abhi set hai:**\n"
-                f"• ᴋᴀɪꜱᴇ ᴅᴇᴋʜᴇɪɴ •: `{current.get('kaise_dekhein') or '—'}`\n"
-                f"• ᴊᴏɪɴ ʙᴀᴄᴋᴜᴘ •: `{current.get('join_backup') or '—'}`\n"
-            )
-        text = (
-            f"🔘 **Main Channel Post Buttons**\n\n"
-            f"**Step 1/2 — • ᴋᴀɪꜱᴇ ᴅᴇᴋʜᴇɪɴ • ka link reply karke bhejo:**\n"
-            f"{cur_line}\n"
-            "**Example:** `https://t.me/+xxxxxxxxxx`\n"
-            "**Us button ko hatana ho toh:** `skip` bhejo\n\n"
-            "_Ya neeche button se dono default buttons ek saath hata "
-            "sakte ho._"
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑️ Remove Both Buttons", callback_data="cmz:rmbtn")],
-            _back_row(),
-        ])
-        await _safe_edit(client, cb, text, kb)
+        from .post_buttons_panel import render_main
+        await render_main(client, cb)
         return
 
     if section == "update_post_list":
@@ -563,17 +548,17 @@ async def _open_section(client: Client, cb: CallbackQuery, section: str):
 
     # ── 👥 Community Tag ──
     if section == "community":
-        from ..utils.community import DEFAULT_COMMUNITY, get_community_name
-        current = await get_community_name()
+        from ..utils.community import DEFAULT_COMMUNITY, get_community_names
+        current = " ".join(f"@{n}" for n in await get_community_names())
         text = (
-            "👥 **Community Tag** _(bot-wide)_\n\n"
+            "👥 **Community / Brand Naam** _(bot-wide)_\n\n"
             f"Current: `{current}`\n\n"
-            "Ye naam thumbnail band, auto-caption tag aur metadata title "
-            "mein — manual aur auto-monitor dono uploads mein — sabki "
-            "jagah use hota hai.\n\n"
+            "Caption / post ki Powered By / Main Channel line mein ye username(s) "
+            "aate hain — 1 set hai to 1, 2 set hain to dono.\n"
+            "Thumbnail band aur metadata title mein pehla naam use hota hai.\n\n"
             "**Command:**\n"
-            "• `/community <name>` — naya naam set karo (sirf letters/"
-            "numbers/underscore)\n"
+            "• `/community @naam` — 1 username\n"
+            "• `/community @naam1 @naam2` — 2 usernames\n"
             f"• `/communityclear` — default `{DEFAULT_COMMUNITY}` pe reset "
             "(niche button se bhi ho jayega)"
         )

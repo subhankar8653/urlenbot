@@ -87,6 +87,7 @@ from .. import app, owner, sudo_users
 from ..utils.database.access_db import db
 from ..utils.bot_upload_engine import _bot_api_send_photo
 from ..utils import update_post_style
+from ..utils.community import get_community_tag
 
 LOGGER = logging.getLogger(__name__)
 
@@ -211,6 +212,26 @@ async def _get_button_defaults() -> dict:
     if not doc:
         return {}
     return doc.get('buttons', {})
+
+
+# ── Per-button customisation (naam / hide) — /customise → Main Channel Post Buttons ──
+#   cfg = {"watch": {"text": str, "url": str, "enabled": bool},
+#          "kaise": {"text": str, "enabled": bool},
+#          "backup": {"text": str, "enabled": bool}}
+#   (kaise/backup ka URL upar wale `_get_button_defaults` mein hi rehta hai)
+async def _get_button_cfg() -> dict:
+    doc = await db.col2.find_one({'id': 'update_post_button_cfg'})
+    if not doc:
+        return {}
+    return doc.get('cfg', {}) or {}
+
+
+async def _save_button_cfg(cfg: dict):
+    await db.col2.update_one(
+        {'id': 'update_post_button_cfg'},
+        {'$set': {'cfg': cfg}},
+        upsert=True,
+    )
 
 
 async def _save_button_defaults(data: dict):
@@ -395,6 +416,7 @@ async def send_update_post(
                 "audio": audio,
                 "genres": genres,
                 "how_to_get_link_url": how_to_get_link_url,
+                "main_channel": await get_community_tag(all_names=True),
             }
             caption, caption_entities = update_post_style.render_update_caption_entities(
                 style_id, style_data
@@ -409,24 +431,31 @@ async def send_update_post(
     kaise_url = button_defaults.get("kaise_dekhein")
     backup_url = button_defaults.get("join_backup")
 
+    # /customise se kiya hua per-button naam / delete (hide) / watch-URL override
+    btn_cfg = await _get_button_cfg()
+    _w = btn_cfg.get("watch") or {}
+    _k = btn_cfg.get("kaise") or {}
+    _b = btn_cfg.get("backup") or {}
+
     row1 = []
-    if invite_link:
+    watch_url = _w.get("url") or invite_link
+    if watch_url and _w.get("enabled", True):
         row1.append({
-            "text": "⎙ ᴡᴀᴛᴄʜ & ᴅᴏᴡɴʟᴏᴀᴅ ⎙",
-            "url": invite_link,
+            "text": _w.get("text") or "⎙ ᴡᴀᴛᴄʜ & ᴅᴏᴡɴʟᴏᴀᴅ ⎙",
+            "url": watch_url,
             "style": _WATCH_DL_STYLE[0],
         })
 
     row2 = []
-    if kaise_url:
+    if kaise_url and _k.get("enabled", True):
         row2.append({
-            "text": "• ᴋᴀɪꜱᴇ ᴅᴇᴋʜᴇɪɴ •",
+            "text": _k.get("text") or "• ᴋᴀɪꜱᴇ ᴅᴇᴋʜᴇɪɴ •",
             "url": kaise_url,
             "style": _KAISE_STYLE[0],
         })
-    if backup_url:
+    if backup_url and _b.get("enabled", True):
         row2.append({
-            "text": "• ᴊᴏɪɴ ʙᴀᴄᴋᴜᴘ •",
+            "text": _b.get("text") or "• ᴊᴏɪɴ ʙᴀᴄᴋᴜᴘ •",
             "url": backup_url,
             "style": _BACKUP_STYLE[0],
         })

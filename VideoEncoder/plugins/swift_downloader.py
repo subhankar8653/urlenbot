@@ -315,7 +315,7 @@ async def _auto_rename(filepath: str, dl_dir: str, user_id: int = None) -> str:
     quality = _quality_from(os.path.basename(filepath))
     resolution = quality.replace("p", "") if quality != "unknown" else "OG"
 
-    channel = await get_community_tag()
+    channel = await get_community_tag(all_names=True)
     caption = build_auto_caption(filepath, resolution=resolution if resolution != "OG" else None,
                                   channel=channel)
     # proper_filename: spaces rakho, sirf illegal chars hatao
@@ -1273,7 +1273,7 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
             if style_id == caption_style.DEFAULT_STYLE_ID:
                 return f"<b>{fname}</b>"
             try:
-                _channel = await get_community_tag(user_id)
+                _channel = await get_community_tag(user_id, all_names=True)
                 cap_data = get_caption_data(None, filepath, channel=_channel)
                 cap_data["quality"] = quality  # is file ki exact quality (already known)
                 cap_data["genres"] = await caption_style.lookup_genres(cap_data["anime_name"])
