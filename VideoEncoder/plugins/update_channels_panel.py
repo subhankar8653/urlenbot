@@ -53,12 +53,15 @@ async def render_main(client: Client, cb: CallbackQuery):
     from .update_channel import _get_update_channels, _get_update_toggle
     _CUR_SECTION.set("update_channels")
     clear_session(cb.from_user.id)
+    from ..utils.multi_mode import is_multi
     channels = await _get_update_channels()
     on = await _get_update_toggle()
+    multi = await is_multi()
     text = (
         f"📢 **Main Channel Post — Channels ({len(channels)})**\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Posting: **{'🟢 ON' if on else '🔴 OFF'}**\n\n"
+        f"Posting: **{'🟢 ON' if on else '🔴 OFF'}**\n"
+        f"Multi Mode: **{'🟢 ON' if multi else '🔴 OFF'}**\n\n"
         "Registered anime ka update post in channels mein jaata hai. "
         "Channel par tap karke detail dekho / remove karo, ya ➕ se naya channel jodo."
         + ("" if channels else "\n\n📭 Abhi koi channel add nahi hai.")
@@ -66,9 +69,12 @@ async def render_main(client: Client, cb: CallbackQuery):
     rows = [[InlineKeyboardButton(
         "🟢 Posting ON — tap karke OFF karo" if on else "🔴 Posting OFF — tap karke ON karo",
         callback_data="cmz:uc:tog")]]
-    for ch in channels:
+    rows.append([InlineKeyboardButton(
+        "🔀 Multi Mode ON — tap karke OFF karo" if multi else "🔀 Multi Mode OFF — tap karke ON karo",
+        callback_data="cmz:uc:multi")])
+    for i, ch in enumerate(channels, 1):
         rows.append([InlineKeyboardButton(
-            f"📢 {_short(ch.get('channel_title'))}",
+            f"📢 Channel {i:02d} — {_short(ch.get('channel_title'), 28)}",
             callback_data=f"cmz:uc:open:{ch.get('channel_id')}")])
     rows.append([InlineKeyboardButton("➕ Add Channel", callback_data="cmz:uc:add")])
     rows.append(_back_row())
@@ -83,22 +89,41 @@ async def _find(cid: int):
     return None
 
 
+async def _pos_of(cid: int) -> int:
+    from .update_channel import _get_update_channels
+    for i, ch in enumerate(await _get_update_channels(), 1):
+        if ch.get("channel_id") == cid:
+            return i
+    return 0
+
+
 async def _render_detail(client: Client, cb: CallbackQuery, cid: int):
     ch = await _find(cid)
     if not ch:
         await cb.answer("Channel list mein nahi mila.", show_alert=True)
         await render_main(client, cb)
         return
+    from ..utils.multi_mode import is_multi, ch_link_idx
+    multi = await is_multi()
+    pos = await _pos_of(cid)
+    extra = ""
+    rows = [[InlineKeyboardButton("🧪 Test (post permission check)", callback_data=f"cmz:uc:test:{cid}")]]
+    if multi:
+        extra = (
+            f"\n🔗 Watch link: **Link {ch_link_idx(ch, pos - 1) + 1}**"
+            f"\n🎛 Buttons: **{'alag (channel-wise)' if ch.get('buttons') else 'default'}**"
+        )
+        rows.append([InlineKeyboardButton("🎛 Is channel ke Buttons edit karo", callback_data=f"cmz:pb:chan:{cid}")])
+    rows.append([InlineKeyboardButton("🗑 Remove Channel", callback_data=f"cmz:uc:del:{cid}")])
+    rows.append(_back())
     text = (
-        "📢 **Update Channel**\n"
+        f"📢 **Update Channel {pos:02d}**\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Naam: **{ch.get('channel_title', 'Unknown')}**\n"
         f"🆔 `{cid}`"
+        f"{extra}"
     )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🗑 Remove Channel", callback_data=f"cmz:uc:del:{cid}")],
-        _back(),
-    ])
+    kb = InlineKeyboardMarkup(rows)
     await _edit(client, cb, text, kb)
 
 
@@ -119,6 +144,52 @@ async def handle(client: Client, cb: CallbackQuery, args: list):
         await render_main(client, cb)
         return
 
+    if sub == "multi":
+        from ..utils.multi_mode import is_multi, set_multi
+        now = not await is_multi()
+        await set_multi(now)
+        await cb.answer("🟢 Multi Mode ON" if now else "🔴 Multi Mode OFF")
+        await render_main(client, cb)
+        return
+
+    if sub == "clone":
+        # Add flow ka aakhri step: kis channel ka clone banana hai (0 = naya)
+        sess = _SESS.get(cb.from_user.id)
+        if not sess or sess.get("mode") != "clone_pick":
+            await cb.answer("⚠️ Ye step ab active nahi hai.", show_alert=True)
+            return
+        try:
+            n = int(args[1])
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+        from .update_channel import new_channel_record
+        channels = await _get_update_channels()
+        if any(c.get("channel_id") == sess["cid"] for c in channels):
+            _SESS.pop(cb.from_user.id, None)
+            await cb.answer("Ye channel pehle hi add hai.", show_alert=True)
+            await render_main(client, cb)
+            return
+        rec, err = new_channel_record(channels, sess["cid"], sess["title"], n)
+        if err:
+            await cb.answer(err, show_alert=True)
+            return
+        channels.append(rec)
+        await _save_update_channels(channels)
+        _SESS.pop(cb.from_user.id, None)
+        await cb.answer("✅ Channel add ho gaya")
+        clone_line = f"\n🔁 Channel {n:02d} ka clone (button-set + link same)" if n else ""
+        await _edit(
+            client, cb,
+            f"✅ **Update Channel add ho gaya!**\n\n📢 **{sess['title']}** (Channel {len(channels):02d})\n"
+            f"🆔 `{sess['cid']}`{clone_line}",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Aur add karo", callback_data="cmz:uc:add")],
+                _back(),
+            ]),
+        )
+        return
+
     if sub == "add":
         _SESS[cb.from_user.id] = {"mode": "add"}
         await cb.answer()
@@ -136,6 +207,19 @@ async def handle(client: Client, cb: CallbackQuery, args: list):
     if sub == "open" and cid is not None:
         await cb.answer()
         await _render_detail(client, cb, cid)
+        return
+
+    if sub == "test" and cid is not None:
+        # Chhota test message bhejo aur turant delete — poora asli reason dikhao
+        try:
+            m = await client.send_message(cid, "🧪 test")
+            try:
+                await client.delete_messages(cid, m.id)
+            except Exception:
+                pass
+            await cb.answer("✅ Is channel mein post ja sakta hai — sab theek hai.", show_alert=True)
+        except Exception as e:
+            await cb.answer(f"❌ Post nahi ja pa raha:\n{type(e).__name__}: {str(e)[:140]}", show_alert=True)
         return
 
     if sub == "del" and cid is not None:
@@ -173,7 +257,7 @@ async def uc_input(client: Client, message: Message):
     if not message.from_user:
         return
     uid = message.from_user.id
-    if uid not in _SESS or not _is_auth(uid):
+    if uid not in _SESS or not _is_auth(uid) or _SESS[uid].get("mode") != "add":
         return
     raw = (message.text or "").strip()
     if raw.startswith("/"):
@@ -222,13 +306,38 @@ async def uc_input(client: Client, message: Message):
             if member.status.name not in ("ADMINISTRATOR", "OWNER"):
                 await message.reply(f"❌ Bot **{title}** mein admin nahi hai! Admin banao, phir ID dobara bhejo.")
                 raise StopPropagation
+            from .update_channel import _can_post
+            if not _can_post(member):
+                await message.reply(
+                    f"❌ Bot **{title}** mein admin hai, lekin **Post Messages** permission nahi hai! "
+                    "Permission do, phir ID dobara bhejo.")
+                raise StopPropagation
         except StopPropagation:
             raise
         except Exception as e:
             await message.reply(f"❌ Admin check fail: `{e}`")
             raise StopPropagation
 
-        channels.append({"channel_id": channel_id, "channel_title": title})
+        from ..utils.multi_mode import is_multi
+        if await is_multi() and channels:
+            # Multi mode: naya channel kisi purane ka clone bane? (button-set + link same)
+            _SESS[uid] = {"mode": "clone_pick", "cid": channel_id, "title": title}
+            rows = [[InlineKeyboardButton(
+                f"📋 Channel {i:02d} jaisa — {_short(c.get('channel_title'), 22)}",
+                callback_data=f"cmz:uc:clone:{i}")] for i, c in enumerate(channels, 1)]
+            rows.append([InlineKeyboardButton("🆕 Naya (default buttons, agla link)", callback_data="cmz:uc:clone:0")])
+            rows.append([InlineKeyboardButton("❌ Cancel", callback_data="cmz:open:update_channels")])
+            await message.reply(
+                f"✅ Channel mil gaya: **{title}**\n\n"
+                "🔀 **Multi Mode ON** — is channel ka post kaisa ho?\n"
+                "• **Clone** — kisi channel ke button-set + link jaisa\n"
+                "• **Naya** — default buttons, aur anime ka agla link (Link N+1)",
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+            raise StopPropagation
+        from .update_channel import new_channel_record
+        rec, _err = new_channel_record(channels, channel_id, title, 0)
+        channels.append(rec)
         await _save_update_channels(channels)
         _SESS.pop(uid, None)
         await message.reply(

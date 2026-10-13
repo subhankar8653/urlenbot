@@ -85,6 +85,8 @@ from pyrogram.types import (
 
 from .. import app, owner, sudo_users
 from ..utils.database.access_db import db
+from ..utils import bot_upload_engine as _bue
+from ..utils import multi_mode as _mm
 from ..utils.bot_upload_engine import _bot_api_send_photo
 from ..utils import update_post_style
 from ..utils.community import get_community_tag
@@ -465,70 +467,120 @@ async def send_update_post(
     kaise_url = button_defaults.get("kaise_dekhein")
     backup_url = button_defaults.get("join_backup")
 
-    # /customise se kiya hua per-button naam / delete (hide) / watch-URL override
+    # /customise se kiya hua per-button naam / delete (hide) / colour / watch-URL override
     btn_cfg = await _get_button_cfg()
-    _w = btn_cfg.get("watch") or {}
-    _k = btn_cfg.get("kaise") or {}
-    _b = btn_cfg.get("backup") or {}
-
     _ep_btn = _ep_plain(episode, episode_start, episode_end)
 
-    def _mk(entry, default_text, url, default_style):
-        b = {
-            "text": _fill_button_text(entry.get("text") or default_text, _ep_btn, season, audio),
-            "url": url,
-        }
-        st = _btn_style(entry, default_style)
-        if st:
-            b["style"] = st
-        return b
+    def _build_markup(over: dict = None, ch_link: str = ""):
+        """
+        Buttons banao. `over` = us channel ka alag button-set (multi mode), jo global
+        setting ke upar chadhta hai. `ch_link` = us channel ka Watch & Download link
+        (multi mode mein Link N). Dono khali ho to bilkul purana behaviour.
+        """
+        over = over or {}
 
-    row1 = []
-    watch_url = _w.get("url") or invite_link
-    if watch_url and _w.get("enabled", True):
-        row1.append(_mk(_w, "⎙ ᴡᴀᴛᴄʜ & ᴅᴏᴡɴʟᴏᴀᴅ ⎙", watch_url, _WATCH_DL_STYLE[0]))
+        def _m(key):
+            e = dict(btn_cfg.get(key) or {})
+            e.update(over.get(key) or {})
+            return e
 
-    row2 = []
-    if kaise_url and _k.get("enabled", True):
-        row2.append(_mk(_k, "• ᴋᴀɪꜱᴇ ᴅᴇᴋʜᴇɪɴ •", kaise_url, _KAISE_STYLE[0]))
-    if backup_url and _b.get("enabled", True):
-        row2.append(_mk(_b, "• ᴊᴏɪɴ ʙᴀᴄᴋᴜᴘ •", backup_url, _BACKUP_STYLE[0]))
+        _w, _k, _b = _m("watch"), _m("kaise"), _m("backup")
 
-    keyboard_rows = [r for r in [row1, row2] if r]
-    reply_markup = {"inline_keyboard": keyboard_rows} if keyboard_rows else {"inline_keyboard": []}
+        def _mk(entry, default_text, url, default_style):
+            b = {
+                "text": _fill_button_text(entry.get("text") or default_text, _ep_btn, season, audio),
+                "url": url,
+            }
+            st = _btn_style(entry, default_style)
+            if st:
+                b["style"] = st
+            return b
 
-    # Pyrogram fallback markup (plain, no colour — used only if Bot API call fails)
-    pyrogram_rows = []
-    if row1:
-        pyrogram_rows.append([InlineKeyboardButton(b["text"], url=b["url"]) for b in row1])
-    if row2:
-        pyrogram_rows.append([InlineKeyboardButton(b["text"], url=b["url"]) for b in row2])
-    pyrogram_markup = InlineKeyboardMarkup(pyrogram_rows) if pyrogram_rows else None
+        r1 = []
+        ow_url = (over.get("watch") or {}).get("url")
+        watch_url = ow_url or ch_link or (btn_cfg.get("watch") or {}).get("url") or invite_link
+        if watch_url and _w.get("enabled", True):
+            r1.append(_mk(_w, "⎙ ᴡᴀᴛᴄʜ & ᴅᴏᴡɴʟᴏᴀᴅ ⎙", watch_url, _WATCH_DL_STYLE[0]))
+
+        r2 = []
+        k_url = (over.get("kaise") or {}).get("url") or kaise_url
+        b_url = (over.get("backup") or {}).get("url") or backup_url
+        if k_url and _k.get("enabled", True):
+            r2.append(_mk(_k, "• ᴋᴀɪꜱᴇ ᴅᴇᴋʜᴇɪɴ •", k_url, _KAISE_STYLE[0]))
+        if b_url and _b.get("enabled", True):
+            r2.append(_mk(_b, "• ᴊᴏɪɴ ʙᴀᴄᴋᴜᴘ •", b_url, _BACKUP_STYLE[0]))
+
+        rows = [r for r in [r1, r2] if r]
+        rm = {"inline_keyboard": rows} if rows else {"inline_keyboard": []}
+        # Pyrogram fallback markup (plain, no colour — used only if Bot API call fails)
+        prows = [[InlineKeyboardButton(b["text"], url=b["url"]) for b in r] for r in rows]
+        pm = InlineKeyboardMarkup(prows) if prows else None
+        return rm, pm
+
+    reply_markup, pyrogram_markup = _build_markup()
+    multi_on = await _mm.is_multi()
 
     # ── Send and store latest post IDs ──
+    import asyncio as _aio
+    from pyrogram.errors import FloodWait as _FloodWait
+
     new_latest = []
-    for ch in channels:
+    failures = []          # (title, id, reason) — owner ko DM ke liye
+    for n, ch in enumerate(channels):
         ch_id = ch.get("channel_id")
         if not ch_id:
             continue
+        if n:
+            await _aio.sleep(1)     # channels ke beech chhota gap (flood se bachne ke liye)
         msg_id = None
+        reason = ""
+        _bue.LAST_BOT_API_ERROR = ""
+
+        # Multi mode: is channel ka apna link (Link N) + apna button-set
+        ch_reply_markup, ch_pyro_markup, ch_entities = reply_markup, pyrogram_markup, caption_entities
+        if multi_on:
+            ch_link = _mm.link_for(entry, _mm.ch_link_idx(ch, n))
+            ch_reply_markup, ch_pyro_markup = _build_markup(ch.get("buttons") or {}, ch_link)
+            if ch_link and ch_link != invite_link and caption_entities:
+                ch_entities = [
+                    ({**e, "url": ch_link} if (isinstance(e, dict) and e.get("type") == "text_link"
+                                               and e.get("url") == invite_link) else e)
+                    for e in caption_entities
+                ]
         try:
-            msg_id = await _bot_api_send_photo(ch_id, image, caption, caption_entities, reply_markup)
+            msg_id = await _bot_api_send_photo(ch_id, image, caption, ch_entities, ch_reply_markup)
         except Exception as e:
+            reason = f"BotAPI: {e}"
             LOGGER.warning(f"[UpdateChannel] Bot API sendPhoto error for {ch_id}: {e}")
+        if not msg_id and not reason:
+            reason = f"BotAPI: {_bue.LAST_BOT_API_ERROR or 'unknown'}"
 
         if not msg_id:
-            # Pyrogram fallback — no custom colours, but post still goes out
-            try:
-                sent = await client.send_photo(
-                    chat_id=ch_id,
-                    photo=image,
-                    caption=caption,
-                    reply_markup=pyrogram_markup,
-                )
-                msg_id = sent.id
-            except Exception as e:
-                LOGGER.error(f"[UpdateChannel] Failed to send to {ch_id}: {e}")
+            # Pyrogram fallback — no custom colours, but post still goes out.
+            # 2 attempts: dusre attempt se pehle channel ka peer refresh (get_chat).
+            for attempt in (1, 2):
+                try:
+                    if attempt == 2:
+                        try:
+                            await client.get_chat(ch_id)
+                        except Exception:
+                            pass
+                    sent = await client.send_photo(
+                        chat_id=ch_id,
+                        photo=image,
+                        caption=caption,
+                        reply_markup=ch_pyro_markup,
+                    )
+                    msg_id = sent.id
+                    break
+                except _FloodWait as fw:
+                    reason = f"{reason} | FloodWait {fw.value}s"
+                    await _aio.sleep(min(fw.value + 1, 60))
+                except Exception as e:
+                    reason = f"{reason} | Pyrogram: {type(e).__name__}: {e}"
+            if not msg_id:
+                LOGGER.error(f"[UpdateChannel] Failed to send to {ch_id}: {reason}")
+                failures.append((ch.get("channel_title", "Unknown"), ch_id, reason))
                 continue
 
         new_latest.append({"channel_id": ch_id, "message_id": msg_id})
@@ -539,6 +591,23 @@ async def send_update_post(
     # Save latest post IDs (overwrite with fresh batch)
     if new_latest:
         await _save_latest_post_ids(new_latest)
+
+    # Jis channel pe post nahi gaya uska ASLI reason owner ko DM — chupchap fail na ho
+    if failures:
+        from pyrogram.enums import ParseMode as _PM
+        lines = [f"⚠️ Update post '{display_name}' in channels mein NAHI gaya:"]
+        for title, cid, why in failures:
+            lines.append(f"\n• {title} ({cid})\n  {why[:300]}")
+        lines.append(
+            "\nZyada tar wajah: bot ko us channel mein 'Post Messages' permission nahi, "
+            "ya bot channel ka admin/member nahi. /customise → Main Channel Post Channels → "
+            "channel → 🧪 Test se check karo."
+        )
+        for oid in dict.fromkeys(list(owner)):
+            try:
+                await client.send_message(oid, "\n".join(lines), parse_mode=_PM.DISABLED)
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────
@@ -628,6 +697,37 @@ async def cmd_latest_post_delete(client: Client, message: Message):
         await message.reply(f"❌ Delete nahi ho paya:\n\n{fail_text}")
 
 
+def new_channel_record(channels: list, channel_id: int, title: str, clone_n: int = 0):
+    """
+    Naya update-channel record banao. clone_n (1-based) di ho to us channel ka
+    button-set + link number copy hota hai (multi mode); warna naya channel
+    agla link number (Link N+1) leta hai aur default buttons.
+    Returns (record, error_text|None).
+    """
+    import copy
+    rec = {"channel_id": channel_id, "channel_title": title}
+    if clone_n:
+        if clone_n < 1 or clone_n > len(channels):
+            return None, f"Clone number 1 se {len(channels)} ke beech hona chahiye."
+        src = channels[clone_n - 1]
+        rec["link_idx"] = _mm.ch_link_idx(src, clone_n - 1)
+        if src.get("buttons"):
+            rec["buttons"] = copy.deepcopy(src["buttons"])
+    else:
+        rec["link_idx"] = len(channels)
+    return rec, None
+
+
+def _can_post(member) -> bool:
+    """Channel mein bot post kar sakta hai? (OWNER ya admin with can_post_messages)."""
+    if member.status.name == "OWNER":
+        return True
+    priv = getattr(member, "privileges", None)
+    if priv is None:
+        return True      # info nahi mili — block mat karo
+    return bool(getattr(priv, "can_post_messages", False))
+
+
 # ─────────────────────────────────────────────
 #  /update_channel [channel_id]
 # ─────────────────────────────────────────────
@@ -637,11 +737,13 @@ async def cmd_update_channel(client: Client, message: Message):
     if not _is_auth(message.from_user.id):
         return
 
-    parts = message.text.split(None, 1)
+    parts = message.text.split()
     if len(parts) < 2 or not parts[1].strip():
         await message.reply(
-            "**Usage:** `/update_channel [channel_id]`\n\n"
-            "**Example:** `/update_channel -1001234567890`"
+            "**Usage:** `/update_channel [channel_id] [clone_no]`\n\n"
+            "**Example:** `/update_channel -1001234567890`\n"
+            "**Clone:** `/update_channel -1001234567890 1` — Channel 01 jaisa "
+            "button-set + link (Multi Mode ke liye, `/multi_mode on`)"
         )
         return
 
@@ -650,6 +752,14 @@ async def cmd_update_channel(client: Client, message: Message):
     except ValueError:
         await message.reply("❌ Valid channel ID chahiye. Format: `-100xxxxxxxxx`")
         return
+
+    clone_n = 0
+    if len(parts) > 2:
+        try:
+            clone_n = int(parts[2])
+        except ValueError:
+            await message.reply("❌ Clone number sirf number hona chahiye. Example: `/update_channel -100123 1`")
+            return
 
     channels = await _get_update_channels()
     for ch in channels:
@@ -674,18 +784,37 @@ async def cmd_update_channel(client: Client, message: Message):
         if member.status.name not in ["ADMINISTRATOR", "OWNER"]:
             await message.reply(f"❌ Bot `{channel_title}` mein admin nahi hai!")
             return
+        if not _can_post(member):
+            await message.reply(
+                f"❌ Bot `{channel_title}` mein admin hai, lekin **Post Messages** permission nahi hai!\n"
+                "Channel admin settings mein bot ko 'Post Messages' do, phir dobara add karo."
+            )
+            return
     except Exception as e:
         await message.reply(f"❌ Admin check fail: `{e}`")
         return
 
-    channels.append({"channel_id": channel_id, "channel_title": channel_title})
+    rec, err = new_channel_record(channels, channel_id, channel_title, clone_n)
+    if err:
+        await message.reply(f"❌ {err}")
+        return
+    channels.append(rec)
     await _save_update_channels(channels)
 
+    clone_line = (
+        f"🔁 **Channel {clone_n:02d}** ka clone (button-set + link same)\n"
+        if clone_n else ""
+    )
+    multi_hint = ""
+    if not await _mm.is_multi():
+        multi_hint = "\n\n_Channel-wise alag link/buttons ke liye `/multi_mode on` karo._"
     await message.reply(
         f"✅ **Update Channel Added!**\n\n"
-        f"📢 **{channel_title}**\n"
-        f"🆔 `{channel_id}`\n\n"
+        f"📢 **{channel_title}** (Channel {len(channels):02d})\n"
+        f"🆔 `{channel_id}`\n"
+        f"{clone_line}\n"
         f"Ab jab bhi registered anime ka 360p upload hoga, yahan post aayega."
+        f"{multi_hint}"
     )
 
 
@@ -711,9 +840,14 @@ async def cmd_update_channel_list(client: Client, message: Message):
         return
 
     text = f"📢 **Update Channels ({len(channels)})** | Posting: **{status}**\n\n"
+    multi = await _mm.is_multi()
     for i, ch in enumerate(channels, 1):
-        text += f"`{i}.` **{ch.get('channel_title', 'Unknown')}**\n"
-        text += f"    🆔 `{ch.get('channel_id')}`\n\n"
+        text += f"`{i:02d}.` **{ch.get('channel_title', 'Unknown')}**\n"
+        text += f"    🆔 `{ch.get('channel_id')}`\n"
+        if multi:
+            text += f"    🔗 Link {_mm.ch_link_idx(ch, i - 1) + 1}"
+            text += " • 🎛 alag buttons\n" if ch.get("buttons") else " • default buttons\n"
+        text += "\n"
 
     text += "💡 Remove: `/delete_update_channel [channel_id]`\n"
     text += "💡 Toggle: `/updatechannel on` | `/updatechannel off`"
@@ -1086,17 +1220,31 @@ async def _show_update_post_edit_menu(event, user_id: int, idx: int, page: int, 
     entry = post_map[key]
     name = entry.get("display_name") or key
 
+    multi = await _mm.is_multi()
+    link_rows = [[InlineKeyboardButton("🔗 Link", callback_data=f"upe_field_{idx}_link_{user_id}_{page}")]]
+    link_text = f"🔗 Link: {_field_display(entry, 'invite_link')}\n"
+    if multi:
+        n_links = max(2, len(await _get_update_channels()), len(entry.get("invite_links") or []))
+        links = entry.get("invite_links") or [entry.get("invite_link") or ""]
+        link_text = ""
+        link_rows = []
+        for n in range(1, n_links + 1):
+            val = links[n - 1] if n - 1 < len(links) else ""
+            link_text += f"🔗 Link {n} (Channel {n:02d}): " + (f"`{val}`" if val else "_(not set)_") + "\n"
+            fld = "link" if n == 1 else f"link{n}"
+            link_rows.append([InlineKeyboardButton(
+                f"🔗 Link {n}", callback_data=f"upe_field_{idx}_{fld}_{user_id}_{page}")])
+
     text = (
         f"✏️ **Editing: {name}**\n\n"
-        f"🔗 Link: {_field_display(entry, 'invite_link')}\n"
+        f"{link_text}"
         f"🎙 Audio: {_field_display(entry, 'audio')}\n"
         f"🎭 Genres: {_field_display(entry, 'genres')}\n"
         f"🖼 Image: {_field_display(entry, 'image')}\n\n"
         f"_Konsa field change karna hai?_"
     )
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔗 Link", callback_data=f"upe_field_{idx}_link_{user_id}_{page}")],
+    kb = InlineKeyboardMarkup(link_rows + [
         [InlineKeyboardButton("🎙 Audio", callback_data=f"upe_field_{idx}_audio_{user_id}_{page}")],
         [InlineKeyboardButton("🎭 Genres", callback_data=f"upe_field_{idx}_genres_{user_id}_{page}")],
         [InlineKeyboardButton("🖼 Image", callback_data=f"upe_field_{idx}_image_{user_id}_{page}")],
@@ -1219,6 +1367,8 @@ async def update_post_edit_callbacks(bot: Client, cb: CallbackQuery):
             "image": ("🖼 Image", "_Photo bhejo (poster/banner)._"),
         }
         label, example = field_labels.get(field, (field, ""))
+        if field.startswith("link") and field[4:].isdigit():
+            label, example = (f"🔗 Link {field[4:]} (Channel {int(field[4:]):02d})", field_labels["link"][1])
 
         back_kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("⬅️ Cancel", callback_data=f"upe_open_{idx}_{owner_id}_{page}")
@@ -1344,7 +1494,8 @@ async def update_post_text_input(client: Client, message: Message):
 
     # ── /update_post_list inline-edit session (link / audio / genres) ──
     edit_session = _update_post_edit_sessions.get(user_id)
-    if edit_session and edit_session.get("field") in ("link", "audio", "genres"):
+    if edit_session and (edit_session.get("field") in ("link", "audio", "genres")
+                         or str(edit_session.get("field", "")).startswith("link")):
         field = edit_session["field"]
         key = edit_session["key"]
         idx = edit_session["idx"]
@@ -1365,14 +1516,19 @@ async def update_post_text_input(client: Client, message: Message):
             await message.reply("❌ Ye entry ab exist nahi karta.")
             raise StopPropagation
 
-        if field == "link":
+        if field.startswith("link"):
+            n_link = 1 if field == "link" else (int(field[4:]) if field[4:].isdigit() else 1)
             if text.lower() == "skip":
-                post_map[key]["invite_link"] = ""
+                new_link = ""
             elif not text.startswith("http"):
                 await message.reply("⚠️ Valid link do (`https://t.me/...`) ya `skip` likho.")
                 raise StopPropagation
             else:
-                post_map[key]["invite_link"] = text
+                new_link = text
+            if n_link == 1 and not post_map[key].get("invite_links"):
+                post_map[key]["invite_link"] = new_link        # purana single-link behaviour
+            else:
+                _mm.set_link(post_map[key], n_link, new_link)
         elif field == "audio":
             post_map[key]["audio"] = text
         elif field == "genres":

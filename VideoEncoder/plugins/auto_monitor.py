@@ -2513,14 +2513,43 @@ async def _add_anime_step_link(client: Client, message: Message, session: dict, 
         await message.reply("⚠️ Valid link do, jaise `https://t.me/+xxxxxxxxxx`.")
         return
 
-    session["channel_link"] = text
+    from ..utils.multi_mode import is_multi
+    links = list(session.get("channel_links") or [])
+    links.append(text)
+    session["channel_links"] = links
+    session["channel_link"] = links[0]
+
+    # Multi mode: Link 1 → Channel 01, Link 2 → Channel 02 ... — aur links maango
+    if await is_multi():
+        from .update_channel import _get_update_channels
+        chans = await _get_update_channels()
+        max_links = max(2, len(chans))
+        if len(links) < max_links:
+            nxt = len(links) + 1
+            ch_hint = ""
+            if nxt - 1 < len(chans):
+                ch_hint = f" — {chans[nxt - 1].get('channel_title', '')}"
+            _add_anime_sessions[user_id] = session
+            await message.reply(
+                f"✅ **Link {len(links)} save ho gaya** (Channel {len(links):02d})\n\n"
+                f"Ab **Link {nxt}** bhejo (Channel {nxt:02d}{ch_hint}),\n"
+                f"ya ✅ Done dabao agar bas itne links kaafi hain\n"
+                f"_(jis channel ka link nahi doge, usme Link 1 jaayega)_",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Done — bas itne links", callback_data=f"aa_ldone_{user_id}")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data=f"aa_cancel_{user_id}")],
+                ]),
+            )
+            return
+
     _add_anime_sessions.pop(user_id, None)
     await _finalize_add_anime(client, message, session)
 
 
-async def _finalize_add_anime(client: Client, message: Message, session: dict):
+async def _finalize_add_anime(client: Client, message: Message, session: dict, user_id: int = None):
     """Session complete — anime_monitor_list + update_post_map +
     episode_schedule_list, teeno ek saath save karo."""
+    user_id = user_id or message.from_user.id
     channel_id = session["channel_id"]
     channel_title = session["channel_title"]
     anime_name = session["anime_name"]
@@ -2552,13 +2581,17 @@ async def _finalize_add_anime(client: Client, message: Message, session: dict):
     # ── 2) update_post_map entry (jo pehle /update_post 5-step karta tha) ──
     _get_post_map, _save_post_map = _get_update_post_fns()
     post_map = await _get_post_map()
-    post_map[anime_name.lower().strip()] = {
+    post_entry = {
         "display_name": anime_name,
         "invite_link":  channel_link,
         "audio":        audio,
         "genres":       genres,
         "image":        image,
     }
+    channel_links = [l for l in (session.get("channel_links") or []) if l]
+    if len(channel_links) > 1:      # Multi mode: Link 1 → Channel 01, Link 2 → Channel 02 ...
+        post_entry["invite_links"] = channel_links
+    post_map[anime_name.lower().strip()] = post_entry
     await _save_post_map(post_map)
 
     # ── 2b) Video-pic (Step 4/5) ko `/setpic <anime_name>` ki tarah save
@@ -2566,7 +2599,7 @@ async def _finalize_add_anime(client: Client, message: Message, session: dict):
     #        auto-thumbnail lage. Ye POST pic (image) se ALAG pic hai ──
     setpic_saved = False
     if video_pic:
-        setpic_saved = await _register_setpic_from_url(message.from_user.id, anime_name, video_pic)
+        setpic_saved = await _register_setpic_from_url(user_id, anime_name, video_pic)
 
     # ── 3) episode schedule (jo pehle /schedule karta tha) ──
     _get_schedule_list, _save_schedule_list = _get_schedule_list_fns()
@@ -2599,6 +2632,12 @@ async def _finalize_add_anime(client: Client, message: Message, session: dict):
         else "📌 **Video Pic (`/setpic`):** ⚠️ save nahi ho paaya — `/setpic " + anime_name + "` manually karo\n"
     )
     interval_str = "❓ Unknown" if interval_days == "unknown" else f"{interval_days} din"
+    if len(channel_links) > 1:
+        link_summary = "".join(
+            f"🔗 **Link {i} (Channel {i:02d}):** {l}\n" for i, l in enumerate(channel_links, 1)
+        )
+    else:
+        link_summary = f"🔗 **Link:** {channel_link or '—'}\n"
     await message.reply(
         f"🎉 **Anime Fully Added!** 🎉\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -2611,7 +2650,7 @@ async def _finalize_add_anime(client: Client, message: Message, session: dict):
         f"{image_line}"
         f"{setpic_line}"
         f"📅 **Next Episode In:** {interval_str}\n"
-        f"🔗 **Link:** {channel_link or '—'}\n"
+        f"{link_summary}"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"> ✨ _Monitor + Update Post + Schedule — teeno set ho gaye! "
         f"Ab uploads automatic honge_ 🚀"
@@ -2898,6 +2937,22 @@ async def add_anime_callbacks(client: Client, cb: CallbackQuery):
         await _show_link_choice(cb.message, owner_id)
         return
 
+    # ── aa_ldone_<uid> — multi mode: bas itne links, ab finalize ──
+    if data.startswith("aa_ldone_"):
+        if session.get("step") != "link_manual" or not session.get("channel_links"):
+            await cb.answer("⚠️ Ye step ab active nahi hai.", show_alert=True)
+            return
+        _add_anime_sessions.pop(owner_id, None)
+        await cb.answer("✅ Links save ho gaye")
+        try:
+            await cb.message.edit(
+                f"✅ **{len(session['channel_links'])} link(s) set.**"
+            )
+        except Exception:
+            pass
+        await _finalize_add_anime(client, cb.message, session, user_id=owner_id)
+        return
+
     # ── aa_link_set_<uid> ── (Skip button removed — link mandatory hai)
     if data.startswith("aa_link_"):
         if session.get("step") != "link_choice":
@@ -2910,9 +2965,16 @@ async def add_anime_callbacks(client: Client, cb: CallbackQuery):
         _add_anime_sessions[owner_id] = session
         await cb.answer()
         try:
+            from ..utils.multi_mode import is_multi as _is_multi
+            _hint = (
+                "\n🔀 **Multi Mode ON** — ye **Link 1 (Channel 01)** hai. Iske baad Link 2, "
+                "Link 3... bhi add kar paoge.\n"
+                if await _is_multi() else ""
+            )
             await cb.message.edit(
                 "**🔗 Channel ka invite link bhejo:**\n\n"
-                "**Example:** `https://t.me/+xxxxxxxxxx`\n\n"
+                "**Example:** `https://t.me/+xxxxxxxxxx`\n"
+                f"{_hint}\n"
                 "_Cancel karna ho toh `/cancel_add_anime` bhejo._"
             )
         except Exception:
