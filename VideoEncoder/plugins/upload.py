@@ -85,20 +85,3 @@ async def driveupload(client, message):
     else:
         await reply.delete()
 
-
-@Client.on_message(filters.command('logs'))
-async def logsup(client, message):
-    c = await check_chat(message, chat='Sudo')
-    if c is None:
-        return
-    file = 'VideoEncoder/utils/extras/logs.txt'
-    caption = '#Logs'
-    try:
-        await message.reply_document(
-            file,
-            caption=caption
-        )
-    except MessageIdInvalid:
-        await message.reply('Upload cancelled!')
-    except Exception as e:
-        await message.reply(': {}'.format(e))

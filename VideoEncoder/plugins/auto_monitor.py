@@ -1260,13 +1260,13 @@ async def _get_notify_mode() -> bool:
 
 
 async def _get_notify_level() -> str:
-    """'fail' (default: sirf detect-FAIL ka DM) | 'all' (success bhi) | 'off' (kuch nahi)."""
+    """'off' (DEFAULT: koi DM nahi) | 'fail' (sirf detect-FAIL ka DM) | 'all' (success bhi)."""
     oid = await _owner_id()
     if not oid:
-        return 'fail'
+        return 'off'
     user = await db._get_user(oid)
-    lvl = user.get('monitor_notify_level', 'fail')
-    return lvl if lvl in ('fail', 'all', 'off') else 'fail'
+    lvl = user.get('monitor_notify_level', 'off')
+    return lvl if lvl in ('fail', 'all', 'off') else 'off'
 
 
 async def _notify_owner(client: Client, text: str, buttons=None):
@@ -3615,7 +3615,7 @@ async def cmd_monitor_notify(client: Client, message: Message):
              'off': 'OFF — koi DM nahi'}[cur]
     await message.reply(
         f"🔔 Notify mode: <b>{label}</b>\n\n"
-        f"<code>/monitor_notify off</code> — DM bilkul band\n"
+        f"<code>/monitor_notify off</code> — DM bilkul band (default)\n"
         f"<code>/monitor_notify fail</code> — sirf problem hone par\n"
         f"<code>/monitor_notify all</code> — har verdict",
         parse_mode=ParseMode.HTML)

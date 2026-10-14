@@ -66,7 +66,6 @@ For Sudo:
 - /restart - restart bot
 - /clean - clean junk
 - /clear - clean queue
-- /logs - view logs
 
 For Owner:
 - /addchat and /addsudo
@@ -104,7 +103,6 @@ For Sudo:
 - /restart - restart bot
 - /clean - clean junk
 - /clear - clean queue
-- /logs - view logs
 
 For Owner:
 - /addchat and /addsudo

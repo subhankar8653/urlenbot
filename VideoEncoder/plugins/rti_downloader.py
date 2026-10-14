@@ -156,6 +156,97 @@ def _best_link(links: list):
     return links[0] if links else None
 
 
+# ── Generic fallback: "Erased S01E01 Fandub" jaise link-text wale pages ──
+# (jahan <p> heading + WatchMultQuality link ka standard layout nahi hota, seedha
+#  episode ke naam wale links ki list hoti hai: "Anime S01E05 Fandub", "1x05", "E05"...)
+_SXXEYY_RE = re.compile(
+    r"\bS(?:eason)?\s*0*(\d{1,2})\s*[-_. ]?\s*E(?:p(?:isode)?)?\s*\.?\s*0*(\d{1,3})\b",
+    re.IGNORECASE,
+)
+_NXN_RE = re.compile(r"\b0*(\d{1,2})x0*(\d{1,3})\b", re.IGNORECASE)
+_EP_SHORT_RE = re.compile(r"(?<![A-Za-z])E(?:p\.?)?\s*0*(\d{1,3})\b", re.IGNORECASE)
+
+
+def _match_item_ext(text: str):
+    """(kind, num, season|None). Pehle purane patterns (OVA/Special/Episode N), phir
+    S01E05 / 1x05 / E05 jaise short formats."""
+    kind, num = _match_item(text)
+    if kind:
+        return kind, num, None
+    m = _SXXEYY_RE.search(text)
+    if m:
+        return "EP", int(m.group(2)), int(m.group(1))
+    m = _NXN_RE.search(text)
+    if m:
+        return "EP", int(m.group(2)), int(m.group(1))
+    m = _EP_SHORT_RE.search(text)
+    if m:
+        return "EP", int(m.group(1)), None
+    return None, None, None
+
+
+def _audio_from_text(text: str) -> str:
+    t = (text or "").lower()
+    if re.search(r"fan\s*dub|dubbed|\bdub\b|hindi", t):
+        return "hindi"
+    if "dual" in t:
+        return "dual"
+    if "multi" in t:
+        return "multi"
+    if re.search(r"english|\beng\b", t):
+        return "english"
+    if "japanese" in t:
+        return "japanese"
+    if re.search(r"\bsubs?\b", t):
+        return "sub"
+    return "unknown"
+
+
+def _generic_items(soup):
+    """
+    Page ke saare <a> links scan karo; jis link ke text (ya chhote parent text) mein
+    episode ka pattern ho, usse (kind, num) → [{href, audio}] banao.
+    Returns (found_dict, season_hint|None).
+    """
+    found = {}
+    seasons = []
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
+        text = a.get_text(" ", strip=True) or (a.get("title") or "")
+        kind, num, season = _match_item_ext(text)
+        ctx = text
+        if not kind:
+            par = a.find_parent()
+            ptxt = par.get_text(" ", strip=True) if par else ""
+            if ptxt and len(ptxt) <= 160:
+                kind, num, season = _match_item_ext(ptxt)
+                ctx = ptxt
+        if not kind:
+            continue
+        audio = _audio_from_text(text)
+        if audio == "unknown":
+            audio = _audio_from_text(ctx)
+        found.setdefault((kind, num), []).append({"href": href, "audio": audio})
+        if season:
+            seasons.append(season)
+    hint = max(set(seasons), key=seasons.count) if seasons else None
+    return found, hint
+
+
+def _page_title(soup) -> str:
+    t = soup.find("h1", class_="entry-title") or soup.find("h1") or soup.find("h2")
+    if t and t.get_text(strip=True):
+        return t.get_text(" ", strip=True)
+    og = soup.find("meta", attrs={"property": "og:title"})
+    if og and og.get("content"):
+        return og["content"].strip()
+    if soup.title and soup.title.get_text(strip=True):
+        return soup.title.get_text(strip=True)
+    return "Unknown Anime"
+
+
 def _match_item(text: str):
     """Text mein Episode/OVA/Special number dhundo. Returns (kind, num) ya (None, None)."""
     for pattern, kind in ITEM_PATTERNS:
@@ -183,8 +274,7 @@ def discover_items(page_url: str):
     r.raise_for_status()
     soup = BeautifulSoup(r.content, "html.parser")
 
-    title_tag = soup.find("h1", class_="entry-title")
-    title = title_tag.text.strip() if title_tag else "Unknown Anime"
+    title = _page_title(soup)
 
     season_match = re.search(r"season\s*(\d+)", title, re.IGNORECASE)
     season = int(season_match.group(1)) if season_match else 1
@@ -222,6 +312,16 @@ def discover_items(page_url: str):
 
         seen.add(key)
         items.append({"kind": kind, "num": num, "wmq_link": best["href"]})
+
+    if not items:
+        # ── Generic fallback ── "Erased S01E01 Fandub" jaise link-text wale pages
+        found, gseason = _generic_items(soup)
+        for (kind, num), links in found.items():
+            best = _best_link(links)
+            if best:
+                items.append({"kind": kind, "num": num, "wmq_link": best["href"]})
+        if items and not season_match and gseason:
+            season = gseason
 
     if not items:
         # ── MOVIE MODE ── Episode/OVA/Special jaisa kuch nahi mila,
@@ -441,8 +541,7 @@ def get_watchmult_link(page_url: str, episode_num: int):
         r.raise_for_status()
         soup = BeautifulSoup(r.content, "html.parser")
 
-        title_tag = soup.find("h1", class_="entry-title")
-        anime_title = title_tag.text.strip() if title_tag else "Unknown Anime"
+        anime_title = _page_title(soup)
 
         # ── MOVIE MODE (episode_num == 0) ──
         # Movies ke page pe "Episode N" jaisa koi text hota hi nahi
@@ -476,6 +575,12 @@ def get_watchmult_link(page_url: str, episode_num: int):
                 best = _best_link(all_links)
                 if best:
                     return best["href"], anime_title
+
+        # Generic fallback — "Anime S01E05 Fandub" jaise link-text wale pages
+        found, _ = _generic_items(soup)
+        best = _best_link(found.get(("EP", episode_num), []))
+        if best:
+            return best["href"], anime_title
 
         return None, None
     except Exception as e:
