@@ -22,6 +22,7 @@ Flow:
   - /delete_update_post [anime_name]      → Kisi anime ka saved post entry remove karo
   - /updatechannel on|off                 → Update channel posting toggle karo
   - /latest_post_delete                   → Last sent update channel post delete karo
+  - /post_delete <link> [more ids/links]  → Link se koi bhi post(s) delete karo
 
 Auto-trigger:
   Jab bhi 360p file upload hoti hai kisi anime channel pe (auto_monitor se),
@@ -390,6 +391,19 @@ async def send_update_post(
 
     style_id = update_post_style.get_current_style_id()
 
+    # Episode label (log + default style ke liye) — har style mein defined rahe.
+    # (Pehle ye sirf default-style branch mein banta tha: custom style mein log line pe
+    #  NameError aata tha, loop pehle channel ke baad ruk jaata tha aur latest post IDs
+    #  save nahi hote the.)
+    if episode_start and episode_end and episode_start != episode_end:
+        ep_str = f"{episode_start}-{episode_end}"
+    elif episode_start:
+        ep_str = f"{episode_start:02d}" if episode_start < 100 else str(episode_start)
+    elif episode:
+        ep_str = f"{episode:02d}" if episode < 100 else str(episode)
+    else:
+        ep_str = "—"
+
     if style_id == update_post_style.DEFAULT_STYLE_ID:
         # ── Purana hardcoded layout — bilkul unchanged ──
         # ── Episode line ──
@@ -526,10 +540,7 @@ async def send_update_post(
 
     new_latest = []
     failures = []          # (title, id, reason) — owner ko DM ke liye
-    for n, ch in enumerate(channels):
-        ch_id = ch.get("channel_id")
-        if not ch_id:
-            continue
+    async def _send_one_channel(n, ch, ch_id):
         if n:
             await _aio.sleep(1)     # channels ke beech chhota gap (flood se bachne ke liye)
         msg_id = None
@@ -581,12 +592,23 @@ async def send_update_post(
             if not msg_id:
                 LOGGER.error(f"[UpdateChannel] Failed to send to {ch_id}: {reason}")
                 failures.append((ch.get("channel_title", "Unknown"), ch_id, reason))
-                continue
+                return
 
         new_latest.append({"channel_id": ch_id, "message_id": msg_id})
         LOGGER.info(
             f"[UpdateChannel] Post sent to {ch_id} for '{display_name}' Ep {ep_str} (msg_id={msg_id})"
         )
+
+    for n, ch in enumerate(channels):
+        ch_id = ch.get("channel_id")
+        if not ch_id:
+            continue
+        try:
+            await _send_one_channel(n, ch, ch_id)
+        except Exception as _ce:
+            LOGGER.error(f"[UpdateChannel] Unexpected error for {ch_id}: {_ce!r}")
+            failures.append((ch.get("channel_title", "Unknown"), ch_id,
+                             f"Internal: {type(_ce).__name__}: {_ce}"))
 
     # Save latest post IDs (overwrite with fresh batch)
     if new_latest:
@@ -695,6 +717,119 @@ async def cmd_latest_post_delete(client: Client, message: Message):
     else:
         fail_text = "\n".join(failed) if failed else "Unknown error"
         await message.reply(f"❌ Delete nahi ho paya:\n\n{fail_text}")
+
+
+# ─────────────────────────────────────────────
+#  /post_delete <link> [link | id | a-b ...] — link se post(s) delete karo
+# ─────────────────────────────────────────────
+_POST_LINK_C = re.compile(r"^https?://(?:www\.)?t\.me/c/(\d+)/(?:\d+/)?(\d+)(?:[/?#].*)?$", re.IGNORECASE)
+_POST_LINK_U = re.compile(r"^https?://(?:www\.)?t\.me/([A-Za-z][A-Za-z0-9_]{3,})/(?:\d+/)?(\d+)(?:[/?#].*)?$", re.IGNORECASE)
+_POST_DELETE_MAX = 200
+
+
+def parse_post_refs(text: str):
+    """
+    '/post_delete' ke arguments parse karo.
+      https://t.me/username/534            → ("@username", 534)
+      https://t.me/c/4427806367/92         → (-1004427806367, 92)
+      link ke baad bare number / range:    97   ya   97-100   (usi chat ke message ids)
+    Returns ({chat: [msg_ids...]}, [error strings]).
+    """
+    tokens = [t for t in re.split(r"[\s,]+", text or "") if t]
+    refs: dict = {}
+    errors = []
+    chat = None
+    total = 0
+
+    def _add(c, mid):
+        nonlocal total
+        if mid not in refs.setdefault(c, []):
+            refs[c].append(mid)
+            total += 1
+
+    for tok in tokens:
+        m = _POST_LINK_C.match(tok)
+        if m:
+            chat = int(f"-100{m.group(1)}")
+            _add(chat, int(m.group(2)))
+            continue
+        m = _POST_LINK_U.match(tok)
+        if m and m.group(1).lower() not in ("c", "joinchat", "addlist", "share", "s"):
+            chat = f"@{m.group(1)}"
+            _add(chat, int(m.group(2)))
+            continue
+        if re.fullmatch(r"\d+", tok):
+            if chat is None:
+                errors.append(f"`{tok}` — pehle link do (kis channel ka message hai?)")
+            else:
+                _add(chat, int(tok))
+            continue
+        m = re.fullmatch(r"(\d+)-(\d+)", tok)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if chat is None:
+                errors.append(f"`{tok}` — pehle link do")
+            elif a > b or b - a >= _POST_DELETE_MAX:
+                errors.append(f"`{tok}` — range galat ya {_POST_DELETE_MAX} se bada")
+            else:
+                for mid in range(a, b + 1):
+                    _add(chat, mid)
+            continue
+        errors.append(f"`{tok[:60]}` — samajh nahi aaya")
+    if total > _POST_DELETE_MAX:
+        errors.append(f"Ek baar mein max {_POST_DELETE_MAX} messages delete ho sakte hain.")
+    return refs, errors
+
+
+@Client.on_message(filters.command("post_delete") & filters.private)
+async def cmd_post_delete(client: Client, message: Message):
+    """Link(s) se post delete karo — update channel ho ya koi bhi channel jahan bot admin ho."""
+    if not _is_auth(message.from_user.id):
+        return
+
+    parts = message.text.split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply(
+            "🗑️ **Post Delete**\n\n"
+            "**Ek post:** `/post_delete https://t.me/kyami_animes_india/534`\n"
+            "**Private channel:** `/post_delete https://t.me/c/4427806367/92`\n"
+            "**Kai posts (usi channel ke):** `/post_delete https://t.me/c/4427806367/92 97`\n"
+            "**Range:** `/post_delete https://t.me/c/4427806367/92 97-100`\n"
+            "**Alag-alag channels:** `/post_delete <link1> <id> <link2> <id>`\n\n"
+            "Bot us channel mein admin hona chahiye, aur uske paas **Delete Messages** permission."
+        )
+        return
+
+    refs, errors = parse_post_refs(parts[1])
+    if errors and not refs:
+        await message.reply("❌ " + "\n".join(errors))
+        return
+
+    lines = []
+    for chat, ids in refs.items():
+        label = chat if isinstance(chat, str) else f"`{chat}`"
+        done = 0
+        err = None
+        for i in range(0, len(ids), 100):
+            chunk = ids[i:i + 100]
+            try:
+                done += int(await client.delete_messages(chat, chunk) or 0)
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                LOGGER.error(f"[PostDelete] {chat} {chunk}: {e}")
+                break
+        if err:
+            lines.append(f"❌ {label} — `{err[:160]}`\n    (bot admin hai? 'Delete Messages' permission hai?)")
+        elif done >= len(ids):
+            lines.append(f"✅ {label} — {done} post(s) delete")
+        else:
+            lines.append(f"⚠️ {label} — {done}/{len(ids)} delete hue (baaki pehle hi delete / nahi mile)")
+        LOGGER.info(f"[PostDelete] {chat}: {done}/{len(ids)} deleted")
+
+    text = "🗑️ **Post Delete**\n\n" + "\n".join(lines)
+    if errors:
+        text += "\n\n⚠️ **Skip hue:**\n" + "\n".join(errors)
+    await message.reply(text)
 
 
 def new_channel_record(channels: list, channel_id: int, title: str, clone_n: int = 0):
