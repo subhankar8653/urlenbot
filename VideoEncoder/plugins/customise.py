@@ -95,6 +95,7 @@ _CATEGORIES = [
          ("🗑 Auto-Delete Old Messages", "delete_message"),
          ("📅 Next-Episode / End Message", "schedule"),
          ("🏁 Upload Extras (end template/stickers)", "bot_upload_extras"),
+         ("📅 Hindi Anime Schedule", "hindi_schedule"),
      ]),
     ("other", "⚙️ Other Settings",
      "⚙️ **Other Settings**",
@@ -205,9 +206,16 @@ async def customise_callback(client: Client, cb: CallbackQuery):
         from .deco_panel import clear_session as _deco_clear
         from .post_buttons_panel import clear_session as _pb_clear
         from .update_channels_panel import clear_session as _uc_clear
+        from .hindi_schedule import clear_session as _hs_clear
         _deco_clear(cb.from_user.id)
         _pb_clear(cb.from_user.id)
         _uc_clear(cb.from_user.id)
+        _hs_clear(cb.from_user.id)
+
+    if action == "hs":
+        from .hindi_schedule import handle as _hs_handle
+        await _hs_handle(client, cb, parts[2:])
+        return
 
     if action == "uc":
         from .update_channels_panel import handle as _uc_handle
@@ -306,6 +314,11 @@ async def customise_callback(client: Client, cb: CallbackQuery):
 async def _open_section(client: Client, cb: CallbackQuery, section: str):
     user_id = cb.from_user.id
     _CUR_SECTION.set(section)
+
+    if section == "hindi_schedule":
+        from .hindi_schedule import render as _hs_render
+        await _hs_render(client, cb)
+        return
 
     if section == "border_panel":
         from .deco_panel import render_border
