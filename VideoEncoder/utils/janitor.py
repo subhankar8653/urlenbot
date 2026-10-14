@@ -291,6 +291,13 @@ def is_busy() -> bool:
             return True
     except Exception:
         pass
+    # Hindi schedule post ban/post ho raha hai (Chrome chal raha hota hai)
+    try:
+        from ..plugins import hindi_schedule
+        if hindi_schedule.BUSY:
+            return True
+    except Exception:
+        pass
     # Upload quota: koi upload chal raha ho ya queue mein wait kar raha ho
     try:
         from . import quota
@@ -486,3 +493,8 @@ def start_janitor():
     loop = asyncio.get_running_loop()
     loop.create_task(janitor_loop())
     loop.create_task(cache_loop())
+    try:   # Hindi anime schedule — roz set time pe channel mein auto-post
+        from ..plugins.hindi_schedule import schedule_loop
+        loop.create_task(schedule_loop())
+    except Exception as e:
+        LOGGER.error(f"[Janitor] hindi schedule loop start failed: {e}")
