@@ -333,15 +333,45 @@ def _lang_line(langs):
     return " • ".join(l.capitalize() for l in langs) if langs else "Hindi"
 
 
-def _ep_text(it) -> str:
-    """'Episode 13' / 'Episodes 361–362' / 'Episode 13+ (2 eps)' (ya khali agar episode info nahi)."""
+_INDIAN_LANGS = ("HINDI", "TAMIL", "TELUGU", "MALAYALAM", "KANNADA", "BENGALI",
+                 "MARATHI", "PUNJABI", "URDU")
+
+# Din ke naam ka stylish font (jaise ᗯᗴᗪᑎᗴՏᗪᗩY)
+_FANCY = {
+    "A": "ᗩ", "B": "ᗷ", "C": "ᑕ", "D": "ᗪ", "E": "ᗴ", "F": "ᖴ", "G": "Ǥ", "H": "ᕼ",
+    "I": "I", "J": "ᒍ", "K": "K", "L": "ᒪ", "M": "ᗰ", "N": "ᑎ", "O": "O", "P": "ᑭ",
+    "Q": "ᑫ", "R": "ᖇ", "S": "Տ", "T": "T", "U": "ᑌ", "V": "ᐯ", "W": "ᗯ", "X": "᙭",
+    "Y": "Y", "Z": "ᘔ",
+}
+
+
+def fancy_day(name: str) -> str:
+    return "".join(_FANCY.get(c, c) for c in name.upper())
+
+
+def _time12(t) -> str:
+    """'7:40 PM' -> '07:40 PM' (do-digit hour)."""
+    m = re.match(r"(\d{1,2}):(\d{2})\s*([AP]M)", t or "", re.IGNORECASE)
+    return f"{int(m.group(1)):02d}:{m.group(2)} {m.group(3).upper()}" if m else (t or "TBA")
+
+
+def _ep_code(it) -> str:
+    """'S04 E13' / 'S01 E361–362' / 'E361' (season na ho) / 'Upcoming Dub'."""
     if it["next"] is None:
-        return ""
+        return "Upcoming Dub" if it["upcoming"] else "TBA"
+    def f(n):
+        return f"{n:02d}" if n < 100 else str(n)
+    ep = f"E{f(it['next'])}"
     if it["next_end"] and it["next_end"] != it["next"]:
-        return f"Episodes {it['next']}–{it['next_end']}"
-    if it["per_release"] and it["per_release"] > 1:
-        return f"Episode {it['next']}+ ({it['per_release']} eps)"
-    return f"Episode {it['next']}"
+        ep += f"–{f(it['next_end'])}"
+    elif it["per_release"] and it["per_release"] > 1:
+        ep += "+"
+    return f"S{it['season']:02d} {ep}" if it["season"] else ep
+
+
+def _lang_tags(langs) -> str:
+    tags = [f"#{l.capitalize()}" for l in langs if l in _INDIAN_LANGS]
+    return " ".join(tags) if tags else "#Hindi"
 
 
 def _is_today(it, today) -> bool:
@@ -350,48 +380,50 @@ def _is_today(it, today) -> bool:
 
 def build_posts(day_idx: int, now: datetime, items: list, footer: str = "") -> list:
     """
-    Items (Hindi, sorted) -> 1+ HTML messages (har ek <= MAX_MSG_LEN).
+    Items (Hindi, sorted) -> 1+ messages (har ek <= MAX_MSG_LEN, HTML-safe).
+    Style:   ⟣──⟢ banner (din ka stylish naam)  →  ⫷ Title ⫸ + ┃ box  →  neeche title + date.
     Sirf wo anime jinka agla release AAJ hai (site ke countdown ke hisaab se).
-    footer khali ho to koi "Powered By" line nahi.
     """
     E = lambda s: _html.escape(str(s), quote=False)
     today = now.date()
     todays = [i for i in items if _is_today(i, today)]
-    head = (
-        "📅 <b>𝐇𝐈𝐍𝐃𝐈 𝐀𝐍𝐈𝐌𝐄 𝐒𝐂𝐇𝐄𝐃𝐔𝐋𝐄</b>\n"
-        f"🗓 <b>{DAY_FULL[day_idx]}</b> • {now.strftime('%d %b %Y')}\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
+
+    name = fancy_day(DAY_FULL[day_idx])
+    pad = " " * max(0, int(20 * (20 - 1.3 * len(name)) / (20 - 1.3 * 9)))
+    line = "⟣────────────────────⟢"
+    banner = f"{line}\n{pad}{name}\n{line}\n"
+    closing = (
+        " 𝐇𝐈𝐍𝐃𝐈 𝐀𝐍𝐈𝐌𝐄 𝐒𝐂𝐇𝐄𝐃𝐔𝐋𝐄\n"
+        f" {DAY_FULL[day_idx]} • {now.strftime('%d %b %Y')}\n"
+        "⟣━━━━━━━━━━━━━━━━━━━━⟢"
     )
-    foot = f"━━━━━━━━━━━━━━━━━━━━\n💜 <b>Powered By</b> : {E(footer)}" if footer else ""
+    if footer:
+        closing += f"\n\n💜 <b>Powered By</b> : {E(footer)}"
 
     if not todays:
-        return [head + "\n😴 <i>Aaj koi Hindi anime nahi aa raha.</i>" + (("\n\n" + foot) if foot else "")]
+        return [banner + "\n😴 Aaj koi Hindi anime nahi aa raha.\n\n" + closing]
 
     blocks = []
-    for n, it in enumerate(todays, 1):
-        num = _NUM[n - 1] if n <= len(_NUM) else f"{n}."
-        title = f"{num} 🎬 <b>{E(it['title'])}</b>"
-        if it["season"]:
-            title += f"  <i>(S{it['season']})</i>"
+    last = len(todays) - 1
+    for n, it in enumerate(todays):
         t = it["next_time"] if it["next_date"] == today and it["next_time"] else it["time"]
-        lines = [title, f" ┣ ⏰ <b>{E(t)}</b> IST" if t else " ┣ ⏰ <b>Time TBA</b>"]
-        ep = _ep_text(it)
-        if ep:
-            prog = f"  <i>({it['cur'] if it['cur'] is not None else '?'}/{it['total']})</i>" if it["total"] else ""
-            lines.append(f" ┣ 📺 <b>{E(ep)}</b> aa raha hai 🔥{prog}")
-        elif it["upcoming"]:
-            lines.append(" ┣ 🎙 <b>Naya Dub Shuru!</b> 🔥")
-        lines.append(f" ┗ 🎙 {E(_lang_line(it['langs']))}")
-        blocks.append("\n".join(lines) + "\n")
+        end = "╰───────────────────" if n == last else "┗━━━━━━━━━━━━━━━━━"
+        blocks.append(
+            f"⫷ {E(it['title'])} ⫸\n"
+            f"┃ 🎬 Episode: {E(_ep_code(it))}\n"
+            f"┃🕗 Time: {E(_time12(t))}\n"
+            f"┃ 🔊 {E(_lang_tags(it['langs']))}\n"
+            f"{end}\n"
+        )
 
-    msgs, cur = [], head + "\n"
-    reserve = len(foot) + 4
+    msgs, cur = [], banner + "\n"
+    reserve = len(closing) + 4
     for b in blocks:
         if len(cur) + len(b) + 1 > MAX_MSG_LEN - reserve:
             msgs.append(cur.rstrip())
             cur = ""
         cur += b + "\n"
-    msgs.append(cur.rstrip() + (("\n\n" + foot) if foot else ""))
+    msgs.append(cur + closing)
     return msgs
 
 
