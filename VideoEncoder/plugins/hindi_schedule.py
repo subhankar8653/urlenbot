@@ -131,28 +131,58 @@ if (!c.length) return false;
 c[0].click(); return true;
 """
 
-_JS_CARDS = """
-const els = [...document.querySelectorAll('body *')].filter(e =>
-  e.children.length === 0 && /per release/i.test(e.textContent) && e.offsetParent !== null);
-function card(e) {
-  let cur = e;
-  while (cur.parentElement) {
-    const p = cur.parentElement;
-    const t = p.innerText || '';
-    if ((t.match(/per release/ig) || []).length > 1) break;
-    if (/All days|Anime Scheduled|Never miss/i.test(t)) break;
-    cur = p;
-  }
-  return cur;
-}
-const seen = new Set(); const out = [];
-for (const e of els) { const t = (card(e).innerText || '').trim(); if (t && !seen.has(t)) { seen.add(t); out.push(t); } }
-return out;
+_JS_SCROLL = """
+window.scrollTo(0, document.body.scrollHeight);
+[...document.querySelectorAll('button,a')].filter(e =>
+  /load more|show more|view more|see more/i.test(e.innerText || '') && e.offsetParent !== null
+).forEach(e => { try { e.click(); } catch (x) {} });
+return document.body ? document.body.innerText : '';
 """
+
+_TAB_LABELS = {"All days", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
+
+
+def cards_from_body(body: str) -> list:
+    """
+    Page ke body innerText ko cards mein todo. Har card countdown ('NEXT RELEASE',
+    'dd DAYS', 'hh HOURS', 'mm MINS', 'ss SECS') pe khatam hota hai, aur uske baad kabhi
+    'Watch Now' button ka text aata hai. DOM/class names pe koi dependency nahi.
+    """
+    lines = [l.rstrip() for l in (body or "").splitlines()]
+    start = 0
+    for i, l in enumerate(lines):          # day-tabs ('All days'...'Sun') ke baad se cards shuru
+        if l.strip() == "Sun" and any(x.strip() == "All days" for x in lines[max(0, i - 8):i]):
+            start = i + 1
+            break
+    cards, cur = [], []
+    skip_watch = False
+    for l in lines[start:]:
+        t = l.strip()
+        if not t:
+            continue
+        if skip_watch:
+            skip_watch = False
+            if t.lower() == "watch now":
+                continue
+        cur.append(t)
+        if t.upper() == "SECS":             # countdown ka aakhri label = card poora
+            cards.append("\n".join(cur))
+            cur = []
+            skip_watch = True
+    if cur and any("per release" in x.lower() for x in cur):   # countdown ke bina aakhri card
+        cards.append("\n".join(cur))
+    return cards
+
+
+def _card_key(card: str) -> str:
+    for l in card.splitlines():
+        if l.strip() and l.strip().lower() not in ("watch now", "i"):
+            return l.strip().lower()
+    return card[:40]
 
 
 def _scrape_sync(day_idx):
-    """Page render karo, day_idx (0=Mon) ka tab chuno, card texts + raw body lauta do."""
+    """Page render karo, day_idx (0=Mon) ka tab chuno, scroll karke saare cards load karo."""
     from .rti_downloader import SELENIUM_OK, _kill_driver_tree
     if not SELENIUM_OK:
         raise RuntimeError("Selenium install nahi hai")
@@ -173,14 +203,35 @@ def _scrape_sync(day_idx):
         if day_idx is not None:
             clicked = bool(driver.execute_script(_JS_CLICK_DAY, DAYS[day_idx]))
             _time.sleep(2.5)
-        cards = driver.execute_script(_JS_CARDS) or []
-        body = driver.execute_script("return document.body ? document.body.innerText : ''") or ""
+
+        # Cards lazy-load hote hain (32 scheduled, par shuru mein 5 hi dikhte hain):
+        # neeche tak scroll karte raho, har step ke cards jama karo (virtual list ho to bhi chale)
+        found: dict = {}
+        body = ""
+        expected = 0
+        stable = 0
+        for _ in range(60):
+            body = driver.execute_script(_JS_SCROLL) or ""
+            m = re.search(r"(\d+)\s+Anime Scheduled", body)
+            if m:
+                expected = int(m.group(1))
+            before = len(found)
+            for c in cards_from_body(body):
+                found.setdefault(_card_key(c), c)
+            if expected and len(found) >= expected:
+                break
+            stable = stable + 1 if len(found) == before else 0
+            if stable >= 4:
+                break
+            _time.sleep(1.2)
+
         try:
             res = driver.execute_script(
                 "return performance.getEntriesByType('resource').map(e => e.name)") or []
         except Exception:
             res = []
-        return {"cards": cards, "body": body, "resources": res, "clicked": clicked}
+        return {"cards": list(found.values()), "body": body, "resources": res,
+                "clicked": clicked, "expected": expected}
     finally:
         try:
             _kill_driver_tree(driver)
@@ -192,18 +243,31 @@ def _scrape_sync(day_idx):
 # ───────────────────────── parsing ─────────────────────────
 _LANGS = {"HINDI", "TAMIL", "TELUGU", "ENGLISH", "JAPANESE", "MALAYALAM", "KANNADA",
           "BENGALI", "KOREAN", "CHINESE", "MARATHI", "URDU", "PUNJABI", "SPANISH"}
-_SKIP_LINES = {"i", "DAILY", "WEEKLY", "NEXT RELEASE", "DAYS", "HOURS", "MINS", "SECS", "NEW", "ONGOING"}
+_SKIP_LINES = {"i", "DAILY", "WEEKLY", "NEXT RELEASE", "DAYS", "HOURS", "MINS", "SECS", "NEW",
+               "ONGOING", "WATCH NOW", "STARTING SOON..."}
+_MONTHS = {m: i for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june", "july", "august",
+     "september", "october", "november", "december"], 1)}
+
+
+def _clean_time(t: str) -> str:
+    t = re.sub(r"\s+", " ", (t or "").strip().upper())
+    m = re.match(r"0?(\d{1,2}:\d{2}) ([AP]M)", t)
+    return f"{m.group(1)} {m.group(2)}" if m else t
 
 
 def parse_card(text: str) -> dict:
-    """Ek card ke innerText se fields nikalo (class names pe nahi, text pattern pe)."""
+    """Ek card ke text se fields nikalo (class names pe nahi, text pattern pe)."""
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
     d = {"title": "", "season": None, "langs": [], "freq": "", "time": None,
-         "per_release": 1, "cur": None, "total": None, "next": None, "raw": text}
+         "per_release": 1, "cur": None, "total": None, "next": None, "next_end": None,
+         "next_date": None, "next_time": None, "upcoming": False, "raw": text}
     for l in lines:
-        if l in _SKIP_LINES or re.fullmatch(r"\d{1,2}", l) or len(l) < 2:
+        if l.upper() in _SKIP_LINES or re.fullmatch(r"\d{1,2}", l) or len(l) < 2:
             continue
-        if re.match(r"^Season\s+\d+", l, re.IGNORECASE) or l.upper() in _LANGS or "Airs" in l:
+        if re.match(r"^Season\s+\d+", l, re.IGNORECASE) or l.upper() in _LANGS:
+            continue
+        if "@" in l or "per release" in l.lower() or l.startswith(("📺", "📅", "🔁", "🎙")):
             continue
         d["title"] = l
         break
@@ -213,16 +277,15 @@ def parse_card(text: str) -> dict:
             d["season"] = int(m.group(1))
         if l.upper() in _LANGS and l.upper() not in d["langs"]:
             d["langs"].append(l.upper())
-        if "Airs" in l and "@" in l:
+        if "@" in l:
             mt = re.search(r"@\s*(\d{1,2}:\d{2}\s*[AP]M)", l, re.IGNORECASE)
-            if mt:
-                d["time"] = mt.group(1).upper().replace("  ", " ")
-            d["freq"] = l.split("·")[0].strip() if "·" in l else ""
+            if mt and not d["time"]:
+                d["time"] = _clean_time(mt.group(1))
             if re.search(r"every day|daily", l, re.IGNORECASE):
                 d["freq"] = "Daily"
             else:
-                mw = re.search(r"every\s+([A-Za-z]+)", l, re.IGNORECASE)
-                if mw:
+                mw = re.search(r"(?:Weekly\s*·\s*|every\s+)([A-Za-z]+)", l, re.IGNORECASE)
+                if mw and mw.group(1).lower() not in ("day", "weekly"):
                     d["freq"] = f"Every {mw.group(1).capitalize()}"
         mp = re.search(r"(\d+)\s*episode\(s\)\s*per release", l, re.IGNORECASE)
         if mp:
@@ -230,13 +293,20 @@ def parse_card(text: str) -> dict:
         me = re.search(r"Episode\s+(\d+)\s*/\s*(\d+)", l, re.IGNORECASE)
         if me and d["cur"] is None:
             d["cur"], d["total"] = int(me.group(1)), int(me.group(2))
-        mn = re.search(r"Next:\s*Episode\s+(\d+)", l, re.IGNORECASE)
+        mn = re.search(r"Next:\s*Episodes?\s*(\d+)(?:\s*[–\-]\s*(\d+))?", l, re.IGNORECASE)
         if mn:
             d["next"] = int(mn.group(1))
-    if not d["time"]:
-        mt = re.search(r"\bat\s+(\d{1,2}:\d{2}\s*[AP]M)", text or "", re.IGNORECASE)
-        if mt:
-            d["time"] = mt.group(1).upper()
+            d["next_end"] = int(mn.group(2)) if mn.group(2) else None
+        md = re.search(r"([A-Za-z]+),\s*([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})\s+at\s+(\d{1,2}:\d{2}\s*[AP]M)", l)
+        if md and md.group(2).lower() in _MONTHS:
+            try:
+                d["next_date"] = datetime(int(md.group(4)), _MONTHS[md.group(2).lower()],
+                                          int(md.group(3))).date()
+                d["next_time"] = _clean_time(md.group(5))
+            except ValueError:
+                pass
+    if re.search(r"UPCOMING DUB|Starting soon", text or "", re.IGNORECASE):
+        d["upcoming"] = True
     return d
 
 
@@ -263,41 +333,87 @@ def _lang_line(langs):
     return " • ".join(l.capitalize() for l in langs) if langs else "Hindi"
 
 
+def _ep_label(it) -> str:
+    if it["next"] is None:
+        return ""
+    if it["next_end"] and it["next_end"] != it["next"]:
+        ep = f"Ep {it['next']}–{it['next_end']}"
+    elif it["per_release"] and it["per_release"] > 1:
+        ep = f"Ep {it['next']}+ ({it['per_release']} eps)"
+    else:
+        ep = f"Ep {it['next']}"
+    return ep
+
+
+def _is_today(it, today) -> bool:
+    return it["next_date"] is None or it["next_date"] == today
+
+
 def build_posts(day_idx: int, now: datetime, items: list, footer: str = "") -> list:
-    """Items (Hindi, sorted) -> 1+ HTML messages (har ek <= MAX_MSG_LEN)."""
+    """
+    Items (Hindi, sorted) -> 1+ HTML messages (har ek <= MAX_MSG_LEN).
+    Jinka agla release aaj hai wo main list mein; baaki (site ke hisaab se aage ki date)
+    neeche "Aane wale" section mein date ke saath.
+    """
     E = lambda s: _html.escape(str(s), quote=False)
+    today = now.date()
+    todays = [i for i in items if _is_today(i, today)]
+    later = sorted((i for i in items if not _is_today(i, today)),
+                   key=lambda i: (i["next_date"], _time_key(i["next_time"] or i["time"])))
     head = (
         "📅 <b>HINDI ANIME SCHEDULE</b>\n"
         f"🗓 <b>{DAY_FULL[day_idx]}</b> • {now.strftime('%d %b %Y')}\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
     )
+
     blocks = []
-    for n, it in enumerate(items, 1):
+    for n, it in enumerate(todays, 1):
         num = _NUM[n - 1] if n <= len(_NUM) else f"{n}."
         title = f"{num} <b>{E(it['title'])}</b>"
         if it["season"]:
             title += f" <i>(S{it['season']})</i>"
+        if it["upcoming"] and it["next"] is None:
+            title += " 🎙 <i>Upcoming Dub</i>"
         l2 = []
-        if it["time"]:
-            l2.append(f"⏰ <b>{E(it['time'])}</b> IST")
-        if it["next"]:
-            ep = f"▶️ Ep {it['next']}"
-            if it["per_release"] and it["per_release"] > 1:
-                ep = f"▶️ Ep {it['next']}+ ({it['per_release']} eps)"
+        t = it["next_time"] if it["next_date"] == today and it["next_time"] else it["time"]
+        if t:
+            l2.append(f"⏰ <b>{E(t)}</b> IST")
+        ep = _ep_label(it)
+        if ep:
             if it["total"]:
                 ep += f" <i>({it['cur'] if it['cur'] is not None else '?'}/{it['total']})</i>"
-            l2.append(ep)
+            l2.append(f"▶️ {ep}")
         l3 = [f"🎙 {E(_lang_line(it['langs']))}"]
         if it["freq"]:
             l3.append(f"🔁 {E(it['freq'])}")
         blocks.append(f"{title}\n   {'  •  '.join(l2) if l2 else '⏰ Time TBA'}\n   {'  •  '.join(l3)}\n")
 
+    later_lines = []
+    for it in later:
+        when = it["next_date"].strftime("%d %b")
+        tm = it["next_time"] or it["time"] or ""
+        ep = _ep_label(it)
+        s = f"• <b>{E(it['title'])}</b>"
+        if it["season"]:
+            s += f" <i>(S{it['season']})</i>"
+        s += f" — {when}{(', ' + E(tm)) if tm else ''}"
+        if ep:
+            s += f" • {ep}"
+        elif it["upcoming"]:
+            s += " • 🎙 Upcoming Dub"
+        later_lines.append(s)
+
     foot = "━━━━━━━━━━━━━━━━━━━━\n⏰ Saare time IST mein hain"
     if footer:
         foot += f"\n💜 <b>Powered By</b> : {E(footer)}"
+    later_block = ""
+    if later_lines:
+        later_block = "\n🔜 <b>AAGE AANE WALE</b>\n" + "\n".join(later_lines) + "\n\n"
 
-    if not blocks:
+    if not blocks and not later_lines:
         return [head + "\n😴 Aaj koi Hindi anime schedule nahi hai.\n" + foot]
+    if not blocks:
+        blocks = ["😴 Aaj in anime ka koi naya episode nahi aa raha.\n"]
 
     msgs, cur = [], head + "\n"
     for b in blocks:
@@ -305,7 +421,20 @@ def build_posts(day_idx: int, now: datetime, items: list, footer: str = "") -> l
             msgs.append(cur.rstrip())
             cur = ""
         cur += b + "\n"
-    msgs.append(cur + foot)
+    tail = later_block
+    if len(cur) + len(tail) + len(foot) > MAX_MSG_LEN:
+        msgs.append(cur.rstrip())
+        cur = ""
+        # aane wale section bhi lamba ho to todo
+        chunk = ""
+        for ln in later_lines:
+            if len(chunk) + len(ln) + 40 > MAX_MSG_LEN - len(foot):
+                msgs.append(("🔜 <b>AAGE AANE WALE</b>\n" + chunk).rstrip())
+                chunk = ""
+            chunk += ln + "\n"
+        cur = ("🔜 <b>AAGE AANE WALE</b>\n" + chunk + "\n") if chunk else ""
+        tail = ""
+    msgs.append(cur + tail + foot)
     return msgs
 
 
@@ -523,7 +652,8 @@ async def _send_debug(client: Client, chat_id: int):
     except Exception as e:
         await wait.edit(f"❌ Scrape fail: {type(e).__name__}: {e}")
         return
-    parts = [f"clicked_day_tab: {data['clicked']}  (day={DAYS[day_idx]})", f"cards: {len(data['cards'])}", ""]
+    parts = [f"clicked_day_tab: {data['clicked']}  (day={DAYS[day_idx]})",
+             f"cards: {len(data['cards'])}  (page ke hisaab se scheduled: {data.get('expected')})", ""]
     for i, c in enumerate(data["cards"], 1):
         parts += [f"===== CARD {i} =====", c, f"--> parsed: { {k: v for k, v in parse_card(c).items() if k != 'raw'} }", ""]
     parts += ["===== RESOURCES (network) =====", *data["resources"][:80], "", "===== BODY TEXT =====", data["body"][:6000]]
