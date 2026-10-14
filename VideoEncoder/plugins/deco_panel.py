@@ -18,7 +18,7 @@ baaki seasons ka number na khisakne ke liye uski jagah khali placeholder
 ({"file_id": None, "type": "empty"}) rakhi jaati hai.
 """
 
-from pyrogram import Client, filters, StopPropagation
+from pyrogram import Client, filters, StopPropagation, ContinuePropagation
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
@@ -313,14 +313,14 @@ async def handle(client: Client, cb: CallbackQuery, args: list):
 # group=-3: bot_upload.py ke /border-/season_sticker handlers (group 0) se
 # pehle chalta hai; sirf tab consume karta hai jab user is panel ke input
 # mode mein ho — warna kuch nahi karta aur baaki handlers normal chalte hain.
-@Client.on_message((filters.sticker | filters.photo) & filters.private, group=-3)
+@Client.on_message((filters.sticker | filters.photo) & filters.private, group=-7)
 async def deco_media_input(client: Client, message: Message):
     if not message.from_user:
-        return
+        raise ContinuePropagation
     uid = message.from_user.id
     sess = _SESS.get(uid)
     if not sess or not _is_auth(uid):
-        return
+        raise ContinuePropagation
 
     if message.sticker:
         item = {"file_id": message.sticker.file_id, "type": "sticker"}

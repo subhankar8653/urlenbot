@@ -12,7 +12,7 @@ Button-driven panel (purane /update_channel, /update_channel_list,
       bot admin-check karke add kar deta hai
 """
 
-from pyrogram import Client, filters, StopPropagation
+from pyrogram import Client, filters, StopPropagation, ContinuePropagation
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
@@ -252,17 +252,17 @@ async def handle(client: Client, cb: CallbackQuery, args: list):
 # ───────────── add: channel ID / forwarded post ─────────────
 # group=-3: update_channel.py ke text handlers se pehle chalta hai; sirf tab
 # consume karta hai jab user ➕ Add Channel input mode mein ho.
-@Client.on_message((filters.text | filters.forwarded) & filters.private, group=-3)
+@Client.on_message((filters.text | filters.forwarded) & filters.private, group=-6)
 async def uc_input(client: Client, message: Message):
     if not message.from_user:
-        return
+        raise ContinuePropagation
     uid = message.from_user.id
     if uid not in _SESS or not _is_auth(uid) or _SESS[uid].get("mode") != "add":
-        return
+        raise ContinuePropagation
     raw = (message.text or "").strip()
     if raw.startswith("/"):
         _SESS.pop(uid, None)       # command aaya — input mode cancel, command normal chale
-        return
+        raise ContinuePropagation
 
     from .update_channel import _get_update_channels, _save_update_channels
     back_kb = InlineKeyboardMarkup([

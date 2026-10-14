@@ -20,7 +20,7 @@ Storage:
   • channel-wise: update_channels record ka  "buttons": {watch/kaise/backup: {text,url,enabled,style}}
 """
 
-from pyrogram import Client, filters, StopPropagation
+from pyrogram import Client, filters, StopPropagation, ContinuePropagation
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
@@ -443,18 +443,18 @@ async def handle(client: Client, cb: CallbackQuery, args: list):
 # ───────────── text input ─────────────
 # group=-3: update_channel.py ke purane button-session text handler se pehle
 # chalta hai; sirf tab consume karta hai jab user is panel ke input mode mein ho.
-@Client.on_message(filters.text & filters.private, group=-3)
+@Client.on_message(filters.text & filters.private, group=-4)
 async def pb_text_input(client: Client, message: Message):
     if not message.from_user:
-        return
+        raise ContinuePropagation
     uid = message.from_user.id
     sess = _SESS.get(uid)
     if not sess or not _is_auth(uid):
-        return
+        raise ContinuePropagation
     raw = (message.text or "").strip()
     if raw.startswith("/"):          # koi command aaya — input mode cancel, command normal chale
         _SESS.pop(uid, None)
-        return
+        raise ContinuePropagation
 
     btn, field, scope = sess["btn"], sess["field"], sess.get("scope")
     emoji, label, default_text, dkey = _BTNS[btn]

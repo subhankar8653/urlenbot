@@ -31,7 +31,7 @@ import tempfile
 import time as _time
 from datetime import datetime, timedelta, timezone
 
-from pyrogram import Client, filters, StopPropagation
+from pyrogram import Client, filters, StopPropagation, ContinuePropagation
 from pyrogram.enums import ParseMode
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
@@ -333,16 +333,15 @@ def _lang_line(langs):
     return " • ".join(l.capitalize() for l in langs) if langs else "Hindi"
 
 
-def _ep_label(it) -> str:
+def _ep_text(it) -> str:
+    """'Episode 13' / 'Episodes 361–362' / 'Episode 13+ (2 eps)' (ya khali agar episode info nahi)."""
     if it["next"] is None:
         return ""
     if it["next_end"] and it["next_end"] != it["next"]:
-        ep = f"Ep {it['next']}–{it['next_end']}"
-    elif it["per_release"] and it["per_release"] > 1:
-        ep = f"Ep {it['next']}+ ({it['per_release']} eps)"
-    else:
-        ep = f"Ep {it['next']}"
-    return ep
+        return f"Episodes {it['next']}–{it['next_end']}"
+    if it["per_release"] and it["per_release"] > 1:
+        return f"Episode {it['next']}+ ({it['per_release']} eps)"
+    return f"Episode {it['next']}"
 
 
 def _is_today(it, today) -> bool:
@@ -352,89 +351,47 @@ def _is_today(it, today) -> bool:
 def build_posts(day_idx: int, now: datetime, items: list, footer: str = "") -> list:
     """
     Items (Hindi, sorted) -> 1+ HTML messages (har ek <= MAX_MSG_LEN).
-    Jinka agla release aaj hai wo main list mein; baaki (site ke hisaab se aage ki date)
-    neeche "Aane wale" section mein date ke saath.
+    Sirf wo anime jinka agla release AAJ hai (site ke countdown ke hisaab se).
+    footer khali ho to koi "Powered By" line nahi.
     """
     E = lambda s: _html.escape(str(s), quote=False)
     today = now.date()
     todays = [i for i in items if _is_today(i, today)]
-    later = sorted((i for i in items if not _is_today(i, today)),
-                   key=lambda i: (i["next_date"], _time_key(i["next_time"] or i["time"])))
     head = (
-        "📅 <b>HINDI ANIME SCHEDULE</b>\n"
+        "📅 <b>𝐇𝐈𝐍𝐃𝐈 𝐀𝐍𝐈𝐌𝐄 𝐒𝐂𝐇𝐄𝐃𝐔𝐋𝐄</b>\n"
         f"🗓 <b>{DAY_FULL[day_idx]}</b> • {now.strftime('%d %b %Y')}\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
     )
+    foot = f"━━━━━━━━━━━━━━━━━━━━\n💜 <b>Powered By</b> : {E(footer)}" if footer else ""
+
+    if not todays:
+        return [head + "\n😴 <i>Aaj koi Hindi anime nahi aa raha.</i>" + (("\n\n" + foot) if foot else "")]
 
     blocks = []
     for n, it in enumerate(todays, 1):
         num = _NUM[n - 1] if n <= len(_NUM) else f"{n}."
-        title = f"{num} <b>{E(it['title'])}</b>"
+        title = f"{num} 🎬 <b>{E(it['title'])}</b>"
         if it["season"]:
-            title += f" <i>(S{it['season']})</i>"
-        if it["upcoming"] and it["next"] is None:
-            title += " 🎙 <i>Upcoming Dub</i>"
-        l2 = []
+            title += f"  <i>(S{it['season']})</i>"
         t = it["next_time"] if it["next_date"] == today and it["next_time"] else it["time"]
-        if t:
-            l2.append(f"⏰ <b>{E(t)}</b> IST")
-        ep = _ep_label(it)
+        lines = [title, f" ┣ ⏰ <b>{E(t)}</b> IST" if t else " ┣ ⏰ <b>Time TBA</b>"]
+        ep = _ep_text(it)
         if ep:
-            if it["total"]:
-                ep += f" <i>({it['cur'] if it['cur'] is not None else '?'}/{it['total']})</i>"
-            l2.append(f"▶️ {ep}")
-        l3 = [f"🎙 {E(_lang_line(it['langs']))}"]
-        if it["freq"]:
-            l3.append(f"🔁 {E(it['freq'])}")
-        blocks.append(f"{title}\n   {'  •  '.join(l2) if l2 else '⏰ Time TBA'}\n   {'  •  '.join(l3)}\n")
-
-    later_lines = []
-    for it in later:
-        when = it["next_date"].strftime("%d %b")
-        tm = it["next_time"] or it["time"] or ""
-        ep = _ep_label(it)
-        s = f"• <b>{E(it['title'])}</b>"
-        if it["season"]:
-            s += f" <i>(S{it['season']})</i>"
-        s += f" — {when}{(', ' + E(tm)) if tm else ''}"
-        if ep:
-            s += f" • {ep}"
+            prog = f"  <i>({it['cur'] if it['cur'] is not None else '?'}/{it['total']})</i>" if it["total"] else ""
+            lines.append(f" ┣ 📺 <b>{E(ep)}</b> aa raha hai 🔥{prog}")
         elif it["upcoming"]:
-            s += " • 🎙 Upcoming Dub"
-        later_lines.append(s)
-
-    foot = "━━━━━━━━━━━━━━━━━━━━\n⏰ Saare time IST mein hain"
-    if footer:
-        foot += f"\n💜 <b>Powered By</b> : {E(footer)}"
-    later_block = ""
-    if later_lines:
-        later_block = "\n🔜 <b>AAGE AANE WALE</b>\n" + "\n".join(later_lines) + "\n\n"
-
-    if not blocks and not later_lines:
-        return [head + "\n😴 Aaj koi Hindi anime schedule nahi hai.\n" + foot]
-    if not blocks:
-        blocks = ["😴 Aaj in anime ka koi naya episode nahi aa raha.\n"]
+            lines.append(" ┣ 🎙 <b>Naya Dub Shuru!</b> 🔥")
+        lines.append(f" ┗ 🎙 {E(_lang_line(it['langs']))}")
+        blocks.append("\n".join(lines) + "\n")
 
     msgs, cur = [], head + "\n"
+    reserve = len(foot) + 4
     for b in blocks:
-        if len(cur) + len(b) + 1 > MAX_MSG_LEN - len(foot):
+        if len(cur) + len(b) + 1 > MAX_MSG_LEN - reserve:
             msgs.append(cur.rstrip())
             cur = ""
         cur += b + "\n"
-    tail = later_block
-    if len(cur) + len(tail) + len(foot) > MAX_MSG_LEN:
-        msgs.append(cur.rstrip())
-        cur = ""
-        # aane wale section bhi lamba ho to todo
-        chunk = ""
-        for ln in later_lines:
-            if len(chunk) + len(ln) + 40 > MAX_MSG_LEN - len(foot):
-                msgs.append(("🔜 <b>AAGE AANE WALE</b>\n" + chunk).rstrip())
-                chunk = ""
-            chunk += ln + "\n"
-        cur = ("🔜 <b>AAGE AANE WALE</b>\n" + chunk + "\n") if chunk else ""
-        tail = ""
-    msgs.append(cur + tail + foot)
+    msgs.append(cur.rstrip() + (("\n\n" + foot) if foot else ""))
     return msgs
 
 
@@ -476,12 +433,14 @@ async def post_schedule(client: Client, day_idx: int = None, manual: bool = Fals
             if not data["clicked"]:
                 LOGGER.warning(f"[HindiSchedule] day tab '{DAYS[day_idx]}' click nahi hua — page ka default view use hua")
 
-            try:
-                from ..utils.community import get_community_tag
-                from ..utils.caption_style import _handles_brackets
-                footer = _handles_brackets(await get_community_tag(all_names=True), spaced=True)
-            except Exception:
-                footer = ""
+            footer = ""
+            if cfg.get("footer"):      # "Powered By" line — default OFF
+                try:
+                    from ..utils.community import get_community_tag
+                    from ..utils.caption_style import _handles_brackets
+                    footer = _handles_brackets(await get_community_tag(all_names=True), spaced=True)
+                except Exception:
+                    footer = ""
 
             msgs = build_posts(day_idx, now, items, footer)
             for i, text in enumerate(msgs):
@@ -673,6 +632,7 @@ def _status_text(cfg: dict) -> str:
         f"📢 Channel: {ch}\n"
         f"⏰ Roz post: **{fmt12(h, m)} IST**\n"
         f"🔔 Auto-post: **{'🟢 ON' if cfg.get('enabled', True) else '🔴 OFF'}**\n"
+        f"💜 Powered By line: **{'🟢 ON' if cfg.get('footer') else '🔴 OFF'}**\n"
         f"🗓 Aaj: {today}\n"
         f"📤 Last post: {cfg.get('last_date') or '—'}"
     )
@@ -701,6 +661,8 @@ async def render(client: Client, cb: CallbackQuery):
          InlineKeyboardButton("⏰ Post Time", callback_data="cmz:hs:time")],
         [InlineKeyboardButton("🟢 Auto-post ON — OFF karo" if on else "🔴 Auto-post OFF — ON karo",
                               callback_data="cmz:hs:tog")],
+        [InlineKeyboardButton("💜 Powered By line: ON — OFF karo" if cfg.get("footer")
+                              else "💜 Powered By line: OFF — ON karo", callback_data="cmz:hs:foot")],
         [InlineKeyboardButton("📤 Aaj ka schedule abhi post karo", callback_data="cmz:hs:now")],
         [InlineKeyboardButton("🧪 Debug file", callback_data="cmz:hs:dbg")],
     ]
@@ -774,6 +736,14 @@ async def handle(client: Client, cb: CallbackQuery, args: list):
         await render(client, cb)
         return
 
+    if sub == "foot":
+        cfg = await _cfg()
+        cfg["footer"] = not cfg.get("footer", False)
+        await _save(cfg)
+        await cb.answer("💜 Powered By ON" if cfg["footer"] else "Powered By OFF")
+        await render(client, cb)
+        return
+
     if sub == "now":
         cfg = await _cfg()
         if not cfg.get("channel_id"):
@@ -812,18 +782,18 @@ async def handle(client: Client, cb: CallbackQuery, args: list):
 
 
 # group=-3: sirf tab consume karta hai jab user is panel ke input mode mein ho
-@Client.on_message((filters.text | filters.forwarded) & filters.private, group=-3)
+@Client.on_message((filters.text | filters.forwarded) & filters.private, group=-8)
 async def hs_input(client: Client, message: Message):
     if not message.from_user:
-        return
+        raise ContinuePropagation
     uid = message.from_user.id
     sess = _SESS.get(uid)
     if not sess or not _is_auth(uid):
-        return
+        raise ContinuePropagation
     raw = (message.text or "").strip()
     if raw.startswith("/"):
         _SESS.pop(uid, None)
-        return
+        raise ContinuePropagation
     back_kb = InlineKeyboardMarkup([_back()])
 
     if sess["mode"] == "time":
