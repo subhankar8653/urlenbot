@@ -42,6 +42,9 @@ MAX_UPTIME_H = _prof.JANITOR_MAX_UPTIME_H       # idle hone par refresh
 CHROME_MAX_AGE = 45 * 60
 CHROME_IDLE_AGE = _prof.CHROME_IDLE_MIN * 60          # bot idle ho to itne purane chrome bhi kill
 IDLE_BEFORE_RESTART = 120                                          # sec continuous idle
+# Routine (25h uptime) refresh ke liye zyada lamba idle wait — kaam khatam hote hi
+# turant restart nahi, itni der continuous khali rehne ke baad hi (default 15 min).
+ROUTINE_IDLE_BEFORE_RESTART = int(os.getenv("JANITOR_ROUTINE_IDLE_SEC", "900"))
 
 _idle_since = None
 _started = False
@@ -281,6 +284,21 @@ def is_busy() -> bool:
             return True
     except Exception:
         pass
+    # Koi bhi running job (auto-monitor / /Rtic / /rti / /toono / /swift ...)
+    try:
+        from . import job_ctl
+        if job_ctl.JOBS:
+            return True
+    except Exception:
+        pass
+    # Upload quota: koi upload chal raha ho ya queue mein wait kar raha ho
+    try:
+        from . import quota
+        st = quota.status()
+        if st["single"] or st["multi"] or st["queued"]:
+            return True
+    except Exception:
+        pass
     if _proc_running(("ffmpeg", "megadl", "megatools", "chrom")):
         return True
     return _recent_file_activity()
@@ -379,6 +397,11 @@ async def soft_restart(reason: str):
     if is_busy():   # last-moment recheck — beech kaam mein kabhi restart nahi
         LOGGER.info("[Janitor] restart skipped — bot busy")
         return
+    # Chhota settle-gap: abhi-abhi shuru hua kaam (naya upload/job) pakad lene ke liye
+    await asyncio.sleep(5)
+    if is_busy():
+        LOGGER.info("[Janitor] restart skipped — bot busy (settle recheck)")
+        return
     LOGGER.warning(f"[Janitor] Soft restart: {reason}")
     # execv ke baad bhi yaad rahe ki abhi restart hua tha (cooldown ke liye)
     os.environ[_LAST_RESTART_ENV] = str(time.time())
@@ -433,7 +456,8 @@ async def janitor_loop():
             # Routine refresh — sirf 24h+ uptime par, aur din mein max 1 baar
             elif (ROUTINE_REFRESH_ENABLED
                   and uptime_h > ROUTINE_MIN_UPTIME_H
-                  and since_restart_h >= ROUTINE_COOLDOWN_H):
+                  and since_restart_h >= ROUTINE_COOLDOWN_H
+                  and idle_for >= ROUTINE_IDLE_BEFORE_RESTART):
                 await soft_restart(f"{uptime_h:.0f}h uptime — routine refresh")
         except asyncio.CancelledError:
             raise
