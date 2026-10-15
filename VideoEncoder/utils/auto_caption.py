@@ -217,6 +217,18 @@ def detect_quality(metadata, current_resolution=None):
     return detect_quality_from_metadata(metadata)
 
 
+# "E01" / "Ep 5" / "Episode 12" — standalone episode marker (SxxEyy alag handle hota hai)
+_EP_MARK_RE = re.compile(
+    r'(?<![A-Za-z0-9])(?:(?:Episode|Ep)\.?\s*0*(\d{1,4})|E0*(\d{1,4}))(?![A-Za-z0-9])',
+    re.IGNORECASE,
+)
+# "S2" / "Season 2" — standalone season marker
+_SEASON_MARK_RE = re.compile(
+    r'(?<![A-Za-z0-9])(?:Season\s*0*(\d{1,2})|S0*(\d{1,2}))(?![A-Za-z0-9])',
+    re.IGNORECASE,
+)
+
+
 def extract_anime_info(filename, metadata, blacklist=None):
     """
     Anime name HAMESHA filename se lo.
@@ -284,13 +296,27 @@ def extract_anime_info(filename, metadata, blacklist=None):
         episode = int(m.group(2))
         anime_name = name[:m.start()].strip(' .-_')
     else:
-        # 2-4 digit episode numbers support (e.g. E06, E106, _06_, _106_)
-        m = re.search(r'[\s\-_](\d{2,4})[\s\-_\.]', name)
-        if m:
-            episode = int(m.group(1))
-            anime_name = name[:m.start()].strip(' .-_')
+        # Alag-alag season / episode markers: "JoJo S2 - Stardust Crusaders E01 - Hindi",
+        # "Show Season 2 Episode 5", "One Piece E1015". Episode marker se pehle ka hissa
+        # anime naam; usme se season marker hata ke season alag nikalo.
+        m_ep = _EP_MARK_RE.search(name)
+        head = name[:m_ep.start()] if m_ep else ''
+        if m_ep and head.strip(' .-_'):
+            episode = int(m_ep.group(1) or m_ep.group(2))
+            m_s = _SEASON_MARK_RE.search(head)
+            if m_s:
+                season = int(m_s.group(1) or m_s.group(2))
+                head = head[:m_s.start()] + ' ' + head[m_s.end():]
+            anime_name = re.sub(r'\s+', ' ', head).strip(' .-_')
+            anime_name = re.sub(r'\s-\s(?:-\s)+', ' - ', anime_name)
         else:
-            anime_name = name
+            # 2-4 digit episode numbers support (e.g. E06, E106, _06_, _106_)
+            m = re.search(r'[\s\-_](\d{2,4})[\s\-_\.]', name)
+            if m:
+                episode = int(m.group(1))
+                anime_name = name[:m.start()].strip(' .-_')
+            else:
+                anime_name = name
 
     # Step 5: Remaining group brackets remove from end
     anime_name = re.sub(r'\[[^\]]+\]\s*$', '', anime_name).strip()
