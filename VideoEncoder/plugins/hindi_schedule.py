@@ -380,28 +380,39 @@ def _is_today(it, today) -> bool:
 
 def build_posts(day_idx: int, now: datetime, items: list, footer: str = "") -> list:
     """
-    Items (Hindi, sorted) -> 1+ messages (har ek <= MAX_MSG_LEN, HTML-safe).
-    Style:   ⟣──⟢ banner (din ka stylish naam)  →  ⫷ Title ⫸ + ┃ box  →  neeche title + date.
+    Items (Hindi, sorted) -> 1+ HTML messages (har ek <= MAX_MSG_LEN).
+
+    Style (poora BOLD):
+        ⟣──⟢ / DIN KA NAAM / ⟣──⟢          (banner)
+        <1 khali line>
+        ⫷ Title ⫸ + ┃ box                 (har anime; beech mein 1 khali line)
+        <khali line nahi>
+        ❝ HINDI ANIME SCHEDULE / date ❞    (QUOTE block)
+        <khali line nahi>
+        ⟣━━━━━━━━━━━━━━━━━━━━⟢
     Sirf wo anime jinka agla release AAJ hai (site ke countdown ke hisaab se).
     """
     E = lambda s: _html.escape(str(s), quote=False)
+    B = lambda t: f"<b>{t}</b>"
     today = now.date()
     todays = [i for i in items if _is_today(i, today)]
 
     name = fancy_day(DAY_FULL[day_idx])
     pad = " " * max(0, int(20 * (20 - 1.3 * len(name)) / (20 - 1.3 * 9)))
     line = "⟣────────────────────⟢"
-    banner = f"{line}\n{pad}{name}\n{line}\n"
-    closing = (
-        " 𝐇𝐈𝐍𝐃𝐈 𝐀𝐍𝐈𝐌𝐄 𝐒𝐂𝐇𝐄𝐃𝐔𝐋𝐄\n"
-        f" {DAY_FULL[day_idx]} • {now.strftime('%d %b %Y')}\n"
-        "⟣━━━━━━━━━━━━━━━━━━━━⟢"
+    banner = f"{line}\n{pad}{name}\n{line}"
+
+    quote = (
+        "<blockquote>"
+        + B("𝐇𝐈𝐍𝐃𝐈 𝐀𝐍𝐈𝐌𝐄 𝐒𝐂𝐇𝐄𝐃𝐔𝐋𝐄\n" + f"{DAY_FULL[day_idx]} • {now.strftime('%d %b %Y')}")
+        + "</blockquote>"
     )
+    closing = quote + "\n" + B("⟣━━━━━━━━━━━━━━━━━━━━⟢")
     if footer:
-        closing += f"\n\n💜 <b>Powered By</b> : {E(footer)}"
+        closing += "\n\n" + B(f"💜 Powered By : {E(footer)}")
 
     if not todays:
-        return [banner + "\n😴 Aaj koi Hindi anime nahi aa raha.\n\n" + closing]
+        return [B(banner + "\n\n😴 Aaj koi Hindi anime nahi aa raha.") + "\n" + closing]
 
     blocks = []
     last = len(todays) - 1
@@ -413,17 +424,22 @@ def build_posts(day_idx: int, now: datetime, items: list, footer: str = "") -> l
             f"┃ 🎬 Episode: {E(_ep_code(it))}\n"
             f"┃🕗 Time: {E(_time12(t))}\n"
             f"┃ 🔊 {E(_lang_tags(it['langs']))}\n"
-            f"{end}\n"
+            f"{end}"
         )
 
-    msgs, cur = [], banner + "\n"
-    reserve = len(closing) + 4
+    # Chunking: pehle chunk mein banner; aakhri mein quote + closing line
+    msgs, cur, first = [], "", True
+    limit = MAX_MSG_LEN - len(closing) - 20
     for b in blocks:
-        if len(cur) + len(b) + 1 > MAX_MSG_LEN - reserve:
-            msgs.append(cur.rstrip())
-            cur = ""
-        cur += b + "\n"
-    msgs.append(cur + closing)
+        head = (banner + "\n\n") if first and not cur else ""
+        add = head + b
+        if cur and len(cur) + len(add) + 2 > limit:
+            msgs.append(B(cur))
+            cur, first = "", False
+            add = b
+        cur = (cur + "\n\n" + add) if cur else (head + b)
+        first = False
+    msgs.append(B(cur + "\n") + closing)
     return msgs
 
 
