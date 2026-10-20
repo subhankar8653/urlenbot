@@ -31,6 +31,7 @@ RUN (wget -q https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.2.1-bet
     rm -rf N_m3u8DL-RE_Beta_linux-x64*
 # .NET binary ko libicu ki zaroorat na pade
 ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
+ENV DOTNET_SYSTEM_GLOBALIZATION_PREDEFINED_CULTURES_ONLY=false
 
 # Selenium ko bata do ke system chromium use karo (selenium-manager mat chalao)
 ENV CHROME_BIN=/usr/bin/chromium
