@@ -821,10 +821,13 @@ async def aniwatch_command(client: Client, message: Message):
     if not c:
         return
 
-    if not get_binary_path():
+    import asyncio as _asyncio
+    # blocking (auto-download ho sakta hai) -> thread mein chalao
+    if not await _asyncio.to_thread(get_binary_path):
         await message.reply(
-            "❌ `N_m3u8DL-RE` binary nahi mili.\n"
-            "Dockerfile se redeploy karo (usme ab install hota hai) ya binary `/usr/local/bin/` mein rakho."
+            "❌ `N_m3u8DL-RE` binary nahi mili aur auto-download bhi fail hua.\n"
+            "Server ka internet / GitHub access check karo, ya binary `binary/N_m3u8DL-RE` "
+            "(ya `/usr/local/bin/`) mein rakho. Logs mein exact error hai."
         )
         return
 
