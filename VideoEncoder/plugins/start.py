@@ -57,6 +57,7 @@ async def help_message(app, message):
 
 For Sudo:
 - /anime <name> - RareAnimes search + /rti
+- /aniwatch <name ya link> - Aniwatch/Animetsu se download + upload
 - /exec - Execute Python
 - /sh - Execute Shell
 - /vupload - video upload
@@ -94,6 +95,7 @@ Supports: <a href='https://t.me/sbanime'>click here</a>"""
 - /stats - cpu stats
 
 For Sudo:
+- /aniwatch <name ya link> - Aniwatch/Animetsu se download + upload
 - /exec - Execute Python
 - /sh - Execute Shell
 - /vupload - video upload
