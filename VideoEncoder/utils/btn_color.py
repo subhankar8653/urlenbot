@@ -56,7 +56,7 @@ def classify(text: str, data: str = "", url: str = "") -> str | None:
         return None
     # Anime/episode ke naam wale buttons — naam ke andar "Start/Close/Add" jaisa word ho to
     # colour galat na lage; inhe hamesha blue rakho.
-    if d.startswith(("anime_r_", "rti_ep", "toono_ep")) or re.match(r"^\[(s\d+|movie)\]", low):
+    if d.startswith(("anime_r_", "rti_ep", "toono_ep", "aniw_ep", "aniw_pick")) or re.match(r"^\[(s\d+|movie)\]", low):
         return PRIMARY
     if any(n in d for n in _NOOP_DATA):
         return None
