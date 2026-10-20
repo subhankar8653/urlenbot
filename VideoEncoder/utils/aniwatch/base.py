@@ -316,8 +316,66 @@ def get_binary_path() -> Optional[Path]:
     if which:
         _binary_cache = Path(which)
         return _binary_cache
+    # Kahin nahi mili (VPS / purana image) -> khud download karke binary/ mein rakh do
+    auto = _auto_install_binary()
+    if auto:
+        _binary_cache = auto
+        return auto
     _binary_cache = None
     return None
+
+
+_N_M3U8DL_VERSION = "v0.2.1-beta"
+_N_M3U8DL_TAG = "20240828"
+
+
+def _auto_install_binary() -> Optional[Path]:
+    """Download N_m3u8DL-RE from GitHub into ./binary/ (linux x64/arm64 only)."""
+    import os
+    import platform
+    import stat
+    import tarfile
+    import tempfile
+    import urllib.request
+
+    if os.name == "nt":
+        return None
+    arch = platform.machine().lower()
+    if arch in ("x86_64", "amd64"):
+        plat = "linux-x64"
+    elif arch in ("aarch64", "arm64"):
+        plat = "linux-arm64"
+    else:
+        print(f"N_m3u8DL-RE auto-install: unsupported arch {arch}", flush=True)
+        return None
+
+    dest_dir = Path("binary")
+    dest = dest_dir / "N_m3u8DL-RE"
+    url = (f"https://github.com/nilaoda/N_m3u8DL-RE/releases/download/"
+           f"{_N_M3U8DL_VERSION}/N_m3u8DL-RE_Beta_{plat}_{_N_M3U8DL_TAG}.tar.gz")
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        print(f"N_m3u8DL-RE nahi mili, download kar raha hu: {url}", flush=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            tgz = Path(tmp) / "n.tgz"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=120) as r, open(tgz, "wb") as f:
+                shutil.copyfileobj(r, f)
+            with tarfile.open(tgz) as tf:
+                member = next((m for m in tf.getmembers()
+                               if m.isfile() and m.name.endswith("N_m3u8DL-RE")), None)
+                if member is None:
+                    print("N_m3u8DL-RE auto-install: tar mein binary nahi", flush=True)
+                    return None
+                src = tf.extractfile(member)
+                with open(dest, "wb") as out:
+                    shutil.copyfileobj(src, out)
+        dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        print(f"N_m3u8DL-RE installed: {dest}", flush=True)
+        return dest
+    except Exception as exc:  # noqa: BLE001
+        print(f"N_m3u8DL-RE auto-install fail: {exc}", flush=True)
+        return None
 
 
 def _parse_progress_line(line: str) -> Optional[dict]:
@@ -416,6 +474,8 @@ def run_n_m3u8dl(url: str, save_name: str, task_dir, *, kind: str = "sub",
     env = dict(os.environ)
     # libicu install na ho tab bhi .NET binary chale
     env.setdefault("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", "1")
+    # invariant mode mein bina iske N_m3u8DL-RE "en-US invalid culture" se crash hota hai
+    env.setdefault("DOTNET_SYSTEM_GLOBALIZATION_PREDEFINED_CULTURES_ONLY", "false")
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, env=env,
