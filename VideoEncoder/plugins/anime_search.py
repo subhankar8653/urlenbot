@@ -48,6 +48,7 @@ from . import rti_downloader as rti
 from . import haz_downloader as haz
 from . import toono_downloader as toono
 from . import aniwatch_downloader as aniw
+from . import aniabyss_downloader as aby
 from ..utils.aniwatch import get_binary_path
 
 import os
@@ -526,6 +527,7 @@ SITES = [
     ("toono", "Toono [hindi]"),
     ("aniwatch", "Aniwatch [ dual eng-jap ]"),
     ("animetsu", "Animetsu [ dual eng-jap ]"),
+    ("aniabyss", "AniAbyss [ hindi dub • 4K ]"),
 ]
 SITE_LABEL = dict(SITES)
 
@@ -537,6 +539,8 @@ def _site_search(site: str, query: str):
         return search_haz(query)
     if site == "toono":
         return search_toono(query)
+    if site == "aniabyss":
+        return aby.search_abyss(query)
     return search_aniw(site, query)
 
 
@@ -733,6 +737,14 @@ async def _open_item(client, cb: CallbackQuery, s: AnimeSearch, item: dict):
             await sess.populate_toggles()
             toono.TOONO_SESSIONS[sess.sid] = sess
             s.child = (toono.TOONO_SESSIONS, sess.sid)
+            drop = ()
+
+        elif site == "aniabyss":
+            detail = await loop.run_in_executor(None, aby.fetch_detail, item["url"], item.get("_alt") or ())
+            sess = aby.make_selector(detail, s.orig)
+            if not sess.qualities:
+                return await fail("❌ Is anime ke liye koi episode download link nahi mila.")
+            s.child = (aby.ABY_SESSIONS, sess.sid)
             drop = ()
 
         else:  # aniwatch / animetsu
