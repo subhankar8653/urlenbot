@@ -2061,6 +2061,9 @@ async def _download_m3u8(url: str, filepath: str, msg: Message, cookie_header: s
 
 async def _download_url(url: str, filename: str, msg: Message, orig_message: Message, cookie_header: str = "") -> str:
     """Download from URL with progress."""
+    # AniAbyss: ?download=1 se "Download Now" HTML page skip hota hai, seedha file milti hai
+    if "dl.aniabyss.xyz" in url and "download=" not in url:
+        url += ("&" if "?" in url else "?") + "download=1"
     filename = _safe_filename(filename)  # Double safety — koi bhi caller se aaye
     filepath = os.path.join(download_dir, filename)
 

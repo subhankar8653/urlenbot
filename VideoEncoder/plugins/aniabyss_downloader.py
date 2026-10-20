@@ -143,9 +143,18 @@ def build_data(detail: dict) -> dict:
     }
 
 
+def _with_dl(url: str) -> str:
+    """dl.aniabyss.xyz ke link pe ?download=1 lagata hai taaki 'Download Now' HTML page skip ho
+    aur seedha file mile."""
+    if "dl.aniabyss.xyz" in url and "download=" not in url:
+        url += ("&" if "?" in url else "?") + "download=1"
+    return url
+
+
 def resolve_direct(url: str) -> str:
     """directUrl redirect / JSON-wrapper ho to final file URL nikalta hai; warna wahi URL.
     Sirf pakke errors (HTTP>=400, HTML page, JSON bina link) par exception uthata hai."""
+    url = _with_dl(url)
     try:
         r = requests.get(url, headers=HEADERS, stream=True, timeout=30, allow_redirects=True)
     except requests.RequestException as e:
