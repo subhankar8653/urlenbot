@@ -21,6 +21,17 @@ RUN apt-get update && \
     chromium chromium-driver)) \
  && rm -rf /var/lib/apt/lists/*
 
+# N_m3u8DL-RE — /aniwatch (Aniwatch/Animetsu) ke HLS download ke liye.
+# Fail hua to build nahi rukta; bot mein /aniwatch "binary nahi mili" batayega.
+RUN (wget -q https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.2.1-beta/N_m3u8DL-RE_Beta_linux-x64_20240828.tar.gz \
+    && tar -xzf N_m3u8DL-RE_Beta_linux-x64_20240828.tar.gz \
+    && mv N_m3u8DL-RE_Beta_linux-x64/N_m3u8DL-RE /usr/local/bin/ \
+    && chmod +x /usr/local/bin/N_m3u8DL-RE) \
+    || echo "WARNING: N_m3u8DL-RE install fail hua — /aniwatch kaam nahi karega"; \
+    rm -rf N_m3u8DL-RE_Beta_linux-x64*
+# .NET binary ko libicu ki zaroorat na pade
+ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
+
 # Selenium ko bata do ke system chromium use karo (selenium-manager mat chalao)
 ENV CHROME_BIN=/usr/bin/chromium
 ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver

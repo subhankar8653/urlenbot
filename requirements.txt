@@ -53,3 +53,7 @@ selenium
 # Captcha solver (Haz downloader)
 peakfo
 captchaai
+
+# Aniwatch / Animetsu downloader (/aniwatch)
+curl_cffi
+pycryptodome
