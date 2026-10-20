@@ -33,6 +33,9 @@ from .. import LOGGER, download_dir
 from ..utils.helper import check_chat
 from .rti_downloader import _kb
 from .url_upload import _download_url, _do_upload, _safe_filename
+import shutil
+from ..utils import job_ctl
+from .swift_downloader import _new_status, _quality_from, _upload_one_file, _prewarm_all_custompics
 
 SITE = os.getenv("ABYSS_SITE", "https://www.aniabyss.xyz").rstrip("/")
 HEADERS = {
@@ -133,6 +136,7 @@ def build_data(detail: dict) -> dict:
                 "season": key[0], "num": key[1], "url": dl["directUrl"],
                 "size": dl.get("fileSize") or "", "fmt": (dl.get("format") or "MKV").lower(),
                 "audio": dl.get("audio") or detail.get("audioLanguages") or "", "fast": fast,
+                "quality": q,
             }
     qualities = sorted(by_q, key=lambda q: (_q_rank(q), q))
     return {
@@ -288,82 +292,155 @@ def make_selector(detail: dict, orig_message: Message) -> AbyssSelector:
 
 
 # ───────────────────────── download pipeline ─────────────────────────
+def _q_tag(q: str) -> str:
+    """'4K' -> '2160p', '1080p'/'1080' -> '1080p', warna khali."""
+    ql = (q or "").lower()
+    if "4k" in ql or "2160" in ql:
+        return "2160p"
+    m = re.search(r"(\d{3,4})", ql)
+    return f"{m.group(1)}p" if m else ""
+
+
 def _make_filename(title: str, ep: dict) -> str:
-    audio = re.sub(r"\s*,\s*", "+", (ep.get("audio") or "").strip())
-    name = f"{title} S{ep['season']:02d}E{ep['num']:02d}"
-    if audio:
-        name += f" [{audio}]"
+    # Naam mein [Hindi] + quality rakhte hain taaki auto-rename "in Hindi 720p [@SBANIME]" bana sake
+    audio = re.sub(r"\s*,\s*", "+", (ep.get("audio") or "").strip()) or "Hindi"
+    name = f"{title} S{ep['season']:02d}E{ep['num']:02d} [{audio}]"
+    qt = _q_tag(ep.get("quality"))
+    if qt:
+        name += f" {qt}"
     name = re.sub(r'[<>:"/\\|?*]', "", name).strip()
     return _safe_filename(f"{name}.{ep.get('fmt') or 'mkv'}")
 
 
-async def _process_item(client, orig_message, sel: AbyssSelector, ep: dict, status_msg, i: int, total: int):
+async def _fast_download(url: str, dest: str, stage):
+    """Seedha multi-connection download (TurboDL) — koi link-check / m3u8 sniff nahi."""
+    from ..utils.turbo_download import TurboDL
+    from ..utils.display_progress import progress_for_url
+    from .. import profile as _prof
+
+    headers = dict(HEADERS)
+    headers["Accept"] = "*/*"
+    dl = TurboDL(url, dest, progress_bar=False, threads=_prof.DOWNLOAD_THREADS,
+                 request_args={"headers": headers}, timeout=30)
+    job = job_ctl.CURRENT.get()
+    if job is not None:
+        job.progresses.append({"phase": "download", "dls": {"abyss": dl}})
+    dl.start(blocking=False)
+    while not dl.isFinished():
+        await progress_for_url(dl, stage)
+        await asyncio.sleep(1.5)
+    if dl.isSuccessful():
+        return dest
+    raise RuntimeError(f"Download fail: {dl.get_errors()}")
+
+
+async def _process_item(client, orig_message, sel: AbyssSelector, ep: dict, stage, i: int, total: int):
     label = f"{sel._ep_label(ep)}"
-    loop = asyncio.get_event_loop()
-    try:
-        await status_msg.edit(f"🔍 **{label}** (`{i}/{total}`)\nDownload link check ho raha hai...")
-    except Exception:
-        pass
-    try:
-        final_url = await loop.run_in_executor(None, resolve_direct, ep["url"])
-    except Exception as e:  # noqa: BLE001
-        try:
-            await status_msg.edit(
-                f"🛑 **{label} — Link Fail**\n\n```\n{str(e)[:300]}\n```\n🔗 {ep['url']}\n"
-                f"⛔ Agle items band kar diye gaye."
-            )
-        except Exception:
-            pass
-        return "error"
+    dl_dir = os.path.join(download_dir, f"aby_{sel.sid}_{ep['season']}_{ep['num']}_{int(time.time())}")
+    os.makedirs(dl_dir, exist_ok=True)
+    job = job_ctl.CURRENT.get()
+    if job is not None:
+        job.dirs.add(dl_dir)          # cancel / finish pe folder saaf
 
-    filename = _make_filename(sel.title, ep)
     try:
-        await status_msg.edit(f"⬇️ **{label}** (`{i}/{total}`) — download ho raha hai...\n`{filename}`")
-    except Exception:
-        pass
-    try:
-        filepath = await _download_url(final_url, filename, status_msg, orig_message)
-    except Exception as e:  # noqa: BLE001
-        LOGGER.error(f"[Abyss] download error: {e}")
-        try:
-            await status_msg.edit(
-                f"🛑 **{label} — Download Fail**\n\n```\n{str(e)[:300]}\n```\n⛔ Agle items band kar diye gaye."
-            )
-        except Exception:
-            pass
-        return "error"
-    if not filepath or not os.path.exists(filepath):
-        try:
-            await status_msg.edit(f"🛑 **{label}** — file nahi bani.\n⛔ Agle items band kar diye gaye.")
-        except Exception:
-            pass
-        return "error"
+        filename = _make_filename(sel.title, ep)
+        dest = os.path.join(dl_dir, filename)
+        await stage.edit(f"⬇️ **{label}** (`{i}/{total}`) — download shuru...\n`{filename}`")
 
-    await _do_upload(client, filepath, orig_message, status_msg)
-    try:
-        final_text = status_msg.text or ""
-    except Exception:
-        final_text = ""
-    return "error" if "failed" in final_text.lower() else "ok"
+        # ?download=1 -> "Download Now" HTML page skip, seedha file. Koi link-check nahi.
+        try:
+            filepath = await _fast_download(_with_dl(ep["url"]), dest, stage)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            LOGGER.warning(f"[Abyss] fast download fail ({e}), purana downloader try hoga")
+            tmp = await _download_url(_with_dl(ep["url"]), filename, stage, orig_message)
+            if tmp and os.path.exists(tmp):
+                shutil.move(tmp, dest)
+            filepath = dest
+
+        if not filepath or not os.path.exists(filepath):
+            await stage.edit(f"🛑 **{label}** — file nahi bani.\n⛔ Agle episodes band kar diye gaye.")
+            return "error"
+
+        await stage.edit(f"✅ **{label}** (`{i}/{total}`) — download ho gaya\n📤 Upload shuru...")
+
+        # /aniwatch wala hi upload: thumbnail / cover / custompic / caption style / auto-rename / quota
+        q = _quality_from(os.path.basename(filepath))
+        slot = await _new_status(orig_message, f"📤 **Uploading `{q}`...**", q)
+        success, _sent, _quality = await _upload_one_file(
+            client, orig_message, slot, filepath, dl_dir, False, label_prefix=label
+        )
+        if not success:
+            try:
+                await slot.edit(f"❌ Upload failed: `{_quality}`")
+            except Exception:
+                pass
+            await stage.edit(f"🛑 **{label} — Upload Fail**\n⛔ Agle episodes band kar diye gaye.")
+            return "error"
+        try:
+            await slot.delete()
+        except Exception:
+            pass
+        return "ok"
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        LOGGER.error(f"[Abyss] {label} error: {e}", exc_info=True)
+        try:
+            await stage.edit(f"🛑 **{label} — Error**\n`{str(e)[:150]}`\n⛔ Agle episodes band kar diye gaye.")
+        except Exception:
+            pass
+        return "error"
+    finally:
+        shutil.rmtree(dl_dir, ignore_errors=True)
 
 
 async def _download_items(client, status_msg, sel: AbyssSelector, idxs: list):
-    total = len(idxs)
-    eps = sel.episodes
-    all_ok = True
-    for i, idx in enumerate(idxs, 1):
-        result = await _process_item(client, sel.orig_message, sel, eps[idx], status_msg, i, total)
-        if result != "ok":
-            all_ok = False
-            break
-        if i < total:
-            status_msg = await sel.orig_message.reply("⏳ Agla episode shuru ho raha hai...")
-            await asyncio.sleep(1)
-    if all_ok:
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
+    """Poora process EK card message mein + ❌ Cancel button (job_ctl) — /aniwatch jaisa."""
+    eps = [sel.episodes[i] for i in idxs]
+    total = len(eps)
+    orig_message = sel.orig_message
+    title = (sel.title or "AniAbyss")[:55]
+    job = job_ctl.Job(status_msg, orig_message.from_user.id, title=title)
+    job.quota_count = total
+    state = {"ok": 0, "last": "ok"}
+
+    async def _body():
+        stage = job.slot("stage", order=0)
+        asyncio.ensure_future(_prewarm_all_custompics(orig_message.from_user.id))
+        for n, ep in enumerate(eps, 1):
+            label = sel._ep_label(ep)
+            job.header = f"📺 **{label}** • `{n}/{total}`"
+            job.reset_slots(keep=("stage",))
+            result = await _process_item(client, orig_message, sel, ep, stage, n, total)
+            state["last"] = result
+            if result != "ok":
+                break
+            state["ok"] += 1
+            job.done_eps.append(label)
+            if n < total:
+                await asyncio.sleep(1)
+
+    try:
+        await job.run(_body)
+    except Exception as e:  # noqa: BLE001
+        LOGGER.error(f"[Abyss] _download_items error: {e}")
+        state["last"] = "error"
+        job.slot("stage", order=0).text = f"❌ `{str(e)[:150]}`"
+
+    if job.cancelled:
+        return
+    job.reset_slots(keep=("stage",))
+    if state["last"] == "ok":
+        await job.finish(
+            f"🎉 **Complete!** — {job.title}\n\n"
+            f"✅ `{state['ok']}/{total}` upload ho gaye\n"
+            f"📋 {' '.join(job.done_eps[-12:])}"
+        )
+    else:
+        job.finished = False
+        await job.finish(job.render() + f"\n\n⛔ Process band ho gaya (`{state['ok']}/{total}` complete).")
 
 
 # ───────────────────────── callbacks ─────────────────────────
