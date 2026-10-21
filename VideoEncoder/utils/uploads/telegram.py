@@ -20,6 +20,36 @@ from .. import turbo_upload   # noqa: F401  — import par Client.save_file turb
 
 
 # ─────────────────────────────────────────────
+#  Non-blocking progress (SPEED FIX)
+#  ─────────────────────────────────
+#  Pehle upload ka progress callback `await progress_for_pyrogram(...)` karta tha —
+#  matlab har status edit (aur FloodWait / slow Telegram edit) ke dauran upload ka
+#  data-pump ruk jata tha. Isi wajah se upload shuru mein tez, aur baad mein dheere
+#  hota dikhta tha. Ab edit alag task mein chalta hai (ek time pe sirf ek), upload
+#  kabhi nahi rukta. /swift, /toono, /aniwatch jaisa hi behaviour.
+# ─────────────────────────────────────────────
+_PROG_BUSY: dict = {}
+
+
+async def progress_nonblocking(current, total, ud_type, prog_msg, start):
+    key = f"{getattr(prog_msg, 'id', id(prog_msg))}_{ud_type}"
+    final = bool(total) and current >= total
+    if _PROG_BUSY.get(key) and not final:
+        return
+
+    async def _run():
+        _PROG_BUSY[key] = True
+        try:
+            await progress_for_pyrogram(current, total, ud_type, prog_msg, start)
+        except Exception:
+            pass
+        finally:
+            _PROG_BUSY.pop(key, None)
+
+    asyncio.ensure_future(_run())
+
+
+# ─────────────────────────────────────────────
 #  cover-safe send wrapper
 #  ───────────────────────
 #  Kuch kurigram/pyrogram versions (e.g. kurigram==2.2.22) ke
@@ -480,7 +510,7 @@ async def upload_video(message, msg, new_file, caption, c_time, thumb,
                        skip_forward=False):
     # progress/progress_args override — caller custom progress callback de sakta hai
     # (e.g. swift_downloader 50% staggered upload ke liye)
-    _progress_fn   = progress      if progress      is not None else progress_for_pyrogram
+    _progress_fn   = progress      if progress      is not None else progress_nonblocking
     _progress_args = progress_args if progress_args is not None else ("📤 Uploading...", msg, c_time)
 
     send_kwargs = dict(
@@ -555,7 +585,7 @@ async def upload_doc(message, msg, c_time, caption, new_file, file_name=None,
         file_name=file_name,
         caption=caption,
         parse_mode=ParseMode.HTML,
-        progress=progress_for_pyrogram,
+        progress=progress_nonblocking,
         progress_args=("📤 Uploading...", msg, c_time),
     )
 
