@@ -22,8 +22,22 @@ class DirectDownloadLinkException(Exception):
 
 def direct_link_generator(text_url: str):
     """ direct links generator """
+    # ── Naye / working resolvers (gofile, buzzheavier, mediafire, krakenfiles ...) ──
+    try:
+        from .direct_link_plus import resolve_plus, PlusLinkError
+    except Exception:
+        resolve_plus = None
+    if resolve_plus is not None:
+        try:
+            _plus = resolve_plus(text_url)
+            if _plus:
+                return _plus
+        except PlusLinkError as e:
+            raise DirectDownloadLinkException(str(e))
+        except Exception:
+            pass   # naya resolver toota to purane chain par fallback
     if 'youtube.com' in text_url or 'youtu.be' in text_url:
-        raise DirectDownloadLinkException(f"ERROR: NO YTDL")
+        raise DirectDownloadLinkException("YouTube / social link hai — /ytdl <link> use karo")
     elif 'dood.to' in text_url or 'yuudrive.' in text_url or 'pdisk.' in text_url or 'Pdisk.' in text_url or 'nitroflare.' in text_url:
         raise DirectDownloadLinkException('ERROR: These Links Are Not Supported')
     elif '0:/' in text_url and text_url.endswith("/") or '1:/' in text_url and text_url.endswith("/") or '2:/' in text_url and text_url.endswith("/") or '3:/' in text_url and text_url.endswith("/") or '4:/' in text_url and text_url.endswith("/") or '5:/' in text_url and text_url.endswith("/") or '6:/' in text_url and text_url.endswith("/"):
