@@ -1,3 +1,4 @@
+import asyncio
 import math
 import time
 
@@ -76,7 +77,7 @@ def _make_bar(pct: float) -> str:
 # ─────────────────────────────────────────────
 _last_update: dict = {}
 
-async def progress_for_pyrogram(current: int, total: int, ud_type: str, message, start: float):
+async def _progress_for_pyrogram_impl(current: int, total: int, ud_type: str, message, start: float):
     now = time.time()
     elapsed = now - start
     task_id = f"{message.id}_{ud_type}"
@@ -158,3 +159,38 @@ async def progress_for_url(downloader, msg):
         await msg.edit_text(text)
     except Exception:
         pass
+
+
+# ─────────────────────────────────────────────
+#  SPEED FIX: progress_for_pyrogram ab NON-BLOCKING hai
+#  Pehle upload/download ka data-pump har status edit (FloodWait / slow edit) ka
+#  intezaar karta tha — isse speed shuru mein tez aur baad mein dheemi lagti thi.
+#  Ab throttle check turant hota hai aur edit alag task mein jaata hai
+#  (ek time pe ek hi per message). /url, /rename, /save, /upload — sab pe lagta hai.
+# ─────────────────────────────────────────────
+_PG_BUSY: dict = {}
+
+
+async def progress_for_pyrogram(current: int, total: int, ud_type: str, message, start: float):
+    try:
+        now = time.time()
+        task_id = f"{message.id}_{ud_type}"
+        final = bool(total) and current >= total
+        if not final:
+            if now - _last_update.get(task_id, 0) < _UPDATE_EVERY:
+                return
+            if _PG_BUSY.get(task_id):
+                return
+    except Exception:
+        return
+
+    async def _run():
+        _PG_BUSY[task_id] = True
+        try:
+            await _progress_for_pyrogram_impl(current, total, ud_type, message, start)
+        except Exception:
+            pass
+        finally:
+            _PG_BUSY.pop(task_id, None)
+
+    asyncio.ensure_future(_run())
