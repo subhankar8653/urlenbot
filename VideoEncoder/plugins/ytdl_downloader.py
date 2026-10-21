@@ -61,7 +61,7 @@ def _clean(name: str, limit: int = 120) -> str:
     return (name[:limit].rstrip() or "video")
 
 
-def _base_opts() -> dict:
+def _base_opts(identity: bool = False) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -80,12 +80,28 @@ def _base_opts() -> dict:
     px = os.environ.get("YTDL_PROXY", "").strip()
     if px:
         opts["proxy"] = px
+    if identity:
+        # Kuch sites (Pinterest ...) ka gzip response decode nahi hota ("Error -2 while
+        # decompressing data") — compression band karke dobara try.
+        opts["http_headers"] = {"Accept-Encoding": "identity"}
     return opts
 
 
-def _extract_info(url: str) -> dict:
+def _with_identity_fallback(fn, *args):
+    """fn normal chalao; gzip/decode wale error par Accept-Encoding: identity ke saath retry."""
+    try:
+        return fn(*args, identity=False)
+    except Exception as e:  # noqa: BLE001
+        m = str(e).lower()
+        if "content-encoding" in m or "decompress" in m or "failed to decode" in m:
+            LOGGER.warning("[YTDL] gzip decode error — identity encoding se retry")
+            return fn(*args, identity=True)
+        raise
+
+
+def _extract_info(url: str, identity: bool = False) -> dict:
     import yt_dlp
-    with yt_dlp.YoutubeDL({**_base_opts(), "skip_download": True}) as ydl:
+    with yt_dlp.YoutubeDL({**_base_opts(identity), "skip_download": True}) as ydl:
         info = ydl.extract_info(url, download=False)
     if info and info.get("_type") == "playlist":
         entries = [e for e in (info.get("entries") or []) if e]
@@ -93,29 +109,44 @@ def _extract_info(url: str) -> dict:
             raise RuntimeError("Playlist khali hai")
         first = entries[0]
         if not first.get("formats") and first.get("url"):
-            with yt_dlp.YoutubeDL({**_base_opts(), "skip_download": True}) as ydl:
+            with yt_dlp.YoutubeDL({**_base_opts(identity), "skip_download": True}) as ydl:
                 first = ydl.extract_info(first.get("webpage_url") or first["url"], download=False)
         first["_from_playlist"] = True
         return first
     return info
 
 
+def _is_vertical(info: dict) -> bool:
+    best = None
+    for f in info.get("formats") or []:
+        w, h = f.get("width"), f.get("height")
+        if w and h and f.get("vcodec") not in (None, "none"):
+            if best is None or w * h > best[0] * best[1]:
+                best = (w, h)
+    if best is None:
+        w, h = info.get("width"), info.get("height")
+        best = (w, h) if w and h else None
+    return bool(best and best[1] > best[0])
+
+
 def _available_heights(info: dict) -> list:
+    """Quality 'chhoti side' se (vertical reel 720x1280 = 720p, landscape 1920x1080 = 1080p)."""
     hs = set()
     for f in info.get("formats") or []:
-        h = f.get("height")
+        w, h = f.get("width"), f.get("height")
         if h and f.get("vcodec") not in (None, "none"):
-            hs.add(int(h))
+            hs.add(int(min(w, h)) if w else int(h))
     if not hs:
         return []
     top = max(hs)
     out = [h for h in HEIGHTS if any(abs(x - h) <= 20 for x in hs)]   # sirf jo sach mein available hain
     if not out or top > out[0] + 40:
-        out.insert(0, top)       # odd height (jaise 1000p / 240p) bhi dikhao
+        out.insert(0, top)       # odd height (jaise 1006p / 240p) bhi dikhao
     return out
 
 
-def _download_blocking(url: str, dl_dir: str, height, prog: dict, job) -> str:
+def _download_blocking(url: str, dl_dir: str, height, prog: dict, job,
+                       vertical: bool = False, identity: bool = False) -> str:
     import yt_dlp
 
     def hook(d):
@@ -133,7 +164,7 @@ def _download_blocking(url: str, dl_dir: str, height, prog: dict, job) -> str:
         elif st == "finished":
             prog["phase"] = "merge"
 
-    opts = _base_opts()
+    opts = _base_opts(identity)
     opts.update({
         "outtmpl": os.path.join(dl_dir, "%(title).120B [%(id)s].%(ext)s"),
         "progress_hooks": [hook],
@@ -145,7 +176,8 @@ def _download_blocking(url: str, dl_dir: str, height, prog: dict, job) -> str:
                                    "preferredquality": "192"}]
     else:
         h = int(height)
-        opts["format"] = f"bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
+        dim = "width" if vertical else "height"   # vertical reel mein quality = width
+        opts["format"] = f"bv*[{dim}<={h}]+ba/b[{dim}<={h}]/bv*+ba/b"
         opts["merge_output_format"] = "mp4"
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.extract_info(url, download=True)
@@ -187,7 +219,8 @@ async def _run_job(client, status_msg, orig_message: Message, url: str, info: di
         try:
             prog = {"phase": "download"}
             await stage.edit(f"🔍 **Download shuru...**\n`{title}`")
-            fut = job_ctl.run_in_thread(_download_blocking, url, dl_dir, height, prog, job)
+            fut = job_ctl.run_in_thread(_with_identity_fallback, _download_blocking, url, dl_dir,
+                                       height, prog, job, _is_vertical(info))
             while not fut.done():
                 await asyncio.sleep(2)
                 await stage.edit(_fmt_progress(prog, title))
@@ -292,7 +325,7 @@ async def ytdl_command(client: Client, message: Message):
     _prune()
     status = await message.reply("🔍 Link scan ho raha hai...")
     try:
-        info = await job_ctl.run_in_thread(_extract_info, url)
+        info = await job_ctl.run_in_thread(_with_identity_fallback, _extract_info, url)
     except Exception as e:  # noqa: BLE001
         LOGGER.error(f"[YTDL] info error: {e}")
         txt = str(e).replace("ERROR: ", "")
