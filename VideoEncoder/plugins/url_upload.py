@@ -1797,6 +1797,9 @@ async def _is_m3u8_url(url: str) -> bool:
     path = urlparse(url).path.lower()
     if path.endswith(".m3u8") or ".m3u8" in url.lower():
         return True
+    # AniAbyss direct file link hai — extra content-sniff request ki zaroorat nahi (speed)
+    if "dl.aniabyss.xyz" in url:
+        return False
 
     # Extension hidden/obfuscated ho sakta hai — content sniff karo
     # jab path mein 'hls' ho ya URL ka koi file extension na ho.
