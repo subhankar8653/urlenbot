@@ -53,6 +53,37 @@ def _low_prio():
     return lambda: os.nice(n)
 
 
+def _tune_flag(x265, tune):
+    """x265 mein 'film' tune hota hi nahi (woh sirf x264 ka hai) — pehle libx265 ko '-tune film'
+    mil jaata tha aur encoder init fail hota tha. Ab x265 pe sirf animation (ya kuch nahi)."""
+    if tune:
+        return '-tune animation'
+    return '' if x265 else '-tune film'
+
+
+def _profile_flag(x265, ten_bit):
+    """10-bit (yuv420p10le) ke saath 'main' profile invalid hai (x264 -> high10, x265 -> main10)."""
+    if x265:
+        return '-profile:v main10' if ten_bit else '-profile:v main'
+    return '-profile:v high10' if ten_bit else '-profile:v main'
+
+
+def _scale_vf(r):
+    """Aspect ratio bachake scale (-2 = even width). Pehle 1920:1080 force hota tha jisse
+    4:3 / 21:9 / vertical video kheench jaati thi. min(ih,H) = chhoti video ko upscale nahi karta."""
+    h = {'1080': 1080, '720': 720, '576': 576, '480': 480}.get(r)
+    return f"-vf scale=-2:'min(ih,{h})'" if h else ''
+
+
+def _x265_params(threads, frame_threads, preset_key):
+    """Parallelism hamesha; quality-ghatane wale speed hacks (ref=1, b-adapt=0, short lookahead)
+    sirf ultrafast/superfast/veryfast preset pe. fast/medium/slow = user ne quality chuni hai."""
+    base = f"pools={threads}:frame-threads={frame_threads}:wpp=1"
+    if preset_key in ('uf', 'sf', 'vf'):
+        base += ":pmode=1:pme=1:rc-lookahead=10:b-adapt=0:ref=1"
+    return base
+
+
 def plan_segments(cpu_count, x265):
     """(n_segments, threads_per_segment). Limit = CPU, RAM aur tier ki max.
     Pehle sirf min(cpu, 6) tha: 8 core par 6 seg x 1 thread = 2 core idle,
@@ -251,7 +282,7 @@ async def parallel_encode(filepath, message, msg, audio_map=None):
     x265 = await db.get_hevc(uid)
     codec_flag = '-c:v libx265' if x265 else '-c:v libx264'
     tune = await db.get_tune(uid)
-    tunevideo = '-tune animation' if tune else '-tune film'
+    tunevideo = _tune_flag(x265, tune)
     cbb = await db.get_cabac(uid)
     cabac = '-coder 1' if cbb else '-coder 0'
     rf = await db.get_reframe(uid)
@@ -281,11 +312,11 @@ async def parallel_encode(filepath, message, msg, audio_map=None):
         'm':  '-preset medium'
     }.get(p, '-preset slow')
 
-    video_opts = '-profile:v main' if x265 else f'{cabac} {reframe} -profile:v main'
+    _prof_flag = _profile_flag(x265, b)
+    video_opts = _prof_flag if x265 else f'{cabac} {reframe} {_prof_flag}'
 
     r = await db.get_resolution(uid)
-    watermark = {'1080': '-vf scale=1920:1080', '720': '-vf scale=1280:720',
-                 '576': '-vf scale=768:576', '480': '-vf scale=852:480'}.get(r, '')
+    watermark = _scale_vf(r)
     w = await db.get_watermark(uid)
     if w:
         watermark += (',subtitles=VideoEncoder/utils/extras/watermark.ass'
@@ -294,10 +325,7 @@ async def parallel_encode(filepath, message, msg, audio_map=None):
     # threads_per_seg upar plan_segments() se aa chuka hai
     x265_speed_params = []
     if x265:
-        params = (
-            f"pools={threads_per_seg}:frame-threads={min(threads_per_seg, 4)}:"
-            f"wpp=1:pmode=1:pme=1:rc-lookahead=10:b-adapt=0:ref=1"
-        )
+        params = _x265_params(threads_per_seg, min(threads_per_seg, 4), p)
         x265_speed_params = ['-x265-params', params]
 
     seg_paths = [os.path.join(encode_dir, f"{msg.id}_seg{i}.mkv") for i in range(n_segments)]
@@ -656,7 +684,7 @@ async def _encode_single(filepath, message, msg, audio_map=None):
 
     # Tune
     tune = await db.get_tune(message.from_user.id)
-    tunevideo = '-tune animation' if tune else '-tune film'
+    tunevideo = _tune_flag(x265, tune)
 
     # CABAC
     cbb = await db.get_cabac(message.from_user.id)
@@ -698,10 +726,11 @@ async def _encode_single(filepath, message, msg, audio_map=None):
     }.get(p, '-preset slow')
 
     # Video opts
+    _prof_flag = _profile_flag(x265, b)
     if x265:
-        video_opts = '-profile:v main -map 0:v? -map_chapters 0 -map_metadata 0'
+        video_opts = f'{_prof_flag} -map 0:v? -map_chapters 0 -map_metadata 0'
     else:
-        video_opts = f'{cabac} {reframe} -profile:v main -map 0:v? -map_chapters 0 -map_metadata 0'
+        video_opts = f'{cabac} {reframe} {_prof_flag} -map 0:v? -map_chapters 0 -map_metadata 0'
 
     # Metadata — Mirror Leech style (list banao, string nahi — spaces safe rahein)
     full_meta = await db.get_full_metadata(message.from_user.id)
@@ -745,8 +774,7 @@ async def _encode_single(filepath, message, msg, audio_map=None):
     # Resolution + Watermark
     r = await db.get_resolution(message.from_user.id)
     w = await db.get_watermark(message.from_user.id)
-    watermark = {'1080': '-vf scale=1920:1080', '720': '-vf scale=1280:720',
-                 '576': '-vf scale=768:576', '480': '-vf scale=852:480'}.get(r, '')
+    watermark = _scale_vf(r)
     if w:
         watermark += (',subtitles=VideoEncoder/utils/extras/watermark.ass'
                       if watermark else '-vf subtitles=VideoEncoder/utils/extras/watermark.ass')
@@ -792,16 +820,7 @@ async def _encode_single(filepath, message, msg, audio_map=None):
     # x265-params se encoder ke andar parallel processing on karo
     x265_speed_params = []
     if x265:
-        params = (
-            f"pools={cpu_count}:"       # worker thread pools
-            f"frame-threads={min(cpu_count, 4)}:"  # parallel frame encoding
-            f"wpp=1:"                   # Wavefront Parallel Processing
-            f"pmode=1:"                 # parallel mode decision
-            f"pme=1:"                   # parallel motion estimation
-            f"rc-lookahead=10:"         # default 40 → 10, speed +25%
-            f"b-adapt=0:"               # B-frame adapt off, speed boost
-            f"ref=1"                    # 1 reference frame (superfast pe waise bhi 1 hota)
-        )
+        params = _x265_params(cpu_count, min(cpu_count, 4), p)
         x265_speed_params = ['-x265-params', params]
 
     # ── Final command ─────────────────────────────────────────────────────────
