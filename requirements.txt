@@ -57,3 +57,6 @@ captchaai
 # Aniwatch / Animetsu downloader (/aniwatch)
 curl_cffi
 pycryptodome
+
+# /ytdl (YouTube + 1000 sites)
+yt-dlp
