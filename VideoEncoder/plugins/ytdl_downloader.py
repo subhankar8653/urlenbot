@@ -71,7 +71,6 @@ def _base_opts(identity: bool = False) -> dict:
         "fragment_retries": 10,
         "socket_timeout": 30,
         "concurrent_fragment_downloads": 8,   # DASH/HLS parts parallel — speed
-        "http_chunk_size": 10 * 1024 * 1024,
         "windowsfilenames": True,
     }
     ck = os.environ.get("YTDL_COOKIES", "").strip()
@@ -93,10 +92,48 @@ def _with_identity_fallback(fn, *args):
         return fn(*args, identity=False)
     except Exception as e:  # noqa: BLE001
         m = str(e).lower()
-        if "content-encoding" in m or "decompress" in m or "failed to decode" in m:
+        if ("content-encoding" in m or "decompress" in m or "failed to decode" in m
+                or "file is empty" in m):
             LOGGER.warning("[YTDL] gzip decode error — identity encoding se retry")
             return fn(*args, identity=True)
         raise
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _pretty_err(e) -> str:
+    t = _ANSI.sub("", str(e)).strip()
+    t = re.sub(r"^(ERROR:\s*)+", "", t)
+    t = re.sub(r";?\s*please report this issue on\s+https?://\S+.*$", "", t, flags=re.I | re.S)
+    return t.strip()[:300] or "unknown error"
+
+
+def _is_pinterest(url: str) -> bool:
+    return bool(re.search(r"(?:^|//|\.)(?:pin\.it|pinterest\.[a-z.]+)/", url))
+
+
+def _find_pin_image(url: str):
+    """Pinterest pin mein video nahi (image pin) to og:image se asli image nikalo."""
+    import requests
+    ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+    r = requests.get(url, headers=ua, timeout=20, allow_redirects=True)
+    html = r.text
+    m = (re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', html)
+         or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html))
+    if not m:
+        return None
+    img = m.group(1).replace("&amp;", "&")
+    big = re.sub(r"/\d{2,4}x(?:\d{2,4})?/", "/originals/", img, count=1)
+    for cand in (big, img):
+        try:
+            rr = requests.get(cand, headers=ua, timeout=30)
+            if rr.status_code == 200 and len(rr.content) > 1024:
+                return rr.content, os.path.splitext(cand.split("?")[0])[1] or ".jpg"
+        except Exception:
+            continue
+    return None
 
 
 def _extract_info(url: str, identity: bool = False) -> dict:
@@ -164,6 +201,13 @@ def _download_blocking(url: str, dl_dir: str, height, prog: dict, job,
         elif st == "finished":
             prog["phase"] = "merge"
 
+    if identity:   # retry: pehle attempt ki adhoori / khali .part files saaf
+        for _f in glob.glob(os.path.join(dl_dir, "*")):
+            if _f.endswith((".part", ".ytdl", ".temp")) or (os.path.isfile(_f) and os.path.getsize(_f) == 0):
+                try:
+                    os.remove(_f)
+                except Exception:
+                    pass
     opts = _base_opts(identity)
     opts.update({
         "outtmpl": os.path.join(dl_dir, "%(title).120B [%(id)s].%(ext)s"),
@@ -281,8 +325,8 @@ async def _run_job(client, status_msg, orig_message: Message, url: str, info: di
         await job.finish(f"🎉 **Complete!** — {job.title}")
     else:
         job.finished = False
-        msg = f"\n\n❌ `{(err or 'upload/download fail')[:200]}`"
-        await job.finish(job.render() + msg)
+        job.slot("stage", order=0).text = f"❌ **Fail**\n`{_pretty_err(err) if err else 'upload/download fail'}`"
+        await job.finish(job.render())
 
 
 def _parse_args(text: str):
@@ -328,7 +372,30 @@ async def ytdl_command(client: Client, message: Message):
         info = await job_ctl.run_in_thread(_with_identity_fallback, _extract_info, url)
     except Exception as e:  # noqa: BLE001
         LOGGER.error(f"[YTDL] info error: {e}")
-        txt = str(e).replace("ERROR: ", "")
+        txt = _pretty_err(e)
+        if "no video formats" in txt.lower() and _is_pinterest(url):
+            try:
+                got = await asyncio.get_event_loop().run_in_executor(None, _find_pin_image, url)
+            except Exception:
+                got = None
+            if got:
+                data, ext = got
+                tmp = os.path.join(download_dir, f"pin_{uuid.uuid4().hex[:8]}{ext}")
+                try:
+                    with open(tmp, "wb") as fh:
+                        fh.write(data)
+                    await message.reply_photo(tmp, caption="📌 <b>Pinterest image</b> (is pin mein video nahi tha)",
+                                              parse_mode=ParseMode.HTML)
+                    await status.delete()
+                finally:
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+                return
+            txt = "Is Pinterest pin mein video nahi mila (image/gif ya private pin)."
+        elif "live" in txt.lower() and "is live" in txt.lower():
+            txt = "Live stream abhi supported nahi."
         hint = ""
         if "Sign in" in txt or "not a bot" in txt:
             hint = "\n\n💡 YouTube ne bot-check lagaya. `YTDL_COOKIES=/path/cookies.txt` env set karo."

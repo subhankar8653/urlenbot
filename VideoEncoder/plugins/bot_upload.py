@@ -482,7 +482,7 @@ async def _bot_upload_existing_post_mode(bot: Client, message: Message, rest: st
         from ..utils.direct_link_generator import direct_link_generator
         from .. import download_dir as DL_DIR
 
-        direct = direct_link_generator(url)
+        direct = await asyncio.get_event_loop().run_in_executor(None, direct_link_generator, url)
         if direct:
             url = direct
 
@@ -716,7 +716,7 @@ async def bot_upload_cmd(bot: Client, message: Message):
         url = m.group(1)
         resume_code = m.group(2)  # None agar naya run hai
 
-        direct = direct_link_generator(url)
+        direct = await asyncio.get_event_loop().run_in_executor(None, direct_link_generator, url)
         if direct:
             url = direct
 
