@@ -95,8 +95,12 @@ async def url_upload_cmd(bot: Client, message: Message):
         url = parts[0].strip()
         custom_name = parts[1].strip() if parts[1].strip() else None
 
-    # Direct link resolve karo
-    direct = direct_link_generator(url)
+    # Direct link resolve karo (thread mein — network wale resolvers event loop ko na rokein)
+    try:
+        direct = await asyncio.get_event_loop().run_in_executor(None, direct_link_generator, url)
+    except Exception as e:  # noqa: BLE001
+        await message.reply(f"❌ <b>Link resolve fail:</b> <code>{str(e)[:300]}</code>")
+        return
     if direct:
         url = direct
 
@@ -1800,6 +1804,12 @@ async def _is_m3u8_url(url: str) -> bool:
     # AniAbyss direct file link hai — extra content-sniff request ki zaroorat nahi (speed)
     if "dl.aniabyss.xyz" in url:
         return False
+    try:   # naye resolver ka diya link direct file hai — sniff request nahi
+        from ..utils.direct_link_plus import is_resolved
+        if is_resolved(url):
+            return False
+    except Exception:
+        pass
 
     # Extension hidden/obfuscated ho sakta hai — content sniff karo
     # jab path mein 'hls' ho ya URL ka koi file extension na ho.
@@ -2079,6 +2089,11 @@ async def _download_url(url: str, filename: str, msg: Message, orig_message: Mes
         return await _download_m3u8(url, filepath, msg, cookie_header=cookie_header)
 
     headers = _default_stream_headers(url, cookie_header=cookie_header)
+    try:   # resolver ke extra headers (gofile Cookie, tmpsend Referer)
+        from ..utils.direct_link_plus import get_extra_headers
+        headers.update(get_extra_headers(url))
+    except Exception:
+        pass
 
     try:
         from ..utils.turbo_download import TurboDL
