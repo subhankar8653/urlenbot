@@ -3,7 +3,8 @@ quota.py
 ========
 Upload QUOTA system — ek saath kitne uploads chal sakte hain.
 
-Rules (auto-monitor + saare manual uploads: /Rtic, /rti, /toono, /swift):
+Rules (SIRF manual uploads: /Rtic, /rti, /toono, /swift, /aniwatch ...).
+Auto-monitor channel uploads pe quota NAHI lagta (na wait, na slot consume):
 
   • SINGLE job  = sirf 1 episode / 1 file-set upload karna hai.
   • MULTI  job  = 2 ya zyada episodes (range / season / multi-select).

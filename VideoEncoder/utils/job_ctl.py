@@ -30,6 +30,7 @@ from .. import LOGGER
 
 CURRENT = contextvars.ContextVar("suhani_current_job", default=None)
 JOBS: dict = {}
+FINISHED: dict = {}   # khatam hue deletable jobs (ledger ke saath) — Delete button ke liye
 
 EDIT_GAP = 3.0          # card ko itne second se zyada baar edit nahi karte (FloodWait se bachao)
 MAX_LINES = 6
@@ -139,6 +140,11 @@ class Job:
         # Quota system (utils/quota.py)
         self.quota_count = None      # set ho to run() shuru karne se pehle quota leta hai
         self._quota_ticket = None
+        # Channel-admin control + "🗑 Delete" (auto-monitor jaise channel jobs ke liye)
+        self.admin_chat = None       # is chat ke ADMINS bhi Cancel / Delete dabा sakte hain
+        self.deletable = False       # True => card pe 🗑 Delete button + ledger tracking
+        self.ledger: list = []       # [(chat_id, message_id)] — is job ne jo bhi channel pe post kiya
+        self.meta: dict = {}         # extra (channels, anime ...) — delete ke time kaam aata hai
 
     # ── quota ──
     async def _quota_wait_text(self, pos, reason):
@@ -201,12 +207,49 @@ class Job:
                 lines.append(_compact(s.text))
         return "\n".join(lines)[:3900]
 
+    # ── ledger (channel pe jo post hua uska hisaab — Delete button isi se chalta hai) ──
+    def track(self, chat_id, msg_id):
+        if not self.deletable or not chat_id or not msg_id:
+            return
+        item = (int(chat_id), int(msg_id))
+        if item not in self.ledger:
+            self.ledger.append(item)
+
+    async def persist_ledger(self):
+        """Restart ke baad bhi Delete button chale — ledger DB mein."""
+        if not self.deletable or not self.ledger:
+            return
+        FINISHED[self.id] = self
+        while len(FINISHED) > 40:
+            FINISHED.pop(next(iter(FINISHED)), None)
+        try:
+            from .database.access_db import db
+            await db.col2.update_one(
+                {"id": f"jledger_{self.id}"},
+                {"$set": {"ledger": [list(x) for x in self.ledger], "admin_chat": self.admin_chat,
+                          "owner": self.owner, "title": self.title, "meta": self.meta,
+                          "ts": time.time()}},
+                upsert=True,
+            )
+        except Exception as e:
+            LOGGER.warning(f"[Job {self.id}] ledger persist fail: {e}")
+
+    def _delete_btn(self):
+        return InlineKeyboardButton("🗑 Delete uploads", callback_data=f"jd_{self.id}")
+
+    def final_markup(self):
+        """Process khatam/cancel ke baad: sirf Delete button (agar kuch post hua ho)."""
+        if self.deletable and self.ledger:
+            return InlineKeyboardMarkup([[self._delete_btn()]])
+        return None
+
     def markup(self):
         if self.finished or self.cancelled:
             return None
-        return InlineKeyboardMarkup(
-            [[InlineKeyboardButton("❌ Cancel", callback_data=f"jc_{self.id}")]]
-        )
+        row = [InlineKeyboardButton("❌ Cancel", callback_data=f"jc_{self.id}")]
+        if self.deletable and self.ledger:
+            row.append(self._delete_btn())
+        return InlineKeyboardMarkup([row])
 
     # ── card edit (throttled) ──
     def touch(self, force=False):
@@ -288,9 +331,10 @@ class Job:
         if self.cancelled:
             return
         self.finished = True
+        await self.persist_ledger()
         if self.card is not None:
             async with self._lock:
-                await self._safe_edit(text[:3900], None)
+                await self._safe_edit(text[:3900], self.final_markup())
         self._rm_dirs()
 
     def _rm_dirs(self):
@@ -366,11 +410,12 @@ class Job:
             f"✅ Pehle complete hue: {done}\n"
             f"🧹 Download/upload cache delete kar diya gaya."
         )
+        await self.persist_ledger()
         try:
             if self.card is not None:
-                await self.card.edit(text, reply_markup=None)
+                await self.card.edit(text, reply_markup=self.final_markup())
             elif self._factory is not None:
-                self.card = await self._factory(text, None)
+                self.card = await self._factory(text, self.final_markup())
         except Exception:
             pass
 
@@ -385,6 +430,23 @@ async def stage_msg(message, text: str):
     return await message.reply(text)
 
 
+def track_msg(msg):
+    """Current job (deletable) ke ledger mein ek bheja hua message likho."""
+    job = CURRENT.get()
+    if job is None or not job.deletable or msg is None:
+        return
+    try:
+        job.track(msg.chat.id, msg.id)
+    except Exception:
+        pass
+
+
+def track_id(chat_id, msg_id):
+    job = CURRENT.get()
+    if job is not None:
+        job.track(chat_id, msg_id)
+
+
 async def acquire_quota(count):
     """Current job ke liye quota lo (job ke andar se). Job nahi hai to kuch nahi."""
     job = CURRENT.get()
@@ -392,7 +454,8 @@ async def acquire_quota(count):
         await job.acquire_quota(count)
 
 
-async def run_with_card(message, title: str, impl, owner_id: int = None, quota_count: int = None):
+async def run_with_card(message, title: str, impl, owner_id: int = None, quota_count: int = None,
+                        admin_chat: int = None, deletable: bool = False):
     """
     impl (bina-argument async callable) ko ek Job ke andar chalao: ek hi card message
     + "❌ Cancel" button. Returns (job, impl_result).
@@ -404,6 +467,8 @@ async def run_with_card(message, title: str, impl, owner_id: int = None, quota_c
         owner_id = message.from_user.id if getattr(message, "from_user", None) else 0
     job = Job(None, owner_id, title, factory=_factory)
     job.quota_count = quota_count
+    job.admin_chat = admin_chat
+    job.deletable = deletable
     box = {}
 
     async def _b():
