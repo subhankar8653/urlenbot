@@ -300,9 +300,11 @@ async def _get_deco():
 
 async def _send_deco_item(client: Client, chat_id: int, item: dict):
     if (item or {}).get("type") == "sticker":
-        await client.send_sticker(chat_id, item["file_id"])
+        m = await client.send_sticker(chat_id, item["file_id"])
     else:
-        await client.send_photo(chat_id, item["file_id"])
+        m = await client.send_photo(chat_id, item["file_id"])
+    job_ctl.track_msg(m)      # 🗑 Delete uploads ke liye
+    return m
 
 
 async def _send_border(client: Client, channel_id: int):
@@ -364,12 +366,12 @@ async def _send_season_intro(client: Client, channel_id: int, anime_name: str, s
     try:
         if image:
             try:
-                await client.send_photo(channel_id, image, caption=caption, parse_mode=ParseMode.HTML)
+                job_ctl.track_msg(await client.send_photo(channel_id, image, caption=caption, parse_mode=ParseMode.HTML))
             except Exception as e:
                 LOGGER.warning(f"[Deco] details photo failed ({e}); text bhej raha hoon")
-                await client.send_message(channel_id, caption, parse_mode=ParseMode.HTML)
+                job_ctl.track_msg(await client.send_message(channel_id, caption, parse_mode=ParseMode.HTML))
         else:
-            await client.send_message(channel_id, caption, parse_mode=ParseMode.HTML)
+            job_ctl.track_msg(await client.send_message(channel_id, caption, parse_mode=ParseMode.HTML))
     except Exception as e:
         LOGGER.error(f"[Deco] details post failed: {e}")
 
@@ -410,6 +412,7 @@ async def _episode_quality_poller(
     update_post_mode: str = "auto",
     season_intro: list = None,
     season_hint: int = None,
+    stats: dict = None,
 ) -> bool:
     """
     update_post_mode: "auto" (global /updatechannel toggle follow kare — /Rtic aur
@@ -604,6 +607,52 @@ async def _episode_quality_poller(
             await asyncio.sleep(interval)
             continue
 
+        # ── DUPLICATE GUARD (upload se PEHLE): channel mein ye season-episode-quality pehle se hai? ──
+        # Season file ke naam se (bot ke caption jaisa: season na mile to 1).
+        try:
+            from ..utils import episode_guard as _eg
+            from ..utils.auto_caption import extract_anime_info as _eai_g
+            _gseason = None
+            try:
+                _, _gseason, _ = _eai_g(os.path.basename(new_files[0]), {})
+            except Exception:
+                _gseason = None
+            _gseason = _gseason or 1
+            _wanted = [_quality_from(os.path.basename(f)) for f in new_files]
+            _pres, _noq, _scan_ok = await _eg.present_qualities(
+                client, channel_id, owner_id, _gseason, episode_num, _wanted)
+            _dups = set(_wanted) if _noq else set(_pres)
+            if _dups:
+                _keep = []
+                for fp in new_files:
+                    _q = _quality_from(os.path.basename(fp))
+                    if _q in _dups:
+                        remaining.discard(_q)
+                        try:
+                            os.remove(fp)
+                        except Exception:
+                            pass
+                        if stats is not None:
+                            stats.setdefault("dups", set()).add(_q)
+                    else:
+                        _keep.append(fp)
+                LOGGER.info(f"[AutoMonitor] ⏭️ S{_gseason:02d}E{episode_num:02d} {sorted(_dups)} channel mein pehle se — skip")
+                try:
+                    await status_msg.edit(
+                        f"🎌 **AutoMonitor** | Ep `{episode_num}`\n\n"
+                        f"⏭️ Channel mein pehle se hai (S{_gseason:02d}): `{' | '.join(sorted(_dups))}` — skip"
+                    )
+                except Exception:
+                    pass
+                new_files = _keep
+                if not new_files:
+                    shutil.rmtree(poll_dl_dir, ignore_errors=True)
+                    if remaining:
+                        await asyncio.sleep(interval)
+                    continue
+        except Exception as _ge:
+            LOGGER.warning(f"[AutoMonitor] dup-guard error (upload chalne diya): {_ge!r}")
+
         if should_stop(anime_name, episode_num):
             shutil.rmtree(poll_dl_dir, ignore_errors=True)
             await _mark_cancelled()
@@ -704,6 +753,25 @@ async def _episode_quality_poller(
                 await um.delete()
             except Exception:
                 pass
+            if success and sent_msg is not None:
+                try:   # 🗑 Delete button ke liye: channel pe jo post hua uska hisaab
+                    if getattr(getattr(sent_msg, "chat", None), "id", None) == channel_id:
+                        job_ctl.track_msg(sent_msg)
+                except Exception:
+                    pass
+                try:   # duplicate guard: abhi upload hua, cache/registry mein daalo
+                    from ..utils import episode_guard as _egr
+                    from ..utils.auto_caption import extract_anime_info as _eai_r
+                    _rs = None
+                    try:
+                        _, _rs, _ = _eai_r(os.path.basename(filepath), {})
+                    except Exception:
+                        _rs = None
+                    _egr.record_upload(channel_id, _rs or 1, episode_num, quality)
+                except Exception:
+                    pass
+                if stats is not None:
+                    stats["uploaded"] = stats.get("uploaded", 0) + 1
             if success and sent_msg and quality == "360p":
                 is_first_ep = (start_ep is not None and episode_num == start_ep)
                 already_sent = (update_post_sent is not None and update_post_sent[0])
@@ -718,11 +786,16 @@ async def _episode_quality_poller(
                             pass
                         _ep_end = end_ep if end_ep else episode_num
                         if update_post_mode != "off":
-                            await send_update_post(
+                            _ups = await send_update_post(
                                 client, anime_name=anime_name, season=_season,
                                 episode_start=episode_num, episode_end=_ep_end,
                                 force=(update_post_mode == "force"),
                             )
+                            for _p in (_ups or []):      # 🗑 Delete button: update post bhi delete ho
+                                try:
+                                    job_ctl.track_id(_p["channel_id"], _p["message_id"])
+                                except Exception:
+                                    pass
                         if update_post_sent is not None:
                             update_post_sent[0] = True
                     except Exception as _ue:
@@ -742,6 +815,8 @@ async def _episode_quality_poller(
                             except Exception:
                                 pass
                         await _bot_post_mgr.add_quality(quality, _deep_link, season=_bm_season, language=_bm_lang)
+                        if _bot_post_mgr.post_msg_id:
+                            job_ctl.track_id(channel_id, _bot_post_mgr.post_msg_id)
                     else:
                         LOGGER.warning(f"[BotMode] No link for {quality}")
                 except Exception as _bme:
@@ -784,6 +859,8 @@ async def _episode_quality_poller(
                 f"🎉 **Complete!** | Ep `{episode_num}`\n\n"
                 f"✅ Uploaded: `{' → '.join(uploaded_qualities)}`\n"
                 f"⏱️ Time: `{poll_elapsed}m`"
+                + (f"\n⏭️ Pehle se channel mein tha: `{' | '.join(sorted(stats['dups']))}`"
+                   if stats and stats.get("dups") else "")
             )
         except Exception:
             pass
@@ -801,8 +878,9 @@ async def _episode_quality_poller(
 
     LOGGER.info(f"[AutoMonitor] Ep {episode_num}: done in {poll_elapsed}m — {uploaded_qualities}")
     unmark_active(anime_name, episode_num)
-    if uploaded_qualities:
-        # Episode ki saari qualities ke baad border line
+    _real_up = (stats.get("uploaded", 0) > 0) if stats is not None else bool(uploaded_qualities)
+    if _real_up:
+        # Episode ki saari qualities ke baad border line (duplicate-skip pe nahi)
         await _send_border(client, channel_id)
     return len(uploaded_qualities) > 0
 
@@ -1489,17 +1567,42 @@ async def _channel_seen_recorder(client: Client, message: Message):
 # ─────────────────────────────────────────────
 #  Monitor Channel Message Handler
 # ─────────────────────────────────────────────
+# ── Duplicate-post / in-flight guards ──
+_recent_posts: dict = {}          # (channel_id, start, end, url) -> ts   (poora ho chuka / chal raha post)
+_POST_DEDUPE_TTL = 3 * 3600
+_ACTIVE_EPS: set = set()          # (channel_id, ep) — abhi koi run isi episode pe lagi hai
+
+
+def _norm_url(u: str) -> str:
+    return (u or "").split("#")[0].split("?")[0].rstrip("/").lower()
+
+
 async def _handle_channel_post(client: Client, message: Message, edited: bool = False):
-    """Wrapper: processing ek card message + ❌ Cancel button ke saath (card tabhi banta hai jab kuch dikhana ho)."""
+    """Wrapper: processing ek card message + ❌ Cancel / 🗑 Delete buttons ke saath
+    (card tabhi banta hai jab kuch dikhana ho). Monitor channel ka KOI BHI admin cancel/delete kar sakta hai."""
     try:
         _oid = await _owner_id()
     except Exception:
         _oid = None
-    await job_ctl.run_with_card(
+    try:
+        _mc = await _get_monitor_channel()
+    except Exception:
+        _mc = None
+    _admin_chat = message.chat.id if (_mc and message.chat.id == _mc) else None
+    job, _ = await job_ctl.run_with_card(
         message, "AutoMonitor",
         lambda: _handle_channel_post_impl(client, message, edited),
         owner_id=_oid or 0,
+        admin_chat=_admin_chat,
+        deletable=bool(_admin_chat),
     )
+    # Post cancel hua / poora nahi hua to dobara post karke retry kar sako
+    try:
+        pk = job.meta.get("post_key")
+        if pk is not None and (job.cancelled or not job.meta.get("all_ok")):
+            _recent_posts.pop(pk, None)
+    except Exception:
+        pass
 
 
 async def _handle_channel_post_impl(client: Client, message: Message, edited: bool = False):
@@ -1579,8 +1682,34 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
 
     total = end_ep - start_ep + 1
 
-    # Quota: 1 episode = single (2 ek saath), 2+ = multi (akela). Jagah nahi to queue.
-    await job_ctl.acquire_quota(total)
+    _jb0 = job_ctl.CURRENT.get()
+    if _jb0 is not None:
+        _chs = _jb0.meta.setdefault("channels", [])
+        if channel_id not in _chs:
+            _chs.append(channel_id)
+        _jb0.meta["anime"] = anime_name
+
+    # ── Duplicate POST guard: wahi post (same anime + episodes + link) dobara aaya to ignore ──
+    _pk = (channel_id, start_ep, end_ep, _norm_url(url))
+    _tnow = time.time()
+    for _k in [k for k, t in _recent_posts.items() if _tnow - t > _POST_DEDUPE_TTL]:
+        _recent_posts.pop(_k, None)
+    if _pk in _recent_posts:
+        LOGGER.info(f"[AutoMonitor] ♻️ Duplicate post ignore: {anime_name} Ep {start_ep}-{end_ep}")
+        if level != 'off':
+            await _notify_owner(
+                client,
+                f"♻️ <b>Duplicate post ignore kiya</b>\n\n"
+                f"🎬 <b>{html.escape(anime_name)}</b> — Ep <code>{start_ep}-{end_ep}</code>\n"
+                f"Yahi post pehle se process ho raha hai / ho chuka hai, dobara upload shuru nahi kiya."
+            )
+        return
+    _recent_posts[_pk] = _tnow
+    if _jb0 is not None:
+        _jb0.meta["post_key"] = _pk
+        _jb0.meta["all_ok"] = False
+
+    # NOTE: Auto-monitor upload pe QUOTA nahi lagta (quota sirf manual uploads ke liye hai).
 
     # Shared flag — pehle episode ke 360p pe True hoga, baaki skip karenge
     update_post_sent = [False]
@@ -1588,100 +1717,137 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
     season_hint = _season_hint_from_text(text)
     # Track karo ki kam se kam ek episode successfully upload hua ya nahi
     any_ep_uploaded = False
+    eps_done = 0          # uploaded + "pehle se channel mein tha" — dono complete maane jaate hain
 
     for i, ep_num in enumerate(range(start_ep, end_ep + 1), 1):
-        is_last = (i == total)
-
-        (_mac, _uac, _ssc, is_season_cancelled, is_episode_cancelled,
-         consume_season_cancel, consume_episode_cancel) = _get_upload_control_fns()
-        if is_season_cancelled(anime_name):
-            consume_season_cancel(anime_name)
-            await message.reply(
-                f"🛑 **Season Upload Cancelled!**\n\n"
-                f"Baaki queued episodes (`{ep_num}`-`{end_ep}`) skip kar diye gaye."
-            )
-            break
-        if is_episode_cancelled(anime_name, ep_num):
-            consume_episode_cancel(anime_name, ep_num)
-            await message.reply(f"⏭️ **Skipped** — Ep `{ep_num}` (cancel request).")
+        _ak = (channel_id, ep_num)
+        if _ak in _ACTIVE_EPS:
+            LOGGER.info(f"[AutoMonitor] ♻️ Ep {ep_num} pe doosri run pehle se chal rahi hai — skip")
+            eps_done += 1
             continue
+        _ACTIVE_EPS.add(_ak)
+        try:
+            is_last = (i == total)
 
-        # Swift URL nikalo
-        _jb = job_ctl.CURRENT.get()
-        if _jb is not None:
-            _jb.header = f"📺 **Ep {ep_num}** • `{i}/{total}`"
-            _jb.reset_slots(keep=("stage",))
-        prep_msg = await job_ctl.stage_msg(
-            message,
-            f"🎌 **AutoMonitor** | Ep `{ep_num}/{end_ep}`\n\n"
-            f"🔍 Swift URL nikaal raha hoon..."
-        )
-
-        # ── Swift URL Retry Logic — 2-phase ──
-        # Phase 1: pehle 10 attempts × 30s = 5 min
-        # Phase 2: baad ke 20 attempts × 60s = 20 min
-        SWIFT_FAST_ATTEMPTS = 10
-        SWIFT_SLOW_ATTEMPTS = 20
-        SWIFT_MAX_ATTEMPTS  = SWIFT_FAST_ATTEMPTS + SWIFT_SLOW_ATTEMPTS  # 30
-
-        swift_url = None
-        for swift_attempt in range(1, SWIFT_MAX_ATTEMPTS + 1):
-            swift_url = await _get_swift_url_for_episode(url, ep_num, prep_msg)
-            if swift_url:
-                break
-
-            # Last attempt ke baad fail → bahar niklo
-            if swift_attempt == SWIFT_MAX_ATTEMPTS:
-                await prep_msg.edit(
-                    f"❌ **AutoMonitor** | Ep `{ep_num}`\n\n"
-                    f"⏱️ {SWIFT_MAX_ATTEMPTS} attempts (~25 min) ke baad bhi\n"
-                    f"Swift URL nahi mila. RTI pe manually check karo."
+            (_mac, _uac, _ssc, is_season_cancelled, is_episode_cancelled,
+             consume_season_cancel, consume_episode_cancel) = _get_upload_control_fns()
+            if is_season_cancelled(anime_name):
+                consume_season_cancel(anime_name)
+                await message.reply(
+                    f"🛑 **Season Upload Cancelled!**\n\n"
+                    f"Baaki queued episodes (`{ep_num}`-`{end_ep}`) skip kar diye gaye."
                 )
                 break
+            if is_episode_cancelled(anime_name, ep_num):
+                consume_episode_cancel(anime_name, ep_num)
+                await message.reply(f"⏭️ **Skipped** — Ep `{ep_num}` (cancel request).")
+                continue
 
-            # Phase decide karo
-            is_fast   = swift_attempt <= SWIFT_FAST_ATTEMPTS
-            interval  = 30 if is_fast else 60
-            phase_lbl = "⚡ Fast" if is_fast else "🐢 Slow"
-            remaining_attempts = SWIFT_MAX_ATTEMPTS - swift_attempt
-            try:
-                await prep_msg.edit(
-                    f"⏳ **AutoMonitor** | Ep `{ep_num}`\n\n"
-                    f"🔄 Attempt `{swift_attempt}/{SWIFT_MAX_ATTEMPTS}` {phase_lbl} — Swift URL nahi mila\n"
-                    f"⏰ `{interval}s` baad retry... ({remaining_attempts} attempts left)"
-                )
-            except Exception:
-                pass
+            # ── Channel check (download se PEHLE): season pata ho to dekho ye episode pehle se hai? ──
+            if season_hint:
+                try:
+                    from ..utils import episode_guard as _eg0
+                    _pres, _noq, _ok = await _eg0.present_qualities(
+                        client, channel_id, oid, season_hint, ep_num, TARGET_QUALITIES)
+                    if set(TARGET_QUALITIES) <= _pres or _noq:
+                        LOGGER.info(f"[AutoMonitor] ⏭️ S{season_hint:02d}E{ep_num:02d} channel mein pehle se hai — skip")
+                        await job_ctl.stage_msg(
+                            message,
+                            f"⏭️ **Ep {ep_num}** (S{season_hint:02d}) channel mein pehle se maujood hai — skip kiya."
+                        )
+                        eps_done += 1
+                        if _jb0 is not None:
+                            _jb0.done_eps.append(f"EP{ep_num:02d}⏭")
+                        continue
+                except Exception as _ge:
+                    LOGGER.warning(f"[AutoMonitor] pre-check error (ignore): {_ge!r}")
 
-            await asyncio.sleep(interval)
-
-        if not swift_url:
-            continue
-
-        await prep_msg.edit(
-            f"✅ **AutoMonitor** | Ep `{ep_num}`\n\n"
-            f"Swift URL mila! Quality poller shuru..."
-        )
-
-        # Episode fully complete hone ke baad hi agli episode shuru karo (sequential)
-        ep_uploaded = await _episode_quality_poller(
-            client, message, swift_url,
-            ep_num, anime_name, channel_id, oid,
-            matched_entry=matched,
-            start_ep=start_ep,
-            end_ep=end_ep,
-            update_post_sent=update_post_sent,
-            season_intro=season_intro_state,
-            season_hint=season_hint,
-        )
-        if ep_uploaded:
-            any_ep_uploaded = True
+            # Swift URL nikalo
+            _jb = job_ctl.CURRENT.get()
             if _jb is not None:
-                _jb.done_eps.append(f"EP{ep_num:02d}")
+                _jb.header = f"📺 **Ep {ep_num}** • `{i}/{total}`"
+                _jb.reset_slots(keep=("stage",))
+            prep_msg = await job_ctl.stage_msg(
+                message,
+                f"🎌 **AutoMonitor** | Ep `{ep_num}/{end_ep}`\n\n"
+                f"🔍 Swift URL nikaal raha hoon..."
+            )
 
-        # Episodes ke beech thoda gap
-        if not is_last:
-            await asyncio.sleep(3)
+            # ── Swift URL Retry Logic — 2-phase ──
+            # Phase 1: pehle 10 attempts × 30s = 5 min
+            # Phase 2: baad ke 20 attempts × 60s = 20 min
+            SWIFT_FAST_ATTEMPTS = 10
+            SWIFT_SLOW_ATTEMPTS = 20
+            SWIFT_MAX_ATTEMPTS  = SWIFT_FAST_ATTEMPTS + SWIFT_SLOW_ATTEMPTS  # 30
+
+            swift_url = None
+            for swift_attempt in range(1, SWIFT_MAX_ATTEMPTS + 1):
+                swift_url = await _get_swift_url_for_episode(url, ep_num, prep_msg)
+                if swift_url:
+                    break
+
+                # Last attempt ke baad fail → bahar niklo
+                if swift_attempt == SWIFT_MAX_ATTEMPTS:
+                    await prep_msg.edit(
+                        f"❌ **AutoMonitor** | Ep `{ep_num}`\n\n"
+                        f"⏱️ {SWIFT_MAX_ATTEMPTS} attempts (~25 min) ke baad bhi\n"
+                        f"Swift URL nahi mila. RTI pe manually check karo."
+                    )
+                    break
+
+                # Phase decide karo
+                is_fast   = swift_attempt <= SWIFT_FAST_ATTEMPTS
+                interval  = 30 if is_fast else 60
+                phase_lbl = "⚡ Fast" if is_fast else "🐢 Slow"
+                remaining_attempts = SWIFT_MAX_ATTEMPTS - swift_attempt
+                try:
+                    await prep_msg.edit(
+                        f"⏳ **AutoMonitor** | Ep `{ep_num}`\n\n"
+                        f"🔄 Attempt `{swift_attempt}/{SWIFT_MAX_ATTEMPTS}` {phase_lbl} — Swift URL nahi mila\n"
+                        f"⏰ `{interval}s` baad retry... ({remaining_attempts} attempts left)"
+                    )
+                except Exception:
+                    pass
+
+                await asyncio.sleep(interval)
+
+            if not swift_url:
+                continue
+
+            await prep_msg.edit(
+                f"✅ **AutoMonitor** | Ep `{ep_num}`\n\n"
+                f"Swift URL mila! Quality poller shuru..."
+            )
+
+            # Episode fully complete hone ke baad hi agli episode shuru karo (sequential)
+            ep_stats = {}
+            ep_uploaded = await _episode_quality_poller(
+                client, message, swift_url,
+                ep_num, anime_name, channel_id, oid,
+                matched_entry=matched,
+                start_ep=start_ep,
+                end_ep=end_ep,
+                update_post_sent=update_post_sent,
+                season_intro=season_intro_state,
+                season_hint=season_hint,
+                stats=ep_stats,
+            )
+            _real = ep_stats.get("uploaded", 0) > 0
+            if ep_uploaded:
+                eps_done += 1
+            if _real:
+                any_ep_uploaded = True
+            if ep_uploaded and _jb is not None:
+                _jb.done_eps.append(f"EP{ep_num:02d}" + ("" if _real else "⏭"))
+
+            # Episodes ke beech thoda gap
+            if not is_last:
+                await asyncio.sleep(3)
+        finally:
+            _ACTIVE_EPS.discard(_ak)
+
+    if _jb0 is not None:
+        _jb0.meta["all_ok"] = (eps_done >= total)
 
     # ── Sirf last episode ke baad schedule/end message bhejo ──
     # Lekin tabhi jab kam se kam ek episode successfully upload hua ho

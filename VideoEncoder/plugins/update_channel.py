@@ -631,6 +631,8 @@ async def send_update_post(
             except Exception:
                 pass
 
+    return new_latest      # [{channel_id, message_id}] — auto-monitor ke 🗑 Delete button ke liye
+
 
 # ─────────────────────────────────────────────
 #  /updatechannel on|off — Toggle
