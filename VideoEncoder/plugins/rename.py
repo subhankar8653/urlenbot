@@ -101,7 +101,8 @@ async def rename_cmd(bot: Client, message: Message):
     async def _rename_body(pm):
         filepath = await _download_replied_file(bot, replied, pm)
         if not filepath:
-            await pm.edit("❌ Download failed ya unsupported file type.")
+            await pm.edit("❌ Download failed ya unsupported file type.\n"
+                          "<i>(Disk full / network issue bhi ho sakta hai — thodi der baad dobara try karo)</i>")
             return
 
         if inline_name:
