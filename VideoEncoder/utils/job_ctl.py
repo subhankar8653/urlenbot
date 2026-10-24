@@ -19,6 +19,7 @@ import re
 import asyncio
 import contextvars
 import gc
+import os
 import shutil
 import threading
 import time
@@ -339,7 +340,13 @@ class Job:
 
     def _rm_dirs(self):
         for d in list(self.dirs):
-            shutil.rmtree(d, ignore_errors=True)
+            if os.path.isfile(d):          # adhoori download file bhi saaf
+                try:
+                    os.remove(d)
+                except Exception:
+                    pass
+            else:
+                shutil.rmtree(d, ignore_errors=True)
 
     def _kill_drivers(self):
         try:
@@ -428,6 +435,78 @@ async def stage_msg(message, text: str):
         await sl.edit(text)
         return sl
     return await message.reply(text)
+
+
+def register_proc(proc):
+    """Current job ke cancel par subprocess (ffmpeg wagairah) bhi kill ho."""
+    job = CURRENT.get()
+    if job is None or proc is None:
+        return
+
+    async def _kill():
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    job.cleanups.append(_kill)
+
+
+class CancelMsg:
+    """
+    Message ka proxy — job chalte waqt HAR edit mein ❌ Cancel button laga deta hai
+    (warna Telegram har plain edit pe button hata deta hai). Baaki sab attribute / method
+    (reply, delete, chat, id ...) asli Message se aate hain.
+      * explicit reply_markup diya ho to wahi use hota hai (menus ke liye)
+      * job khatam / cancel ke baad koi button nahi lagta
+    """
+    def __init__(self, msg, job):
+        self._m = msg
+        self._job = job
+        self.closed = False
+        self.injected = False
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._m, name)
+
+    async def edit(self, text=None, *args, **kwargs):
+        if "reply_markup" in kwargs:
+            self.injected = False
+        else:
+            mk = None
+            if not (self.closed or self._job.cancelled or self._job.finished):
+                mk = self._job.markup()
+            kwargs["reply_markup"] = mk
+            self.injected = mk is not None
+        return await self._m.edit_text(text, *args, **kwargs)
+
+    edit_text = edit
+
+
+async def run_cancelable(msg, owner_id, title: str, body):
+    """
+    body(pmsg) chalao; pmsg = CancelMsg (har edit pe ❌ Cancel). Cancel dabane par download /
+    upload / ffmpeg ruk jaate hain, adhoori files delete hoti hain.
+    Returns (job, result) — cancel hua to result None.
+    """
+    raw = getattr(msg, "_m", msg)          # proxy ho to asli message
+    job = Job(raw, owner_id, title)
+    proxy = CancelMsg(raw, job)
+
+    async def _b():
+        return await body(proxy)
+
+    try:
+        res = await job.run(_b)
+    finally:
+        proxy.closed = True
+        if proxy.injected and not job.cancelled:
+            try:
+                await raw.edit_reply_markup(None)     # final message pe Cancel button na reh jaaye
+            except Exception:
+                pass
+    return job, res
 
 
 def track_msg(msg):

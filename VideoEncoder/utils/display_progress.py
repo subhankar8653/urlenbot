@@ -141,7 +141,25 @@ async def _progress_for_pyrogram_impl(current: int, total: int, ud_type: str, me
 # ─────────────────────────────────────────────
 #  URL downloader progress
 # ─────────────────────────────────────────────
+_URL_LAST: dict = {}     # msg id -> last edit time
+
+
 async def progress_for_url(downloader, msg):
+    # THROTTLE: callers `while not isFinished(): await progress_for_url(...)` tight loop chalate hain —
+    # pehle har iteration pe Telegram edit hota tha (FloodWait + faltu CPU). Ab 2.5s mein ek edit,
+    # beech mein halka sleep.
+    try:
+        _k = getattr(msg, "id", None) or id(msg)
+        _now = time.time()
+        if _now - _URL_LAST.get(_k, 0) < 2.5:
+            await asyncio.sleep(0.5)
+            return
+        _URL_LAST[_k] = _now
+        if len(_URL_LAST) > 200:
+            for _o in sorted(_URL_LAST, key=_URL_LAST.get)[:100]:
+                _URL_LAST.pop(_o, None)
+    except Exception:
+        pass
     try:
         total      = downloader.filesize if downloader.filesize else 0
         downloaded = downloader.get_dl_size()
