@@ -42,6 +42,8 @@ from ..utils.community import get_community_tag
 from ..utils.encoding import get_duration, get_thumbnail, get_width_height
 from ..utils.thumb_source import get_tmdb_thumbnail
 from ..utils.display_progress import progress_for_pyrogram
+from ..utils.fast_download import fast_download, close_pools
+from ..utils import turbo_upload
 
 
 # ──────────────────────────────────────────────
@@ -331,16 +333,19 @@ async def saveget(client: Client, message: Message):
     except Exception as e:
         await status_msg.edit(f"❌ **Fetch failed:** `{e}`")
         if user_client:
+            await close_pools(user_client)
             await user_client.disconnect()
         return
 
     if msg_obj.empty:
         if user_client:
+            await close_pools(user_client)
             await user_client.disconnect()
         return await status_msg.edit("❌ **Message empty/deleted.**")
 
     if msg_obj.text:
         if user_client:
+            await close_pools(user_client)
             await user_client.disconnect()
         return await client.send_message(message.chat.id, msg_obj.text)
 
@@ -350,6 +355,7 @@ async def saveget(client: Client, message: Message):
     )
     if not media:
         if user_client:
+            await close_pools(user_client)
             await user_client.disconnect()
         return await status_msg.edit("❌ **Unsupported content.**")
 
@@ -361,22 +367,41 @@ async def saveget(client: Client, message: Message):
     c_time = time.time()
     await status_msg.edit("⬇️ **Downloading...**")
 
+    # Download chalte-chalte bot ke upload sessions taiyar (upload ke time wait nahi)
+    asyncio.ensure_future(turbo_upload.prewarm(app))
+
     try:
-        file_path = await fetch_client.download_media(
-            msg_obj,
-            file_name=f"{dl_dir}/",
-            progress=progress_for_pyrogram,
-            progress_args=("⬇️ Downloading...", status_msg, c_time),
-        )
+        file_path = None
+        _fm = msg_obj.video or msg_obj.document or msg_obj.audio
+        if _fm and (getattr(_fm, "file_size", 0) or 0) > 0:
+            # SPEED: video/document/audio ke liye parallel multi-connection download
+            # (normal download_media 1 connection = ~2 MB/s cap). Fail ho to niche normal path.
+            _fname = os.path.basename(getattr(_fm, "file_name", None) or f"file_{session_id}")
+            file_path = await fast_download(
+                client=fetch_client,
+                message=msg_obj,
+                file_name=os.path.join(dl_dir, _fname),
+                progress_callback=progress_for_pyrogram,
+                progress_args=("⚡ Downloading...", status_msg, c_time),
+            )
+        if not file_path or not os.path.exists(file_path):
+            file_path = await fetch_client.download_media(
+                msg_obj,
+                file_name=f"{dl_dir}/",
+                progress=progress_for_pyrogram,
+                progress_args=("⬇️ Downloading...", status_msg, c_time),
+            )
     except Exception as e:
         shutil.rmtree(dl_dir, ignore_errors=True)
         if user_client:
+            await close_pools(user_client)
             await user_client.disconnect()
         return await status_msg.edit(f"❌ **Download failed:** `{e}`")
 
     if not file_path or not os.path.exists(file_path):
         shutil.rmtree(dl_dir, ignore_errors=True)
         if user_client:
+            await close_pools(user_client)
             await user_client.disconnect()
         return await status_msg.edit("❌ **File nahi mili.**")
 
@@ -456,6 +481,7 @@ async def saveget(client: Client, message: Message):
         # Cleanup
         if user_client:
             try:
+                await close_pools(user_client)
                 await user_client.disconnect()
             except Exception:
                 pass

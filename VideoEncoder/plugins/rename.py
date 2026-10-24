@@ -89,6 +89,9 @@ async def rename_cmd(bot: Client, message: Message):
 
     status = await message.reply("<b>💠 Downloading...</b>")
 
+    # Download chalte-chalte upload ke connections/sessions taiyar (upload ke time wait nahi)
+    asyncio.ensure_future(_prewarm_upload(bot, user_id))
+
     # Download + rename + upload — ❌ Cancel button ke saath
     async def _rename_body(pm):
         filepath = await _download_replied_file(bot, replied, pm)
@@ -119,6 +122,20 @@ async def rename_cmd(bot: Client, message: Message):
         )
 
     await job_ctl.run_cancelable(status, user_id, "Rename", _rename_body)
+
+
+async def _prewarm_upload(bot: Client, user_id: int):
+    """User session hai to uska uploader client + turbo sessions, warna bot ke turbo sessions.
+    Chupchap fail ho jaata hai — upload khud bana lega."""
+    try:
+        from ..utils.uploads.telegram import _get_user_session, prewarm_uploader
+        if await _get_user_session(user_id):
+            await prewarm_uploader(user_id)
+        else:
+            from ..utils import turbo_upload
+            await turbo_upload.prewarm(bot)
+    except Exception as e:
+        LOGGER.debug(f"[rename] upload prewarm skipped: {e!r}")
 
 
 async def _download_replied_file(bot: Client, replied: Message, status: Message) -> "str | None":
@@ -258,83 +275,111 @@ async def _do_rename_and_upload(bot: Client, user_id: int, filepath: str, given_
             pass
 
 
+async def _send_with_fallback(clients, kind: str, **kw):
+    """clients ko order mein try karo (pehle user uploader, aakhir mein bot). Last client ka
+    error upar jaata hai. 'file_name' unsupported ho to wahi kwarg hata ke retry."""
+    last = None
+    for cl in clients:
+        fn = getattr(cl, kind)
+        args = dict(kw)
+        try:
+            try:
+                return await fn(**args)
+            except TypeError as e:
+                if "file_name" in args and "unexpected keyword argument" in str(e):
+                    args.pop("file_name")
+                    return await fn(**args)
+                raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            last = e
+            if cl is not clients[-1]:
+                LOGGER.warning(f"[rename] {kind} via user client fail ({e!r}) — bot se retry")
+    raise last
+
+
 async def _upload_renamed_file(bot: Client, filepath: str, new_filename: str, ext: str,
                                 user_id: int, orig_message: Message, status: Message):
     """Final renamed file ko sahi media type (video/audio/document) mein upload karo,
-    saved default thumbnail (/setpic ya /thumb) apply karke."""
-    from ..utils.encoding import get_duration, get_thumbnail, get_width_height
+    saved default thumbnail (/setpic ya /thumb) apply karke.
+
+    SPEED: uploader client connect | ffprobe | thumbnail — teeno EK SAATH (pehle ek ke baad ek,
+    aur TMDB slow ho to 12s tak upload ruka rehta tha). Custom thumb ab cached
+    (thumb_source.fetch_custom_thumb) hai aur kabhi upload fail nahi karta — pehle yahi
+    bot.download_media thumb ke liye cross-DC auth.ExportAuthorization maangta tha aur
+    FloodWait (420) se poora rename fail ho jata tha."""
+    from ..utils.encoding import probe_media_async, get_thumbnail_async
     from ..utils.community import get_community_tag
-    from ..utils.thumb_source import get_tmdb_thumbnail
+    from ..utils.thumb_source import get_tmdb_thumbnail, fetch_custom_thumb
+    from ..utils.uploads.telegram import _make_uploader_client
 
     caption = f"<b>{new_filename}</b>"
     custom_thumb = await db.get_thumbnail(user_id)
     thumb_path = None
+    uc = None
     c_time = time.time()
 
+    uc_task = asyncio.ensure_future(_make_uploader_client(user_id))   # session nahi to turant None
+
+    async def _dl_thumb(fid, path):
+        return await bot.download_media(fid, file_name=path)
+
+    async def _custom_thumb():
+        if not custom_thumb:
+            return None
+        try:
+            return await fetch_custom_thumb(custom_thumb, download_dir, _dl_thumb)
+        except Exception as e:
+            LOGGER.warning(f"[rename] custom thumb fail: {e!r}")
+            return None
+
     try:
+        probe = {}
         if ext in VIDEO_EXTENSIONS:
-            duration = get_duration(filepath) or 0
-            if custom_thumb:
-                thumb_path = await bot.download_media(
-                    custom_thumb,
-                    file_name=os.path.join(download_dir, f"{time.time()}.jpg"),
-                )
-            else:
+            probe_task = asyncio.ensure_future(probe_media_async(filepath))
+            thumb_path = await _custom_thumb()
+            try:
+                probe = await probe_task or {}
+            except Exception:
+                probe = {}
+            if not thumb_path:
                 band_text = await get_community_tag(user_id)
                 try:
                     thumb_path = await asyncio.wait_for(
-                        get_tmdb_thumbnail(filepath, download_dir, band_text=band_text), timeout=12)
+                        get_tmdb_thumbnail(filepath, download_dir, band_text=band_text), timeout=8)
                 except Exception:
                     thumb_path = None     # TMDB slow / fail — seedha ffmpeg frame, upload na ruke
                 if not thumb_path:
-                    thumb_path = get_thumbnail(filepath, download_dir, duration / 4 if duration else 0, band_text=band_text)
-            width, height = get_width_height(filepath) or (0, 0)
+                    dur = int(probe.get("duration") or 0)
+                    thumb_path = await get_thumbnail_async(
+                        filepath, download_dir, dur / 4 if dur else 0, band_text=band_text)
+        else:
+            thumb_path = await _custom_thumb()
 
-            await bot.send_video(
-                chat_id=orig_message.chat.id,
-                video=filepath,
-                caption=caption,
-                duration=int(duration),
-                width=width or 0,
-                height=height or 0,
-                thumb=thumb_path,
-                file_name=new_filename,
-                progress=progress_for_pyrogram,
-                progress_args=("📤 Uploading...", status, c_time),
-            )
+        try:
+            uc = await asyncio.wait_for(asyncio.shield(uc_task), timeout=40)
+        except Exception:
+            uc = None
+        clients = [uc, bot] if uc else [bot]
+
+        common = dict(chat_id=orig_message.chat.id, caption=caption, thumb=thumb_path,
+                      file_name=new_filename, progress=progress_for_pyrogram,
+                      progress_args=("📤 Uploading...", status, c_time))
+
+        if ext in VIDEO_EXTENSIONS:
+            await _send_with_fallback(
+                clients, "send_video", video=filepath,
+                duration=int(probe.get("duration") or 0),
+                width=probe.get("width") or 1280, height=probe.get("height") or 720,
+                supports_streaming=True, **common)
 
         elif ext in AUDIO_EXTENSIONS:
-            if custom_thumb:
-                thumb_path = await bot.download_media(
-                    custom_thumb,
-                    file_name=os.path.join(download_dir, f"{time.time()}.jpg"),
-                )
-            await bot.send_audio(
-                chat_id=orig_message.chat.id,
-                audio=filepath,
-                caption=caption,
-                thumb=thumb_path,
-                file_name=new_filename,
-                progress=progress_for_pyrogram,
-                progress_args=("📤 Uploading...", status, c_time),
-            )
+            await _send_with_fallback(clients, "send_audio", audio=filepath, **common)
 
         else:
             # apk / zip / pdf / kuch bhi — plain document
-            if custom_thumb:
-                thumb_path = await bot.download_media(
-                    custom_thumb,
-                    file_name=os.path.join(download_dir, f"{time.time()}.jpg"),
-                )
-            await bot.send_document(
-                chat_id=orig_message.chat.id,
-                document=filepath,
-                caption=caption,
-                thumb=thumb_path,
-                file_name=new_filename,
-                progress=progress_for_pyrogram,
-                progress_args=("📤 Uploading...", status, c_time),
-            )
+            await _send_with_fallback(clients, "send_document", document=filepath, **common)
 
         try:
             await status.edit("✅ <b>Renamed & Uploaded!</b>")
@@ -342,6 +387,24 @@ async def _upload_renamed_file(bot: Client, filepath: str, new_filename: str, ex
             pass
 
     finally:
+        if uc is None:
+            # Connect abhi chal raha ho / timeout ke baad bana ho — ban-ne par chupchap release
+            def _late_release(t):
+                try:
+                    c = t.result()
+                    if c:
+                        asyncio.ensure_future(c.disconnect())
+                except BaseException:
+                    pass
+            if uc_task.done():
+                _late_release(uc_task)
+            else:
+                uc_task.add_done_callback(_late_release)
+        if uc:
+            try:
+                await uc.disconnect()     # sirf release (shared client)
+            except Exception:
+                pass
         if thumb_path and os.path.isfile(thumb_path):
             try:
                 os.remove(thumb_path)
