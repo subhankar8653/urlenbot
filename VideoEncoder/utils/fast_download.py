@@ -202,7 +202,11 @@ class _DCPool:
         if s in self.dead:
             return
         self.dead.add(s)
-        asyncio.ensure_future(self._stop(s))
+        # Turant stop() karne se in-flight GetFile hang ho jaate the (download aakhir mein atak jata tha)
+        try:
+            asyncio.get_running_loop().call_later(DROP_STOP_DELAY, lambda: asyncio.ensure_future(self._stop(s)))
+        except RuntimeError:
+            asyncio.ensure_future(self._stop(s))
 
     @staticmethod
     async def _stop(s):
@@ -261,50 +265,85 @@ async def close_pools(client: Client):
         await p.close()
 
 
+REQ_TIMEOUT = 25          # sec — ek GetFile ka max intezaar; hang hua request retry hota hai (end pe atakna nahi)
+DROP_STOP_DELAY = 30      # sec — drop kiye session ko in-flight requests nipatne ke baad hi band karo
+
+
 async def _download_worker(pool: _DCPool, session: Session, location, fd, queue: asyncio.Queue,
                            progress_state: dict, lock: asyncio.Lock):
     """Shared queue se chunk uthata hai (work-stealing). Ek session par PIPELINE
     workers chalte hain => ek hi connection par kai GetFile request ek saath
-    in-flight rehte hain, isse network latency (RTT) ka wait nahi hota."""
+    in-flight rehte hain, isse network latency (RTT) ka wait nahi hota.
+
+    ENDGAME: queue khali hone par idle worker band nahi hota — jo chunks abhi doosre (slow)
+    sessions par in-flight hain unhe woh bhi fetch karta hai; jo pehle aaye uska data use hota hai.
+    Isse aakhri % pe ek slow connection poori download ko roke nahi rakh sakta."""
+    inflight = progress_state['inflight']
+    chunks = progress_state['chunks']
     while True:
         if session in pool.dead:
             return                      # session toota — baaki sessions kaam sambhal lenge
         try:
             idx = queue.get_nowait()
         except asyncio.QueueEmpty:
-            return
+            idx = None
+            for i, c in inflight.items():
+                if c < 2 and i not in chunks:
+                    idx = i
+                    break
+            if idx is None:
+                return
+        if idx in chunks:
+            continue
+        inflight[idx] = inflight.get(idx, 0) + 1
         offset = idx * CHUNK_SIZE
         attempt = 0
         floods = 0
-        while True:
-            try:
-                r = await session.send(
-                    raw.functions.upload.GetFile(location=location, offset=offset, limit=CHUNK_SIZE)
-                )
-                break
-            except FloodWait as e:
-                floods += 1
-                if floods > 5:
-                    queue.put_nowait(idx)
-                    raise
-                await asyncio.sleep(getattr(e, 'value', getattr(e, 'x', 5)))
-            except Exception:
-                attempt += 1
-                if attempt >= MAX_RETRIES_PER_CHUNK:
-                    # Chunk wapas queue mein, taaki doosra (healthy) session retry kare
-                    queue.put_nowait(idx)
-                    pool.drop(session)
-                    raise
-                await asyncio.sleep(min(0.5 * (2 ** attempt), 4))
+        r = None
+        try:
+            while True:
+                try:
+                    r = await asyncio.wait_for(
+                        session.send(raw.functions.upload.GetFile(
+                            location=location, offset=offset, limit=CHUNK_SIZE)),
+                        REQ_TIMEOUT)
+                    break
+                except FloodWait as e:
+                    floods += 1
+                    if floods > 5:
+                        if idx not in chunks and inflight.get(idx, 0) <= 1:
+                            queue.put_nowait(idx)
+                        raise
+                    await asyncio.sleep(getattr(e, 'value', getattr(e, 'x', 5)))
+                except Exception:
+                    if idx in chunks:
+                        break               # doosre worker ne chunk la diya — kaam khatam
+                    attempt += 1
+                    if attempt >= MAX_RETRIES_PER_CHUNK:
+                        # Chunk wapas queue mein, taaki doosra (healthy) session retry kare
+                        if inflight.get(idx, 0) <= 1:
+                            queue.put_nowait(idx)
+                        pool.drop(session)
+                        raise
+                    await asyncio.sleep(min(0.5 * (2 ** attempt), 4))
 
-        if isinstance(r, raw.types.upload.File) and r.bytes:
-            # disk write thread mein — event loop (Telegram I/O) kabhi block nahi hota
-            await asyncio.to_thread(os.pwrite, fd, r.bytes, offset)
-            async with lock:
-                progress_state['done'] += len(r.bytes)
-                progress_state['chunks'].add(idx)
-                sb = progress_state['sess_bytes']
-                sb[session] = sb.get(session, 0) + len(r.bytes)
+            if idx not in chunks and isinstance(r, raw.types.upload.File) and r.bytes:
+                # disk write thread mein — event loop (Telegram I/O) kabhi block nahi hota
+                await asyncio.to_thread(os.pwrite, fd, r.bytes, offset)
+                if idx not in chunks:
+                    async with lock:
+                        progress_state['done'] += len(r.bytes)
+                        chunks.add(idx)
+                        if len(chunks) >= progress_state['total']:
+                            progress_state['evt'].set()
+                        sb = progress_state['sess_bytes']
+                        sb[session] = sb.get(session, 0) + len(r.bytes)
+        finally:
+            n = inflight.get(idx, 1) - 1
+            if n <= 0:
+                inflight.pop(idx, None)
+            else:
+                inflight[idx] = n
 
 
 async def _parallel_download(client: Client, media, file_name: str,
@@ -326,7 +365,7 @@ async def _parallel_download(client: Client, media, file_name: str,
         try:
             os.ftruncate(fd, file_size)
 
-            progress_state = {'done': 0, 'chunks': set(), 'sess_bytes': {}}
+            progress_state = {'done': 0, 'chunks': set(), 'sess_bytes': {}, 'inflight': {}, 'total': total_chunks, 'evt': asyncio.Event()}
             lock = asyncio.Lock()
             stop_reporting = asyncio.Event()
 
@@ -378,7 +417,7 @@ async def _parallel_download(client: Client, media, file_name: str,
                 # ── STABLE SPEED monitor ──
                 # Download ke beech mein kuch sessions/connections slow ho jaate hain (Telegram per-connection
                 # throttle / toota hua route) aur total speed dheere dheere gir jaati hai. Har 4s check:
-                #   (a) koi session baaki sessions ke median se <35% speed pe => use hata ke NAYA session
+                #   (a) koi session baaki sessions ke median se <25% speed pe, lagatar 12s => use hata ke NAYA session
                 #   (b) total speed peak ke 50% se neeche 12s+ => saare purane sessions refresh (naye connection
                 #       shuru mein full speed dete hain)
                 # Naya session pool ke cached auth_key se banta hai (ExportAuthorization dobara nahi).
@@ -390,6 +429,7 @@ async def _parallel_download(client: Client, media, file_name: str,
                     peak = 0.0
                     low_since = None
                     last_refresh = t_prev
+                    strikes = {}
                     while not stop_reporting.is_set():
                         try:
                             await asyncio.wait_for(stop_reporting.wait(), timeout=4)
@@ -405,17 +445,25 @@ async def _parallel_download(client: Client, media, file_name: str,
                                  for s in list(sb) if s not in pool.dead}
                         b_prev = dict(sb)
                         tot_prev, t_prev = tot, now
-                        if queue.empty() or now - t_start < 8:
-                            continue
+                        remaining = total_chunks - len(progress_state['chunks'])
+                        if queue.empty() or now - t_start < 8 or remaining < max(24, total_chunks * 0.2):
+                            strikes.clear()
+                            continue      # aakhri 20% mein koi refresh nahi — wahan stability zaroori hai
                         peak = max(peak * 0.995, agg)
                         victims = []
                         if len(rates) >= 3:
                             med = statistics.median(rates.values())
                             if med > 0:
-                                victims = [s for s, r in rates.items() if r < 0.35 * med]
+                                flagged = [s for s, r in rates.items() if r < 0.25 * med]
+                                for s_ in list(strikes):
+                                    if s_ not in flagged:
+                                        strikes.pop(s_, None)
+                                for s_ in flagged:
+                                    strikes[s_] = strikes.get(s_, 0) + 1
+                                victims = [s_ for s_ in flagged if strikes[s_] >= 3][:2]   # lagatar 3 window (12s) slow
                         if peak > 1.5 * 1048576 and agg < 0.5 * peak:
                             low_since = low_since or now
-                            if now - low_since >= 12 and now - last_refresh >= 20:
+                            if now - low_since >= 16 and now - last_refresh >= 30:
                                 victims = list(rates)
                                 last_refresh = now
                                 low_since = None
@@ -436,7 +484,10 @@ async def _parallel_download(client: Client, media, file_name: str,
                 if not workers:
                     raise RuntimeError(f"media sessions nahi ban paaye: {join_errors[:1]!r}")
 
+                evt_task = asyncio.ensure_future(progress_state['evt'].wait())
                 while True:
+                    if len(progress_state['chunks']) >= total_chunks:
+                        break       # poori file aa gayi — atke hue (hung) request ka wait nahi
                     pend_w = [t for t in workers if not t.done()]
                     pend_j = [t for t in joins if not t.done()]
                     if not pend_w and (queue.empty() or not pend_j):
@@ -447,7 +498,7 @@ async def _parallel_download(client: Client, media, file_name: str,
                             await asyncio.sleep(0)
                             continue
                         break
-                    await asyncio.wait(pend_w + pend_j, return_when=asyncio.FIRST_COMPLETED)
+                    await asyncio.wait(pend_w + pend_j + [evt_task], return_when=asyncio.FIRST_COMPLETED)
 
                 # Koi worker mara bhi ho to baaki ne uska chunk utha liya hota hai; yahan
                 # sirf poori file ka verify karo, adhoori file kabhi "success" na maani jaye.
@@ -459,6 +510,10 @@ async def _parallel_download(client: Client, media, file_name: str,
             finally:
                 closed[0] = True
                 stop_reporting.set()
+                try:
+                    evt_task.cancel()
+                except Exception:
+                    pass
                 try:
                     monitor_task.cancel()
                 except Exception:
