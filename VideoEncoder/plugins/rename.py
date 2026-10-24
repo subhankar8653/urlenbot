@@ -62,6 +62,11 @@ _rename_sessions: dict = {}
 # ─── /rename command ────────────────────────────────────────────────────────
 @Client.on_message(filters.command("rename"))
 async def rename_cmd(bot: Client, message: Message):
+    # Download sessions turant taiyar hone lagein (db checks ke wait se pehle)
+    _r0 = message.reply_to_message
+    if _r0 and (_r0.video or _r0.document or _r0.audio):
+        asyncio.ensure_future(_prewarm_download(bot, _r0))
+
     c = await check_chat(message, chat="Both")
     if not c:
         return
@@ -122,6 +127,14 @@ async def rename_cmd(bot: Client, message: Message):
         )
 
     await job_ctl.run_cancelable(status, user_id, "Rename", _rename_body)
+
+
+async def _prewarm_download(bot: Client, replied: Message):
+    try:
+        from ..utils.fast_download import prewarm
+        await prewarm(bot, replied)
+    except Exception:
+        pass
 
 
 async def _prewarm_upload(bot: Client, user_id: int):

@@ -96,11 +96,14 @@ async def url_upload_cmd(bot: Client, message: Message):
         url = parts[0].strip()
         custom_name = parts[1].strip() if parts[1].strip() else None
 
+    # Status message PEHLE — resolve / filename-detect ke dauran user ko turant "Downloading" dikhe
+    msg = await message.reply("<b>💠 Downloading...</b>")
+
     # Direct link resolve karo (thread mein — network wale resolvers event loop ko na rokein)
     try:
         direct = await asyncio.get_event_loop().run_in_executor(None, direct_link_generator, url)
     except Exception as e:  # noqa: BLE001
-        await message.reply(f"❌ <b>Link resolve fail:</b> <code>{str(e)[:300]}</code>")
+        await msg.edit(f"❌ <b>Link resolve fail:</b> <code>{str(e)[:300]}</code>")
         return
     if direct:
         url = direct
@@ -110,8 +113,6 @@ async def url_upload_cmd(bot: Client, message: Message):
 
     # Filename too long fix — Linux max = 255 bytes, safe limit = 200 chars
     custom_name = _safe_filename(custom_name)
-
-    msg = await message.reply("<b>💠 Downloading...</b>")
 
     # Poora kaam (download → process → upload) ❌ Cancel button ke saath
     async def _url_body(msg):
@@ -1796,7 +1797,21 @@ def _capture_browser_session(url: str) -> dict:
     return result
 
 
+_M3U8_MEMO: dict = {}     # url -> (time, bool) — same URL ka sniff 2 baar na ho (start-delay)
+
+
 async def _is_m3u8_url(url: str) -> bool:
+    _hit = _M3U8_MEMO.get(url)
+    if _hit and time.time() - _hit[0] < 120:
+        return _hit[1]
+    res = await _is_m3u8_url_uncached(url)
+    if len(_M3U8_MEMO) > 100:
+        _M3U8_MEMO.clear()
+    _M3U8_MEMO[url] = (time.time(), res)
+    return res
+
+
+async def _is_m3u8_url_uncached(url: str) -> bool:
     """
     Check karo ki URL ek HLS (.m3u8) playlist hai ya nahi.
 
@@ -1833,7 +1848,7 @@ async def _is_m3u8_url(url: str) -> bool:
                 headers["Range"] = "bytes=0-1024"
                 async with sess.get(
                     url, headers=headers, allow_redirects=True,
-                    timeout=aiohttp.ClientTimeout(total=10)
+                    timeout=aiohttp.ClientTimeout(total=6)
                 ) as resp:
                     ctype = resp.headers.get("Content-Type", "").lower()
                     if "mpegurl" in ctype or "x-mpegurl" in ctype or "m3u8" in ctype:
@@ -1880,7 +1895,7 @@ async def _get_filename_from_url(url: str) -> str:
     # Step 1: HEAD request se Content-Disposition check karo
     try:
         async with aiohttp.ClientSession() as _sess:
-            async with _sess.head(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with _sess.head(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 cd = resp.headers.get("Content-Disposition", "")
                 if cd:
                     m = _re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\r\n]+)', cd, _re.IGNORECASE)
