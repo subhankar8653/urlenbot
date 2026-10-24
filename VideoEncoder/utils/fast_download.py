@@ -89,49 +89,192 @@ def _build_session(client, dc_id, auth_key, test_mode):
     return Session(**kw)
 
 
-async def _new_media_session(client: Client, dc_id: int) -> Session:
-    """Har call ek NAYA, independent session banata hai (shared cached
-    media_session use nahi karta) — taaki sach mein N alag connections ek
-    sath chal sakein, ek connection ki speed-cap se bachne ke liye."""
-    if dc_id != await client.storage.dc_id():
-        session = _build_session(
-            client, dc_id,
-            await Auth(client, dc_id, await client.storage.test_mode()).create(),
-            await client.storage.test_mode(),
-        )
-        await session.start()
-        for _ in range(6):
-            exported_auth = await client.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+# ════════════════════════════════════════════════════════════════════════
+#  Session pool — per (client, DC)
+#  ─────────────────────────────
+#  PEHLE: har download pe N naye sessions bante the, aur DC alag ho to HAR session ke
+#  liye alag auth.ExportAuthorization (+ 6x retry loop). Telegram ExportAuthorization
+#  pe bahut jaldi FloodWait deta hai (10s -> 240s...), isse:
+#    * download start hone mein 10+ sec lagte the (FloodWait ka chhupa hua sleep)
+#    * baad mein koi bhi doosra cross-DC kaam (thumbnail download_media wagairah)
+#      "420 FLOOD_WAIT auth.ExportAuthorization" se fail ho jata tha.
+#  AB:
+#    * Har DC ke liye ExportAuthorization SIRF EK BAAR (process mein), auth_key cache.
+#      Baaki saare sessions wahi authorized auth_key share karte hain (MTProto mein
+#      ek auth_key pe kai session allowed hain — home DC pe bhi yahi ho raha tha).
+#    * Sessions download ke baad band nahi hote — agli file/download pe turant reuse
+#      (idle IDLE_CLOSE sec baad band, RAM bachti hai).
+#    * Download pehla session ready hote hi shuru; baaki sessions chalte-chalte judte hain.
+# ════════════════════════════════════════════════════════════════════════
+IDLE_CLOSE = 120          # sec — idle pool ke sessions itni der baad band
+EXPORT_FLOOD_MAX_WAIT = 300
+
+
+class _DCPool:
+    def __init__(self, client: Client, dc_id: int):
+        self.client = client
+        self.dc_id = dc_id
+        self.sessions = []        # live Session objects
+        self.dead = set()
+        self.auth_key = None
+        self._spare = None        # export ke time bana session — pehle creator ko mil jata hai
+        self._lock = asyncio.Lock()
+        self.refs = 0
+        self._idle = None
+
+    # ── auth ──
+    async def _ensure_key(self):
+        if self.auth_key is not None:
+            return self.auth_key
+        async with self._lock:
+            if self.auth_key is not None:
+                return self.auth_key
+            client, dc_id = self.client, self.dc_id
+            test_mode = await client.storage.test_mode()
+            if dc_id == await client.storage.dc_id():
+                self.auth_key = await client.storage.auth_key()
+                return self.auth_key
+
+            # Library ne is DC ka media session pehle hi bana rakha ho to uska authorized key reuse
             try:
-                await session.send(raw.functions.auth.ImportAuthorization(
-                    id=exported_auth.id, bytes=exported_auth.bytes))
-                break
-            except AuthBytesInvalid:
-                continue
-        else:
-            await session.stop()
-            raise AuthBytesInvalid()
-    else:
-        session = _build_session(
-            client, dc_id, await client.storage.auth_key(),
-            await client.storage.test_mode(),
-        )
-        await session.start()
-    return session
+                lib = getattr(client, "media_sessions", None)
+                ls = lib.get(dc_id) if isinstance(lib, dict) else None
+                k = getattr(ls, "auth_key", None)
+                if k:
+                    self.auth_key = k
+                    return k
+            except Exception:
+                pass
+
+            key = await Auth(client, dc_id, test_mode).create()
+            tmp = _build_session(client, dc_id, key, test_mode)
+            await tmp.start()
+            try:
+                floods = 0
+                bad = 0
+                while True:
+                    try:
+                        exported = await client.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                        await tmp.send(raw.functions.auth.ImportAuthorization(
+                            id=exported.id, bytes=exported.bytes))
+                        break
+                    except AuthBytesInvalid:
+                        bad += 1
+                        if bad >= 3:
+                            raise
+                    except FloodWait as e:
+                        wait = getattr(e, "value", getattr(e, "x", 0)) or 0
+                        floods += 1
+                        if wait > EXPORT_FLOOD_MAX_WAIT or floods > 2:
+                            raise
+                        log.warning(f"[TGDL] ExportAuthorization FloodWait {wait}s (DC{dc_id}) — wait karke retry")
+                        await asyncio.sleep(wait + 1)
+            except BaseException:
+                try:
+                    await tmp.stop()
+                except Exception:
+                    pass
+                raise
+            self.auth_key = key
+            self._spare = tmp
+            return key
+
+    async def new_session(self) -> Session:
+        key = await self._ensure_key()
+        if self._spare is not None:
+            s, self._spare = self._spare, None
+            return s
+        s = _build_session(self.client, self.dc_id, key, await self.client.storage.test_mode())
+        await s.start()
+        return s
+
+    # ── pool state ──
+    def live(self):
+        return [s for s in self.sessions if s not in self.dead]
+
+    def add(self, s):
+        self.sessions.append(s)
+        if self.refs == 0:
+            self._schedule_idle()
+
+    def drop(self, s):
+        if s in self.dead:
+            return
+        self.dead.add(s)
+        asyncio.ensure_future(self._stop(s))
+
+    @staticmethod
+    async def _stop(s):
+        try:
+            await s.stop()
+        except Exception:
+            pass
+
+    def begin(self):
+        self.refs += 1
+        if self._idle:
+            self._idle.cancel()
+            self._idle = None
+
+    def end(self):
+        self.refs = max(0, self.refs - 1)
+        if self.refs == 0:
+            self._schedule_idle()
+
+    def _schedule_idle(self):
+        if self._idle:
+            self._idle.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._idle = loop.call_later(IDLE_CLOSE, lambda: asyncio.ensure_future(self.close(only_idle=True)))
+
+    async def close(self, only_idle=False):
+        if only_idle and self.refs > 0:
+            return
+        self._idle = None
+        ss = self.live()
+        self.sessions = []
+        self.dead.clear()
+        spare, self._spare = self._spare, None
+        if spare is not None:
+            ss.append(spare)
+        await asyncio.gather(*[self._stop(s) for s in ss], return_exceptions=True)
 
 
-async def _download_worker(session: Session, location, fd, queue: asyncio.Queue,
+def _pool_for(client: Client, dc_id: int) -> _DCPool:
+    pools = client.__dict__.setdefault("_fd_pools", {})
+    p = pools.get(dc_id)
+    if p is None:
+        p = pools[dc_id] = _DCPool(client, dc_id)
+    return p
+
+
+async def close_pools(client: Client):
+    """Client disconnect karne se pehle bulao (short-lived user client ke liye)."""
+    pools = client.__dict__.pop("_fd_pools", None) or {}
+    for p in pools.values():
+        if p._idle:
+            p._idle.cancel()
+        await p.close()
+
+
+async def _download_worker(pool: _DCPool, session: Session, location, fd, queue: asyncio.Queue,
                            progress_state: dict, lock: asyncio.Lock):
     """Shared queue se chunk uthata hai (work-stealing). Ek session par PIPELINE
     workers chalte hain => ek hi connection par kai GetFile request ek saath
     in-flight rehte hain, isse network latency (RTT) ka wait nahi hota."""
     while True:
+        if session in pool.dead:
+            return                      # session toota — baaki sessions kaam sambhal lenge
         try:
             idx = queue.get_nowait()
         except asyncio.QueueEmpty:
             return
         offset = idx * CHUNK_SIZE
         attempt = 0
+        floods = 0
         while True:
             try:
                 r = await session.send(
@@ -139,12 +282,17 @@ async def _download_worker(session: Session, location, fd, queue: asyncio.Queue,
                 )
                 break
             except FloodWait as e:
+                floods += 1
+                if floods > 5:
+                    queue.put_nowait(idx)
+                    raise
                 await asyncio.sleep(getattr(e, 'value', getattr(e, 'x', 5)))
             except Exception:
                 attempt += 1
                 if attempt >= MAX_RETRIES_PER_CHUNK:
-                    # Chunk wapas queue mein, taaki doosra (healthy) worker retry kare
+                    # Chunk wapas queue mein, taaki doosra (healthy) session retry kare
                     queue.put_nowait(idx)
+                    pool.drop(session)
                     raise
                 await asyncio.sleep(min(0.5 * (2 ** attempt), 4))
 
@@ -168,17 +316,9 @@ async def _parallel_download(client: Client, media, file_name: str,
     n_conn = max(1, min(connections, total_chunks, HARD_MAX_CONNECTIONS))
     location = _get_location(file_id_obj)
 
-    sessions = []
+    pool = _pool_for(client, file_id_obj.dc_id)
+    pool.begin()
     try:
-        # Saare sessions EK SAATH banao (pehle ek-ek karke bante the => start mein 5-15 sec waste)
-        made = await asyncio.gather(
-            *[_new_media_session(client, file_id_obj.dc_id) for _ in range(n_conn)],
-            return_exceptions=True)
-        sessions = [m for m in made if isinstance(m, Session)]
-        if not sessions:
-            raise RuntimeError(f"media sessions nahi ban paaye: {made[0]!r}")
-        n_conn = len(sessions)
-
         fd = os.open(file_name, os.O_CREAT | os.O_RDWR | os.O_TRUNC)
         try:
             os.ftruncate(fd, file_size)
@@ -194,29 +334,70 @@ async def _parallel_download(client: Client, media, file_name: str,
                         if asyncio.iscoroutine(res):
                             await res
                     try:
-                        await asyncio.wait_for(stop_reporting.wait(), timeout=3)
+                        await asyncio.wait_for(stop_reporting.wait(), timeout=1.0)
                     except asyncio.TimeoutError:
                         pass
 
+            # Reporter PEHLE — sessions ban rahe hain tab bhi user ko 0% progress turant dikhe
             reporter_task = asyncio.create_task(_reporter())
 
             queue = asyncio.Queue()
             for i in range(total_chunks):
                 queue.put_nowait(i)
 
+            workers = []
+            join_errors = []
+            closed = [False]
+
+            def _spawn(sess):
+                for _ in range(PIPELINE):
+                    workers.append(asyncio.ensure_future(
+                        _download_worker(pool, sess, location, fd, queue, progress_state, lock)))
+
+            async def _join():
+                try:
+                    s = await pool.new_session()
+                except Exception as e:
+                    join_errors.append(e)
+                    return
+                pool.add(s)
+                if not closed[0] and not queue.empty():
+                    _spawn(s)
+
             try:
-                results = await asyncio.gather(*[
-                    _download_worker(sessions[i % n_conn], location, fd, queue, progress_state, lock)
-                    for i in range(n_conn * PIPELINE)
-                ], return_exceptions=True)
+                # Pool mein jo sessions pehle se ready hain unse TURANT shuru (0s wait)
+                existing = pool.live()[:n_conn]
+                for s in existing:
+                    _spawn(s)
+                joins = [asyncio.ensure_future(_join()) for _ in range(n_conn - len(existing))]
+
+                # Agar koi ready session nahi tha, to pehla session ban-ne tak ruko — baaki chalte-chalte judenge
+                while not workers and any(not t.done() for t in joins):
+                    await asyncio.wait([t for t in joins if not t.done()], return_when=asyncio.FIRST_COMPLETED)
+                if not workers:
+                    raise RuntimeError(f"media sessions nahi ban paaye: {join_errors[:1]!r}")
+
+                while True:
+                    pend_w = [t for t in workers if not t.done()]
+                    pend_j = [t for t in joins if not t.done()]
+                    if not pend_w and (queue.empty() or not pend_j):
+                        break
+                    await asyncio.wait(pend_w + pend_j, return_when=asyncio.FIRST_COMPLETED)
+
                 # Koi worker mara bhi ho to baaki ne uska chunk utha liya hota hai; yahan
                 # sirf poori file ka verify karo, adhoori file kabhi "success" na maani jaye.
                 if len(progress_state['chunks']) < total_chunks:
-                    errs = [r for r in results if isinstance(r, Exception)]
+                    errs = [t.exception() for t in workers
+                            if t.done() and not t.cancelled() and t.exception()]
                     raise RuntimeError(
-                        f"{total_chunks - len(progress_state['chunks'])} chunk reh gaye: {errs[:1]!r}")
+                        f"{total_chunks - len(progress_state['chunks'])} chunk reh gaye: {(errs or join_errors)[:1]!r}")
             finally:
+                closed[0] = True
                 stop_reporting.set()
+                for t in workers:
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
                 try:
                     await reporter_task
                 except Exception:
@@ -231,11 +412,7 @@ async def _parallel_download(client: Client, media, file_name: str,
 
         return file_name
     finally:
-        for s in sessions:
-            try:
-                await s.stop()
-            except Exception:
-                pass
+        pool.end()     # sessions band nahi — agli download reuse karegi (idle pe band)
 
 
 def _labeled(progress_args, label):
