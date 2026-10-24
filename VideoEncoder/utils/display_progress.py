@@ -167,12 +167,20 @@ async def progress_for_url(downloader, msg):
         eta_str    = downloader.get_eta(human=True)
         pct        = downloader.get_progress() * 100
         bar        = _make_bar(pct)
+        engine_line = ""
+        try:                                   # TurboDL: "Turbo 12/16 conn" ya "SmartDL fallback (reason)"
+            _gi = getattr(downloader, "get_info", None)
+            if _gi:
+                engine_line = f"\n🔧 **Engine:** `{_gi()}`"
+        except Exception:
+            pass
         text = (
             f"⬇️ **Downloading...**\n\n"
             f"`{bar}` **{pct:.1f}%**\n\n"
             f"📦 **Size :** `{humanbytes(downloaded)}` / `{humanbytes(total)}`\n"
             f"⚡ **Speed:** `{speed_str}`\n"
             f"⏳ **ETA :** `{eta_str}`"
+            f"{engine_line}"
         )
         await msg.edit_text(text)
     except Exception:

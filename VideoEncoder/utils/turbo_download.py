@@ -2,34 +2,35 @@
 turbo_download.py — SmartDL ka tez, seedha replacement (sirf stdlib, naya requirement nahi)
 ============================================================================================
 
-SmartDL kyun slow padta tha:
-  * File ko pehle se FIXED hisson mein baant deta hai (har thread ka apna hissa). Jo thread
-    slow connection pe aaya woh sabse aakhir tak chalta hai, baaki threads khali baithe rehte
-    hain => end mein speed gir jaati hai.
-  * Parts alag-alag temp files mein likhta hai aur end mein sabko jodta hai (COMBINE): badi
-    file (200-500MB) ko disk pe DO baar likhna padta hai => download khatam hone ke baad bhi
-    kuch seconds extra (slow disk pe bahut zyada), aur disk bhi 2x chahiye.
-  * Har file ke apne 8-10 threads, koi global limit nahi: 4 quality ek saath = 32-40 connections.
+V2 (speed-decay fix) — "shuru mein tez, phir dheere dheere speed gir jaati hai" ka ilaaj:
 
-Yeh engine:
-  * File ek baar pre-allocate karta hai, har chunk seedha apni sahi offset pe pwrite hota hai
-    => combine step hai hi nahi, disk 1x.
-  * Chhote chunks (4MB) ki SHARED queue — koi thread slow ho to baaki zyada chunks utha lete
-    hain (work-stealing), end tak saare connections busy.
-  * Connection keep-alive: ek thread ek hi connection pe kai chunks leta hai (baar-baar TLS
-    handshake nahi).
-  * GLOBAL connection budget (profile.DL_CONN_MAX): saari files milake itne se zyada connection
-    nahi => host/CDN pe load control mein, har file ko barabar hissa.
-  * Chunk fail ho to usi chunk ko resume karke retry (jitna aa chuka tha utna dobara nahi).
-  * SAFE: range/size ka pata na chale, ya server Range na maane, ya koi bhi dikkat ho to
-    automatically pySmartDL pe fallback (purana tareeka) — download purane se kharab kabhi nahi.
+  PURANI BUGS (jo ab theek hain):
+  * Worker thread lagatar 5 fail ke baad HAMESHA ke liye mar jaata tha => parallel connections
+    ghatte rehte the => speed gir-ti jaati thi. Ab thread kabhi nahi marta; fail pe backoff + retry.
+  * Server 429/503/403 (too many connections) de to purana code poora download abort karke
+    pySmartDL pe RESTART kar deta tha (0% se, aur woh bhi dheema). Ab AUTO-THROTTLE: connections
+    ghata deta hai (cap), 20s shant rahe to dheere dheere wapas badhata hai.
+  * Beech mein koi connection atak jaye (0 bytes) => 60s stall watchdog sab connections recycle
+    karke SAME file pe resume karta hai (done chunks dobara nahi).
+  * Slow connection detection: jo connection baaki ke muqable 4x se zyada slow ho, use turant
+    badal diya jata hai (naya connection = full speed).
+  * Cancel (stop) karne par ab SmartDL fallback start nahi hota.
+  * Speed/ETA ab 1s sampling se (10s window) — jhatke nahi, ETA sahi.
+  * Progress msg me Engine line: "Turbo 12/16" ya "SmartDL fallback (reason)" => pata chal jaata hai
+    kaunsa engine chal raha hai.
 
-API SmartDL jaisi hai (isliye purana code bina badle chalta hai):
+Design (pehle jaisa):
+  * File ek baar pre-allocate, har chunk seedha apni offset pe pwrite => combine step nahi.
+  * 4MB chunks ki SHARED queue (work-stealing), connection keep-alive.
+  * GLOBAL connection budget (profile.DL_CONN_MAX) saari files ke liye.
+  * Range/size ka pata na chale to pySmartDL pe fallback (purana tareeka).
+
+API SmartDL jaisi hai:
     d = TurboDL(url, dest, request_args={"headers": {...}}, threads=8, timeout=30)
     d.start(blocking=False); d.isFinished(); d.isSuccessful(); d.get_dest(); d.get_dl_size();
-    d.get_speed(human=True); d.get_eta(human=True); d.get_progress(); d.get_errors()
+    d.get_speed(human=True); d.get_eta(human=True); d.get_progress(); d.get_errors(); d.get_info()
 
-Env: TURBO_DL=0 (band, seedha SmartDL), DOWNLOAD_CONN_MAX, DOWNLOAD_CHUNK_MB.
+Env: TURBO_DL=0 (band, seedha SmartDL), DOWNLOAD_CONN_MAX, DOWNLOAD_CHUNK_MB, TURBO_STALL_SEC.
 """
 import http.client
 import logging
@@ -45,12 +46,19 @@ LOGGER = logging.getLogger(__name__)
 
 ENABLED = os.getenv("TURBO_DL", "1") != "0"
 CHUNK = max(1, int(os.getenv("DOWNLOAD_CHUNK_MB", "4") or 4)) * 1024 * 1024
-READ_BLOCK = 1024 * 1024            # bada read => kam Python/GIL overhead (16 threads pe farq padta hai)
-MAX_CHUNKS_PER_CONN = 8            # itne chunk ke baad connection refresh (server per-connection throttle se bachav)
-SLOW_RATIO = 0.5                   # chunk speed fresh-connection speed ke is hisse se neeche => naya connection
+READ_BLOCK = 512 * 1024             # chhota block => slow-connection check jaldi hota hai
+MAX_CHUNKS_PER_CONN = 8             # itne chunk ke baad connection refresh (per-connection throttle se bachav)
+SLOW_RATIO = 0.5                    # chunk speed fresh-connection speed ke is hisse se neeche => naya connection
 MAX_REDIRECTS = 8
-MIN_SIZE = 8 * 1024 * 1024          # isse chhoti file => SmartDL/normal (overhead ka fayda nahi)
+MIN_SIZE = 8 * 1024 * 1024          # isse chhoti file => SmartDL/normal
 CHUNK_RETRIES = 6
+STALL_SEC = max(15, int(os.getenv("TURBO_STALL_SEC", "60") or 60))   # itni der 0 bytes => connections recycle
+MAX_ROUNDS = 8                      # bina progress ke itne recycle ke baad hi fallback
+RAMP_AFTER = 20                     # itne sec shant rahe to cap +1
+MIN_CAP = 2                         # auto-throttle itne se neeche nahi jaayega
+SLOW_CHECK_AFTER = 6.0              # connection ko itne sec do, phir baaki se compare
+SLOW_FACTOR = 0.25                  # conn speed < is hisse * avg-per-conn => badlo
+CONN_IDLE_SEC = 12.0                # ek connection pe itni der 0 bytes (baaki chal rahe hon) => band karke retry
 
 try:
     from .. import profile as _prof
@@ -70,7 +78,26 @@ class _NoRange(Exception):
 
 
 class _Fatal(Exception):
-    """Retry se theek nahi hoga (403/404...)."""
+    """Retry se theek nahi hoga (404/410/...)."""
+
+
+class _Throttle(Exception):
+    """Server bol raha hai 'dheere' (429/503/403 beech me) — connections ghatao, thoda ruko."""
+
+    def __init__(self, msg, retry_after=None):
+        super().__init__(msg)
+        try:
+            self.retry_after = min(30.0, float(retry_after)) if retry_after else None
+        except Exception:
+            self.retry_after = None
+
+
+class _Recycle(Exception):
+    """Round khatam / stop — chunk wapas queue mein rakho aur thread band karo."""
+
+
+class _Slow(Exception):
+    """Yeh connection baaki se bahut slow — naya connection lo (fail nahi gina jaata)."""
 
 
 def _human_size(n):
@@ -101,6 +128,31 @@ def _path(parsed):
     return p + ("?" + parsed.query if parsed.query else "")
 
 
+def _kill(conn):
+    """Doosre thread mein recv() pe atke connection ko jagao: pehle shutdown(), phir close()."""
+    try:
+        sk = getattr(conn, "sock", None)
+        if sk is not None:
+            try:
+                sk.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _drop(conn_box):
+    try:
+        if conn_box[0] is not None:
+            conn_box[0].close()
+    except Exception:
+        pass
+    conn_box[0] = None
+
+
 class _Job:
     """Ek file ki saari state; threads isi ko share karte hain."""
 
@@ -111,52 +163,88 @@ class _Job:
         self.headers.setdefault("User-Agent", "Mozilla/5.0")
         self.headers.setdefault("Accept-Encoding", "identity")      # compressed nahi — byte offsets sahi rahein
         self.threads = max(1, int(threads or 8))
-        self.timeout = timeout or 30
+        self.timeout = min(max(10, timeout or 30), 30)
         self.size = 0
         self.final_url = url
         self.done_bytes = 0
         self.lock = threading.Lock()
         self.queue = deque()
-        self.errors = []
-        self.abort = False
+        self.inflight = 0
+        self.errors = deque(maxlen=20)
+        self.abort = False             # hard stop (user stop / fatal)
+        self.recycle = False           # round khatam — workers chhodo, naye round mein resume
         self.fd = None
         self.t0 = time.time()
-        self._samples = deque(maxlen=12)       # (time, bytes) — smooth speed
+        self.cap = self.threads        # abhi kitne workers kaam kar sakte hain (auto-throttle)
+        self.boxes = []
+        self.last_progress = time.time()
+        self.last_throttle = 0.0
+        self.last_ramp = 0.0
+        self.fail_times = deque(maxlen=8)
+        self.consec403 = 0
+        self.speed = 0.0
+        self._samples = deque(maxlen=10)       # (time, bytes) — 1s ke gap pe, supervisor bharta hai
 
     # ── probe: size + range support + final URL (redirects follow) ──
     def probe(self):
+        last = None
+        for attempt in range(3):
+            try:
+                return self._probe_once()
+            except _NoRange:
+                raise
+            except Exception as e:                       # network hiccup — thoda ruk ke dobara
+                last = e
+                time.sleep(1.0 * (attempt + 1))
+        raise _NoRange(f"probe failed: {last!r}")
+
+    def _probe_once(self):
         url = self.url
-        for _ in range(MAX_REDIRECTS):
+        use_range = True
+        for _ in range(MAX_REDIRECTS + 2):
             p = urllib.parse.urlparse(url)
             if p.scheme not in ("http", "https") or not p.hostname:
                 raise _NoRange("unsupported url")
             conn = _connect(p, self.timeout)
             try:
                 h = dict(self.headers)
-                h["Range"] = "bytes=0-0"
+                if use_range:
+                    h["Range"] = "bytes=0-0"
+                else:
+                    h.pop("Range", None)
                 conn.request("GET", _path(p), headers=h)
                 r = conn.getresponse()
-                if r.status in (301, 302, 303, 307, 308):
+                st = r.status
+                if st in (301, 302, 303, 307, 308):
                     loc = r.getheader("Location")
                     r.read()
                     if not loc:
                         raise _NoRange("redirect without location")
                     url = urllib.parse.urljoin(url, loc)
                     continue
-                if r.status == 206:
+                if st == 206:
                     cr = r.getheader("Content-Range", "")          # bytes 0-0/12345
                     r.read()
                     try:
                         total = int(cr.rsplit("/", 1)[1])
                     except Exception:
                         raise _NoRange("bad content-range")
+                    if total <= 0:
+                        raise _NoRange("unknown size")
                     self.size, self.final_url = total, url
                     return
-                if r.status == 200:
+                if st == 200:
+                    # Range ignore kiya ya probe ke bina bheja gaya — Accept-Ranges + length se bharosa karo
+                    ar = (r.getheader("Accept-Ranges") or "").lower()
+                    cl = r.getheader("Content-Length") or ""
+                    if "bytes" in ar and cl.isdigit() and int(cl) > 0:
+                        self.size, self.final_url = int(cl), url
+                        return
                     raise _NoRange("server ignored Range")
-                if r.status in (401, 403, 404, 410):
-                    raise _NoRange(f"HTTP {r.status}")            # SmartDL/browser fallback decide karenge
-                raise _NoRange(f"HTTP {r.status}")
+                if use_range and st in (400, 403, 405, 416, 501):
+                    use_range = False                              # kuch servers Range probe pe bigadte hain
+                    continue
+                raise _NoRange(f"HTTP {st}")
             finally:
                 try:
                     conn.close()
@@ -180,9 +268,14 @@ class _Job:
                 pass
             self.fd = None
 
+    # ── shared state helpers ──
+    def err(self, msg):
+        self.errors.append(msg)
+
     def add_bytes(self, n):
         with self.lock:
             self.done_bytes += n
+            self.last_progress = time.time()
 
     def sub_bytes(self, n):
         with self.lock:
@@ -190,23 +283,98 @@ class _Job:
 
     def next_chunk(self):
         with self.lock:
-            return self.queue.popleft() if self.queue else None
+            if self.queue:
+                self.inflight += 1
+                return self.queue.popleft()
+            return None
+
+    def finish_chunk(self):
+        with self.lock:
+            self.inflight -= 1
 
     def put_back(self, idx):
         with self.lock:
             self.queue.appendleft(idx)
+            self.inflight -= 1
+
+    def all_done(self):
+        with self.lock:
+            return not self.queue and self.inflight == 0
+
+    def remaining(self):
+        with self.lock:
+            return len(self.queue) + self.inflight
+
+    def kill_conns(self):
+        with self.lock:
+            boxes = list(self.boxes)
+        for b in boxes:
+            try:
+                if b[0] is not None:
+                    _kill(b[0])
+            except Exception:
+                pass
+
+    def _kill_idle_conns(self, now_wall):
+        """Ek connection atak gaya (baaki chal rahe hain) => sirf use band karo, worker naye conn pe retry karega."""
+        now = time.monotonic()
+        with self.lock:
+            boxes = list(self.boxes)
+        for b in boxes:
+            try:
+                if b[4] and b[0] is not None and now - b[3] > CONN_IDLE_SEC:
+                    LOGGER.info("[TurboDL] atka hua connection band kiya — naya connection")
+                    b[3] = now
+                    _kill(b[0])
+            except Exception:
+                pass
+
+    def _sleep(self, sec):
+        end = time.time() + sec
+        while time.time() < end and not self.abort and not self.recycle:
+            time.sleep(0.2)
+
+    # ── auto-throttle ──
+    def throttle(self, why):
+        with self.lock:
+            now = time.time()
+            if now - self.last_throttle < 4:
+                return
+            self.last_throttle = now
+            new = max(MIN_CAP, int(self.cap * 0.75))
+            if new < self.cap:
+                LOGGER.warning(f"[TurboDL] server throttle ({why}) — connections {self.cap} -> {new}")
+                self.cap = new
+
+    def note_fail(self):
+        now = time.time()
+        self.fail_times.append(now)
+        if len(self.fail_times) >= 4 and now - self.fail_times[-4] < 10:
+            self.throttle("bahut saare connection errors")
 
     # ── ek chunk fetch (resume ke saath), connection reuse ──
     def fetch_chunk(self, conn_box, idx):
+        got = [0]
+        conn_box[3] = time.monotonic()
+        conn_box[4] = True
+        try:
+            return self._fetch_chunk(conn_box, idx, got)
+        except BaseException:
+            self.sub_bytes(got[0])        # chunk wapas queue mein jayega — dobara gino mat
+            raise
+        finally:
+            conn_box[4] = False
+
+    def _fetch_chunk(self, conn_box, idx, got):
         start = idx * CHUNK
         end = min(start + CHUNK, self.size) - 1
         pos = start
-        got_here = 0
         attempt = 0
+        slow_hits = 0
         t_chunk = time.monotonic()
         while pos <= end:
-            if self.abort:
-                raise _Fatal("aborted")
+            if self.abort or self.recycle:
+                raise _Recycle()
             p = urllib.parse.urlparse(self.final_url)
             try:
                 if conn_box[0] is None:
@@ -214,114 +382,205 @@ class _Job:
                     conn_box[1], conn_box[2] = 0.0, 0
                 h = dict(self.headers)
                 h["Range"] = f"bytes={pos}-{end}"
+                conn_box[3] = time.monotonic()
                 conn_box[0].request("GET", _path(p), headers=h)
                 r = conn_box[0].getresponse()
-                if r.status in (301, 302, 303, 307, 308):          # CDN ne final URL badal diya
+                conn_box[3] = time.monotonic()
+                st = r.status
+                if st in (301, 302, 303, 307, 308):               # CDN ne final URL badal diya
                     loc = r.getheader("Location")
                     r.read()
                     if loc:
                         self.final_url = urllib.parse.urljoin(self.final_url, loc)
-                    conn_box[0].close()
-                    conn_box[0] = None
+                    _drop(conn_box)
                     continue
-                if r.status != 206:
-                    r.read()
-                    if r.status in (401, 403, 404, 410) or r.status == 200:
-                        raise _Fatal(f"HTTP {r.status}")
-                    raise OSError(f"HTTP {r.status}")
+                if st != 206:
+                    ra = r.getheader("Retry-After")
+                    _drop(conn_box)                                # body mat padho (200 = poori file!)
+                    if st in (429, 503, 509):
+                        raise _Throttle(f"HTTP {st}", ra)
+                    if st == 403:
+                        if self.done_bytes > 0 and self.consec403 < 15:
+                            self.consec403 += 1
+                            raise _Throttle("HTTP 403", ra)
+                        raise _Fatal("HTTP 403")
+                    if st in (200, 401, 404, 410, 416):
+                        raise _Fatal(f"HTTP {st}")
+                    raise OSError(f"HTTP {st}")
+                self.consec403 = 0
+                t_req = time.monotonic()
+                got_req = 0
                 while pos <= end:
                     blk = r.read(min(READ_BLOCK, end - pos + 1))
                     if not blk:
                         raise OSError("connection closed early")
                     os.pwrite(self.fd, blk, pos)
-                    pos += len(blk)
-                    got_here += len(blk)
-                    self.add_bytes(len(blk))
-                    if self.abort:
-                        raise _Fatal("aborted")
-                if r.getheader("Connection", "").lower() == "close":
-                    conn_box[0].close()
-                    conn_box[0] = None
-            except _Fatal:
+                    n = len(blk)
+                    pos += n
+                    got[0] += n
+                    got_req += n
+                    self.add_bytes(n)
+                    conn_box[3] = time.monotonic()
+                    if self.abort or self.recycle:
+                        raise _Recycle()
+                    if pos <= end and slow_hits < 3:
+                        el = time.monotonic() - t_req
+                        if el >= SLOW_CHECK_AFTER:
+                            ref = self.speed / max(1, self.inflight)      # baaki connections ki avg speed
+                            if ref > 256 * 1024 and (got_req / el) < SLOW_FACTOR * ref:
+                                slow_hits += 1
+                                raise _Slow()
+                if (r.getheader("Connection", "") or "").lower() == "close":
+                    _drop(conn_box)
+            except (_Fatal, _Recycle, _Throttle):
                 raise
+            except _Slow:
+                _drop(conn_box)               # naya connection, attempt nahi gina
+                continue
             except Exception as e:
-                try:
-                    if conn_box[0] is not None:
-                        conn_box[0].close()
-                except Exception:
-                    pass
-                conn_box[0] = None
+                _drop(conn_box)
+                if self.abort or self.recycle:
+                    raise _Recycle()
                 attempt += 1
+                self.note_fail()
                 if attempt >= CHUNK_RETRIES:
-                    self.sub_bytes(got_here)     # chunk wapas queue mein jayega — dobara gino mat
                     raise
                 time.sleep(min(0.4 * (2 ** attempt), 5))
 
         # ── STABLE SPEED: connection health ──
         # Kai server/CDN ek hi connection pe kuch MB ke baad throttle kar dete hain (burst phir slow).
-        # Fresh connection ki chunk-speed yaad rakho; ab ki speed uske SLOW_RATIO se kam, ya connection
-        # MAX_CHUNKS_PER_CONN chunk purana ho gaya => band karo, agla chunk NAYE connection pe (full speed).
         try:
             dt = max(time.monotonic() - t_chunk, 0.001)
-            rate = got_here / dt
-            if attempt == 0 and got_here >= CHUNK // 2:
+            rate = got[0] / dt
+            if attempt == 0 and got[0] >= CHUNK // 2:
                 conn_box[2] += 1
                 if conn_box[1] <= 0:
                     conn_box[1] = rate
                 elif rate < SLOW_RATIO * conn_box[1] or conn_box[2] >= MAX_CHUNKS_PER_CONN:
-                    if conn_box[0] is not None:
-                        conn_box[0].close()
-                    conn_box[0] = None
+                    _drop(conn_box)
                     conn_box[1] = 0.0
                     conn_box[2] = 0
         except Exception:
             pass
-        return got_here
+        return got[0]
 
-    def worker(self):
-        conn_box = [None, 0.0, 0]       # [connection, fresh-connection chunk speed, chunks on this connection]
+    def worker(self, wid):
+        conn_box = [None, 0.0, 0, 0.0, False]   # [connection, fresh-conn chunk speed, chunks on conn, last activity, busy]
+        with self.lock:
+            self.boxes.append(conn_box)
         fails = 0
         try:
-            while not self.abort:
+            while not self.abort and not self.recycle:
+                if wid >= self.cap:                    # auto-throttle: is worker ko abhi aaram
+                    if self.all_done():
+                        return
+                    time.sleep(0.5)
+                    continue
                 idx = self.next_chunk()
                 if idx is None:
-                    return
-                failed = False
-                _SLOTS.acquire()
+                    if self.all_done():
+                        return
+                    time.sleep(0.2)                    # koi aur ka chunk fail hua to main utha lunga
+                    continue
+                got_slot = False
+                while not got_slot:
+                    got_slot = _SLOTS.acquire(timeout=1)
+                    if not got_slot and (self.abort or self.recycle):
+                        self.put_back(idx)
+                        return
+                wait = 0.0
                 try:
                     self.fetch_chunk(conn_box, idx)
+                    self.finish_chunk()
                     fails = 0
+                except _Recycle:
+                    self.put_back(idx)
+                    return
                 except _Fatal as e:
                     self.put_back(idx)
-                    self.errors.append(str(e))
+                    self.err(str(e))
                     self.abort = True
                     return
-                except Exception as e:
-                    # Chunk wapas queue mein. Thread PEHLE ek error pe hamesha ke liye mar jaata tha =>
-                    # parallel connections ghatte rehte the => speed gir-ti jaati thi. Ab naye connection
-                    # pe dobara koshish; lagatar 5 baar fail hone par hi thread band.
+                except _Throttle as e:
                     self.put_back(idx)
-                    self.errors.append(repr(e))
+                    self.err(str(e))
+                    self.throttle(str(e))
                     fails += 1
-                    failed = True
-                    try:
-                        if conn_box[0] is not None:
-                            conn_box[0].close()
-                    except Exception:
-                        pass
-                    conn_box[0], conn_box[1], conn_box[2] = None, 0.0, 0
+                    wait = e.retry_after or min(2.0 + fails * 2, 15.0)
+                except Exception as e:
+                    # Thread KABHI nahi marta — pehle 5 fail pe mar jaata tha => speed girti thi.
+                    self.put_back(idx)
+                    self.err(repr(e))
+                    fails += 1
+                    _drop(conn_box)
+                    wait = min(1.0 * fails, 8.0)
                 finally:
                     _SLOTS.release()
-                if failed:
-                    if fails >= 5:
-                        return
-                    time.sleep(min(1.0 * fails, 5))
+                if wait:
+                    self._sleep(wait)
         finally:
+            _drop(conn_box)
+
+    # ── supervisor: workers chalao, speed sample karo, stall pe recycle, throttle ke baad ramp-up ──
+    def run(self):
+        rounds = 0
+        while True:
+            rounds += 1
+            before = self.done_bytes
+            self.recycle = False
+            n = max(1, min(self.threads, self.remaining(), _CONN_MAX))
+            self.cap = min(self.cap, n)
+            self.cap = max(self.cap, min(n, MIN_CAP))
+            with self.lock:
+                self.boxes = []
+            ths = [threading.Thread(target=self.worker, args=(i,), name=f"turbo-dl-w{i}", daemon=True)
+                   for i in range(n)]
+            self.last_progress = time.time()
+            for t in ths:
+                t.start()
+            last_sample = 0.0
+            while any(t.is_alive() for t in ths):
+                time.sleep(0.25)
+                now = time.time()
+                if now - last_sample >= 1.0:
+                    last_sample = now
+                    self._samples.append((now, self.done_bytes))
+                    if len(self._samples) >= 2:
+                        t0, b0 = self._samples[0]
+                        if now - t0 > 0.5:
+                            self.speed = max(0.0, (self.done_bytes - b0) / (now - t0))
+                if (self.cap < n and now - max(self.last_throttle, self.last_ramp) > RAMP_AFTER):
+                    self.cap += 1
+                    self.last_ramp = now
+                if not self.abort and not self.recycle and now - self.last_progress > STALL_SEC \
+                        and not self.all_done():
+                    LOGGER.warning(f"[TurboDL] {STALL_SEC}s se koi byte nahi aaya — connections recycle")
+                    self.err("stalled")
+                    self.recycle = True
+                    self.kill_conns()
+                if self.abort:
+                    self.kill_conns()
+                else:
+                    self._kill_idle_conns(now)
+            for t in ths:
+                t.join()
+            if self.abort or self.all_done():
+                return
+            if self.done_bytes > before:
+                rounds = 0                                   # progress hua — recycle ginti reset
+            if rounds >= MAX_ROUNDS:
+                return
+            # URL/redirect refresh (token wale CDN ke liye) — best effort
             try:
-                if conn_box[0] is not None:
-                    conn_box[0].close()
+                old = self.size
+                self.probe()
+                if self.size != old:
+                    self.err("file size badal gaya")
+                    self.abort = True
+                    return
             except Exception:
                 pass
+            self.recycle = False
 
 
 class TurboDL:
@@ -340,7 +599,9 @@ class TurboDL:
         self._ok = False
         self._errors = []
         self._fb = None                     # pySmartDL fallback object
+        self._fb_reason = ""
         self._started = False
+        self._stopped = False
 
     # ── public API ──
     def start(self, blocking=True):
@@ -386,6 +647,17 @@ class TurboDL:
                 pass
         return list(self._errors)
 
+    def get_info(self):
+        """Progress msg ke liye: kaunsa engine + kitne connection."""
+        if self._fb is not None:
+            r = (self._fb_reason or "")[:45]
+            return f"SmartDL fallback ({r})" if r else "SmartDL fallback"
+        j = self._job
+        if j:
+            act = min(j.inflight, j.cap)
+            return f"Turbo {act}/{j.cap} conn" + (" ⚠️throttled" if j.cap < j.threads else "")
+        return "Turbo (starting)"
+
     def get_dl_size(self, human=False):
         if self._fb is not None:
             return self._fb.get_dl_size(human=human)
@@ -412,14 +684,11 @@ class TurboDL:
         j = self._job
         sp = 0.0
         if j:
-            now = time.time()
-            j._samples.append((now, j.done_bytes))
-            if len(j._samples) >= 2:
-                t0, b0 = j._samples[0]
-                if now - t0 > 0.05:
-                    sp = max(0.0, (j.done_bytes - b0) / (now - t0))
-            elif now - j.t0 > 0.05:
-                sp = j.done_bytes / (now - j.t0)
+            sp = j.speed
+            if sp <= 0:                                     # shuru ke 1-2 sec: simple average
+                el = time.time() - j.t0
+                if el > 0.2:
+                    sp = j.done_bytes / el
         return f"{_human_size(sp)}/s" if human else sp
 
     def get_eta(self, human=False):
@@ -438,6 +707,7 @@ class TurboDL:
         return "[" + "#" * n + "-" * (length - n) + "]"
 
     def stop(self):
+        self._stopped = True
         if self._fb is not None:
             try:
                 self._fb.stop()
@@ -445,9 +715,11 @@ class TurboDL:
                 pass
         if self._job:
             self._job.abort = True
+            self._job.kill_conns()
 
     # ── internals ──
     def _run(self):
+        job = None
         try:
             if not ENABLED:
                 raise _NoRange("TURBO_DL=0")
@@ -457,22 +729,21 @@ class TurboDL:
                 raise _NoRange(f"small file ({job.size})")
             self._job = job
             job.prepare()
-            n_threads = min(job.threads, len(job.queue), _CONN_MAX)
             with _ACTIVE_LOCK:
                 _ACTIVE.add(self)
             try:
-                ths = [threading.Thread(target=job.worker, name=f"turbo-dl-w{i}", daemon=True)
-                       for i in range(n_threads)]
-                for t in ths:
-                    t.start()
-                for t in ths:
-                    t.join()
+                job.run()
             finally:
                 with _ACTIVE_LOCK:
                     _ACTIVE.discard(self)
                 job.close_fd()
-            if job.queue or job.abort or job.done_bytes < job.size:
-                self._errors = job.errors[-3:] or ["incomplete"]
+            if self._stopped:                                  # user ne cancel kiya — fallback nahi
+                self._errors = ["stopped"]
+                self._ok = False
+                self._finished.set()
+                return
+            if not job.all_done() or job.abort or job.done_bytes < job.size:
+                self._errors = list(job.errors)[-3:] or ["incomplete"]
                 raise _NoRange("incomplete: " + "; ".join(self._errors))
             try:
                 if os.path.getsize(self.dest) != job.size:
@@ -489,17 +760,22 @@ class TurboDL:
             reason = str(e)
         except Exception as e:                                       # noqa: BLE001
             reason = repr(e)
+        if self._stopped:
+            self._finished.set()
+            return
         # ── fallback: purana SmartDL ──
-        if self._job is not None:
-            self._job.abort = True
-            self._job.close_fd()
+        if job is not None:
+            job.abort = True
+            job.kill_conns()
+            job.close_fd()
         self._job = None
         try:
             if os.path.isfile(self.dest):
                 os.remove(self.dest)
         except Exception:
             pass
-        LOGGER.info(f"[TurboDL] fallback to SmartDL ({reason})")
+        self._fb_reason = reason
+        LOGGER.warning(f"[TurboDL] fallback to SmartDL ({reason}) url={self.url[:120]}")
         try:
             from pySmartDL import SmartDL
             fb = SmartDL(self.url, self.dest, progress_bar=False, threads=self.threads,
