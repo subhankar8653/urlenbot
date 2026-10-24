@@ -196,6 +196,13 @@ async def rename_text_input(bot: Client, message: Message):
 
     _rename_sessions.pop(user_id, None)
 
+    if text != "-" and not os.path.isfile(session["filepath"]):
+        await message.reply(
+            "⚠️ <b>File server se hat chuki hai</b> (bot restart / cleanup ki wajah se).\n"
+            "Kripya file pe reply karke dobara <code>/rename</code> bhejo."
+        )
+        return
+
     if text == "-":
         await message.reply("❌ Cancelled.")
         try:

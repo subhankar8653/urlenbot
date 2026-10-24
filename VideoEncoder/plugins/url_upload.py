@@ -671,6 +671,17 @@ async def url_upload_callbacks(bot: Client, cb: CallbackQuery):
     msg = session["msg"]
     original_message = session["message"]
 
+    # File gayab ho gayi (restart / cleanup)? — beech mein crash/chup hone ki jagah saaf msg
+    if action != "cancel" and not os.path.exists(filepath):
+        _url_sessions.pop(owner_id, None)
+        await cb.answer("⚠️ File server se hat chuki hai", show_alert=True)
+        try:
+            await msg.edit("⚠️ <b>File ab server pe nahi hai</b> (restart/cleanup ki wajah se).\n"
+                           "Kripya <code>/url</code> dobara bhejo.")
+        except Exception:
+            pass
+        return
+
     # ── Upload as-is ──────────────────────────────────────────────────────────
     if action == "upload":
         await cb.answer()
@@ -852,7 +863,13 @@ async def url_upload_callbacks(bot: Client, cb: CallbackQuery):
             await _show_url_options(msg, owner_id, filepath)
             return
         new_path = os.path.join(os.path.dirname(filepath), new_name)
-        os.rename(filepath, new_path)
+        try:
+            os.rename(filepath, new_path)
+        except Exception as e:
+            LOGGER.error(f"Name swap rename failed: {e}")
+            await cb.answer(f"❌ Rename failed: {e}", show_alert=True)
+            await _show_url_options(msg, owner_id, filepath)
+            return
         session["filepath"] = new_path
         _url_sessions[owner_id] = session
         await cb.answer(f"✅ Renamed: {new_name}", show_alert=True)
