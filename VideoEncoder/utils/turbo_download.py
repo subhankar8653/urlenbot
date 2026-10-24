@@ -45,7 +45,9 @@ LOGGER = logging.getLogger(__name__)
 
 ENABLED = os.getenv("TURBO_DL", "1") != "0"
 CHUNK = max(1, int(os.getenv("DOWNLOAD_CHUNK_MB", "4") or 4)) * 1024 * 1024
-READ_BLOCK = 256 * 1024
+READ_BLOCK = 1024 * 1024            # bada read => kam Python/GIL overhead (16 threads pe farq padta hai)
+MAX_CHUNKS_PER_CONN = 8            # itne chunk ke baad connection refresh (server per-connection throttle se bachav)
+SLOW_RATIO = 0.5                   # chunk speed fresh-connection speed ke is hisse se neeche => naya connection
 MAX_REDIRECTS = 8
 MIN_SIZE = 8 * 1024 * 1024          # isse chhoti file => SmartDL/normal (overhead ka fayda nahi)
 CHUNK_RETRIES = 6
@@ -201,6 +203,7 @@ class _Job:
         pos = start
         got_here = 0
         attempt = 0
+        t_chunk = time.monotonic()
         while pos <= end:
             if self.abort:
                 raise _Fatal("aborted")
@@ -208,6 +211,7 @@ class _Job:
             try:
                 if conn_box[0] is None:
                     conn_box[0] = _connect(p, self.timeout)
+                    conn_box[1], conn_box[2] = 0.0, 0
                 h = dict(self.headers)
                 h["Range"] = f"bytes={pos}-{end}"
                 conn_box[0].request("GET", _path(p), headers=h)
@@ -249,32 +253,69 @@ class _Job:
                 conn_box[0] = None
                 attempt += 1
                 if attempt >= CHUNK_RETRIES:
+                    self.sub_bytes(got_here)     # chunk wapas queue mein jayega — dobara gino mat
                     raise
                 time.sleep(min(0.4 * (2 ** attempt), 5))
+
+        # ── STABLE SPEED: connection health ──
+        # Kai server/CDN ek hi connection pe kuch MB ke baad throttle kar dete hain (burst phir slow).
+        # Fresh connection ki chunk-speed yaad rakho; ab ki speed uske SLOW_RATIO se kam, ya connection
+        # MAX_CHUNKS_PER_CONN chunk purana ho gaya => band karo, agla chunk NAYE connection pe (full speed).
+        try:
+            dt = max(time.monotonic() - t_chunk, 0.001)
+            rate = got_here / dt
+            if attempt == 0 and got_here >= CHUNK // 2:
+                conn_box[2] += 1
+                if conn_box[1] <= 0:
+                    conn_box[1] = rate
+                elif rate < SLOW_RATIO * conn_box[1] or conn_box[2] >= MAX_CHUNKS_PER_CONN:
+                    if conn_box[0] is not None:
+                        conn_box[0].close()
+                    conn_box[0] = None
+                    conn_box[1] = 0.0
+                    conn_box[2] = 0
+        except Exception:
+            pass
         return got_here
 
     def worker(self):
-        conn_box = [None]
+        conn_box = [None, 0.0, 0]       # [connection, fresh-connection chunk speed, chunks on this connection]
+        fails = 0
         try:
             while not self.abort:
                 idx = self.next_chunk()
                 if idx is None:
                     return
+                failed = False
                 _SLOTS.acquire()
                 try:
                     self.fetch_chunk(conn_box, idx)
+                    fails = 0
                 except _Fatal as e:
                     self.put_back(idx)
                     self.errors.append(str(e))
                     self.abort = True
                     return
                 except Exception as e:
-                    # ye thread haar gaya — chunk wapas queue mein, doosre thread le lenge
+                    # Chunk wapas queue mein. Thread PEHLE ek error pe hamesha ke liye mar jaata tha =>
+                    # parallel connections ghatte rehte the => speed gir-ti jaati thi. Ab naye connection
+                    # pe dobara koshish; lagatar 5 baar fail hone par hi thread band.
                     self.put_back(idx)
                     self.errors.append(repr(e))
-                    return
+                    fails += 1
+                    failed = True
+                    try:
+                        if conn_box[0] is not None:
+                            conn_box[0].close()
+                    except Exception:
+                        pass
+                    conn_box[0], conn_box[1], conn_box[2] = None, 0.0, 0
                 finally:
                     _SLOTS.release()
+                if failed:
+                    if fails >= 5:
+                        return
+                    time.sleep(min(1.0 * fails, 5))
         finally:
             try:
                 if conn_box[0] is not None:

@@ -19,6 +19,7 @@ import inspect
 import logging
 import math
 import os
+import statistics
 import time
 import traceback
 
@@ -106,7 +107,7 @@ def _build_session(client, dc_id, auth_key, test_mode):
 #      (idle IDLE_CLOSE sec baad band, RAM bachti hai).
 #    * Download pehla session ready hote hi shuru; baaki sessions chalte-chalte judte hain.
 # ════════════════════════════════════════════════════════════════════════
-IDLE_CLOSE = 120          # sec — idle pool ke sessions itni der baad band
+IDLE_CLOSE = int(os.getenv('TGDL_IDLE_CLOSE', '600'))   # sec — idle pool ke sessions itni der baad band
 EXPORT_FLOOD_MAX_WAIT = 300
 
 
@@ -302,6 +303,8 @@ async def _download_worker(pool: _DCPool, session: Session, location, fd, queue:
             async with lock:
                 progress_state['done'] += len(r.bytes)
                 progress_state['chunks'].add(idx)
+                sb = progress_state['sess_bytes']
+                sb[session] = sb.get(session, 0) + len(r.bytes)
 
 
 async def _parallel_download(client: Client, media, file_name: str,
@@ -323,7 +326,7 @@ async def _parallel_download(client: Client, media, file_name: str,
         try:
             os.ftruncate(fd, file_size)
 
-            progress_state = {'done': 0, 'chunks': set()}
+            progress_state = {'done': 0, 'chunks': set(), 'sess_bytes': {}}
             lock = asyncio.Lock()
             stop_reporting = asyncio.Event()
 
@@ -348,6 +351,7 @@ async def _parallel_download(client: Client, media, file_name: str,
             workers = []
             join_errors = []
             closed = [False]
+            heal = [0]
 
             def _spawn(sess):
                 for _ in range(PIPELINE):
@@ -371,6 +375,61 @@ async def _parallel_download(client: Client, media, file_name: str,
                     _spawn(s)
                 joins = [asyncio.ensure_future(_join()) for _ in range(n_conn - len(existing))]
 
+                # ── STABLE SPEED monitor ──
+                # Download ke beech mein kuch sessions/connections slow ho jaate hain (Telegram per-connection
+                # throttle / toota hua route) aur total speed dheere dheere gir jaati hai. Har 4s check:
+                #   (a) koi session baaki sessions ke median se <35% speed pe => use hata ke NAYA session
+                #   (b) total speed peak ke 50% se neeche 12s+ => saare purane sessions refresh (naye connection
+                #       shuru mein full speed dete hain)
+                # Naya session pool ke cached auth_key se banta hai (ExportAuthorization dobara nahi).
+                async def _monitor():
+                    t_prev = time.monotonic()
+                    t_start = t_prev
+                    b_prev = {}
+                    tot_prev = 0
+                    peak = 0.0
+                    low_since = None
+                    last_refresh = t_prev
+                    while not stop_reporting.is_set():
+                        try:
+                            await asyncio.wait_for(stop_reporting.wait(), timeout=4)
+                            return
+                        except asyncio.TimeoutError:
+                            pass
+                        now = time.monotonic()
+                        dt = max(now - t_prev, 0.1)
+                        sb = progress_state['sess_bytes']
+                        tot = progress_state['done']
+                        agg = (tot - tot_prev) / dt
+                        rates = {s: (sb.get(s, 0) - b_prev.get(s, 0)) / dt
+                                 for s in list(sb) if s not in pool.dead}
+                        b_prev = dict(sb)
+                        tot_prev, t_prev = tot, now
+                        if queue.empty() or now - t_start < 8:
+                            continue
+                        peak = max(peak * 0.995, agg)
+                        victims = []
+                        if len(rates) >= 3:
+                            med = statistics.median(rates.values())
+                            if med > 0:
+                                victims = [s for s, r in rates.items() if r < 0.35 * med]
+                        if peak > 1.5 * 1048576 and agg < 0.5 * peak:
+                            low_since = low_since or now
+                            if now - low_since >= 12 and now - last_refresh >= 20:
+                                victims = list(rates)
+                                last_refresh = now
+                                low_since = None
+                        else:
+                            low_since = None
+                        for s in victims[:max(1, n_conn)]:
+                            log.info(f"[TGDL] slow session refresh (agg {agg / 1048576:.1f} MB/s, peak {peak / 1048576:.1f})")
+                            pool.drop(s)
+                            joins.append(asyncio.ensure_future(_join()))
+                        if victims:
+                            peak = agg   # naya baseline
+
+                monitor_task = asyncio.ensure_future(_monitor())
+
                 # Agar koi ready session nahi tha, to pehla session ban-ne tak ruko — baaki chalte-chalte judenge
                 while not workers and any(not t.done() for t in joins):
                     await asyncio.wait([t for t in joins if not t.done()], return_when=asyncio.FIRST_COMPLETED)
@@ -381,6 +440,12 @@ async def _parallel_download(client: Client, media, file_name: str,
                     pend_w = [t for t in workers if not t.done()]
                     pend_j = [t for t in joins if not t.done()]
                     if not pend_w and (queue.empty() or not pend_j):
+                        # Saare workers mar gaye (session drop/refresh) par chunks baaki => naya session
+                        if not queue.empty() and heal[0] < 3:
+                            heal[0] += 1
+                            joins.append(asyncio.ensure_future(_join()))
+                            await asyncio.sleep(0)
+                            continue
                         break
                     await asyncio.wait(pend_w + pend_j, return_when=asyncio.FIRST_COMPLETED)
 
@@ -394,6 +459,10 @@ async def _parallel_download(client: Client, media, file_name: str,
             finally:
                 closed[0] = True
                 stop_reporting.set()
+                try:
+                    monitor_task.cancel()
+                except Exception:
+                    pass
                 for t in workers:
                     if not t.done():
                         t.cancel()
@@ -413,6 +482,34 @@ async def _parallel_download(client: Client, media, file_name: str,
         return file_name
     finally:
         pool.end()     # sessions band nahi — agli download reuse karegi (idle pe band)
+
+
+async def prewarm(client: Client, message=None, dc_id: int = None, connections: int = DEFAULT_CONNECTIONS):
+    """Download shuru hone se PEHLE sessions taiyar (command aate hi bulao). Chupchap fail ho jaata hai.
+    message do (file ka DC khud nikal lenge) ya seedha dc_id."""
+    try:
+        if dc_id is None and message is not None:
+            media = message.video or message.document or message.audio
+            if not media:
+                return
+            dc_id = FileId.decode(media.file_id).dc_id
+        if dc_id is None:
+            dc_id = await client.storage.dc_id()
+        pool = _pool_for(client, dc_id)
+        n = max(1, min(connections, HARD_MAX_CONNECTIONS)) - len(pool.live())
+        if n <= 0:
+            return
+        pool.begin()
+        try:
+            res = await asyncio.gather(*[pool.new_session() for _ in range(n)], return_exceptions=True)
+            for r in res:
+                if isinstance(r, Session):
+                    pool.add(r)
+        finally:
+            pool.end()
+    except Exception as e:
+        log.debug(f"[TGDL] prewarm skipped: {e!r}")
+
 
 
 def _labeled(progress_args, label):
