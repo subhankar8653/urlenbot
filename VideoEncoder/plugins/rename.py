@@ -26,6 +26,7 @@ Metadata + Thumbnail:
     woh bhi auto-apply hogi.
 """
 
+import asyncio
 import os
 import re
 import time
@@ -36,6 +37,7 @@ from pyrogram.types import Message
 from .. import LOGGER, download_dir
 from ..utils.database.access_db import db
 from ..utils.database.add_user import AddUserToDatabase
+from ..utils import job_ctl
 from ..utils.helper import check_chat
 from ..utils.display_progress import progress_for_pyrogram
 from ..utils.fast_download import fast_download
@@ -87,31 +89,36 @@ async def rename_cmd(bot: Client, message: Message):
 
     status = await message.reply("<b>💠 Downloading...</b>")
 
-    filepath = await _download_replied_file(bot, replied, status)
-    if not filepath:
-        await status.edit("❌ Download failed ya unsupported file type.")
-        return
+    # Download + rename + upload — ❌ Cancel button ke saath
+    async def _rename_body(pm):
+        filepath = await _download_replied_file(bot, replied, pm)
+        if not filepath:
+            await pm.edit("❌ Download failed ya unsupported file type.")
+            return
 
-    if inline_name:
-        # Caption seedha diya gaya hai — koi prompt nahi, direct rename
-        await _do_rename_and_upload(bot, user_id, filepath, inline_name, message, status)
-        return
+        if inline_name:
+            # Caption seedha diya gaya hai — koi prompt nahi, direct rename
+            await _do_rename_and_upload(bot, user_id, filepath, inline_name, message, pm)
+            return
 
-    # Interactive: naya naam poocho
-    orig_ext = os.path.splitext(filepath)[1].lstrip(".") or "original"
-    _rename_sessions[user_id] = {
-        "filepath": filepath,
-        "message": message,
-        "msg": status,
-    }
-    await status.edit(
-        "✅ <b>File download ho gayi!</b>\n\n"
-        f"Original: <code>{os.path.basename(filepath)}</code>\n\n"
-        "Ab <b>naya filename</b> bhejo.\n"
-        f"<i>Extension nahi doge to <code>.{orig_ext}</code> hi rahega, "
-        "de doge (e.g. .mkv/.mp4/...) to usi mein convert ho jaayega.</i>\n\n"
-        "<i>Cancel karne ke liye <code>-</code> bhejo.</i>"
-    )
+        # Interactive: naya naam poocho (yahan Cancel button nahi — download ho chuka, ab sirf naam chahiye)
+        orig_ext = os.path.splitext(filepath)[1].lstrip(".") or "original"
+        _rename_sessions[user_id] = {
+            "filepath": filepath,
+            "message": message,
+            "msg": status,
+        }
+        await pm.edit(
+            "✅ <b>File download ho gayi!</b>\n\n"
+            f"Original: <code>{os.path.basename(filepath)}</code>\n\n"
+            "Ab <b>naya filename</b> bhejo.\n"
+            f"<i>Extension nahi doge to <code>.{orig_ext}</code> hi rahega, "
+            "de doge (e.g. .mkv/.mp4/...) to usi mein convert ho jaayega.</i>\n\n"
+            "<i>Cancel karne ke liye <code>-</code> bhejo.</i>",
+            reply_markup=None,
+        )
+
+    await job_ctl.run_cancelable(status, user_id, "Rename", _rename_body)
 
 
 async def _download_replied_file(bot: Client, replied: Message, status: Message) -> "str | None":
@@ -127,6 +134,9 @@ async def _download_replied_file(bot: Client, replied: Message, status: Message)
         return None
 
     file_path = os.path.join(download_dir, fname)
+    _jb = job_ctl.CURRENT.get()
+    if _jb is not None:
+        _jb.dirs.add(file_path)      # ❌ Cancel pe adhoori file delete
     try:
         path = await fast_download(
             client=bot,
@@ -164,7 +174,10 @@ async def rename_text_input(bot: Client, message: Message):
             pass
         return
 
-    await _do_rename_and_upload(bot, user_id, session["filepath"], text, session["message"], session["msg"])
+    async def _rn_body(pm):
+        await _do_rename_and_upload(bot, user_id, session["filepath"], text, session["message"], pm)
+
+    await job_ctl.run_cancelable(session["msg"], user_id, "Rename", _rn_body)
 
 
 # ─── Extension resolver ─────────────────────────────────────────────────────
@@ -268,7 +281,11 @@ async def _upload_renamed_file(bot: Client, filepath: str, new_filename: str, ex
                 )
             else:
                 band_text = await get_community_tag(user_id)
-                thumb_path = await get_tmdb_thumbnail(filepath, download_dir, band_text=band_text)
+                try:
+                    thumb_path = await asyncio.wait_for(
+                        get_tmdb_thumbnail(filepath, download_dir, band_text=band_text), timeout=12)
+                except Exception:
+                    thumb_path = None     # TMDB slow / fail — seedha ffmpeg frame, upload na ruke
                 if not thumb_path:
                     thumb_path = get_thumbnail(filepath, download_dir, duration / 4 if duration else 0, band_text=band_text)
             width, height = get_width_height(filepath) or (0, 0)

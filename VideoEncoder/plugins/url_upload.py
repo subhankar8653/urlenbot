@@ -30,6 +30,7 @@ from pyrogram.types import (
 )
 
 from .. import LOGGER, data, download_dir, encode_dir
+from ..utils import job_ctl
 from ..utils.community import get_community_name, get_community_tag
 from ..utils.database.access_db import db
 from ..utils.database.add_user import AddUserToDatabase
@@ -112,80 +113,85 @@ async def url_upload_cmd(bot: Client, message: Message):
 
     msg = await message.reply("<b>💠 Downloading...</b>")
 
-    # Download chalte-chalte Telegram upload connection + sessions taiyar (pehle upload ke
-    # time "connection ban raha hai" ka wait aata tha). Fail ho to chupchap ignore.
-    try:
-        from ..utils.uploads.telegram import prewarm_uploader
-        asyncio.ensure_future(prewarm_uploader(message.from_user.id))
-    except Exception:
-        pass
+    # Poora kaam (download → process → upload) ❌ Cancel button ke saath
+    async def _url_body(msg):
 
-    try:
-        filepath = await _download_url(url, custom_name, msg, message)
-    except Exception as e:
-        await msg.edit(f"❌ Download failed: <code>{e}</code>")
-        return
+        # Download chalte-chalte Telegram upload connection + sessions taiyar (pehle upload ke
+        # time "connection ban raha hai" ka wait aata tha). Fail ho to chupchap ignore.
+        try:
+            from ..utils.uploads.telegram import prewarm_uploader
+            asyncio.ensure_future(prewarm_uploader(message.from_user.id))
+        except Exception:
+            pass
 
-    if not filepath or not os.path.isfile(filepath):
-        await msg.edit("❌ Download failed or file not found.")
-        return
-
-    # ── ZIP/Archive extract ────────────────────────────────────────────────────
-    if extract_zip:
-        await msg.edit("<b>📦 Extracting archive...</b>")
-        # FIX: ab ALL files return hongi (list), sirf ek nahi
-        all_files = await _extract_archive_all(filepath, msg)
-        if not all_files:
+        try:
+            filepath = await _download_url(url, custom_name, msg, message)
+        except Exception as e:
+            await msg.edit(f"❌ Download failed: <code>{e}</code>")
             return
 
-        total = len(all_files)
+        if not filepath or not os.path.isfile(filepath):
+            await msg.edit("❌ Download failed or file not found.")
+            return
+
+        # ── ZIP/Archive extract ────────────────────────────────────────────────────
+        if extract_zip:
+            await msg.edit("<b>📦 Extracting archive...</b>")
+            # FIX: ab ALL files return hongi (list), sirf ek nahi
+            all_files = await _extract_archive_all(filepath, msg)
+            if not all_files:
+                return
+
+            total = len(all_files)
+
+            if show_buttons:
+                # -vt mode: sirf pehli file ke liye buttons dikhao
+                filepath = all_files[0]
+                user_id = message.from_user.id
+                _url_sessions[user_id] = {
+                    "filepath": filepath,
+                    "msg": msg,
+                    "orig_name": os.path.basename(filepath),
+                    "message": message,
+                    # Remaining files queue mein
+                    "zip_queue": all_files[1:],
+                }
+                await _show_url_options(msg, user_id, filepath)
+            else:
+                # Auto mode: SAARI files process + upload karo (urlpreset settings apply hongi)
+                await msg.edit(f"<b>📦 Extracted {total} files! Processing...</b>")
+                user_id = message.from_user.id
+                for idx, fp in enumerate(all_files, 1):
+                    status_msg = await message.reply(
+                        f"<b>⚙️ [{idx}/{total}] Processing:</b> <code>{os.path.basename(fp)}</code>"
+                    )
+                    _url_sessions[user_id] = {
+                        "filepath": fp,
+                        "msg": status_msg,
+                        "orig_name": os.path.basename(fp),
+                        "message": message,
+                        "has_eng_sub": False,
+                    }
+                    # urlpreset ki saari settings apply hongi _auto_process_and_upload mein
+                    await _auto_process_and_upload(bot, user_id, status_msg, message)
+                await msg.delete()
+            return
+
+        # ── Single file flow (no zip) ──────────────────────────────────────────────
+        user_id = message.from_user.id
+        _url_sessions[user_id] = {
+            "filepath": filepath,
+            "msg": msg,
+            "orig_name": os.path.basename(filepath),
+            "message": message,
+        }
 
         if show_buttons:
-            # -vt mode: sirf pehli file ke liye buttons dikhao
-            filepath = all_files[0]
-            user_id = message.from_user.id
-            _url_sessions[user_id] = {
-                "filepath": filepath,
-                "msg": msg,
-                "orig_name": os.path.basename(filepath),
-                "message": message,
-                # Remaining files queue mein
-                "zip_queue": all_files[1:],
-            }
             await _show_url_options(msg, user_id, filepath)
         else:
-            # Auto mode: SAARI files process + upload karo (urlpreset settings apply hongi)
-            await msg.edit(f"<b>📦 Extracted {total} files! Processing...</b>")
-            user_id = message.from_user.id
-            for idx, fp in enumerate(all_files, 1):
-                status_msg = await message.reply(
-                    f"<b>⚙️ [{idx}/{total}] Processing:</b> <code>{os.path.basename(fp)}</code>"
-                )
-                _url_sessions[user_id] = {
-                    "filepath": fp,
-                    "msg": status_msg,
-                    "orig_name": os.path.basename(fp),
-                    "message": message,
-                    "has_eng_sub": False,
-                }
-                # urlpreset ki saari settings apply hongi _auto_process_and_upload mein
-                await _auto_process_and_upload(bot, user_id, status_msg, message)
-            await msg.delete()
-        return
+            await _auto_process_and_upload(bot, user_id, msg, message)
 
-    # ── Single file flow (no zip) ──────────────────────────────────────────────
-    user_id = message.from_user.id
-    _url_sessions[user_id] = {
-        "filepath": filepath,
-        "msg": msg,
-        "orig_name": os.path.basename(filepath),
-        "message": message,
-    }
-
-    if show_buttons:
-        await _show_url_options(msg, user_id, filepath)
-    else:
-        await _auto_process_and_upload(bot, user_id, msg, message)
+    await job_ctl.run_cancelable(msg, message.from_user.id, "URL Upload", _url_body)
 
 
 # ─── Auto-process (saved settings ke hisaab se) ───────────────────────────────
@@ -667,9 +673,13 @@ async def url_upload_callbacks(bot: Client, cb: CallbackQuery):
     # ── Upload as-is ──────────────────────────────────────────────────────────
     if action == "upload":
         await cb.answer()
-        await _do_upload(bot, filepath, original_message, msg, has_eng_sub=session.get("has_eng_sub", False))
-        # FIX: zip_queue process karo upload ke baad
-        await _process_zip_queue(bot, owner_id, original_message)
+
+        async def _up_body(pm):
+            await _do_upload(bot, filepath, original_message, pm, has_eng_sub=session.get("has_eng_sub", False))
+            # FIX: zip_queue process karo upload ke baad
+            await _process_zip_queue(bot, owner_id, original_message)
+
+        await job_ctl.run_cancelable(msg, owner_id, "URL Upload", _up_body)
 
     # ── Cancel ────────────────────────────────────────────────────────────────
     elif action == "cancel":
@@ -1994,6 +2004,13 @@ async def _download_m3u8(url: str, filepath: str, msg: Message, cookie_header: s
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    job_ctl.register_proc(proc)      # ❌ Cancel pe ffmpeg bhi kill
+    try:
+        _jb2 = job_ctl.CURRENT.get()
+        if _jb2 is not None:
+            _jb2.dirs.add(filepath)
+    except Exception:
+        pass
 
     last_edit = time.time()
 
@@ -2100,10 +2117,15 @@ async def _download_url(url: str, filename: str, msg: Message, orig_message: Mes
         from ..utils.display_progress import progress_for_url
         # TurboDL: work-stealing chunks, direct pwrite (combine step nahi), global connection
         # budget; kuch bhi dikkat ho to khud pySmartDL pe fallback (same API).
+        from .. import profile as _prof
         downloader = TurboDL(
-            url, filepath, progress_bar=False, threads=10,
+            url, filepath, progress_bar=False, threads=_prof.DOWNLOAD_THREADS,   # VPS tier ke hisaab se (big = 16)
             request_args={"headers": headers},
         )
+        _jb = job_ctl.CURRENT.get()
+        if _jb is not None:        # ❌ Cancel: downloader band + adhoori file delete
+            _jb.progresses.append({"phase": "download", "dls": {"url": downloader}})
+            _jb.dirs.add(filepath)
         downloader.start(blocking=False)
         while not downloader.isFinished():
             await progress_for_url(downloader, msg)
@@ -2194,6 +2216,7 @@ async def _ffmpeg_process(input_path: str, output_path: str, extra_args: list, m
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    job_ctl.register_proc(proc)      # ❌ Cancel pe ffmpeg bhi kill
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
         LOGGER.error(f"FFmpeg error: {stderr.decode()}")
