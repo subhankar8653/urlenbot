@@ -527,8 +527,29 @@ class _Job:
         finally:
             _drop(conn_box)
 
+    def _flusher(self):
+        """Har 3s: likha data disk pe flush + page-cache khali => container RAM (cache) nahi bharti,
+        badi file pe 'atak ke restart' (OOM) nahi hota."""
+        while not self._flush_stop.wait(3.0):
+            fd = self.fd
+            if fd is None:
+                continue
+            try:
+                os.fdatasync(fd)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            except Exception:
+                pass
+
     # ── supervisor: workers chalao, speed sample karo, stall pe recycle, throttle ke baad ramp-up ──
     def run(self):
+        self._flush_stop = threading.Event()
+        threading.Thread(target=self._flusher, name="turbo-dl-flush", daemon=True).start()
+        try:
+            self._run_rounds()
+        finally:
+            self._flush_stop.set()
+
+    def _run_rounds(self):
         rounds = 0
         while True:
             rounds += 1

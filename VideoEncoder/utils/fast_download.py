@@ -15,6 +15,7 @@ message.download() pe fallback ho jata hai — download kabhi fail nahi
 hota, sirf speed thoda kam mil sakta hai.
 """
 import asyncio
+import errno
 import inspect
 import logging
 import math
@@ -41,6 +42,9 @@ DEFAULT_CONNECTIONS = _prof.TG_DL_CONN     # tier ke hisaab se (profile.py / env
 PIPELINE = _prof.TG_DL_PIPE                # har connection par in-flight requests
 HARD_MAX_CONNECTIONS = 32
 MAX_RETRIES_PER_CHUNK = 3
+STALL_TIMEOUT = int(os.getenv("TGDL_STALL_SEC", "60"))     # itni der 0 bytes => sessions badal ke SAME jagah se resume
+RESUME_TRIES = 3                                           # Turbo layer itni baar resume karega (0% se restart nahi)
+FLUSH_EVERY = float(os.getenv("TGDL_FLUSH_SEC", "2.5"))    # 0 = band. Likhe hue data ko disk pe flush + page-cache khali
 
 
 def _get_location(file_id: FileId):
@@ -329,7 +333,11 @@ async def _download_worker(pool: _DCPool, session: Session, location, fd, queue:
 
             if idx not in chunks and isinstance(r, raw.types.upload.File) and r.bytes:
                 # disk write thread mein — event loop (Telegram I/O) kabhi block nahi hota
-                await asyncio.to_thread(os.pwrite, fd, r.bytes, offset)
+                try:
+                    await asyncio.to_thread(os.pwrite, fd, r.bytes, offset)
+                except OSError as e:
+                    progress_state['disk_err'] = e      # disk full / IO error — retry se theek nahi hota
+                    raise
                 if idx not in chunks:
                     async with lock:
                         progress_state['done'] += len(r.bytes)
@@ -346,9 +354,19 @@ async def _download_worker(pool: _DCPool, session: Session, location, fd, queue:
                 inflight[idx] = n
 
 
+def _flush_cache(fd):
+    """Likha hua data disk pe + uska page-cache turant wapas OS ko (container RAM nahi bharti)."""
+    os.fdatasync(fd)
+    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+
+
 async def _parallel_download(client: Client, media, file_name: str,
                              progress_callback=None, progress_args=(),
-                             connections: int = DEFAULT_CONNECTIONS):
+                             connections: int = DEFAULT_CONNECTIONS,
+                             shared: dict = None, fresh: bool = False):
+    """shared={'chunks':set,'done':int}: pichhli koshish ke complete chunks — resume ke liye
+    (file dobara truncate nahi hoti, sirf bache hue chunks aate hain). fresh=True: purane sessions
+    chhod ke naye banao (hung/slow sessions se bachne ke liye)."""
     file_id_obj = FileId.decode(media.file_id)
     file_size = media.file_size or 0
     if file_size <= 0:
@@ -360,12 +378,25 @@ async def _parallel_download(client: Client, media, file_name: str,
 
     pool = _pool_for(client, file_id_obj.dc_id)
     pool.begin()
+    if shared is None:
+        shared = {'chunks': set(), 'done': 0}
+    resumed = bool(shared['chunks']) and os.path.isfile(file_name)
+    if not resumed:
+        shared['chunks'].clear()
+        shared['done'] = 0
+    if fresh:
+        for _s in list(pool.live()):
+            pool.drop(_s)
     try:
-        fd = os.open(file_name, os.O_CREAT | os.O_RDWR | os.O_TRUNC)
+        fd = os.open(file_name, os.O_CREAT | os.O_RDWR | (0 if resumed else os.O_TRUNC))
         try:
-            os.ftruncate(fd, file_size)
+            if not resumed:
+                os.ftruncate(fd, file_size)
 
-            progress_state = {'done': 0, 'chunks': set(), 'sess_bytes': {}, 'inflight': {}, 'total': total_chunks, 'evt': asyncio.Event()}
+            progress_state = {'done': shared['done'], 'chunks': shared['chunks'], 'sess_bytes': {},
+                              'inflight': {}, 'total': total_chunks, 'evt': asyncio.Event()}
+            if len(shared['chunks']) >= total_chunks:
+                progress_state['evt'].set()
             lock = asyncio.Lock()
             stop_reporting = asyncio.Event()
 
@@ -385,7 +416,22 @@ async def _parallel_download(client: Client, media, file_name: str,
 
             queue = asyncio.Queue()
             for i in range(total_chunks):
-                queue.put_nowait(i)
+                if i not in progress_state['chunks']:          # resume: jo aa chuka wo dobara nahi
+                    queue.put_nowait(i)
+
+            async def _flusher():
+                while not stop_reporting.is_set():
+                    try:
+                        await asyncio.wait_for(stop_reporting.wait(), timeout=FLUSH_EVERY)
+                        return
+                    except asyncio.TimeoutError:
+                        pass
+                    try:
+                        await asyncio.to_thread(_flush_cache, fd)
+                    except Exception:
+                        pass
+
+            flusher_task = asyncio.ensure_future(_flusher()) if FLUSH_EVERY > 0 else None
 
             workers = []
             join_errors = []
@@ -399,7 +445,7 @@ async def _parallel_download(client: Client, media, file_name: str,
 
             async def _join():
                 try:
-                    s = await pool.new_session()
+                    s = await asyncio.wait_for(pool.new_session(), 25)    # session.start() atke to forever wait nahi
                 except Exception as e:
                     join_errors.append(e)
                     return
@@ -469,7 +515,7 @@ async def _parallel_download(client: Client, media, file_name: str,
                                 low_since = None
                         else:
                             low_since = None
-                        for s in victims[:max(1, n_conn)]:
+                        for s in victims[:max(2, n_conn // 3)]:     # ek saath sab nahi — kuch chalte rahein
                             log.info(f"[TGDL] slow session refresh (agg {agg / 1048576:.1f} MB/s, peak {peak / 1048576:.1f})")
                             pool.drop(s)
                             joins.append(asyncio.ensure_future(_join()))
@@ -485,9 +531,12 @@ async def _parallel_download(client: Client, media, file_name: str,
                     raise RuntimeError(f"media sessions nahi ban paaye: {join_errors[:1]!r}")
 
                 evt_task = asyncio.ensure_future(progress_state['evt'].wait())
+                last_done, last_move = progress_state['done'], time.monotonic()
                 while True:
                     if len(progress_state['chunks']) >= total_chunks:
                         break       # poori file aa gayi — atke hue (hung) request ka wait nahi
+                    if progress_state.get('disk_err'):
+                        break
                     pend_w = [t for t in workers if not t.done()]
                     pend_j = [t for t in joins if not t.done()]
                     if not pend_w and (queue.empty() or not pend_j):
@@ -498,10 +547,17 @@ async def _parallel_download(client: Client, media, file_name: str,
                             await asyncio.sleep(0)
                             continue
                         break
-                    await asyncio.wait(pend_w + pend_j + [evt_task], return_when=asyncio.FIRST_COMPLETED)
+                    await asyncio.wait(pend_w + pend_j + [evt_task], timeout=5,
+                                       return_when=asyncio.FIRST_COMPLETED)
+                    if progress_state['done'] != last_done:
+                        last_done, last_move = progress_state['done'], time.monotonic()
+                    elif time.monotonic() - last_move > STALL_TIMEOUT:
+                        raise RuntimeError(f"stall: {STALL_TIMEOUT}s se koi data nahi aaya")
 
                 # Koi worker mara bhi ho to baaki ne uska chunk utha liya hota hai; yahan
                 # sirf poori file ka verify karo, adhoori file kabhi "success" na maani jaye.
+                if progress_state.get('disk_err'):
+                    raise progress_state['disk_err']
                 if len(progress_state['chunks']) < total_chunks:
                     errs = [t.exception() for t in workers
                             if t.done() and not t.cancelled() and t.exception()]
@@ -522,10 +578,14 @@ async def _parallel_download(client: Client, media, file_name: str,
                     if not t.done():
                         t.cancel()
                 await asyncio.gather(*workers, return_exceptions=True)
+                shared['done'] = progress_state['done']          # resume ke liye yaad rakho
                 try:
                     await reporter_task
                 except Exception:
                     pass
+                if flusher_task is not None:
+                    flusher_task.cancel()
+                    await asyncio.gather(flusher_task, return_exceptions=True)
         finally:
             os.close(fd)
 
@@ -675,16 +735,30 @@ async def fast_download(client: Client, message: Message, file_name: str,
         dt = max(0.1, time.time() - t0)
         log.info(f"[TGDL] {mode} OK | {size / 1048576:.1f} MB in {dt:.1f}s = {size / 1048576 / dt:.2f} MB/s")
 
-    try:
-        r = await _parallel_download(
-            client, media, file_name, progress_callback=progress_callback,
-            progress_args=_labeled(progress_args, f"⚡ Turbo ({connections}x{PIPELINE}) Downloading..."),
-            connections=connections)
-        _done("turbo-sessions")
-        return r
-    except Exception as e:
-        log.error(f"[TGDL] Layer-1 (turbo sessions) FAIL: {e!r}\n{traceback.format_exc()}")
-        _rm(file_name)
+    # Layer-1: Turbo sessions — fail/stall hone par SAME jagah se RESUME (0% se restart nahi)
+    shared = {'chunks': set(), 'done': 0}
+    for attempt in range(RESUME_TRIES):
+        label = f"⚡ Turbo ({connections}x{PIPELINE}) Downloading..." + (f" ♻️ resume {attempt}" if attempt else "")
+        try:
+            r = await _parallel_download(
+                client, media, file_name, progress_callback=progress_callback,
+                progress_args=_labeled(progress_args, label),
+                connections=connections, shared=shared, fresh=attempt > 0)
+            _done("turbo-sessions")
+            return r
+        except OSError as e:
+            if e.errno in (errno.ENOSPC, errno.EDQUOT):
+                log.error(f"[TGDL] DISK FULL — download roka gaya: {e!r}")
+                _rm(file_name)
+                return None                      # doosre layers bhi isi disk pe likhenge — fayda nahi
+            log.error(f"[TGDL] Layer-1 try {attempt + 1}/{RESUME_TRIES} OSError: {e!r}")
+        except Exception as e:
+            log.error(f"[TGDL] Layer-1 try {attempt + 1}/{RESUME_TRIES} FAIL "
+                      f"({len(shared['chunks'])} chunks safe): {e!r}\n{traceback.format_exc()}")
+        if attempt < RESUME_TRIES - 1:
+            await asyncio.sleep(2)
+    log.error("[TGDL] Layer-1 (turbo sessions) resume ke baad bhi FAIL — Layer-2")
+    _rm(file_name)
 
     try:
         r = await _range_download(
