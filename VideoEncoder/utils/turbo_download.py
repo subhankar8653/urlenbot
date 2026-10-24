@@ -217,14 +217,20 @@ class _Job:
                 st = r.status
                 if st in (301, 302, 303, 307, 308):
                     loc = r.getheader("Location")
-                    r.read()
+                    try:
+                        r.read()
+                    except Exception:
+                        pass
                     if not loc:
                         raise _NoRange("redirect without location")
                     url = urllib.parse.urljoin(url, loc)
                     continue
                 if st == 206:
                     cr = r.getheader("Content-Range", "")          # bytes 0-0/12345
-                    r.read()
+                    try:
+                        r.read()                                   # 1 byte body — kuch servers bheje bina conn band kar dete hain
+                    except Exception:
+                        pass                                       # header mil gaya, body ki zarurat nahi
                     try:
                         total = int(cr.rsplit("/", 1)[1])
                     except Exception:
