@@ -49,6 +49,14 @@ ROUTINE_IDLE_BEFORE_RESTART = int(os.getenv("JANITOR_ROUTINE_IDLE_SEC", "900"))
 _idle_since = None
 _started = False
 
+# ── FIX: user ke input ka intezar karte sessions (/rename naam, /url options menu) ──
+# Bug: download khatam hote hi job_ctl.JOBS khali => bot "idle" dikhta tha. User naam likhne mein
+# 2-3 min lagaye to janitor (a) file ko "stale" maan ke DELETE kar deta tha (idle 10 min) ya
+# (b) RAM/disk emergency pe soft-restart (execv) kar deta tha => rename beech mein "restart".
+# Ab: jab tak session zinda hai (default 45 min) uski file safe + bot busy.
+SESSION_HOLD_MIN = float(os.getenv("JANITOR_SESSION_HOLD_MIN", "45"))
+_sess_seen: dict = {}      # (kind, uid, filepath) -> pehli baar kab dikha
+
 # ── Restart guard (FIX: baar-baar restart loop) ─────────────────────────
 # Bug tha: os.execv process ko replace karta hai par PID SAME rehta hai,
 # isliye psutil create_time() kabhi reset nahi hota tha => uptime hamesha
@@ -273,10 +281,47 @@ def _recent_file_activity(window: int = 300) -> bool:
     return False
 
 
+def _live_session_paths() -> set:
+    """Wo files jinke liye user ka jawab/click pending hai (SESSION_HOLD_MIN tak)."""
+    now = time.time()
+    srcs = []
+    try:
+        from ..plugins import rename as _rn
+        srcs.append(("rn", _rn._rename_sessions))
+    except Exception:
+        pass
+    try:
+        from ..plugins import url_upload as _uu
+        srcs.append(("url", _uu._url_sessions))
+    except Exception:
+        pass
+    live, current = set(), set()
+    for kind, d in srcs:
+        try:
+            items = list(d.items())
+        except Exception:
+            continue
+        for uid, sess in items:
+            fp = sess.get("filepath") if isinstance(sess, dict) else None
+            if not fp:
+                continue
+            key = (kind, uid, fp)
+            current.add(key)
+            first = _sess_seen.setdefault(key, now)
+            if now - first < SESSION_HOLD_MIN * 60:
+                live.add(os.path.abspath(fp))
+    for k in list(_sess_seen):          # khatam hue sessions bhool jao
+        if k not in current:
+            _sess_seen.pop(k, None)
+    return live
+
+
 def is_busy() -> bool:
     """Koi bhi kaam chal raha hai? (queue, auto-upload, Swift/Rti/Adh chrome
     downloads, ffmpeg, mega, ya recent file activity)"""
     if data:
+        return True
+    if _live_session_paths():           # user rename/options ka jawab de raha hai
         return True
     try:
         from ..plugins.upload_control import _active
@@ -312,14 +357,19 @@ def is_busy() -> bool:
 
 
 # ── cleanup steps ───────────────────────────────────────────────────────
-def clean_dirs(min_idle: int) -> int:
-    """download_dir / encode_dir ki wo entries hatao jo min_idle sec se idle hain."""
+def clean_dirs(min_idle: int, protect: bool = True) -> int:
+    """download_dir / encode_dir ki wo entries hatao jo min_idle sec se idle hain.
+    protect=True: jin files pe user ka rename/options session pending hai wo nahi hatengi."""
     freed, now = 0, time.time()
+    prot = _live_session_paths() if protect else set()
     for base in (download_dir, encode_dir):
         if not base or not os.path.isdir(base):
             continue
         for name in os.listdir(base):
             path = os.path.join(base, name)
+            ap = os.path.abspath(path)
+            if prot and any(q == ap or q.startswith(ap + os.sep) for q in prot):
+                continue
             if now - _entry_mtime(path) > min_idle:
                 freed += _remove(path)
     return freed
@@ -391,7 +441,7 @@ def run_cleanup(force: bool = False) -> dict:
     idle_limit = 60 if force else (AGGRESSIVE_IDLE if low else STALE_AFTER)
     if not force and not is_busy():
         idle_limit = min(idle_limit, 600)   # bot khali hai => 10 min purana sab kachra
-    freed = clean_dirs(idle_limit) + clean_tmp()
+    freed = clean_dirs(idle_limit, protect=not force) + clean_tmp()
     clean_logs()
     killed = kill_orphan_browsers(CHROME_MAX_AGE if is_busy() else CHROME_IDLE_AGE)
     trim_memory()
