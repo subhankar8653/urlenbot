@@ -32,6 +32,7 @@ from .. import LOGGER
 CURRENT = contextvars.ContextVar("suhani_current_job", default=None)
 JOBS: dict = {}
 FINISHED: dict = {}   # khatam hue deletable jobs (ledger ke saath) — Delete button ke liye
+RECHECKS: dict = {}   # timeout hue jobs jinpe "🔄 Re-check" button abhi bhi kaam karta hai
 
 EDIT_GAP = 3.0          # card ko itne second se zyada baar edit nahi karte (FloodWait se bachao)
 MAX_LINES = 6
@@ -145,7 +146,11 @@ class Job:
         self.admin_chat = None       # is chat ke ADMINS bhi Cancel / Delete dabा sakte hain
         self.deletable = False       # True => card pe 🗑 Delete button + ledger tracking
         self.ledger: list = []       # [(chat_id, message_id)] — is job ne jo bhi channel pe post kiya
-        self.meta: dict = {}         # extra (channels, anime ...) — delete ke time kaam aata hai
+        self.meta: dict = {}         # extra (channels, anime, community ...) — delete ke time kaam aata hai
+        # 🔄 Re-check button (auto-monitor): poller soye hue ho to turant jagao
+        self.can_recheck = False     # True => card pe "🔄 Re-check" button (job chalte waqt)
+        self.recheck_ev = None       # asyncio.Event — button dabane par set hota hai
+        self.recheck_items: list = []  # timeout ke baad dobara chalane wale async callables
 
     # ── quota ──
     async def _quota_wait_text(self, pos, reason):
@@ -206,6 +211,10 @@ class Job:
                 lines.append(f"▸ **{s.label}**\n{body}")
             else:
                 lines.append(_compact(s.text))
+        comm = (self.meta or {}).get("community")
+        if comm:
+            lines.append("")
+            lines.append(f"Community :- {comm}")
         return "\n".join(lines)[:3900]
 
     # ── ledger (channel pe jo post hua uska hisaab — Delete button isi se chalta hai) ──
@@ -238,11 +247,18 @@ class Job:
     def _delete_btn(self):
         return InlineKeyboardButton("🗑 Delete uploads", callback_data=f"jd_{self.id}")
 
+    def _recheck_btn(self, label="🔄 Re-check"):
+        return InlineKeyboardButton(label, callback_data=f"jr_{self.id}")
+
     def final_markup(self):
-        """Process khatam/cancel ke baad: sirf Delete button (agar kuch post hua ho)."""
+        """Process khatam/cancel ke baad: Delete button (agar kuch post hua ho) +
+        Re-check button (agar timeout ho gaya aur kuch qualities baaki hain)."""
+        rows = []
         if self.deletable and self.ledger:
-            return InlineKeyboardMarkup([[self._delete_btn()]])
-        return None
+            rows.append([self._delete_btn()])
+        if self.recheck_items and not self.cancelled:
+            rows.append([self._recheck_btn("🔄 Re-check (baaki qualities)")])
+        return InlineKeyboardMarkup(rows) if rows else None
 
     def markup(self):
         if self.finished or self.cancelled:
@@ -250,7 +266,10 @@ class Job:
         row = [InlineKeyboardButton("❌ Cancel", callback_data=f"jc_{self.id}")]
         if self.deletable and self.ledger:
             row.append(self._delete_btn())
-        return InlineKeyboardMarkup([row])
+        rows = [row]
+        if self.can_recheck:                      # Cancel/Delete ke NICHE
+            rows.append([self._recheck_btn("🔄 Re-check abhi")])
+        return InlineKeyboardMarkup(rows)
 
     # ── card edit (throttled) ──
     def touch(self, force=False):
@@ -524,6 +543,15 @@ def track_id(chat_id, msg_id):
     job = CURRENT.get()
     if job is not None:
         job.track(chat_id, msg_id)
+
+
+def register_recheck(job):
+    """Timeout hue job ko Re-check button ke liye yaad rakho (max 20)."""
+    if job is None or not job.recheck_items:
+        return
+    RECHECKS[job.id] = job
+    while len(RECHECKS) > 20:
+        RECHECKS.pop(next(iter(RECHECKS)), None)
 
 
 async def acquire_quota(count):
