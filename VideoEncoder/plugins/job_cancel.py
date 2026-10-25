@@ -12,6 +12,7 @@ Kaun dabा sakta hai:
   Pehle confirm poochta hai (✅ Haan / ↩️ Nahi). Job abhi chal raha ho to pehle cancel hota hai.
 """
 import asyncio
+import time
 
 from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
@@ -90,8 +91,15 @@ async def job_recheck_cb(client: Client, cb: CallbackQuery):
             if ev is None or not job.can_recheck:
                 await cb.answer("Abhi re-check ka time nahi hai — thodi der baad try karo.", show_alert=True)
                 return
+            _t = time.strftime("%H:%M:%S", time.gmtime(time.time() + 19800))   # IST
+            if (job.meta or {}).get("phase") == "checking":
+                job.meta["rc_note"] = (f"🔄 Re-check queued ({_t} IST) — abhi ek check chal raha hai, "
+                                       f"uske turant baad dobara hoga")
+            else:
+                job.meta["rc_note"] = f"🔄 Re-check ho raha hai... ({_t} IST)"
             ev.set()
-            await cb.answer("🔄 Dobara check ho raha hai...")
+            job.touch(force=True)
+            await cb.answer("🔄 Re-check ho raha hai...")
             return
 
         rj = job_ctl.RECHECKS.get(jid)

@@ -470,6 +470,62 @@ async def _send_season_intro(client: Client, channel_id: int, anime_name: str, s
 #  tarah download + upload karo, channel pe
 #  send karo, update_post trigger karo.
 # ─────────────────────────────────────────────
+def _ist_now() -> str:
+    return time.strftime("%H:%M:%S", time.gmtime(time.time() + 19800))
+
+
+_BAR_LINE_RE = re.compile(r"^.*\d+(?:\.\d+)?\s*%.*$", re.M)
+
+
+def _bar_line(text: str) -> str:
+    """Upload card text se sirf progress-bar wali line (bar + %) nikalo."""
+    m = _BAR_LINE_RE.search(text or "")
+    return m.group(0).strip() if m else ""
+
+
+class _ChannelLive:
+    """
+    Jis channel pe file upload hogi, wahan ek live message: SIRF Download + Upload progress bar
+    (aur kuch nahi). Kaam khatam / cancel hote hi message delete ho jaata hai.
+    """
+    def __init__(self, client, chat_id):
+        self.client = client
+        self.chat_id = chat_id
+        self.msg = None
+        self.last = ""
+        self.dead = False          # bot channel mein post nahi kar sakta => chupchaap band
+
+    async def update(self, text: str):
+        if self.dead or not text or text == self.last:
+            return
+        try:
+            if self.msg is None:
+                self.msg = await self.client.send_message(
+                    self.chat_id, text, disable_notification=True)
+            else:
+                await self.msg.edit(text)
+            self.last = text
+        except Exception as e:
+            es = str(e)
+            if "MESSAGE_NOT_MODIFIED" in es:
+                self.last = text
+            elif "FLOOD" in es.upper() or "wait of" in es:
+                pass
+            elif "MESSAGE_ID_INVALID" in es or "MESSAGE_DELETE" in es:
+                self.msg = None
+            else:
+                LOGGER.warning(f"[AutoMonitor] channel live msg off ({self.chat_id}): {e}")
+                self.dead = True
+
+    async def clear(self):
+        m, self.msg, self.last = self.msg, None, ""
+        if m is not None:
+            try:
+                await m.delete()
+            except Exception:
+                pass
+
+
 async def _episode_quality_poller(
     client: Client,
     log_message: Message,
@@ -492,18 +548,24 @@ async def _episode_quality_poller(
     """Wrapper: card pe '🔄 Re-check' button lagata hai (poll chalte waqt), phir asli poller chalata hai."""
     _job = job_ctl.CURRENT.get()
     ev = asyncio.Event()
+    _live = _ChannelLive(client, channel_id)      # destination channel pe live download/upload bar
     if _job is not None:
         _job.recheck_ev = ev
         _job.can_recheck = True       # markup() agli card-edit pe Cancel/Delete ke NICHE button laga dega
+        _job.cleanups.append(_live.clear)
     try:
         return await _episode_quality_poller_impl(
             client, log_message, swift_url, episode_num, anime_name, channel_id, owner_id,
             matched_entry=matched_entry, start_ep=start_ep, end_ep=end_ep,
             update_post_sent=update_post_sent, update_post_mode=update_post_mode,
             season_intro=season_intro, season_hint=season_hint, stats=stats,
-            page_url=page_url, target_qualities=target_qualities, _recheck_ev=ev,
+            page_url=page_url, target_qualities=target_qualities, _recheck_ev=ev, _live=_live,
         )
     finally:
+        try:
+            await _live.clear()
+        except BaseException:
+            pass
         if _job is not None:
             _job.can_recheck = False
             _job.recheck_ev = None
@@ -524,13 +586,14 @@ async def _retry_episode_poll(client, message, page_url, ep_num, anime_name, cha
         if channel_id not in _chs:
             _chs.append(channel_id)
         _jb.header = f"📺 **Ep {ep_num}** • 🔄 Re-check"
+        _jb.meta["rc_note"] = f"🔄 Re-check ho raha hai... ({_ist_now()} IST)"
     _ak = (channel_id, ep_num)
     if _ak in _ACTIVE_EPS:
         await job_ctl.stage_msg(message, f"♻️ Ep `{ep_num}` pe doosri run pehle se chal rahi hai — skip.")
         return False
     _ACTIVE_EPS.add(_ak)
     try:
-        prep = await job_ctl.stage_msg(message, _WAIT_TXT)
+        prep = await job_ctl.stage_msg(message, "🔄 Re-check: naya download link dhoondh raha hoon...")
         swift_url = None
         for _i in range(3):
             swift_url = await _get_swift_url_for_episode(page_url, ep_num, prep)
@@ -570,6 +633,7 @@ async def _episode_quality_poller_impl(
     page_url: str = None,
     target_qualities: set = None,
     _recheck_ev: asyncio.Event = None,
+    _live: "_ChannelLive" = None,
 ) -> bool:
     """
     update_post_mode: "auto" (global /updatechannel toggle follow kare — /Rtic aur
@@ -653,6 +717,9 @@ async def _episode_quality_poller_impl(
         proxy_msg = _ProxyMsg(log_message, owner_id, channel_id)
 
     _job = job_ctl.CURRENT.get()
+    if _job is not None:
+        _job.meta["swift_link"] = swift_url      # 🔄 Re-check pe card pe sirf yeh link dikhta hai
+        _job.meta["phase"] = "checking"
     status_msg = await job_ctl.stage_msg(log_message, _WAIT_TXT)
 
     mark_active, unmark_active, should_stop, _, _, _, _ = _get_upload_control_fns()
@@ -692,6 +759,27 @@ async def _episode_quality_poller_impl(
     manual_polls = 0            # 🔄 Re-check button se hue extra checks (limit mein nahi gine jaate)
     woke_manual = False
     _old_msgs_deleted_poll = False
+    _is_retry_job = target_qualities is not None     # timeout ke baad Re-check wala naya job
+
+    def _qline() -> str:
+        _ord = {"360p": 0, "480p": 1, "720p": 2, "1080p": 3}
+        return " • ".join(
+            f"{'✅' if q not in remaining else '⏳'} {q}"
+            for q in sorted(TARGET_QUALITIES_SET, key=lambda x: _ord.get(x, 9)))
+
+    def _chk() -> str:
+        _m = f" +{manual_polls}🔄" if manual_polls else ""
+        return f"🔎 Check {max(poll_attempt, 1)}/{POLL_TOTAL_ATTEMPTS}{_m} • {_qline()}"
+
+    def _set_meta(**kw):
+        if _job is not None:
+            _job.meta.update(kw)
+
+    def _rc(text: str):
+        """Re-check ka note (card pe) — sirf tab jab re-check chal raha ho."""
+        if _job is not None:
+            _job.meta["rc_note"] = text
+            _job.touch(force=True)
 
     async def _wait_next(deadline: float, tag: str) -> bool:
         """Agle check tak intezaar (countdown ke saath). True = 🔄 Re-check button dabaya gaya.
@@ -706,9 +794,12 @@ async def _episode_quality_poller_impl(
             left = deadline - time.time()
             if left <= 0:
                 return False
+            _set_meta(phase="waiting")
             try:
                 await status_msg.edit(
-                    f"⏳ Next check: `{int(left)}s`" if CARD_SHOW_COUNTDOWN else _WAIT_TXT
+                    f"{_qline()}\n"
+                    f"⏳ Agla check **{int(left)}s** mein • check {poll_attempt}/{POLL_TOTAL_ATTEMPTS} ho chuka\n"
+                    f"🔄 Abhi check karna ho to neeche Re-check dabao"
                 )
             except Exception:
                 pass
@@ -726,6 +817,7 @@ async def _episode_quality_poller_impl(
             unmark_active(anime_name, episode_num)
             return False
 
+        _is_manual = woke_manual
         if woke_manual:
             manual_polls += 1
         else:
@@ -740,8 +832,11 @@ async def _episode_quality_poller_impl(
         poll_began = time.time()
         _next_tag = f"({poll_attempt}/{POLL_TOTAL_ATTEMPTS})"
 
+        _set_meta(phase="checking")
+        if _is_manual or _is_retry_job:
+            _rc(f"🔄 Re-check chal raha hai... ({_ist_now()} IST)")
         try:
-            await status_msg.edit(_WAIT_TXT)
+            await status_msg.edit(f"{_chk()}\n🔎 Qualities dhoondh raha hoon...")
         except Exception:
             pass
 
@@ -799,6 +894,9 @@ async def _episode_quality_poller_impl(
         )
 
         # Download ka live status (pehle sirf "scan ho raha hai" dikhta tha => stuck jaisa lagta tha)
+        _live_txt = {"dl": ""}            # destination channel ke liye download bar
+        _live_ups: dict = {}              # quality -> upload slot (uska bar channel pe dikhega)
+
         async def _dl_status_updater():
             # Card pe SIRF download progress bar (source / link / scan kuch nahi)
             from ..utils.display_progress import _make_bar, humanbytes, TimeFormatter
@@ -809,7 +907,8 @@ async def _episode_quality_poller_impl(
                 try:
                     dls = list(_poll_prog.get("dls", {}).values())
                     if not dls:
-                        await status_msg.edit(_WAIT_TXT)
+                        _live_txt["dl"] = ""
+                        await status_msg.edit(f"{_chk()}\n🔎 Qualities scan ho rahi hain...")
                         continue
                     live, fin, total = 0, 0, 0
                     for d in dls:
@@ -829,14 +928,18 @@ async def _episode_quality_poller_impl(
                     if total > 0:
                         pct = min(live * 100 / total, 100.0)
                         eta = (total - live) / spd if spd > 0 else 0
+                        _live_txt["dl"] = f"⬇️ **Downloading**\n`{_make_bar(pct)}` **{pct:.1f}%**"
                         await status_msg.edit(
+                            f"{_chk()}\n"
                             f"⬇️ **Downloading**\n"
                             f"`{_make_bar(pct)}` **{pct:.1f}%**\n"
                             f"📦 `{humanbytes(live)}` / `{humanbytes(total)}`\n"
                             f"🚀 `{humanbytes(spd)}/s` • ⏳ `{TimeFormatter(eta) if spd > 0 else '...'}`"
                         )
                     else:
+                        _live_txt["dl"] = "⬇️ **Downloading**"
                         await status_msg.edit(
+                            f"{_chk()}\n"
                             f"⬇️ **Downloading**\n"
                             f"📦 `{humanbytes(live)}` • 🚀 `{humanbytes(spd)}/s`"
                         )
@@ -932,6 +1035,7 @@ async def _episode_quality_poller_impl(
                 um = await _ns(log_message, f"📤 **Uploading `{q}`** — Ep `{episode_num}`...", q)
             except Exception:
                 um = status_msg
+            _live_ups[q] = um
             success, sent_msg, quality = False, None, q
             try:
                 success, sent_msg, quality = await _upload_one_file(
@@ -942,6 +1046,7 @@ async def _episode_quality_poller_impl(
                     uploader_client=(_poll_ucs[0] if (gate is not None and _poll_ucs) else None),
                 )
             finally:
+                _live_ups.pop(q, None)
                 half_ev.set()
                 if gate is not None:
                     gate.done(q)
@@ -1074,9 +1179,46 @@ async def _episode_quality_poller_impl(
             LOGGER.info(f"[AutoMonitor] ▶ upload start (download baaki ho sakta hai): {os.path.basename(path)}")
             up_tasks[path] = job_ctl.track_task(asyncio.ensure_future(_upload_task(path, q, _half, _prev)))
 
+        async def _chan_live_loop():
+            """Destination channel pe sirf download + upload bar (har ~5s)."""
+            _empty = 0
+            while True:
+                await asyncio.sleep(5)
+                try:
+                    parts = []
+                    if _live_txt["dl"]:
+                        parts.append(_live_txt["dl"])
+                    for _lq, _lum in sorted(_live_ups.items()):
+                        _bl = _bar_line(getattr(_lum, "text", "") or "")
+                        if _bl:
+                            parts.append(f"📤 **Uploading {_lq}**\n{_bl}")
+                    if parts:
+                        _empty = 0
+                        await _live.update("\n\n".join(parts))
+                    else:
+                        _empty += 1
+                        if _empty >= 2:
+                            await _live.clear()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+
+        async def _cl_stop():
+            _cl_task.cancel()
+            try:
+                await _cl_task
+            except BaseException:
+                pass
+            _live_txt["dl"] = ""
+            _live_ups.clear()
+            await _live.clear()
+
         _dl_upd = asyncio.ensure_future(_dl_status_updater())
+        _cl_task = asyncio.ensure_future(_chan_live_loop() if _live is not None else asyncio.sleep(0))
         if _job is not None:
             _job.tasks.add(_dl_upd)
+            _job.tasks.add(_cl_task)
         poll_result = {"files": [], "error": None}
         _cancelled_mid = False
         try:
@@ -1113,8 +1255,10 @@ async def _episode_quality_poller_impl(
                 await _dl_upd
             except BaseException:
                 pass
+            _live_txt["dl"] = ""
 
         if _cancelled_mid:
+            await _cl_stop()
             for _t in up_tasks.values():
                 _t.cancel()
             await asyncio.gather(*up_tasks.values(), return_exceptions=True)
@@ -1138,9 +1282,12 @@ async def _episode_quality_poller_impl(
                     _g.done(_q_)
 
         if not up_tasks:
+            await _cl_stop()
             if _pre_task is not None and not _poll_ucs:
                 await _drop_pre_task(_pre_task)
             shutil.rmtree(poll_dl_dir, ignore_errors=True)
+            if _is_manual or _is_retry_job:
+                _rc(f"ℹ️ Re-check ({_ist_now()} IST): abhi kuch naya nahi mila • {_qline()}")
             if remaining and poll_attempt < POLL_TOTAL_ATTEMPTS:
                 woke_manual = await _wait_next(poll_began + interval, _next_tag)
             continue
@@ -1151,6 +1298,7 @@ async def _episode_quality_poller_impl(
             pass
 
         poll_results = await asyncio.gather(*up_tasks.values(), return_exceptions=True)
+        await _cl_stop()
 
         try:
             await _close_uploaders(_poll_ucs)
@@ -1166,6 +1314,8 @@ async def _episode_quality_poller_impl(
                 remaining.discard(quality)
 
         shutil.rmtree(poll_dl_dir, ignore_errors=True)
+        if _is_manual or _is_retry_job:
+            _rc(f"✅ Re-check pura ({_ist_now()} IST) • {_qline()}")
 
         if remaining and poll_attempt < POLL_TOTAL_ATTEMPTS:
             woke_manual = await _wait_next(poll_began + interval, _next_tag)
@@ -1503,13 +1653,14 @@ async def _forward_to_anime_channel(client: Client, sent_msg, channel_id: int, a
 #  Episode ko RTI se Swift URL tak le jaao
 # ─────────────────────────────────────────────
 async def _get_swift_url_for_episode(page_url: str, episode_num: int, status_msg,
-                                     wmq_link: str = None) -> str | None:
+                                     wmq_link: str = None, label: str = None) -> str | None:
     get_watchmult_link, get_argon_link, argon_to_swift = _get_rti_fns()
     loop = asyncio.get_event_loop()
 
     if not wmq_link:
         try:
-            await status_msg.edit(_WAIT_TXT)
+            await status_msg.edit(f"{label}\n🔎 Episode page se download button dhoondh raha hoon..."
+                                  if label else _WAIT_TXT)
         except Exception:
             pass
 
@@ -1518,7 +1669,8 @@ async def _get_swift_url_for_episode(page_url: str, episode_num: int, status_msg
             return None
 
     try:
-        await status_msg.edit(_WAIT_TXT)
+        await status_msg.edit(f"{label}\n🌐 Player page se download link nikal raha hoon (10-30s)..."
+                              if label else _WAIT_TXT)
     except Exception:
         pass
 
@@ -2136,29 +2288,59 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
             SWIFT_MAX_ATTEMPTS  = SWIFT_FAST_ATTEMPTS + SWIFT_SLOW_ATTEMPTS  # 30
 
             swift_url = None
-            for swift_attempt in range(1, SWIFT_MAX_ATTEMPTS + 1):
-                swift_url = await _get_swift_url_for_episode(url, ep_num, prep_msg)
-                if swift_url:
-                    break
+            _rc_ev = asyncio.Event()
+            if _jb is not None:                       # link dhundhte waqt bhi 🔄 Re-check kaam kare
+                _jb.recheck_ev = _rc_ev
+                _jb.can_recheck = True
+                _jb.meta["phase"] = "link"
+            try:
+                for swift_attempt in range(1, SWIFT_MAX_ATTEMPTS + 1):
+                    _lbl = f"🔎 Ep {ep_num} • link try {swift_attempt}/{SWIFT_MAX_ATTEMPTS}"
+                    swift_url = await _get_swift_url_for_episode(url, ep_num, prep_msg, label=_lbl)
+                    if swift_url:
+                        break
 
-                # Last attempt ke baad fail → bahar niklo
-                if swift_attempt == SWIFT_MAX_ATTEMPTS:
-                    await prep_msg.edit(
-                        f"❌ Ep `{ep_num}` — ~25 min ke baad bhi available nahi hua. Baad mein dobara check karna."
-                    )
-                    break
+                    # Last attempt ke baad fail → bahar niklo
+                    if swift_attempt == SWIFT_MAX_ATTEMPTS:
+                        await prep_msg.edit(
+                            f"❌ Ep `{ep_num}` — ~25 min ke baad bhi available nahi hua. Baad mein dobara check karna."
+                        )
+                        break
 
-                # Phase decide karo
-                is_fast   = swift_attempt <= SWIFT_FAST_ATTEMPTS
-                interval  = 30 if is_fast else 60
-                phase_lbl = "⚡ Fast" if is_fast else "🐢 Slow"
-                remaining_attempts = SWIFT_MAX_ATTEMPTS - swift_attempt
-                try:
-                    await prep_msg.edit(_WAIT_TXT)
-                except Exception:
-                    pass
+                    # Phase decide karo
+                    is_fast   = swift_attempt <= SWIFT_FAST_ATTEMPTS
+                    interval  = 30 if is_fast else 60
+                    phase_lbl = "⚡ Fast" if is_fast else "🐢 Slow"
+                    remaining_attempts = SWIFT_MAX_ATTEMPTS - swift_attempt
 
-                await asyncio.sleep(interval)
+                    # Countdown ke saath intezaar — 🔄 Re-check dabane par turant agla try
+                    _end = time.time() + interval
+                    while True:
+                        _left = _end - time.time()
+                        if _left <= 0:
+                            break
+                        try:
+                            await prep_msg.edit(
+                                f"{_lbl}\n"
+                                f"❌ Download link abhi page pe nahi aaya\n"
+                                f"⏳ Agla try **{int(_left)}s** mein ({phase_lbl}) • {remaining_attempts} baaki\n"
+                                f"🔄 Abhi try karna ho to Re-check dabao"
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            await asyncio.wait_for(_rc_ev.wait(), timeout=min(_left, 10))
+                            _rc_ev.clear()
+                            break
+                        except asyncio.TimeoutError:
+                            pass
+            finally:
+                if _jb is not None:
+                    _jb.can_recheck = False
+                    _jb.recheck_ev = None
+                    if swift_url and _jb.meta.get("rc_note"):
+                        _jb.meta["swift_link"] = swift_url
+                        _jb.meta["rc_note"] = f"✅ Link mil gaya ({_ist_now()} IST) — qualities check ho rahi hain"
 
             if not swift_url:
                 continue
