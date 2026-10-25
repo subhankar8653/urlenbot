@@ -903,11 +903,13 @@ async def _episode_quality_poller_impl(
             _t0 = time.time()
             _lb, _lt = 0, _t0
             while True:
-                await asyncio.sleep(4)
+                await asyncio.sleep(2)
                 try:
                     dls = list(_poll_prog.get("dls", {}).values())
                     if not dls:
-                        _live_txt["dl"] = ""
+                        if _live_txt["dl"]:      # download ho chuka — channel pe 100% bar rehne do
+                            _live_txt["dl"] = f"⬇️ **Downloading**\n`{_make_bar(100)}` **100.0%**"
+                            continue
                         await status_msg.edit(f"{_chk()}\n🔎 Qualities scan ho rahi hain...")
                         continue
                     live, fin, total = 0, 0, 0
@@ -1183,7 +1185,7 @@ async def _episode_quality_poller_impl(
             """Destination channel pe sirf download + upload bar (har ~5s)."""
             _empty = 0
             while True:
-                await asyncio.sleep(5)
+                await asyncio.sleep(3)
                 try:
                     parts = []
                     if _live_txt["dl"]:
@@ -1255,7 +1257,9 @@ async def _episode_quality_poller_impl(
                 await _dl_upd
             except BaseException:
                 pass
-            _live_txt["dl"] = ""
+            if _live_txt["dl"]:   # upload ke dauraan channel pe download ka 100% bar bhi dikhe
+                from ..utils.display_progress import _make_bar as _mb_f
+                _live_txt["dl"] = f"⬇️ **Downloading**\n`{_mb_f(100)}` **100.0%**"
 
         if _cancelled_mid:
             await _cl_stop()
