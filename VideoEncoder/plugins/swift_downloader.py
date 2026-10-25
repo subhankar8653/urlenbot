@@ -756,6 +756,19 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
                 LOGGER.warning(f"[Swift] Quality `{quality_filter}` missing. Available: {available}")
                 return result
 
+        # ── Auto-monitor: jo qualities pehle hi upload ho chuki hain unhe DOBARA download mat karo ──
+        # (pehle har poll pe 360p/720p poori download hoti thi aur phir delete — sirf 1080p ka
+        #  intezaar karte hue bahut time/bandwidth barbaad hota tha)
+        _skip_q = progress.get("skip_q")
+        if _skip_q and download_links:
+            _new_links = [l for l in download_links if l["quality"] not in _skip_q]
+            if not _new_links:
+                LOGGER.info(f"[Swift] Page pe naya kuch nahi (sirf already-uploaded: {sorted(_skip_q)}) — skip download")
+                result["nothing_new"] = True
+                return result
+            download_links = _new_links
+            LOGGER.info(f"[Swift] skip_q applied → {[l['quality'] for l in download_links]}")
+
         # ── STEP 4: Sirf page pe present qualities click karo ──
         fast_downloaded_files = []  # multi-connection downloads jo already confirm done hain
 

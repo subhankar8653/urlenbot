@@ -70,6 +70,63 @@ async def job_cancel_cb(client: Client, cb: CallbackQuery):
             pass
 
 
+# ───────────────────────── 🔄 Re-check ─────────────────────────
+@Client.on_callback_query(filters.regex(r"^jr_"))
+async def job_recheck_cb(client: Client, cb: CallbackQuery):
+    """
+    Auto-monitor card ka "🔄 Re-check" button.
+      • Job abhi chal raha hai  -> poller ko turant jagao (agle interval ka wait nahi) /
+                                   agar abhi check chal hi raha hai to uske turant baad dobara.
+      • Job timeout se khatam   -> baaki qualities ke liye naya poll-cycle shuru.
+    """
+    try:
+        jid = cb.data[3:]
+        job = job_ctl.JOBS.get(jid)
+        if job is not None and not job.finished and not job.cancelled:
+            if not await _is_allowed(client, cb.from_user.id, job.owner, job.admin_chat):
+                await cb.answer("❌ Sirf bot owner / is channel ke admins hi Re-check kar sakte hain.", show_alert=True)
+                return
+            ev = job.recheck_ev
+            if ev is None or not job.can_recheck:
+                await cb.answer("Abhi re-check ka time nahi hai — thodi der baad try karo.", show_alert=True)
+                return
+            ev.set()
+            await cb.answer("🔄 Dobara check ho raha hai...")
+            return
+
+        rj = job_ctl.RECHECKS.get(jid)
+        if rj is None or not rj.recheck_items:
+            await cb.answer("Is process ka re-check ab available nahi (restart / pehle hi chal chuka).", show_alert=True)
+            return
+        if not await _is_allowed(client, cb.from_user.id, rj.owner, rj.admin_chat):
+            await cb.answer("❌ Sirf bot owner / is channel ke admins hi Re-check kar sakte hain.", show_alert=True)
+            return
+
+        items = list(rj.recheck_items)
+        rj.recheck_items.clear()
+        job_ctl.RECHECKS.pop(jid, None)
+        await cb.answer("🔄 Naya check shuru ho raha hai...")
+        try:   # purane card se Re-check button hata do (Delete button rehne do)
+            await cb.message.edit_reply_markup(rj.final_markup())
+        except Exception:
+            pass
+
+        async def _run_all():
+            for fn in items:
+                await fn()
+
+        asyncio.ensure_future(job_ctl.run_with_card(
+            cb.message, "AutoMonitor", _run_all,
+            owner_id=rj.owner or 0, admin_chat=rj.admin_chat, deletable=rj.deletable,
+        ))
+    except Exception as e:
+        LOGGER.error(f"[Job] recheck cb error: {e}", exc_info=True)
+        try:
+            await cb.answer("❌ Re-check error", show_alert=True)
+        except Exception:
+            pass
+
+
 # ───────────────────────── 🗑 Delete uploads ─────────────────────────
 @Client.on_callback_query(filters.regex(r"^jd_"))
 async def job_delete_ask_cb(client: Client, cb: CallbackQuery):

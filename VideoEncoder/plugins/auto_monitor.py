@@ -89,12 +89,17 @@ def _get_upload_control_fns():
 # ─────────────────────────────────────────────
 #  Constants
 # ─────────────────────────────────────────────
-POLL_INTERVAL_FAST = 30         # seconds — pehle 10 attempts (5 min)
-POLL_INTERVAL_SLOW = 60         # seconds — baad ke 20 attempts (20 min)
-POLL_FAST_ATTEMPTS = 10         # kitne attempts fast interval pe
-POLL_SLOW_ATTEMPTS = 20         # kitne attempts slow interval pe
-# Total max time = (10×30s) + (20×60s) = 5min + 20min = 25min
+# Quality poll schedule (baki qualities — jaise 1080p — website pe aane ka intezaar):
+#   PEHLE (purana):  10 × 30s  + 20 × 60s  = 30 checks (~25 min)
+#   AB    (naya):    15 × 45s  + 10 × 120s = 25 checks (~29 min)  → uske baad auto-cancel
+#   (🔄 Re-check button dabane par turant extra check — yeh 25 checks mein nahi gina jaata)
+POLL_INTERVAL_FAST = 45         # seconds — pehle 15 checks
+POLL_INTERVAL_SLOW = 120        # seconds — baad ke 10 checks (2 min)
+POLL_FAST_ATTEMPTS = 15         # kitne checks fast interval pe
+POLL_SLOW_ATTEMPTS = 10         # kitne checks slow interval pe
+POLL_TOTAL_ATTEMPTS = POLL_FAST_ATTEMPTS + POLL_SLOW_ATTEMPTS
 TARGET_QUALITIES   = ["360p", "720p", "1080p"]   # inhe dhundna hai
+_ALL_QUALITIES     = {"360p", "480p", "720p", "1080p"}
 
 # ─────────────────────────────────────────────
 #  DB Helpers — owner ke user doc mein store hota hai
@@ -413,6 +418,96 @@ async def _episode_quality_poller(
     season_intro: list = None,
     season_hint: int = None,
     stats: dict = None,
+    page_url: str = None,
+    target_qualities: set = None,
+) -> bool:
+    """Wrapper: card pe '🔄 Re-check' button lagata hai (poll chalte waqt), phir asli poller chalata hai."""
+    _job = job_ctl.CURRENT.get()
+    ev = asyncio.Event()
+    if _job is not None:
+        _job.recheck_ev = ev
+        _job.can_recheck = True       # markup() agli card-edit pe Cancel/Delete ke NICHE button laga dega
+    try:
+        return await _episode_quality_poller_impl(
+            client, log_message, swift_url, episode_num, anime_name, channel_id, owner_id,
+            matched_entry=matched_entry, start_ep=start_ep, end_ep=end_ep,
+            update_post_sent=update_post_sent, update_post_mode=update_post_mode,
+            season_intro=season_intro, season_hint=season_hint, stats=stats,
+            page_url=page_url, target_qualities=target_qualities, _recheck_ev=ev,
+        )
+    finally:
+        if _job is not None:
+            _job.can_recheck = False
+            _job.recheck_ev = None
+
+
+async def _retry_episode_poll(client, message, page_url, ep_num, anime_name, channel_id, owner_id,
+                              matched, remaining_qs, start_ep, end_ep, update_post_sent,
+                              season_hint, season_intro, community):
+    """
+    Timeout ke baad 🔄 Re-check dabane par: sirf BAKI qualities ke liye Swift URL dobara
+    nikaalo aur naya poll-cycle chalao (jo upload ho chuka woh dobara nahi hota).
+    """
+    _jb = job_ctl.CURRENT.get()
+    if _jb is not None:
+        _jb.meta["community"] = community
+        _jb.meta["anime"] = anime_name
+        _chs = _jb.meta.setdefault("channels", [])
+        if channel_id not in _chs:
+            _chs.append(channel_id)
+        _jb.header = f"📺 **Ep {ep_num}** • 🔄 Re-check"
+    _ak = (channel_id, ep_num)
+    if _ak in _ACTIVE_EPS:
+        await job_ctl.stage_msg(message, f"♻️ Ep `{ep_num}` pe doosri run pehle se chal rahi hai — skip.")
+        return False
+    _ACTIVE_EPS.add(_ak)
+    try:
+        prep = await job_ctl.stage_msg(
+            message,
+            f"🎌 **AutoMonitor** | Ep `{ep_num}`\n\n🔍 Swift URL dobara nikaal raha hoon..."
+        )
+        swift_url = None
+        for _i in range(3):
+            swift_url = await _get_swift_url_for_episode(page_url, ep_num, prep)
+            if swift_url:
+                break
+            await asyncio.sleep(10)
+        if not swift_url:
+            await prep.edit(
+                f"❌ **AutoMonitor** | Ep `{ep_num}`\n\n"
+                f"Swift URL dobara nahi mila. RTI pe manually check karo."
+            )
+            return False
+        return await _episode_quality_poller(
+            client, message, swift_url, ep_num, anime_name, channel_id, owner_id,
+            matched_entry=matched, start_ep=start_ep, end_ep=end_ep,
+            update_post_sent=update_post_sent, season_intro=season_intro,
+            season_hint=season_hint, stats={}, page_url=page_url,
+            target_qualities=set(remaining_qs),
+        )
+    finally:
+        _ACTIVE_EPS.discard(_ak)
+
+
+async def _episode_quality_poller_impl(
+    client: Client,
+    log_message: Message,
+    swift_url: str,
+    episode_num: int,
+    anime_name: str,
+    channel_id: int,
+    owner_id: int,
+    matched_entry: dict = None,
+    start_ep: int = None,
+    end_ep: int = None,
+    update_post_sent: list = None,
+    update_post_mode: str = "auto",
+    season_intro: list = None,
+    season_hint: int = None,
+    stats: dict = None,
+    page_url: str = None,
+    target_qualities: set = None,
+    _recheck_ev: asyncio.Event = None,
 ) -> bool:
     """
     update_post_mode: "auto" (global /updatechannel toggle follow kare — /Rtic aur
@@ -529,16 +624,46 @@ async def _episode_quality_poller(
         _scrape_and_download, _upload_one_file, _sort_by_size, _quality_from, QUALITY_ORDER
     )
 
-    POLL_INTERVAL_FAST = 30
-    POLL_INTERVAL_SLOW = 60
-    POLL_FAST_ATTEMPTS = 10
-    POLL_SLOW_ATTEMPTS = 20
-    TARGET_QUALITIES_SET = set(TARGET_QUALITIES)
+    # Poll schedule module-level constants se aata hai (POLL_* upar dekho):
+    #   15 × 45s (⚡ Fast) → 10 × 120s (🐢 Slow) → nahi mila to auto-cancel
+    TARGET_QUALITIES_SET = set(target_qualities) if target_qualities else set(TARGET_QUALITIES)
 
     remaining = set(TARGET_QUALITIES_SET)
     poll_start = time.time()
-    poll_attempt = 0
+    poll_attempt = 0            # sirf AUTO checks (max POLL_TOTAL_ATTEMPTS)
+    manual_polls = 0            # 🔄 Re-check button se hue extra checks (limit mein nahi gine jaate)
+    woke_manual = False
     _old_msgs_deleted_poll = False
+
+    async def _wait_next(deadline: float, tag: str) -> bool:
+        """Agle check tak intezaar (countdown ke saath). True = 🔄 Re-check button dabaya gaya.
+        Deadline POLL START se naapi jaati hai — isliye upload mein jitna time laga woh
+        intezaar se kat jaata hai (pehle upload ke BAAD poora interval aur sona padta tha)."""
+        while True:
+            if should_stop(anime_name, episode_num):
+                return False            # loop ke top pe cancel handle hoga
+            if _recheck_ev is not None and _recheck_ev.is_set():
+                _recheck_ev.clear()
+                return True
+            left = deadline - time.time()
+            if left <= 0:
+                return False
+            try:
+                await status_msg.edit(
+                    f"🎌 **AutoMonitor** | Ep `{episode_num}`\n\n"
+                    f"⏳ Agla check: `{int(left)}s` mein {tag}\n"
+                    f"🎯 Baki: `{' | '.join(sorted(remaining))}`\n"
+                    f"👇 Turant check karna ho to 🔄 Re-check dabao"
+                )
+            except Exception:
+                pass
+            if _recheck_ev is None:
+                await asyncio.sleep(min(left, 10))
+                continue
+            try:
+                await asyncio.wait_for(_recheck_ev.wait(), timeout=min(left, 10))
+            except asyncio.TimeoutError:
+                pass
 
     while remaining:
         if should_stop(anime_name, episode_num):
@@ -546,20 +671,27 @@ async def _episode_quality_poller(
             unmark_active(anime_name, episode_num)
             return False
 
-        poll_attempt += 1
-        is_fast = poll_attempt <= POLL_FAST_ATTEMPTS
-        is_slow = POLL_FAST_ATTEMPTS < poll_attempt <= (POLL_FAST_ATTEMPTS + POLL_SLOW_ATTEMPTS)
-        if not is_fast and not is_slow:
-            break
+        if woke_manual:
+            manual_polls += 1
+            phase_lbl = "🔄 Manual"
+            is_fast = poll_attempt <= POLL_FAST_ATTEMPTS
+        else:
+            poll_attempt += 1
+            if poll_attempt > POLL_TOTAL_ATTEMPTS:
+                break               # saare auto checks ho gaye — ab auto-cancel
+            is_fast = poll_attempt <= POLL_FAST_ATTEMPTS
+            phase_lbl = "⚡ Fast" if is_fast else "🐢 Slow"
+        woke_manual = False
 
         interval = POLL_INTERVAL_FAST if is_fast else POLL_INTERVAL_SLOW
         elapsed_min = int((time.time() - poll_start) / 60)
-        phase_lbl = "⚡ Fast" if is_fast else "🐢 Slow"
+        poll_began = time.time()
+        _next_tag = f"({poll_attempt}/{POLL_TOTAL_ATTEMPTS})"
 
         try:
             await status_msg.edit(
                 f"🎌 **AutoMonitor** | Ep `{episode_num}`\n\n"
-                f"🔄 Poll `{poll_attempt}` {phase_lbl} | Elapsed: `{elapsed_min}m`\n"
+                f"🔄 Poll `{poll_attempt + manual_polls}` {phase_lbl} | Elapsed: `{elapsed_min}m`\n"
                 f"🎯 Baki: `{' | '.join(sorted(remaining))}`\n"
                 f"⏳ Swift page scan ho raha hai..."
             )
@@ -570,7 +702,8 @@ async def _episode_quality_poller(
         poll_dl_dir = os.path.join(download_dir, poll_session_id)
         os.makedirs(poll_dl_dir, exist_ok=True)
 
-        _poll_prog = {"phase": "scan", "dls": {}}
+        # Jo qualities pehle upload ho chuki hain unhe dobara download nahi karna (time bachta hai)
+        _poll_prog = {"phase": "scan", "dls": {}, "skip_q": (_ALL_QUALITIES - remaining)}
         if _job is not None:
             _job.dirs.add(poll_dl_dir)
             _poll_prog["cancel"] = _job.cancel_ev
@@ -936,8 +1069,8 @@ async def _episode_quality_poller(
             if _pre_task is not None and not _poll_ucs:
                 await _drop_pre_task(_pre_task)
             shutil.rmtree(poll_dl_dir, ignore_errors=True)
-            if remaining:
-                await asyncio.sleep(interval)
+            if remaining and poll_attempt < POLL_TOTAL_ATTEMPTS:
+                woke_manual = await _wait_next(poll_began + interval, _next_tag)
             continue
 
         try:
@@ -966,13 +1099,13 @@ async def _episode_quality_poller(
 
         shutil.rmtree(poll_dl_dir, ignore_errors=True)
 
-        if remaining:
-            await asyncio.sleep(interval)
+        if remaining and poll_attempt < POLL_TOTAL_ATTEMPTS:
+            woke_manual = await _wait_next(poll_began + interval, _next_tag)
 
     # Poll loop khatam
     poll_elapsed = int((time.time() - poll_start) / 60)
     uploaded_qualities = sorted(
-        set(TARGET_QUALITIES) - remaining,
+        TARGET_QUALITIES_SET - remaining,
         key=lambda q: ["360p", "480p", "720p", "1080p"].index(q) if q in ["360p", "480p", "720p", "1080p"] else 99
     )
 
@@ -989,12 +1122,27 @@ async def _episode_quality_poller(
             pass
     else:
         missing_str = ' | '.join(sorted(remaining))
+        # ── AUTO-CANCEL: POLL_TOTAL_ATTEMPTS checks ke baad bhi nahi mili ──
+        _can_retry = False
+        _jb_t = job_ctl.CURRENT.get()
+        if _jb_t is not None and page_url:
+            try:   # 🔄 Re-check button baad mein bhi kaam kare (sirf baaki qualities ke liye)
+                _jb_t.recheck_items.append(functools.partial(
+                    _retry_episode_poll, client, log_message, page_url, episode_num, anime_name,
+                    channel_id, owner_id, matched_entry, set(remaining), start_ep, end_ep,
+                    update_post_sent, season_hint, season_intro, (_jb_t.meta or {}).get("community", ""),
+                ))
+                job_ctl.register_recheck(_jb_t)
+                _can_retry = True
+            except Exception as _re:
+                LOGGER.warning(f"[AutoMonitor] recheck register failed: {_re!r}")
         try:
             await status_msg.edit(
-                f"⚠️ **Incomplete!** | Ep `{episode_num}`\n\n"
-                f"❌ Timeout ke baad bhi nahi mili: `{missing_str}`\n"
+                f"🛑 **Auto-cancelled (timeout)!** | Ep `{episode_num}`\n\n"
+                f"❌ `{POLL_TOTAL_ATTEMPTS}` checks (~{poll_elapsed}m) ke baad bhi nahi mili: `{missing_str}`\n"
                 f"✅ Jo mili: `{' | '.join(uploaded_qualities) or '—'}`\n\n"
-                f"RTI pe manually check karo."
+                + ("Website pe update hone ke baad neeche 🔄 Re-check dabao." if _can_retry
+                   else "RTI pe manually check karo.")
             )
         except Exception:
             pass
@@ -1002,8 +1150,9 @@ async def _episode_quality_poller(
     LOGGER.info(f"[AutoMonitor] Ep {episode_num}: done in {poll_elapsed}m — {uploaded_qualities}")
     unmark_active(anime_name, episode_num)
     _real_up = (stats.get("uploaded", 0) > 0) if stats is not None else bool(uploaded_qualities)
-    if _real_up:
+    if _real_up and target_qualities is None:
         # Episode ki saari qualities ke baad border line (duplicate-skip pe nahi)
+        # (Re-check run mein border dobara nahi — pehle hi ja chuka hota hai)
         await _send_border(client, channel_id)
     return len(uploaded_qualities) > 0
 
@@ -1811,6 +1960,10 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
         if channel_id not in _chs:
             _chs.append(channel_id)
         _jb0.meta["anime"] = anime_name
+        try:   # card pe "Community :- @USERNAME" — kaun si community ka upload ho raha hai
+            _jb0.meta["community"] = await get_community_tag(all_names=True)
+        except Exception:
+            _jb0.meta["community"] = ""
 
     # ── Duplicate POST guard: wahi post (same anime + episodes + link) dobara aaya to ignore ──
     _pk = (channel_id, start_ep, end_ep, _norm_url(url))
@@ -1954,6 +2107,7 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
                 season_intro=season_intro_state,
                 season_hint=season_hint,
                 stats=ep_stats,
+                page_url=url,
             )
             _real = ep_stats.get("uploaded", 0) > 0
             if ep_uploaded:
@@ -2070,6 +2224,13 @@ async def cmd_rtic(client: Client, message: Message):
 async def _cmd_rtic_impl(client: Client, message: Message):
 
     get_latest_episode = _get_rti_latest_fn()
+
+    _jb_r = job_ctl.CURRENT.get()
+    if _jb_r is not None:
+        try:   # card pe "Community :- @USERNAME"
+            _jb_r.meta["community"] = await get_community_tag(all_names=True)
+        except Exception:
+            _jb_r.meta["community"] = ""
 
     parts = message.text.split()
     if len(parts) < 2:
@@ -2234,6 +2395,7 @@ async def _cmd_rtic_impl(client: Client, message: Message):
             update_post_sent=update_post_sent,
             season_intro=season_intro_state,
             season_hint=season_hint,
+            page_url=page_url,
         )
         if ep_uploaded:
             any_ep_uploaded = True
