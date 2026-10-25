@@ -213,13 +213,21 @@ class Job:
                 lines.append(f"▸ **{s.label}**\n{body}")
             else:
                 lines.append(_compact(s.text))
+        if self.title == "AutoMonitor":
+            # Channel pe dikhne wala card: source / link / scan jaisi koi line nahi (sirf progress)
+            lines = [l for l in lines if not _SOURCE_LINE_RE.search(l)]
+        # 🔄 Re-check dabane par: note + (mila ho to) sirf quality-page ka link — filter ke BAAD jodte hain
+        _rc = (self.meta or {}).get("rc_note")
+        if _rc:
+            lines.append("")
+            lines.append(str(_rc))
+            _lk = (self.meta or {}).get("swift_link")
+            if _lk:
+                lines.append(f"[🔗 Qualities dekhne ke liye yahan tap karo]({_lk})")
         comm = (self.meta or {}).get("community")
         if comm:
             lines.append("")
             lines.append(f"Community :- {comm}")
-        if self.title == "AutoMonitor":
-            # Channel pe dikhne wala card: source / link / scan jaisi koi line nahi (sirf progress)
-            lines = [l for l in lines if not _SOURCE_LINE_RE.search(l)]
         return "\n".join(lines)[:3900]
 
     # ── ledger (channel pe jo post hua uska hisaab — Delete button isi se chalta hai) ──
