@@ -61,6 +61,8 @@ def track_task(task):
 
 
 _URL_RE = re.compile(r"https?://\S+")
+# AutoMonitor card se hatane wali lines (source ka pata chalne wali)
+_SOURCE_LINE_RE = re.compile(r"swift|argon|watchmult|\brti\b|rareanimes|toono|link scan|page scan|source", re.I)
 
 
 def _compact(text: str, drop=()) -> str:
@@ -215,6 +217,9 @@ class Job:
         if comm:
             lines.append("")
             lines.append(f"Community :- {comm}")
+        if self.title == "AutoMonitor":
+            # Channel pe dikhne wala card: source / link / scan jaisi koi line nahi (sirf progress)
+            lines = [l for l in lines if not _SOURCE_LINE_RE.search(l)]
         return "\n".join(lines)[:3900]
 
     # ── ledger (channel pe jo post hua uska hisaab — Delete button isi se chalta hai) ──

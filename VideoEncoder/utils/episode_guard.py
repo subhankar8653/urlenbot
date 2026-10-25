@@ -176,6 +176,63 @@ def forget_channel(channel_id: int):
     _CACHE.pop(channel_id, None)
     for k in [k for k in _REG if k[0] == channel_id]:
         _REG.pop(k, None)
+    for k in [k for k in _INFLIGHT if k[0] == channel_id]:
+        _INFLIGHT.pop(k, None)
+    for k in [k for k in _COMPLETE if k[0] == channel_id]:
+        _COMPLETE.pop(k, None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  IN-FLIGHT CLAIM  +  "EPISODE COMPLETE" flag
+#  -------------------------------------------
+#  Auto-monitor (RTI) aur Direct-File channel DONO ek hi episode ki same quality
+#  ek saath upload na kar dein, isliye upload shuru karne se pehle quality "claim"
+#  hoti hai. Jo pehle claim kare wahi upload karega, doosra skip.
+#  Claim ko TTL hai — kisi crash/exception se atak bhi jaye to khud expire ho jaata hai.
+# ─────────────────────────────────────────────────────────────────────────────
+_INFLIGHT: dict = {}       # (channel_id, season, ep, quality) -> ts
+_INFLIGHT_TTL = 45 * 60
+_COMPLETE: dict = {}       # (channel_id, season, ep) -> ts   (Direct channel ne poora episode finalize kar diya)
+_COMPLETE_TTL = 24 * 3600
+
+
+def claim(channel_id: int, season, ep: int, quality: str) -> bool:
+    """True = ab ye quality tumhari hai (upload karo). False = koi aur already upload kar raha hai."""
+    now = time.time()
+    for k in [k for k, t in _INFLIGHT.items() if now - t > _INFLIGHT_TTL]:
+        _INFLIGHT.pop(k, None)
+    key = (channel_id, season or 1, ep, quality)
+    if key in _INFLIGHT:
+        return False
+    _INFLIGHT[key] = now
+    return True
+
+
+def release(channel_id: int, season, ep: int, quality: str):
+    _INFLIGHT.pop((channel_id, season or 1, ep, quality), None)
+
+
+def is_claimed(channel_id: int, season, ep: int, quality: str) -> bool:
+    t = _INFLIGHT.get((channel_id, season or 1, ep, quality))
+    return bool(t and time.time() - t <= _INFLIGHT_TTL)
+
+
+def mark_complete(channel_id: int, season, ep: int):
+    _COMPLETE[(channel_id, season or 1, ep)] = time.time()
+
+
+def clear_complete(channel_id: int, season, ep: int):
+    _COMPLETE.pop((channel_id, season or 1, ep), None)
+
+
+def is_complete(channel_id: int, season, ep: int) -> bool:
+    t = _COMPLETE.get((channel_id, season or 1, ep))
+    if not t:
+        return False
+    if time.time() - t > _COMPLETE_TTL:
+        _COMPLETE.pop((channel_id, season or 1, ep), None)
+        return False
+    return True
 
 
 async def present_qualities(client, channel_id: int, owner_id, season, ep: int, wanted=()):
