@@ -126,7 +126,8 @@ def build_data(detail: dict) -> dict:
     for dl in detail.get("downloads") or []:
         if dl.get("isBatch") or not dl.get("directUrl"):
             continue                       # ZIP/batch entries skip — episode wise download
-        q = (dl.get("quality") or "Unknown").strip()
+        q_raw = (dl.get("quality") or "Unknown").strip()
+        q = _q_key(q_raw)          # "4K UHD" -> "2160p", "1080p FHD" -> "1080p"
         key = (int(dl.get("seasonNumber") or 1), int(dl.get("episodeNumber") or 0))
         eps = by_q.setdefault(q, {})
         prev = eps.get(key)
@@ -136,7 +137,7 @@ def build_data(detail: dict) -> dict:
                 "season": key[0], "num": key[1], "url": dl["directUrl"],
                 "size": dl.get("fileSize") or "", "fmt": (dl.get("format") or "MKV").lower(),
                 "audio": dl.get("audio") or detail.get("audioLanguages") or "", "fast": fast,
-                "quality": q,
+                "quality": q_raw,
             }
     qualities = sorted(by_q, key=lambda q: (_q_rank(q), q))
     return {
@@ -145,6 +146,19 @@ def build_data(detail: dict) -> dict:
         "qualities": qualities,
         "by_q": {q: [by_q[q][k] for k in sorted(by_q[q])] for q in qualities},
     }
+
+
+def _q_key(q: str) -> str:
+    """Quality ka normalized key: '4K UHD' -> '2160p', '720p HD' -> '720p', warna raw."""
+    ql = (q or "").lower()
+    if "4k" in ql or "2160" in ql:
+        return "2160p"
+    m = re.search(r"(\d{3,4})\s*p?", ql)
+    return f"{m.group(1)}p" if m else (q or "Unknown")
+
+
+def _q_label(key: str) -> str:
+    return "4K" if key == "2160p" else key
 
 
 def _with_dl(url: str) -> str:
@@ -193,12 +207,12 @@ class AbyssSelector:
     def __init__(self, data: dict, orig_message: Message):
         self.data = data
         self.title = data["title"]
-        self.qualities = data["qualities"]
+        self.qualities = data["qualities"]             # normalized keys: 480p, 720p, 1080p, 2160p ...
         self.orig_message = orig_message
         self.sid = uuid.uuid4().hex[:10]
         self.msg = None
-        self.stage = "quality"
-        self.quality = None
+        # default: 720p agar hai, warna sabse pehli available
+        self.quality = "720p" if "720p" in self.qualities else (self.qualities[0] if self.qualities else None)
         self.page = 0
         self.multi = False
         self.selected = set()
@@ -206,7 +220,27 @@ class AbyssSelector:
 
     @property
     def episodes(self):
+        if self.quality == "all":
+            union = {}
+            for q in self.qualities:
+                for ep in self.data["by_q"].get(q, []):
+                    u = union.setdefault((ep["season"], ep["num"]),
+                                         {"season": ep["season"], "num": ep["num"], "by": {}, "size": ""})
+                    u["by"][q] = ep
+            return [union[k] for k in sorted(union)]
         return self.data["by_q"].get(self.quality, [])
+
+    def jobs(self, idxs: list) -> list:
+        """Chuni hui episode indexes -> download karne wale ep dicts (All mein har quality ka alag)."""
+        eps = self.episodes
+        out = []
+        for i in idxs:
+            ep = eps[i]
+            if self.quality == "all":
+                out.extend(ep["by"][q] for q in reversed(self.qualities) if q in ep["by"])
+            else:
+                out.append(ep)
+        return out
 
     @property
     def total_pages(self):
@@ -214,63 +248,68 @@ class AbyssSelector:
 
     def _ep_label(self, ep):
         multi_season = len({e["season"] for e in self.episodes}) > 1
-        return f"S{ep['season']}E{ep['num']:02d}" if multi_season else f"E{ep['num']:02d}"
+        lab = f"S{ep['season']}E{ep['num']:02d}" if multi_season else f"E{ep['num']:02d}"
+        if self.quality == "all" and ep.get("quality"):
+            lab += f" {_q_label(_q_key(ep['quality']))}"
+        return lab
 
     def header_text(self):
-        lines = ["📂 **Select**", "━━━━━━━━━━━━━━━━━━", f"🎬 **{self.title}**",
+        lines = ["📂 **Select Episode**", "━━━━━━━━━━━━━━━━━━", f"🎬 **{self.title}**",
                  "🌐 Website: 🌀 AniAbyss"]
         if self.data.get("dub"):
             lines.append(f"🗣️ {self.data['dub']}")
-        if self.stage == "quality":
-            if not self.qualities:
-                lines.append("\n❌ Is anime ke liye koi download link nahi mila.")
-            else:
-                lines.append("👇 Quality chuno:")
-        else:
-            eps = self.episodes
-            size = eps[0]["size"] if eps else ""
-            lines.append(f"🎞️ Quality: **{self.quality}**" + (f" • ~{size}/ep" if size else ""))
-            lines.append(f"📖 Episodes: {len(eps)}")
-            lines.append("━━━━━━━━━━━━━━━━━━")
-            lines.append(f"👇 Tap an episode to download:  (Page {self.page + 1}/{self.total_pages})")
-            if self.multi:
-                lines.append(f"\n☑️ **Multi-select ON** — chosen: `{len(self.selected)}`")
+        if not self.qualities:
+            lines.append("\n❌ Is anime ke liye koi download link nahi mila.")
+            return "\n".join(lines)
+        eps = self.episodes
+        size = eps[0].get("size", "") if eps else ""
+        qlabel = "All" if self.quality == "all" else _q_label(self.quality)
+        lines.append(f"📖 Episodes: {len(eps)} • 🎚 Quality: {qlabel}" + (f" • ~{size}/ep" if size else ""))
+        lines.append("━━━━━━━━━━━━━━━━━━")
+        lines.append(f"👇 Tap an episode to download:  (Page {self.page + 1}/{self.total_pages})")
+        if self.multi:
+            lines.append(f"\n☑️ **Multi-select ON** — chosen: `{len(self.selected)}`")
         return "\n".join(lines)
 
     def build_markup(self):
         sid = self.sid
         rows = []
-        if self.stage == "quality":
-            for i, q in enumerate(self.qualities):
-                n = len(self.data["by_q"][q])
-                rows.append([(f"🎞️ {q}  ({n} ep)", f"aby_q_{sid}_{i}")])
-        else:
-            eps = self.episodes
-            start = self.page * PER_PAGE
-            row = []
-            for idx in range(start, min(start + PER_PAGE, len(eps))):
-                mark = "✅ " if idx in self.selected else ""
-                row.append((f"{mark}{self._ep_label(eps[idx])}", f"aby_e_{sid}_{idx}"))
-                if len(row) == 3:
-                    rows.append(row)
-                    row = []
-            if row:
+        eps = self.episodes
+        start = self.page * PER_PAGE
+        row = []
+        for idx in range(start, min(start + PER_PAGE, len(eps))):
+            mark = "✅ " if idx in self.selected else ""
+            lab = f"S{eps[idx]['season']}E{eps[idx]['num']:02d}" \
+                if len({e["season"] for e in eps}) > 1 else f"E{eps[idx]['num']:02d}"
+            row.append((f"{mark}{lab}", f"aby_e_{sid}_{idx}"))
+            if len(row) == 3:
                 rows.append(row)
-            if self.total_pages > 1:
-                nav = []
-                if self.page > 0:
-                    nav.append(("◀️ Prev", f"aby_pg_{sid}_{self.page - 1}"))
-                nav.append((f"📄 {self.page + 1}/{self.total_pages}", f"aby_noop_{sid}"))
-                if self.page < self.total_pages - 1:
-                    nav.append(("Next ▶️", f"aby_pg_{sid}_{self.page + 1}"))
-                rows.append(nav)
-            rows.append([(f"📦 Download All ({len(eps)})", f"aby_all_{sid}")])
-            if self.multi:
-                rows.append([(f"⬇️ Download Selected ({len(self.selected)})", f"aby_dl_{sid}")])
-                rows.append([("☑️ Multi-select: ON (tap to turn off)", f"aby_toggle_{sid}")])
-            else:
-                rows.append([("☑️ Select Multiple", f"aby_toggle_{sid}")])
-            rows.append([("🔙 Back to Quality", f"aby_backq_{sid}")])
+                row = []
+        if row:
+            rows.append(row)
+        if self.total_pages > 1:
+            nav = []
+            if self.page > 0:
+                nav.append(("◀️ Prev", f"aby_pg_{sid}_{self.page - 1}"))
+            nav.append((f"📄 {self.page + 1}/{self.total_pages}", f"aby_noop_{sid}"))
+            if self.page < self.total_pages - 1:
+                nav.append(("Next ▶️", f"aby_pg_{sid}_{self.page + 1}"))
+            rows.append(nav)
+
+        # Quality row: jo qualities is anime ke liye available hain (480p / 720p / 1080p / 4K ...) + All
+        qrow = [((("✅ " if self.quality == q else "") + _q_label(q)), f"aby_q_{sid}_{q}")
+                for q in reversed(self.qualities)]          # chhoti -> badi (480p ... 4K)
+        if len(self.qualities) > 1:
+            qrow.append(((("✅ " if self.quality == "all" else "") + "All"), f"aby_q_{sid}_all"))
+        for i in range(0, len(qrow), 5):
+            rows.append(qrow[i:i + 5])
+
+        rows.append([(f"📦 Download All Episodes ({len(eps)})", f"aby_all_{sid}")])
+        if self.multi:
+            rows.append([(f"⬇️ Download Selected ({len(self.selected)})", f"aby_dl_{sid}")])
+            rows.append([("☑️ Multi-select: ON (tap to turn off)", f"aby_toggle_{sid}")])
+        else:
+            rows.append([("☑️ Select Multiple", f"aby_toggle_{sid}")])
         rows.append([("❌ Close", f"aby_close_{sid}")])
         return _kb(rows)
 
@@ -398,7 +437,7 @@ async def _process_item(client, orig_message, sel: AbyssSelector, ep: dict, stag
 
 async def _download_items(client, status_msg, sel: AbyssSelector, idxs: list):
     """Poora process EK card message mein + ❌ Cancel button (job_ctl) — /aniwatch jaisa."""
-    eps = [sel.episodes[i] for i in idxs]
+    eps = sel.jobs(idxs)
     total = len(eps)
     orig_message = sel.orig_message
     title = (sel.title or "AniAbyss")[:55]
@@ -472,17 +511,12 @@ async def aby_callback(client: Client, cb: CallbackQuery):
             return
 
         if action == "q":
-            sel.quality = sel.qualities[int(parts[3])]
-            sel.stage, sel.page, sel.multi = "episodes", 0, False
-            sel.selected.clear()
-            await cb.answer()
-            sel.msg = cb.message
-            await sel.render()
-            return
-
-        if action == "backq":
-            sel.stage = "quality"
-            await cb.answer()
+            key = parts[3] if len(parts) > 3 else ""
+            if key == "all" or key in sel.qualities:
+                sel.quality = key
+                sel.page, sel.multi = 0, False
+                sel.selected.clear()
+            await cb.answer(f"Quality: {'All' if sel.quality == 'all' else _q_label(sel.quality)}")
             sel.msg = cb.message
             await sel.render()
             return

@@ -366,6 +366,11 @@ def _prune_sessions():
         RTI_SESSIONS.pop(k, None)
 
 
+# Quality row (Raretoon pe 360p / 720p / 1080p milta hai; "All" = jaisa pehle tha, saari qualities)
+RTI_QUALITIES = [("360", "360p"), ("720", "720p"), ("1080", "1080p"), ("all", "All")]
+_RTI_Q_KEYS = {k for k, _ in RTI_QUALITIES}
+
+
 class RTISelector:
     """
     /rti <url> ke liye interactive button menu:
@@ -391,6 +396,16 @@ class RTISelector:
         # session banate waqt, taaki build_markup() sync reh sake.
         self.update_toggle = False
         self.channel_toggle = False
+        self.quality = "all"      # Quality row: 360 | 720 | 1080 | all (default = purana behaviour)
+
+    @property
+    def quality_filter(self):
+        """_run_swift ke liye: None = saari qualities, warna '720p' jaisa."""
+        return None if self.quality == "all" else f"{self.quality}p"
+
+    @property
+    def quality_label(self):
+        return dict(RTI_QUALITIES).get(self.quality, self.quality)
 
     async def populate_toggles(self):
         # "Update Post" toggle ab poori tarah session-local hai (default OFF,
@@ -430,6 +445,10 @@ class RTISelector:
                 info += f" • ✨ Special: {counts['SP']}"
             lines.append(info)
 
+        if self.channel_toggle:
+            lines.append("🎚 Quality: All  _(Channel Upload ON — saari qualities)_")
+        else:
+            lines.append(f"🎚 Quality: {self.quality_label}")
         lines.append("━━━━━━━━━━━━━━━━━━")
         if self.mode == "movie":
             lines.append("👇 Tap the button to download:")
@@ -448,6 +467,7 @@ class RTISelector:
         if self.mode == "movie":
             mark = "✅ " if 0 in self.selected else "🎬 "
             rows.append([(f"{mark}Movie", f"rti_ep_{sid}_0")])
+            rows.append(self._quality_row())
         else:
             ep_count = sum(1 for it in self.items if it.get("kind") == "EP") or len(self.items)
             rows.append([(f"🏝️ SEASON {self.season:02d} • ⬇️ Download All ({ep_count})", f"rti_season_{sid}")])
@@ -471,6 +491,8 @@ class RTISelector:
                     nav.append(("Next ▶️", f"rti_pg_{sid}_{self.page + 1}"))
                 rows.append(nav)
 
+            rows.append(self._quality_row())
+
             if self.multi:
                 rows.append([(f"⬇️ Download Selected ({len(self.selected)})", f"rti_dl_{sid}")])
                 rows.append([("☑️ Multi-select: ON (tap to turn off)", f"rti_toggle_{sid}")])
@@ -486,13 +508,20 @@ class RTISelector:
         rows.append([("❌ Close", f"rti_close_{sid}")])
         return _kb(rows)
 
+    def _quality_row(self):
+        return [
+            ((("✅ " if self.quality == k else "") + label), f"rti_q_{self.sid}_{k}")
+            for k, label in RTI_QUALITIES
+        ]
+
     async def render(self):
         if not self.msg:
             return
         try:
             await self.msg.edit(self.header_text(), reply_markup=self.build_markup())
         except Exception as e:
-            LOGGER.error(f"[RTI] selector render error: {e}")
+            if "MESSAGE_NOT_MODIFIED" not in str(e):
+                LOGGER.error(f"[RTI] selector render error: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -777,8 +806,10 @@ async def _run_rti_swift(client, message: Message, swift_url: str, status_msg, e
     # show_url=False: DM mein swift_url kabhi nahi dikhega, sirf status (downloading/
     # uploading/quality/episode) — episode_label se pata chalega kaunsa episode chal raha hai
     _lbl = None if job_ctl.CURRENT.get() is not None else ep_label
+    _qf = sess.quality_filter if sess is not None else None     # Quality row ka chuna hua
     uploaded_results = await _run_swift(
-        client, message, swift_url, encode=False, episode_label=_lbl, show_url=False
+        client, message, swift_url, encode=False, episode_label=_lbl, show_url=False,
+        quality_filter=_qf,
     )
     await _forward_to_channel_if_enabled(client, message, uploaded_results, sess=sess, page_url=page_url)
     await _send_update_post_if_enabled(client, sess, ep_num, uploaded_results)
@@ -1247,6 +1278,18 @@ async def rti_callback_handler(client: Client, cb: CallbackQuery):
                 await cb.message.delete()
             except Exception:
                 pass
+            return
+
+        if action == "q":
+            key = parts[3] if len(parts) > 3 else ""
+            if key in _RTI_Q_KEYS:
+                sess.quality = key
+            if sess.channel_toggle and sess.quality != "all":
+                await cb.answer("ℹ️ Channel Upload ON hai — channel flow mein saari qualities upload hoti hain. "
+                                "Sirf ye quality chahiye to Channel Upload OFF karo.", show_alert=True)
+            else:
+                await cb.answer(f"Quality: {sess.quality_label}")
+            await sess.render()
             return
 
         if action == "toggle":

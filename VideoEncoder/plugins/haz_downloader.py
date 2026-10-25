@@ -87,6 +87,11 @@ HEADERS = {
 # In yehi 3 qualities dikhani hain (5 available hain page pe, baaki 2 skip)
 HAZ_QUALITIES = ["480p x264", "720p x265", "1080p x265"]
 
+# Quality row (button key, page ka asli label, button pe dikhne wala naam). "all" = teeno.
+HAZ_Q_OPTS = [("480", "480p x264", "480p"), ("720", "720p x265", "720p"), ("1080", "1080p x265", "1080p")]
+HAZ_Q_FULL = {k: full for k, full, _ in HAZ_Q_OPTS}
+HAZ_Q_SHORT = {k: short for k, _, short in HAZ_Q_OPTS}
+
 # Language button label -> ffprobe audio-language codes jo isse match karte hain
 LANG_STREAM_CODES = {
     "hindi":    {"hin", "hi", "hindi"},
@@ -837,7 +842,8 @@ def _fetch_mega_link_with_api(download_url: str, debug: list) -> str | None:
 
 
 # ─────────────────────────────────────────────
-#  Selector UI: Language -> Quality -> Episode list (multi-select)
+#  Selector UI: Episode grid + Quality row + Language row (ek hi view, multi-select)
+#  (/anime ke baaki sites jaisa — Aniwatch wale layout jaisa)
 # ─────────────────────────────────────────────
 class HazSelector:
     def __init__(self, series_url: str, data: dict, orig_message: Message):
@@ -848,13 +854,17 @@ class HazSelector:
         self.orig_message = orig_message
         self.sid = None
         self.msg = None
-        self.stage = "lang" if len(self.languages) > 1 else "quality"
-        self.language = self.languages[0] if len(self.languages) == 1 else None
-        self.quality = None
+        # Defaults: 720p + Hindi (agar page pe Hindi hai, warna pehli language)
+        self.quality_key = "720"                       # 480 | 720 | 1080 | all
+        self.language = next((l for l in self.languages if l.lower() == "hindi"), self.languages[0])
         self.page = 0
         self.multi = False
         self.selected = set()
         self.created = time.time()
+
+    @property
+    def quality_label(self):
+        return "All" if self.quality_key == "all" else HAZ_Q_SHORT.get(self.quality_key, self.quality_key)
 
     @property
     def total_pages(self):
@@ -865,69 +875,59 @@ class HazSelector:
         return list(enumerate(self.episodes))[start:start + PER_PAGE]
 
     def header_text(self):
-        lines = ["📂 **Select**", "━━━━━━━━━━━━━━━━━━", f"🎬 **{self.title}**", "🌐 Website: 🍥 Hindi Anime Zone"]
-        if self.stage == "lang":
-            lines.append("👇 Pehle Language chuno:")
-        elif self.stage == "quality":
-            if self.language:
-                lines.append(f"🗣️ Language: **{self.language}**")
-            lines.append("👇 Ab Quality chuno:")
-        else:
-            lines.append(f"🗣️ Language: **{self.language}** • 🎞️ Quality: **{self.quality}**")
-            lines.append(f"📖 Episodes: {len(self.episodes)}")
-            lines.append("━━━━━━━━━━━━━━━━━━")
-            lines.append(f"👇 Tap an episode to download:  (Page {self.page + 1}/{self.total_pages})")
-            if self.multi:
-                lines.append(f"\n☑️ **Multi-select ON** — chosen: `{len(self.selected)}`")
+        lines = ["📂 **Select Episode**", "━━━━━━━━━━━━━━━━━━", f"🎬 **{self.title}**",
+                 "🌐 Website: 🍥 Hindi Anime Zone",
+                 f"📖 Episodes: {len(self.episodes)} • 🎚 Quality: {self.quality_label}"]
+        if len(self.languages) > 1:
+            lines.append(f"🗣 Language: {self.language}")
+        lines.append("━━━━━━━━━━━━━━━━━━")
+        lines.append(f"👇 Tap an episode to download:  (Page {self.page + 1}/{self.total_pages})")
+        if self.multi:
+            lines.append(f"\n☑️ **Multi-select ON** — chosen: `{len(self.selected)}`")
         return "\n".join(lines)
 
     def build_markup(self):
         sid = self.sid
         rows = []
 
-        if self.stage == "lang":
-            row = []
-            for lang in self.languages:
-                row.append((f"🗣️ {lang}", f"haz_lang_{sid}_{lang}"))
-                if len(row) == 2:
-                    rows.append(row)
-                    row = []
-            if row:
+        row = []
+        for idx, ep in self.page_items():
+            mark = "✅ " if idx in self.selected else ""
+            row.append((f"{mark}E{ep['num']:02d}", f"haz_ep_{sid}_{idx}"))
+            if len(row) == 3:
                 rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
 
-        elif self.stage == "quality":
-            for q in HAZ_QUALITIES:
-                rows.append([(f"🎞️ {q}", f"haz_qual_{sid}_{q}")])
-            if len(self.languages) > 1:
-                rows.append([("🔙 Back to Language", f"haz_back_{sid}")])
+        if self.total_pages > 1:
+            nav = []
+            if self.page > 0:
+                nav.append(("◀️ Prev", f"haz_pg_{sid}_{self.page - 1}"))
+            nav.append((f"📄 {self.page + 1}/{self.total_pages}", f"haz_noop_{sid}"))
+            if self.page < self.total_pages - 1:
+                nav.append(("Next ▶️", f"haz_pg_{sid}_{self.page + 1}"))
+            rows.append(nav)
 
+        # Quality row: 480p / 720p / 1080p / All
+        rows.append(
+            [((("✅ " if self.quality_key == k else "") + short), f"haz_q_{sid}_{k}") for k, _f, short in HAZ_Q_OPTS]
+            + [((("✅ " if self.quality_key == "all" else "") + "All"), f"haz_q_{sid}_all")]
+        )
+
+        # Language row (sirf multi-language page pe): har language + All (= saare audio tracks)
+        if len(self.languages) > 1:
+            lang_btns = [((("✅ " if self.language == l else "") + l), f"haz_lg_{sid}_{i}")
+                         for i, l in enumerate(self.languages)]
+            lang_btns.append(((("✅ " if self.language == "All" else "") + "All"), f"haz_lg_{sid}_all"))
+            for i in range(0, len(lang_btns), 3):
+                rows.append(lang_btns[i:i + 3])
+
+        if self.multi:
+            rows.append([(f"⬇️ Download Selected ({len(self.selected)})", f"haz_dl_{sid}")])
+            rows.append([("☑️ Multi-select: ON (tap to turn off)", f"haz_toggle_{sid}")])
         else:
-            row = []
-            for idx, ep in self.page_items():
-                mark = "✅ " if idx in self.selected else ""
-                row.append((f"{mark}E{ep['num']:02d}", f"haz_ep_{sid}_{idx}"))
-                if len(row) == 3:
-                    rows.append(row)
-                    row = []
-            if row:
-                rows.append(row)
-
-            if self.total_pages > 1:
-                nav = []
-                if self.page > 0:
-                    nav.append(("◀️ Prev", f"haz_pg_{sid}_{self.page - 1}"))
-                nav.append((f"📄 {self.page + 1}/{self.total_pages}", f"haz_noop_{sid}"))
-                if self.page < self.total_pages - 1:
-                    nav.append(("Next ▶️", f"haz_pg_{sid}_{self.page + 1}"))
-                rows.append(nav)
-
-            if self.multi:
-                rows.append([(f"⬇️ Download Selected ({len(self.selected)})", f"haz_dl_{sid}")])
-                rows.append([("☑️ Multi-select: ON (tap to turn off)", f"haz_toggle_{sid}")])
-            else:
-                rows.append([("☑️ Select Multiple", f"haz_toggle_{sid}")])
-
-            rows.append([("🔙 Back to Quality", f"haz_backq_{sid}")])
+            rows.append([("☑️ Select Multiple", f"haz_toggle_{sid}")])
 
         rows.append([("❌ Close", f"haz_close_{sid}")])
         return _kb(rows)
@@ -938,7 +938,8 @@ class HazSelector:
         try:
             await self.msg.edit(self.header_text(), reply_markup=self.build_markup())
         except Exception as e:
-            LOGGER.error(f"[Haz] selector render error: {e}")
+            if "MESSAGE_NOT_MODIFIED" not in str(e):
+                LOGGER.error(f"[Haz] selector render error: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -985,8 +986,8 @@ async def _apply_language_filter(filepath: str, language: str, status_msg: Messa
 #  Ek episode: link nikaalo -> mega download -> filter -> upload
 # ─────────────────────────────────────────────
 async def _process_haz_item(client, message, ep: dict, status_msg, index: int, total: int,
-                             language: str, quality: str):
-    ep_label = f"E{ep['num']:02d}"
+                             language: str, quality: str, ep_tag: str = ""):
+    ep_label = f"E{ep['num']:02d}" + (f" {ep_tag}" if ep_tag else "")
     loop = asyncio.get_event_loop()
     download_url = ep["qualities"].get(quality)
     if not download_url:
@@ -1080,11 +1081,25 @@ async def _download_haz_items(client, status_msg, orig_message, sess: "HazSelect
         await status_msg.edit("❌ **AZAPI_KEY set nahi hai.** (CAPTCHA_PROVIDER=azapi)")
         return
 
-    all_ok = True
-    for i, idx in enumerate(idxs, 1):
+    # Quality row: "All" => har episode ki jo-jo qualities page pe hain (480p → 720p → 1080p)
+    jobs = []
+    for idx in idxs:
         ep = sess.episodes[idx]
+        if sess.quality_key == "all":
+            for k, full, short in HAZ_Q_OPTS:
+                if full in ep["qualities"]:
+                    jobs.append((ep, full, short))
+        else:
+            jobs.append((ep, HAZ_Q_FULL[sess.quality_key], ""))
+    if not jobs:
+        await status_msg.edit("❌ Chuni hui episodes mein koi quality available nahi hai.")
+        return
+    total = len(jobs)
+
+    all_ok = True
+    for i, (ep, qfull, tag) in enumerate(jobs, 1):
         result = await _process_haz_item(
-            client, orig_message, ep, status_msg, i, total, sess.language, sess.quality,
+            client, orig_message, ep, status_msg, i, total, sess.language, qfull, ep_tag=tag,
         )
         if result != "ok":
             all_ok = False
@@ -1128,33 +1143,21 @@ async def haz_callback_handler(client: Client, cb: CallbackQuery):
                 pass
             return
 
-        if action == "lang":
-            sess.language = "_".join(parts[3:])
-            sess.stage = "quality"
-            await cb.answer()
+        if action == "q":
+            key = parts[3] if len(parts) > 3 else ""
+            if key == "all" or key in HAZ_Q_FULL:
+                sess.quality_key = key
+            await cb.answer(f"Quality: {sess.quality_label}")
             await sess.render()
             return
 
-        if action == "back":
-            sess.stage = "lang"
-            sess.quality = None
-            await cb.answer()
-            await sess.render()
-            return
-
-        if action == "qual":
-            sess.quality = "_".join(parts[3:])
-            sess.stage = "episodes"
-            sess.page = 0
-            sess.multi = False
-            sess.selected.clear()
-            await cb.answer()
-            await sess.render()
-            return
-
-        if action == "backq":
-            sess.stage = "quality"
-            await cb.answer()
+        if action == "lg":
+            key = parts[3] if len(parts) > 3 else ""
+            if key == "all":
+                sess.language = "All"
+            elif key.isdigit() and int(key) < len(sess.languages):
+                sess.language = sess.languages[int(key)]
+            await cb.answer(f"Language: {sess.language}")
             await sess.render()
             return
 
@@ -1233,7 +1236,7 @@ async def haz_callback_handler(client: Client, cb: CallbackQuery):
 @Client.on_message(filters.command("haz"))
 async def haz_command(client: Client, message: Message):
     """
-    /Haz <series_page_url>  -> Language menu -> Quality menu -> Episode menu
+    /Haz <series_page_url>  -> Episode menu (+ Quality row + Language row)
     """
     c = await check_chat(message, chat="Sudo")
     if not c:
@@ -1243,7 +1246,7 @@ async def haz_command(client: Client, message: Message):
     if len(parts) < 2:
         await message.reply(
             "**Usage:**\n"
-            "`/Haz <series_page_url>` — Language/Quality/Episode button menu khulega\n\n"
+            "`/Haz <series_page_url>` — Episode button menu (Quality + Language rows ke saath) khulega\n\n"
             "**Example:**\n"
             "`/Haz https://hindianimeszone.com/liar-game-season-1-multi-audio-hindi-tamil-telugu-eng-jap-480p-720p-1080p-hd-web-dl-10bit-hevc-esub/`"
         )

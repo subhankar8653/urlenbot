@@ -675,6 +675,11 @@ def _codedew_flow(episode_url: str, debug: list, holder: dict):
 # ─────────────────────────────────────────────
 #  NEW: Season -> Episode button selector (/toono <url>)
 # ─────────────────────────────────────────────
+# Quality row (Toono pe 360p / 720p / 1080p; "All" = jaisa pehle tha)
+TOONO_QUALITIES = [("360", "360p"), ("720", "720p"), ("1080", "1080p"), ("all", "All")]
+_TOONO_Q_KEYS = {k for k, _ in TOONO_QUALITIES}
+
+
 class ToonoSelector:
     def __init__(self, series_url: str, data: dict, orig_message: Message):
         self.series_url = series_url
@@ -693,6 +698,15 @@ class ToonoSelector:
         # /updatechannel se bilkul independent — RTI wale fix jaisa hi.
         self.update_toggle = False
         self.channel_toggle = False
+        self.quality = "all"      # Quality row: 360 | 720 | 1080 | all (default = purana behaviour)
+
+    @property
+    def quality_filter(self):
+        return None if self.quality == "all" else f"{self.quality}p"
+
+    @property
+    def quality_label(self):
+        return dict(TOONO_QUALITIES).get(self.quality, self.quality)
 
     async def populate_toggles(self):
         self.channel_toggle = await _get_toono_channel_upload(self.orig_message.from_user.id)
@@ -720,6 +734,7 @@ class ToonoSelector:
             lines.append("👇 Pehle ek Season chuno:")
         else:
             lines.append(f"🏝️ Season: {self.current_season} • 📖 Episodes: {len(self.items)}")
+            lines.append(f"🎚 Quality: {self.quality_label}")
             lines.append("━━━━━━━━━━━━━━━━━━")
             lines.append(f"👇 Tap an episode to download:  (Page {self.page + 1}/{self.total_pages})")
             if self.multi:
@@ -762,6 +777,11 @@ class ToonoSelector:
                 if self.page < self.total_pages - 1:
                     nav.append(("Next ▶️", f"toono_pg_{sid}_{self.page + 1}"))
                 rows.append(nav)
+
+            rows.append([
+                ((("✅ " if self.quality == k else "") + label), f"toono_q_{sid}_{k}")
+                for k, label in TOONO_QUALITIES
+            ])
 
             if self.multi:
                 rows.append([(f"⬇️ Download Selected ({len(self.selected)})", f"toono_dl_{sid}")])
@@ -912,9 +932,10 @@ async def _process_toono_item(client, message, item: dict, status_msg, index: in
         )
         from .swift_downloader import _run_swift
         _lbl = None if job_ctl.CURRENT.get() is not None else ep_label
+        _qf = sess.quality_filter if sess is not None else None     # Quality row ka chuna hua
         uploaded_results = await _run_swift(
             client, message, codedew_url, encode=False, episode_label=_lbl, show_url=False,
-            fast=True, driver=driver,
+            fast=True, driver=driver, quality_filter=_qf,
         )
         driver = None  # ownership _run_swift -> _scrape_and_download ko chali gayi (wahi kill karta hai)
 
@@ -932,7 +953,7 @@ async def _process_toono_item(client, message, item: dict, status_msg, index: in
                 uploaded_results = await _run_swift(
                     client, message, codedew_url, encode=False,
                     episode_label=(None if job_ctl.CURRENT.get() is not None else ep_label),
-                    show_url=False, fast=True, driver=driver,
+                    show_url=False, fast=True, driver=driver, quality_filter=_qf,
                 )
                 driver = None
 
@@ -1068,6 +1089,14 @@ async def toono_callback_handler(client: Client, cb: CallbackQuery):
             sess.multi = False
             sess.selected.clear()
             await cb.answer()
+            await sess.render()
+            return
+
+        if action == "q":
+            key = parts[3] if len(parts) > 3 else ""
+            if key in _TOONO_Q_KEYS:
+                sess.quality = key
+            await cb.answer(f"Quality: {sess.quality_label}")
             await sess.render()
             return
 

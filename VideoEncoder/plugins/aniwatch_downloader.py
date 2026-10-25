@@ -87,6 +87,12 @@ if _DEFAULT_QUALITY not in ("360", "720", "1080", "all"):
 QUALITIES = [("360", "360p"), ("720", "720p"), ("1080", "1080p"), ("all", "All")]
 _QUALITY_KEYS = {k for k, _ in QUALITIES}
 
+# Language row (dual eng-jap sites): jpn = sirf Japanese (sub), eng = sirf English (dub),
+# all = dono audio ek file mein (Dual Audio) — purana default behaviour.
+LANGUAGES = [("jpn", "Japanese"), ("eng", "English"), ("all", "All")]
+_LANG_KEYS = {k for k, _ in LANGUAGES}
+_LANG_LONG = {"jpn": "Japanese (Sub)", "eng": "English (Dub)", "all": "All (Dual Audio)"}
+
 ANIW_SESSIONS = {}      # sid -> AniwSession
 
 
@@ -201,6 +207,7 @@ class AniwSession:
         self.multi = False
         self.selected = set()
         self.quality = _DEFAULT_QUALITY
+        self.audio = "all"               # Language row: jpn | eng | all
         self.busy = False                # search / episode-load chal raha hai
         self.update_toggle = False       # session-local, /updatechannel se independent
         self.channel_toggle = False
@@ -221,6 +228,10 @@ class AniwSession:
     @property
     def quality_label(self):
         return dict(QUALITIES).get(self.quality, self.quality)
+
+    @property
+    def audio_label(self):
+        return _LANG_LONG.get(self.audio, self.audio)
 
     async def populate_toggles(self):
         try:
@@ -254,6 +265,7 @@ class AniwSession:
             f"🎬 **{_md_safe(self.series_title)}**",
             f"🌐 Source: 🍥 {self.source_label}",
             f"📖 Episodes: {len(self.episodes)} • 🎚 Quality: {self.quality_label}",
+            f"🗣 Language: {self.audio_label}",
             "━━━━━━━━━━━━━━━━━━",
             f"👇 Tap an episode to download:  (Page {self.page + 1}/{self.total_pages})",
         ]
@@ -300,6 +312,10 @@ class AniwSession:
         rows.append([
             ((("✅ " if self.quality == k else "") + label), f"aniw_q_{sid}_{k}")
             for k, label in QUALITIES
+        ])
+        rows.append([
+            ((("✅ " if self.audio == k else "") + label), f"aniw_lg_{sid}_{k}")
+            for k, label in LANGUAGES
         ])
 
         if self.multi:
@@ -435,6 +451,7 @@ async def _download_episode_files(sess: AniwSession, item: dict, dl_dir: str, st
         name_override=name,
         season_override=season,
         ep_num_override=str(item.get("ep_number") or ""),
+        audio=sess.audio,
     )
 
     ok = False
@@ -685,6 +702,14 @@ async def aniwatch_callback_handler(client: Client, cb: CallbackQuery):
             if key in _QUALITY_KEYS:
                 sess.quality = key
             await cb.answer(f"Quality: {sess.quality_label}")
+            await sess.render()
+            return
+
+        if action == "lg":
+            key = parts[3] if len(parts) > 3 else ""
+            if key in _LANG_KEYS:
+                sess.audio = key
+            await cb.answer(f"Language: {sess.audio_label}")
             await sess.render()
             return
 

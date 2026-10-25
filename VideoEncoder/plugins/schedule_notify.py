@@ -543,6 +543,7 @@ async def cmd_end_message(client: Client, message: Message):
         "rename",
         # auto_monitor
         "set_monitor", "add_anime", "list_anime", "del_anime", "monitor_status",
+        "monitor_blacklist", "mbl", "allcommand",
         # upload_control
         "cancel_season", "cancel_episode", "active_uploads",
         # update_channel

@@ -30,6 +30,8 @@ Commands:
   /monitor_status       → System health + bot access + received-updates check
   /monitor_debug on|off → Har monitor post ka verdict DM mein
   /check_post           → Forwarded post pe reply: dry-run verdict
+  /monitor_blacklist    → Blacklist panel (alias /mbl) — jis post ke text mein blacklisted
+                          word ho, wo post auto-upload NAHI hoti. Add / Remove buttons.
 """
 
 import asyncio
@@ -155,6 +157,66 @@ async def _save_monitor_channel(channel_id: int):
 
 def _is_authorized(user_id: int) -> bool:
     return user_id in owner or user_id in sudo_users
+
+
+# ─────────────────────────────────────────────
+#  Monitor Blacklist — post ke text/caption mein blacklisted word mila
+#  to wo post auto-upload NAHI hoti. Owner ke doc mein 'monitor_blacklist'.
+#  (NOTE: /blacklist command pehle se caption-words ke liye hai (url_upload.py),
+#   isliye yeh /monitor_blacklist (alias /mbl) hai.)
+# ─────────────────────────────────────────────
+MBL_MAX_WORDS = 200
+MBL_MAX_LEN = 60
+
+
+async def _get_monitor_blacklist() -> list:
+    try:
+        oid = await _owner_id()
+        if not oid:
+            return []
+        user = await db._get_user(oid)
+        words = user.get('monitor_blacklist', []) or []
+        return [w for w in words if isinstance(w, str) and w.strip()]
+    except Exception as e:
+        LOGGER.warning(f"[AutoMonitor] blacklist load fail: {e}")
+        return []
+
+
+async def _save_monitor_blacklist(words: list):
+    oid = await _owner_id()
+    if not oid:
+        return
+    await db.col.update_one({'id': oid}, {'$set': {'monitor_blacklist': words}}, upsert=True)
+
+
+def _blacklist_hit(text: str, words: list) -> str | None:
+    """Post text mein koi blacklisted word mile to wahi word return karo (case-insensitive).
+    Plain word: seedha substring ("multi" -> "Multi Audio" bhi pakad leta hai).
+    Agar word mein space/dash jaisa symbol ho ("multi audio") to symbols ignore karke bhi match."""
+    if not text or not words:
+        return None
+    low = text.lower()
+    norm = _normalize(text)
+    for w in words:
+        wl = (w or "").strip().lower()
+        if not wl:
+            continue
+        if wl in low:
+            return w
+        wn = _normalize(wl)
+        if wn and wn != wl and wn in norm:
+            return w
+    return None
+
+
+def _split_blacklist_input(raw: str) -> list:
+    """'multi | dual audio, camrip' -> ['multi', 'dual audio', 'camrip']"""
+    out = []
+    for part in re.split(r'[|,\n]+', raw or ""):
+        w = re.sub(r'\s+', ' ', part).strip()
+        if w and w.lower() not in (x.lower() for x in out):
+            out.append(w[:MBL_MAX_LEN])
+    return out
 
 
 # ─────────────────────────────────────────────
@@ -1691,6 +1753,15 @@ async def _analyze_post(message: Message, text: str, anime_list: list) -> dict:
         res['fix'] = "RTI post ke saath caption hona chahiye."
         return res
 
+    # ── Blacklist: post text mein blacklisted word ho to seedha skip ──
+    _bl_hit = _blacklist_hit(text, await _get_monitor_blacklist())
+    if _bl_hit:
+        ck.append(("🚫", f"Blacklist word mila: {_bl_hit}"))
+        res['blacklisted'] = _bl_hit
+        res['reason'] = f"Post <b>blacklist</b> hai — word <code>{html.escape(_bl_hit)}</code> post mein mila."
+        res['fix'] = "Blacklist se hatana ho to /monitor_blacklist kholo."
+        return res
+
     text_url, btn_url = _collect_urls(message, text)
     ep_text = _extract_episodes(text)
     ck.append(("✅" if text_url else "➖", f"Link text mein: {'mila' if text_url else 'nahi'}"))
@@ -1939,7 +2010,10 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
         await _notify_owner(client, body, btns)
 
     if not res['ok']:
-        LOGGER.info(f"[AutoMonitor] NOT detected: {re.sub('<[^>]+>', '', res['reason'] or '')}")
+        if res.get('blacklisted'):
+            LOGGER.info(f"[AutoMonitor] 🚫 Blacklist skip — word '{res['blacklisted']}' | post: {text[:80]!r}")
+        else:
+            LOGGER.info(f"[AutoMonitor] NOT detected: {re.sub('<[^>]+>', '', res['reason'] or '')}")
         return
 
     if key in _processed_posts:
@@ -4109,6 +4183,275 @@ async def cmd_check_post(client: Client, message: Message):
     btns = _set_monitor_buttons(fc.id) if fc else [[InlineKeyboardButton("📊 Monitor Status", callback_data="mon_status")]]
     await message.reply(f"{head}\n<b>Checks</b>\n{_fmt_checks(res)}{src}\n📡 Monitor: <code>{monitor_ch}</code>",
                         parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(btns))
+
+
+# ─────────────────────────────────────────────
+#  /monitor_blacklist  (alias /mbl) — Blacklist panel: Add / Remove
+#
+#    /monitor_blacklist                   → panel (buttons)
+#    /monitor_blacklist add multi|camrip  → seedha add (| ya , ya nayi line se alag)
+#    /monitor_blacklist remove multi      → word ya list ka number
+#    /monitor_blacklist clear             → sab hata do
+# ─────────────────────────────────────────────
+_mbl_pending: dict = {}      # user_id -> panel message id (agla text = add karne wale words)
+MBL_PER_PAGE = 16
+
+
+def _mbl_text(words: list) -> str:
+    lines = ["🚫 <b>Monitor Blacklist</b>", "━━━━━━━━━━━━━━━━━━",
+             "Monitor channel ki post ke <b>text/caption</b> mein neeche ka koi bhi word mila "
+             "to wo post <b>upload nahi hogi</b>.", ""]
+    if words:
+        for i, w in enumerate(words[:60], 1):
+            lines.append(f"{i}. <code>{html.escape(w)}</code>")
+        if len(words) > 60:
+            lines.append(f"… +{len(words) - 60} aur")
+    else:
+        lines.append("📭 Abhi koi word blacklist mein nahi hai.")
+    lines += ["", "💡 Capital/small same maana jaata hai. Word post mein kahin bhi mila to skip.",
+              "➕ Add: button dabake word bhejo (ek se zyada ho to <code>|</code> ya comma se alag karo)."]
+    return "\n".join(lines)
+
+
+def _mbl_kb(words: list) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("➕ Add Word", callback_data="mbl_add")]]
+    if words:
+        rows[0].append(InlineKeyboardButton("➖ Remove Word", callback_data="mbl_rmv_0"))
+        rows.append([InlineKeyboardButton("🧹 Clear All", callback_data="mbl_clr")])
+    rows.append([InlineKeyboardButton("❌ Close", callback_data="mbl_close")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _mbl_remove_view(words: list, page: int):
+    total_pages = max(1, (len(words) + MBL_PER_PAGE - 1) // MBL_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * MBL_PER_PAGE
+    rows, row = [], []
+    for idx in range(start, min(start + MBL_PER_PAGE, len(words))):
+        row.append(InlineKeyboardButton(f"🗑 {words[idx][:24]}", callback_data=f"mbl_del_{idx}_{page}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"mbl_rmv_{page - 1}"))
+        nav.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="mbl_noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"mbl_rmv_{page + 1}"))
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="mbl_back")])
+    text = ("➖ <b>Kaun sa word hatana hai?</b>\n━━━━━━━━━━━━━━━━━━\n"
+            "Word pe tap karo — turant blacklist se hat jaayega.")
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def _mbl_add_words(raw_words: list) -> tuple[list, list]:
+    """(added, already) return karta hai."""
+    cur = await _get_monitor_blacklist()
+    have = {w.lower() for w in cur}
+    added, dup = [], []
+    for w in raw_words:
+        if w.lower() in have:
+            dup.append(w)
+        elif len(cur) >= MBL_MAX_WORDS:
+            break
+        else:
+            cur.append(w)
+            have.add(w.lower())
+            added.append(w)
+    if added:
+        await _save_monitor_blacklist(cur)
+    return added, dup
+
+
+@Client.on_message(filters.command(["monitor_blacklist", "mbl"]) & filters.private)
+async def cmd_monitor_blacklist(client: Client, message: Message):
+    if not message.from_user or not _is_authorized(message.from_user.id):
+        return
+    _mbl_pending.pop(message.from_user.id, None)
+    parts = message.text.split(None, 2)
+    sub = parts[1].lower() if len(parts) > 1 else ""
+    arg = parts[2] if len(parts) > 2 else ""
+
+    if sub in ("add", "+") and arg.strip():
+        added, dup = await _mbl_add_words(_split_blacklist_input(arg))
+        msg = []
+        if added:
+            msg.append("✅ <b>Blacklist mein add hua:</b> " + ", ".join(f"<code>{html.escape(w)}</code>" for w in added))
+        if dup:
+            msg.append("ℹ️ Pehle se tha: " + ", ".join(f"<code>{html.escape(w)}</code>" for w in dup))
+        if not msg:
+            msg.append("⚠️ Koi valid word nahi mila (ya limit full hai).")
+        await message.reply("\n".join(msg), parse_mode=ParseMode.HTML)
+        return
+
+    if sub in ("remove", "rm", "del", "delete", "-") and arg.strip():
+        words = await _get_monitor_blacklist()
+        removed = []
+        for tok in _split_blacklist_input(arg):
+            if tok.isdigit() and 1 <= int(tok) <= len(words):
+                removed.append(words[int(tok) - 1])
+            else:
+                for w in words:
+                    if w.lower() == tok.lower():
+                        removed.append(w)
+        removed = list(dict.fromkeys(removed))
+        if removed:
+            await _save_monitor_blacklist([w for w in words if w not in removed])
+            await message.reply("🗑 <b>Hata diya:</b> " + ", ".join(f"<code>{html.escape(w)}</code>" for w in removed),
+                                parse_mode=ParseMode.HTML)
+        else:
+            await message.reply("⚠️ Yeh word list mein nahi mila. /monitor_blacklist se list dekho.")
+        return
+
+    if sub == "clear":
+        await _save_monitor_blacklist([])
+        await message.reply("🧹 Monitor blacklist saaf kar di.")
+        return
+
+    words = await _get_monitor_blacklist()
+    await message.reply(_mbl_text(words), reply_markup=_mbl_kb(words), parse_mode=ParseMode.HTML)
+
+
+@Client.on_callback_query(filters.regex(r"^mbl_"))
+async def mbl_callbacks(client: Client, cb: CallbackQuery):
+    try:
+        if not _is_authorized(cb.from_user.id):
+            await cb.answer("❌ Allowed nahi.", show_alert=True)
+            return
+        parts = cb.data.split("_")
+        action = parts[1] if len(parts) > 1 else ""
+        uid = cb.from_user.id
+
+        if action == "noop":
+            await cb.answer()
+            return
+
+        if action == "close":
+            _mbl_pending.pop(uid, None)
+            await cb.answer()
+            try:
+                await cb.message.delete()
+            except Exception:
+                pass
+            return
+
+        words = await _get_monitor_blacklist()
+
+        if action in ("back", "cancel"):
+            _mbl_pending.pop(uid, None)
+            await cb.answer()
+            await cb.message.edit(_mbl_text(words), reply_markup=_mbl_kb(words), parse_mode=ParseMode.HTML)
+            return
+
+        if action == "add":
+            _mbl_pending[uid] = cb.message.id
+            await cb.answer()
+            await cb.message.edit(
+                "➕ <b>Blacklist Word Add</b>\n━━━━━━━━━━━━━━━━━━\n"
+                "Ab wo word bhejo jo post mein hone par upload <b>nahi</b> karna.\n\n"
+                "Example: <code>multi</code>\n"
+                "Ek saath kai: <code>multi | camrip | dual audio</code>\n\n"
+                "<i>Cancel karna ho to neeche button dabao.</i>",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="mbl_cancel")]]),
+                parse_mode=ParseMode.HTML)
+            return
+
+        if action == "rmv":
+            page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+            if not words:
+                await cb.answer("List khaali hai.", show_alert=True)
+                await cb.message.edit(_mbl_text(words), reply_markup=_mbl_kb(words), parse_mode=ParseMode.HTML)
+                return
+            text, kb = _mbl_remove_view(words, page)
+            await cb.answer()
+            await cb.message.edit(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+
+        if action == "del":
+            idx = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else -1
+            page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+            if 0 <= idx < len(words):
+                gone = words.pop(idx)
+                await _save_monitor_blacklist(words)
+                await cb.answer(f"🗑 '{gone[:30]}' hata diya")
+            else:
+                await cb.answer("Word pehle hi hat chuka hai.")
+            if not words:
+                await cb.message.edit(_mbl_text(words), reply_markup=_mbl_kb(words), parse_mode=ParseMode.HTML)
+            else:
+                text, kb = _mbl_remove_view(words, page)
+                await cb.message.edit(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+
+        if action == "clr":
+            if not words:
+                await cb.answer("List pehle se khaali hai.", show_alert=True)
+                return
+            await cb.answer()
+            await cb.message.edit(
+                f"🧹 <b>Poori blacklist ({len(words)} words) saaf karni hai?</b>",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Haan, saaf karo", callback_data="mbl_clrok"),
+                    InlineKeyboardButton("🔙 Nahi", callback_data="mbl_back"),
+                ]]), parse_mode=ParseMode.HTML)
+            return
+
+        if action == "clrok":
+            await _save_monitor_blacklist([])
+            await cb.answer("🧹 Saaf ho gayi")
+            await cb.message.edit(_mbl_text([]), reply_markup=_mbl_kb([]), parse_mode=ParseMode.HTML)
+            return
+
+        await cb.answer()
+    except Exception as e:
+        if "MESSAGE_NOT_MODIFIED" in str(e):
+            return
+        LOGGER.error(f"[AutoMonitor] mbl callback error: {e}", exc_info=True)
+        try:
+            await cb.answer("❌ Error, dubara try karo.", show_alert=True)
+        except Exception:
+            pass
+
+
+@Client.on_message(filters.private & filters.text, group=-9)
+async def mbl_text_input(client: Client, message: Message):
+    """'➕ Add Word' dabane ke baad aaya agla text = blacklist words."""
+    if not message.from_user:
+        return
+    uid = message.from_user.id
+    panel_id = _mbl_pending.get(uid)
+    if not panel_id:
+        return
+    text = (message.text or "").strip()
+    if text.startswith("/"):          # koi aur command — add mode chhod do, command ko chalne do
+        _mbl_pending.pop(uid, None)
+        return
+    _mbl_pending.pop(uid, None)
+    added, dup = await _mbl_add_words(_split_blacklist_input(text))
+    words = await _get_monitor_blacklist()
+    note = []
+    if added:
+        note.append("✅ Add hua: " + ", ".join(f"<code>{html.escape(w)}</code>" for w in added))
+    if dup:
+        note.append("ℹ️ Pehle se tha: " + ", ".join(f"<code>{html.escape(w)}</code>" for w in dup))
+    if not note:
+        note.append("⚠️ Koi valid word nahi mila (ya limit full hai).")
+    try:
+        await client.edit_message_text(
+            message.chat.id, panel_id, "\n".join(note) + "\n\n" + _mbl_text(words),
+            reply_markup=_mbl_kb(words), parse_mode=ParseMode.HTML)
+    except Exception:
+        await message.reply("\n".join(note) + "\n\n" + _mbl_text(words), reply_markup=_mbl_kb(words),
+                            parse_mode=ParseMode.HTML)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    raise StopPropagation
 
 
 # ─────────────────────────────────────────────
