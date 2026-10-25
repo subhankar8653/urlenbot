@@ -983,7 +983,11 @@ class BaseScraper:
     # ── download entry points (mirror the legacy downloader API) ─────────────
 
     def download_episode(self, url, quality="auto", name_override=None,
-                         season_override=None, ep_num_override=None) -> bool:
+                         season_override=None, ep_num_override=None,
+                         audio="all") -> bool:
+        # audio: "all" (default: sub + dub -> Dual Audio), "jpn" (sirf Japanese/sub),
+        #        "eng" (sirf English/dub). Language buttons (/anime, /aniwatch) se aata hai.
+        self.audio_mode = audio if audio in ("all", "jpn", "eng") else "all"
         # 'all' means "every quality the CDN actually has". The scrapers only
         # publish one variant per title more often than not, so the same file
         # would otherwise be fetched three times under three different names.
@@ -1048,6 +1052,19 @@ class BaseScraper:
         if not sub and not dub:
             self.reporter.error("no video source found for this episode")
             return None
+
+        # ── Language selection (Language row): sirf Japanese ya sirf English ──
+        _mode = getattr(self, "audio_mode", "all")
+        if _mode == "jpn":
+            if not sub:
+                self.reporter.error("Japanese (sub) audio is episode mein available nahi hai")
+                return None
+            dub = None
+        elif _mode == "eng":
+            if not dub:
+                self.reporter.error("English (dub) audio is episode mein available nahi hai")
+                return None
+            sub = None
 
         series = name_override or recipe.get("series") or "Anime"
         season = str(season_override or recipe.get("season") or "1")
