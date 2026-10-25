@@ -2385,7 +2385,7 @@ async def _convert_audio_to_aac(filepath: str, msg: Message) -> str | None:
     return await _ffmpeg_process(filepath, out_path, map_args + codec_args, msg)
 
 
-
+async def _apply_metadata(filepath: str, meta: dict, msg: Message) -> "str | None":
     """Legacy wrapper for -vt mode manual metadata."""
     out = _make_output_path(filepath, "_meta")
     meta_args = ["-map", "0", "-c", "copy"]

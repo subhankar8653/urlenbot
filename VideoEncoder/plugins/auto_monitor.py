@@ -576,179 +576,185 @@ async def _episode_quality_poller(
             _poll_prog["cancel"] = _job.cancel_ev
             _poll_prog["job"] = _job
             _job.progresses.append(_poll_prog)
-        try:
-            poll_result = await loop.run_in_executor(
-                None, functools.partial(
-                    _scrape_and_download, swift_url, poll_dl_dir, None, None, progress=_poll_prog
-                )
+        # ══════════ PIPELINE (bilkul /rti jaisa): file download hote hi UPLOAD shuru ══════════
+        # Pehle: _scrape_and_download poori tarah (saari qualities) khatam hone ke baad hi upload
+        # shuru hota tha => 1080p ka wait karte karte 360p bhi atka rehta tha ("bahut der stuck").
+        # Ab: har file jaise hi ready ho, turant upload; uploader client download ke SAATH connect.
+        from .swift_downloader import (
+            _preconnect_uploaders, _close_uploaders, _OrderedGate, _new_status as _ns,
+            _PARALLEL_UPLOAD, _prewarm_all_custompics, _drop_pre_task,
+        )
+        import threading as _thr
+
+        class _OrEvent:
+            """Job cancel YA is episode ka local cancel — dono pe scrape thread ruk jaye."""
+            def __init__(self, *evs):
+                self._evs = [e for e in evs if e is not None]
+
+            def is_set(self):
+                return any(e.is_set() for e in self._evs)
+
+        _local_cancel = _thr.Event()
+        _poll_prog["cancel"] = _OrEvent(_job.cancel_ev if _job is not None else None, _local_cancel)
+
+        file_q: asyncio.Queue = asyncio.Queue()
+
+        def _on_file(path, _q):                      # download thread se aata hai
+            loop.call_soon_threadsafe(file_q.put_nowait, (path, _q))
+
+        _use_gate = bool(_PARALLEL_UPLOAD and not _bot_mode_active)
+        _poll_ucs: list = []
+        _pre_task = None
+        asyncio.ensure_future(_prewarm_all_custompics(proxy_msg.from_user.id))
+        if _use_gate:
+            _pre_task = asyncio.ensure_future(_preconnect_uploaders(proxy_msg.from_user.id, 3))
+            if _job is not None:
+                _job.cleanups.append(functools.partial(_drop_pre_task, _pre_task))
+
+        scrape_fut = loop.run_in_executor(
+            None, functools.partial(
+                _scrape_and_download, swift_url, poll_dl_dir, None, None,
+                progress=_poll_prog, on_file=_on_file,
             )
-        except Exception as e:
-            LOGGER.error(f"[AutoMonitor] Poll Ep {episode_num} attempt {poll_attempt} error: {e}")
-            shutil.rmtree(poll_dl_dir, ignore_errors=True)
-            await asyncio.sleep(interval)
-            continue
+        )
 
-        if poll_result["error"] and not poll_result["files"]:
-            shutil.rmtree(poll_dl_dir, ignore_errors=True)
-            await asyncio.sleep(interval)
-            continue
-
-        poll_files = poll_result.get("files", [])
-        if not poll_files:
-            shutil.rmtree(poll_dl_dir, ignore_errors=True)
-            await asyncio.sleep(interval)
-            continue
-
-        poll_files = _sort_by_size(poll_files)
-        new_files = [fp for fp in poll_files if _quality_from(os.path.basename(fp)) in remaining]
-
-        if not new_files:
-            shutil.rmtree(poll_dl_dir, ignore_errors=True)
-            await asyncio.sleep(interval)
-            continue
-
-        # ── DUPLICATE GUARD (upload se PEHLE): channel mein ye season-episode-quality pehle se hai? ──
-        # Season file ke naam se (bot ke caption jaisa: season na mile to 1).
-        try:
-            from ..utils import episode_guard as _eg
-            from ..utils.auto_caption import extract_anime_info as _eai_g
-            _gseason = None
-            try:
-                _, _gseason, _ = _eai_g(os.path.basename(new_files[0]), {})
-            except Exception:
-                _gseason = None
-            _gseason = _gseason or 1
-            _wanted = [_quality_from(os.path.basename(f)) for f in new_files]
-            _pres, _noq, _scan_ok = await _eg.present_qualities(
-                client, channel_id, owner_id, _gseason, episode_num, _wanted)
-            _dups = set(_wanted) if _noq else set(_pres)
-            if _dups:
-                _keep = []
-                for fp in new_files:
-                    _q = _quality_from(os.path.basename(fp))
-                    if _q in _dups:
-                        remaining.discard(_q)
+        # Download ka live status (pehle sirf "scan ho raha hai" dikhta tha => stuck jaisa lagta tha)
+        async def _dl_status_updater():
+            _t0 = time.time()
+            _lb, _lt = 0, _t0
+            while True:
+                await asyncio.sleep(4)
+                try:
+                    dls = list(_poll_prog.get("dls", {}).values())
+                    if not dls:
+                        _sec = int(time.time() - _t0)
+                        await status_msg.edit(
+                            f"🎌 **AutoMonitor** | Ep `{episode_num}`\n\n"
+                            f"🔍 Link scan ho raha hai... `{_sec}s`\n"
+                            f"🎯 Baki: `{' | '.join(sorted(remaining))}`"
+                        )
+                        continue
+                    live, fin = 0, 0
+                    for d in dls:
                         try:
-                            os.remove(fp)
+                            live += int(d.get_dl_size())
+                            if d.isFinished():
+                                fin += 1
                         except Exception:
                             pass
-                        if stats is not None:
-                            stats.setdefault("dups", set()).add(_q)
-                    else:
-                        _keep.append(fp)
-                LOGGER.info(f"[AutoMonitor] ⏭️ S{_gseason:02d}E{episode_num:02d} {sorted(_dups)} channel mein pehle se — skip")
-                try:
+                    now = time.time()
+                    spd = max(live - _lb, 0) / max(now - _lt, 0.001) / (1024 * 1024)
+                    _lb, _lt = live, now
                     await status_msg.edit(
                         f"🎌 **AutoMonitor** | Ep `{episode_num}`\n\n"
-                        f"⏭️ Channel mein pehle se hai (S{_gseason:02d}): `{' | '.join(sorted(_dups))}` — skip"
+                        f"⬇️ **Downloading...** `{fin}/{len(dls)}` complete\n"
+                        f"💾 `{live / (1024 * 1024):.1f} MB` • 🚀 `{spd:.1f} MB/s`\n"
+                        f"📤 Uploaded/started: `{' | '.join(sorted(started_q)) or '—'}`\n"
+                        f"⏱️ `{int(now - _t0)}s`"
                     )
+                except asyncio.CancelledError:
+                    raise
                 except Exception:
                     pass
-                new_files = _keep
-                if not new_files:
-                    shutil.rmtree(poll_dl_dir, ignore_errors=True)
-                    if remaining:
-                        await asyncio.sleep(interval)
-                    continue
-        except Exception as _ge:
-            LOGGER.warning(f"[AutoMonitor] dup-guard error (upload chalne diya): {_ge!r}")
 
-        if should_stop(anime_name, episode_num):
-            shutil.rmtree(poll_dl_dir, ignore_errors=True)
-            await _mark_cancelled()
-            unmark_active(anime_name, episode_num)
-            return False
+        up_tasks: dict = {}                 # path -> upload task
+        started_q: set = set()              # jin qualities ka upload shuru ho chuka
+        _st = {"gate": None, "prepared": False, "dup": None, "prev_half": None}
+        _prep_lock = asyncio.Lock()
+        _dup_lock = asyncio.Lock()
 
-        # Season ka pehla episode: details post → border → season sticker
-        # (kisi bhi quality ke upload se PEHLE, sirf ek baar per batch)
-        if (season_intro is not None and not season_intro[0]
-                and start_ep == 1 and episode_num == 1):
-            season_intro[0] = True
-            try:
-                from ..utils.auto_caption import extract_anime_info as _eai_s
-                _sn = None
+        async def _dup_check(q, fp):
+            """(season, is_duplicate) — channel mein ye season-episode-quality pehle se hai?"""
+            async with _dup_lock:
                 try:
-                    _, _sn, _ = _eai_s(os.path.basename(new_files[0]), {})
-                except Exception:
-                    _sn = None
-                try:
-                    _sn = int(_sn) if _sn else None
-                except (TypeError, ValueError):
-                    _sn = None
-                _sn = _sn or season_hint or 1
-                await _send_season_intro(client, channel_id, anime_name, _sn)
-            except Exception as _ie:
-                LOGGER.error(f"[Deco] season intro error: {_ie}")
+                    from ..utils import episode_guard as _eg
+                    from ..utils.auto_caption import extract_anime_info as _eai_g
+                    if _st["dup"] is None:
+                        _gs = None
+                        try:
+                            _, _gs, _ = _eai_g(os.path.basename(fp), {})
+                        except Exception:
+                            _gs = None
+                        _gs = _gs or 1
+                        _wanted = sorted(set(remaining) | {q})
+                        _pres, _noq, _ = await _eg.present_qualities(
+                            client, channel_id, owner_id, _gs, episode_num, _wanted)
+                        _st["dup"] = (_gs, set(_wanted) if _noq else set(_pres))
+                    _gs, _dups = _st["dup"]
+                    return _gs, (q in _dups)
+                except Exception as _ge:
+                    LOGGER.warning(f"[AutoMonitor] dup-guard error (upload chalne diya): {_ge!r}")
+                    return 1, False
 
-        qualities_found = [_quality_from(os.path.basename(f)) for f in new_files]
-        try:
-            await status_msg.edit(
-                f"🎌 **AutoMonitor** | Ep `{episode_num}`\n\n"
-                f"✅ Mili: `{' | '.join(qualities_found)}`\n"
-                f"📤 Upload ho raha hai..."
-            )
-        except Exception:
-            pass
-
-        # Parallel upload ke liye connections pehle se ready (3-4s, ek baar)
-        _poll_ucs = []
-        try:
-            from .swift_downloader import _preconnect_uploaders, _PARALLEL_UPLOAD as _PARALLEL_UPLOAD_AM
-            if _PARALLEL_UPLOAD_AM and not _bot_mode_active and len(new_files) > 1:
-                _uid_pc = proxy_msg.from_user.id
-                _poll_ucs = [u for u in await _preconnect_uploaders(_uid_pc, len(new_files)) if u]
-                if _job is not None and _poll_ucs:
-                    from .swift_downloader import _close_uploaders as _cu
-                    _job.cleanups.append(functools.partial(_cu, _poll_ucs))
-        except Exception as _pce:
-            LOGGER.warning(f"[AutoMonitor] preconnect failed: {_pce!r}")
-            _poll_ucs = []
-
-        _dummy_msgs_poll = {}
-        for fp in new_files:
-            q = _quality_from(os.path.basename(fp))
-            try:
-                from .swift_downloader import _new_status as _ns
-                dm = await _ns(log_message, f"📤 **Uploading `{q}`** — Ep `{episode_num}`...", q)
-                _dummy_msgs_poll[fp] = dm
-            except Exception:
-                _dummy_msgs_poll[fp] = status_msg
-
-        _half_events_poll = [asyncio.Event() for _ in new_files]
-
-        # FAST MODE (file mode): sab qualities EK SAATH upload -> log channel,
-        # delivery 360p -> 720p -> 1080p order mein. Bot mode purane tareeke pe
-        # (wahan 'Link Ready' msg_id+1 se milta hai, parallel mein mix ho jata).
-        from .swift_downloader import _PARALLEL_UPLOAD, _OrderedGate
-        _poll_gate = None
-        if _PARALLEL_UPLOAD and not _bot_mode_active and len(new_files) > 1:
-            _poll_gate = _OrderedGate([_quality_from(os.path.basename(f)) for f in new_files])
-            if not _old_msgs_deleted_poll:
-                _old_msgs_deleted_poll = True
-                await _delete_old_bot_msgs(channel_id)
-
-        async def _poll_upload_task(filepath, idx):
+        async def _prepare(first_fp):
+            """Pehli file aane par ek baar: uploader client, gate, purane msgs delete, season intro."""
             nonlocal _old_msgs_deleted_poll
-            if idx > 0 and _poll_gate is None:
-                await _half_events_poll[idx - 1].wait()
-            elif _poll_gate is not None and idx > 0:
-                await asyncio.sleep(0.3 * idx)
-            if idx == 0 and not _old_msgs_deleted_poll:
-                _old_msgs_deleted_poll = True
-                await _delete_old_bot_msgs(channel_id)
-            um = _dummy_msgs_poll.get(filepath, status_msg)
-            _gq = _quality_from(os.path.basename(filepath))
+            async with _prep_lock:
+                if _st["prepared"]:
+                    return
+                _st["prepared"] = True
+                if _pre_task is not None:
+                    try:
+                        _poll_ucs.extend(
+                            u for u in await asyncio.wait_for(asyncio.shield(_pre_task), timeout=45) if u)
+                    except Exception as _pe:
+                        LOGGER.warning(f"[AutoMonitor] preconnect wait failed: {_pe!r}")
+                    if _job is not None and _poll_ucs:
+                        _job.cleanups.append(functools.partial(_close_uploaders, _poll_ucs))
+                _dups = (_st["dup"][1] if _st["dup"] else set())
+                _exp = [q_ for q_ in (_poll_prog.get("expected") or []) if q_ in remaining and q_ not in _dups]
+                if _use_gate and len(_exp) > 1:
+                    _st["gate"] = _OrderedGate(_exp)
+                    LOGGER.info(f"[AutoMonitor] Pipeline upload ON, expected={_exp}")
+                if not _old_msgs_deleted_poll:
+                    _old_msgs_deleted_poll = True
+                    await _delete_old_bot_msgs(channel_id)
+                # Season ka pehla episode: details post → border → season sticker (ek baar)
+                if (season_intro is not None and not season_intro[0]
+                        and start_ep == 1 and episode_num == 1):
+                    season_intro[0] = True
+                    try:
+                        from ..utils.auto_caption import extract_anime_info as _eai_s
+                        _sn = None
+                        try:
+                            _, _sn, _ = _eai_s(os.path.basename(first_fp), {})
+                        except Exception:
+                            _sn = None
+                        try:
+                            _sn = int(_sn) if _sn else None
+                        except (TypeError, ValueError):
+                            _sn = None
+                        _sn = _sn or season_hint or 1
+                        await _send_season_intro(client, channel_id, anime_name, _sn)
+                    except Exception as _ie:
+                        LOGGER.error(f"[Deco] season intro error: {_ie}")
+
+        async def _upload_task(filepath, q, half_ev, prev_half):
+            gate = _st["gate"]
+            if gate is not None:
+                gate.ensure(q)
+            elif prev_half is not None:
+                try:   # gate nahi (bot mode / single): pichhli file 50% ho tab shuru (purana stagger)
+                    await asyncio.wait_for(prev_half.wait(), timeout=40 * 60)
+                except asyncio.TimeoutError:
+                    pass
+            try:
+                um = await _ns(log_message, f"📤 **Uploading `{q}`** — Ep `{episode_num}`...", q)
+            except Exception:
+                um = status_msg
+            success, sent_msg, quality = False, None, q
             try:
                 success, sent_msg, quality = await _upload_one_file(
                     client, proxy_msg, um, filepath, poll_dl_dir, encode=False,
-                    on_half=_half_events_poll[idx],
+                    on_half=half_ev,
                     skip_forward=_bot_mode_active,
-                    gate=_poll_gate,
-                    uploader_client=(_poll_ucs[0] if (_poll_gate is not None and _poll_ucs) else None),
+                    gate=gate,
+                    uploader_client=(_poll_ucs[0] if (gate is not None and _poll_ucs) else None),
                 )
             finally:
-                if _poll_gate:
-                    _poll_gate.done(_gq)
+                half_ev.set()
+                if gate is not None:
+                    gate.done(q)
             try:
                 await um.delete()
             except Exception:
@@ -823,19 +829,136 @@ async def _episode_quality_poller(
                     LOGGER.error(f"[BotMode] add_quality error: {_bme}")
             return success, sent_msg, quality
 
-        poll_results = await asyncio.gather(
-            *[_poll_upload_task(fp, i) for i, fp in enumerate(new_files)],
-            return_exceptions=True,
-        )
+        async def _start(path):
+            q = _quality_from(os.path.basename(path))
+            if path in up_tasks or q in started_q:
+                return          # same quality dobara nahi (upload ke baad rename se naya naam aata hai)
+            if q not in remaining:
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except Exception:
+                    pass
+                return
+            _gs, _is_dup = await _dup_check(q, path)
+            if _is_dup:
+                remaining.discard(q)
+                started_q.add(q)
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+                if stats is not None:
+                    stats.setdefault("dups", set()).add(q)
+                if _st["gate"] is not None:
+                    _st["gate"].done(q)
+                LOGGER.info(f"[AutoMonitor] ⏭️ S{_gs:02d}E{episode_num:02d} {q} channel mein pehle se — skip")
+                try:
+                    await status_msg.edit(
+                        f"🎌 **AutoMonitor** | Ep `{episode_num}`\n\n"
+                        f"⏭️ Channel mein pehle se hai (S{_gs:02d}): `{q}` — skip"
+                    )
+                except Exception:
+                    pass
+                return
+            started_q.add(q)
+            await _prepare(path)
+            _half = asyncio.Event()
+            _prev = _st["prev_half"]
+            _st["prev_half"] = _half
+            LOGGER.info(f"[AutoMonitor] ▶ upload start (download baaki ho sakta hai): {os.path.basename(path)}")
+            up_tasks[path] = job_ctl.track_task(asyncio.ensure_future(_upload_task(path, q, _half, _prev)))
+
+        _dl_upd = asyncio.ensure_future(_dl_status_updater())
+        if _job is not None:
+            _job.tasks.add(_dl_upd)
+        poll_result = {"files": [], "error": None}
+        _cancelled_mid = False
+        try:
+            # pump: jaise-jaise files ready hon, upload start karo
+            _getter = None
+            while True:
+                if should_stop(anime_name, episode_num):
+                    _cancelled_mid = True
+                    _local_cancel.set()
+                    break
+                if _getter is None:
+                    _getter = asyncio.ensure_future(file_q.get())
+                # nayi file ya scrape khatam — jo pehle ho, turant jaag jao (polling delay nahi)
+                await asyncio.wait({_getter, scrape_fut}, timeout=1.0,
+                                   return_when=asyncio.FIRST_COMPLETED)
+                if _getter.done():
+                    _path, _qq = _getter.result()
+                    _getter = None
+                    await _start(_path)
+                    continue
+                if scrape_fut.done():
+                    _getter.cancel()
+                    break
+            if _getter is not None and not _getter.done():
+                _getter.cancel()
+            try:
+                poll_result = await scrape_fut
+            except Exception as e:
+                LOGGER.error(f"[AutoMonitor] Poll Ep {episode_num} attempt {poll_attempt} error: {e}")
+                poll_result = {"files": [], "error": str(e)}
+        finally:
+            _dl_upd.cancel()
+            try:
+                await _dl_upd
+            except BaseException:
+                pass
+
+        if _cancelled_mid:
+            for _t in up_tasks.values():
+                _t.cancel()
+            await asyncio.gather(*up_tasks.values(), return_exceptions=True)
+            await _close_uploaders(_poll_ucs)
+            if _pre_task is not None and not _poll_ucs:
+                await _drop_pre_task(_pre_task)
+            shutil.rmtree(poll_dl_dir, ignore_errors=True)
+            await _mark_cancelled()
+            unmark_active(anime_name, episode_num)
+            return False
+
+        # Jo file callback se miss ho gayi (safety) — ab start karo
+        for _f in _sort_by_size(poll_result.get("files", []) or []):
+            await _start(_f)
+
+        # Jo quality kabhi aayi hi nahi (download fail) — uske peeche wale na atkein
+        _g = _st["gate"]
+        if _g is not None:
+            for _q_ in list(_g._order):
+                if _q_ not in started_q:
+                    _g.done(_q_)
+
+        if not up_tasks:
+            if _pre_task is not None and not _poll_ucs:
+                await _drop_pre_task(_pre_task)
+            shutil.rmtree(poll_dl_dir, ignore_errors=True)
+            if remaining:
+                await asyncio.sleep(interval)
+            continue
 
         try:
-            from .swift_downloader import _close_uploaders
+            await status_msg.edit(
+                f"🎌 **AutoMonitor** | Ep `{episode_num}`\n\n"
+                f"✅ Mili: `{' | '.join(sorted(started_q))}`\n"
+                f"📤 Upload ho raha hai..."
+            )
+        except Exception:
+            pass
+
+        poll_results = await asyncio.gather(*up_tasks.values(), return_exceptions=True)
+
+        try:
             await _close_uploaders(_poll_ucs)
         except Exception:
             pass
 
         for r in poll_results:
             if isinstance(r, Exception):
+                LOGGER.error(f"[AutoMonitor] Upload task exception: {r!r}")
                 continue
             success, sent_msg, quality = r
             if success:
