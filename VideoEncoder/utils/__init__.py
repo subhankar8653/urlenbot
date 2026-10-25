@@ -4,6 +4,7 @@ from .lk21_patch import *   # ⭐ MUST BE FIRST LINE ⭐
 
 
 from pyrogram import Client, filters
+from pyrogram.errors import RPCError
 from .. import LOGGER
 from . import (direct_link_generator, display_progress, encoding, helper,
                settings, tasks)
