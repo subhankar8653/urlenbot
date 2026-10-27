@@ -275,6 +275,10 @@ def _quality_from(text: str) -> str:
 # ─────────────────────────────────────────────
 #  Download complete hone ka wait
 # ─────────────────────────────────────────────
+_NON_VIDEO_EXT = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".temp", ".dl", ".txt", ".json", ".srt", ".vtt", ".ass")
+_THUMB_PREFIXES = ("tmdb_thumb_", "cthumb_", "thumb_", "warm_", "p_", "m_", "c_")
+
+
 def _get_done_files(dl_dir: str) -> list:
     done = []
     for f in glob.glob(os.path.join(dl_dir, "*")):
@@ -284,6 +288,10 @@ def _get_done_files(dl_dir: str) -> list:
             continue
         basename = os.path.basename(f)
         if basename.startswith("_tmp_"):  # temp rename files skip
+            continue
+        # Thumbnail/poster ki images VIDEO nahi hain — inhe upload list mein kabhi mat lo
+        # (pehle tmdb_thumb_*.jpg (170 KB) video ki tarah upload ho jaati thi => error + baaki quality ka thumb white).
+        if basename.lower().endswith(_NON_VIDEO_EXT) or basename.startswith(_THUMB_PREFIXES):
             continue
         try:
             if os.path.getsize(f) > 100 * 1024:  # > 100KB
@@ -1080,6 +1088,20 @@ _THUMB_CACHE: dict = {}   # file_id -> local path
 _THUMB_CACHE_DIR = os.path.join(download_dir, "_thumbcache")   # episode khatam hone par bhi bacha rahe
 
 
+def _delete_later(m, delay: float = 12.0):
+    """Error/status message `delay` sec baad chupchap delete (fail hone par bhi upload nahi rukta)."""
+    async def _go():
+        try:
+            await asyncio.sleep(delay)
+            await m.delete()
+        except Exception:
+            pass
+    try:
+        asyncio.ensure_future(_go())
+    except Exception:
+        pass
+
+
 async def _swift_dl_media(fid, path):
     return await app.download_media(fid, file_name=path)
 
@@ -1394,13 +1416,19 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
         LOGGER.error(f"[Swift] Upload error ({quality}): {e}")
         if gate:
             gate.done(gate_q)   # fail hone par bhi baaki qualities atke nahi
+        # Error message thodi der dikhao, phir khud delete (chat mein error ka kachra nahi bachta)
         if job_ctl.CURRENT.get() is not None:
             try:
                 await msg.edit(f"⚠️ Upload failed `{quality}`: `{str(e)[:120]}`")
             except Exception:
                 pass
+            _delete_later(msg)
         else:
-            await message.reply(f"⚠️ Upload failed `{fname}`: `{e}`")
+            try:
+                _em = await message.reply(f"⚠️ Upload failed `{fname}`: `{e}`")
+                _delete_later(_em)
+            except Exception:
+                pass
         return False, None, quality
 
 
