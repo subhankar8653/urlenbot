@@ -15,7 +15,7 @@ from ..community import get_community_tag
 from ..display_progress import progress_for_pyrogram
 from ..encoding import (get_duration, get_thumbnail, get_width_height,
                         probe_media_async, get_thumbnail_async)
-from ..thumb_source import get_tmdb_thumbnail, fetch_custom_thumb
+from ..thumb_source import get_tmdb_thumbnail, fetch_custom_thumb, cached_cover_id
 from .. import turbo_upload   # noqa: F401  — import par Client.save_file turbo se patch ho jata hai
 
 
@@ -412,6 +412,12 @@ async def apply_swap(caption, user_id):
 # ─────────────────────────────────────────────
 #  upload_to_tg
 # ─────────────────────────────────────────────
+async def _send_cover_photo(path):
+    """Auto-thumb ko log channel pe photo bhejke uska file_id (video cover) lo."""
+    sent = await app.send_photo(log, photo=path)
+    return sent.photo.file_id
+
+
 async def upload_to_tg(new_file, message, msg, resolution='480'):
     c_time = time.time()
     filename = os.path.basename(new_file)
@@ -499,6 +505,14 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
 
     _resp = None
     _cover = custom_thumb if custom_thumb else None
+    # FIX: custom thumb na ho to bhi auto poster-thumb ko cover banao (/adh, /url, /anime sab
+    # isi path se guzarte hain) — pehle sirf `thumb=` jaata tha jo player mein cover nahi dikhata.
+    if not _cover and thumb and os.path.isfile(thumb):
+        try:
+            _cover = await cached_cover_id(thumb, _send_cover_photo)
+        except Exception as _ce:
+            LOGGER.warning(f"[Upload] auto-cover fail: {_ce!r}")
+            _cover = None
     try:
         if await db.get_upload_as_doc(uid) is True:
             link = await upload_doc(
