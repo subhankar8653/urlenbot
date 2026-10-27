@@ -179,8 +179,10 @@ async def get_tmdb_thumbnail(filepath: str, dl_dir: str, band_text: str = None):
         master = await _ensure_master(anime_name, dl_dir, band_text)
         if not master:
             return None
-        os.makedirs(dl_dir, exist_ok=True)
-        out_path = os.path.join(dl_dir, f"tmdb_thumb_{time.time_ns()}.jpg")
+        # dl_dir ke andar NAHI — wahan se upload-scanner ise video samajh leta tha. Alag 'thumbs' folder.
+        out_dir = os.path.join(dl_dir, "thumbs")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"tmdb_thumb_{time.time_ns()}.jpg")
         await asyncio.to_thread(shutil.copyfile, master, out_path)
         return out_path
     except Exception as e:
