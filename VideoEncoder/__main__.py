@@ -21,6 +21,13 @@ async def main():
     await load_poster_cfg()
     from .utils.janitor import start_janitor
     start_janitor()
+    try:
+        from .utils import memguard
+        from . import owner as _owners
+        await memguard.check_previous(app, _owners)
+        memguard.start()
+    except Exception as _e:
+        print(f"memguard start fail: {_e!r}")
     await app.send_message(chat_id=log, text=f'<b>Bot Started! @{(await app.get_me()).username}</b>')
     await idle()
     await app.stop()
