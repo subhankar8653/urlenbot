@@ -889,7 +889,7 @@ async def _episode_quality_poller_impl(
         scrape_fut = loop.run_in_executor(
             None, functools.partial(
                 _scrape_and_download, swift_url, poll_dl_dir, None, None,
-                progress=_poll_prog, on_file=_on_file,
+                fast=True, progress=_poll_prog, on_file=_on_file,
             )
         )
 

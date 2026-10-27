@@ -738,18 +738,51 @@ def _close_popups(driver, main_window):
         pass
 
 
+_ARGON_RE = re.compile(r'https?://argon\.razorshell\.space/embed/[A-Za-z0-9_-]+')
+
+
+def _argon_via_requests(watchmult_url: str):
+    """Chrome kholne se pehle (3-8s bachta hai) plain HTTP se argon embed dhundo."""
+    try:
+        r = requests.get(watchmult_url, headers=HEADERS, timeout=8)
+        if r.status_code == 200:
+            m = _ARGON_RE.search(r.text)
+            if m:
+                return m.group(0)
+    except Exception:
+        pass
+    return None
+
+
 def get_argon_link(watchmult_url: str):
+    # Fast path: static HTML mein hi iframe/link ho to Chrome ki zaroorat nahi
+    _quick = _argon_via_requests(watchmult_url)
+    if _quick:
+        LOGGER.info("[RTI] argon link requests se mila (Chrome skip)")
+        return _quick
     driver = None
     try:
         driver = _make_selenium_driver()
         driver.get(watchmult_url)
         main = driver.current_window_handle
-        # Pehle 2s mein hi argon iframe aa jata hai mostly
-        time.sleep(2)
-        driver.execute_script("window.stop();")
+        # Fixed 2s sleep ki jagah: iframe aate hi turant nikal lo (0.25s polling, max 4s)
+        argon = None
+        for _ in range(16):
+            try:
+                _m = _ARGON_RE.search(driver.page_source or "")
+                if _m:
+                    argon = _m.group(0)
+                    break
+            except Exception:
+                pass
+            time.sleep(0.25)
+        try:
+            driver.execute_script("window.stop();")
+        except Exception:
+            pass
         _close_popups(driver, main)
 
-        argon = _extract_argon_from_iframes(driver)
+        argon = argon or _extract_argon_from_iframes(driver)
         if argon:
             return argon
 
