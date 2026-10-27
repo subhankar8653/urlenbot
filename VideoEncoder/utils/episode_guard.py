@@ -47,6 +47,14 @@ _EP = re.compile(r'(?<![a-z0-9])(?:episode|ep|e)\s*[-:.]?\s*0*(\d{1,4})(?!\d)')
 _SN = re.compile(r'(?<![a-z0-9])(?:season|s)\s*[-:.]?\s*0*(\d{1,2})(?![a-z0-9])')
 _Q = re.compile(r'(?<![0-9])(2160|1440|1080|720|576|480|360|240|144)\s*p(?![a-z0-9])')
 
+
+
+def canon(q: str) -> str:
+    """Quality tier: ADH ka 480p aur RTI ka 360p EK HI tier hai (dono 'sabse chhoti quality').
+    360p aa gaya to 480p ki zarurat nahi, aur 480p aa gaya to 360p ki nahi."""
+    return "360p" if q == "480p" else q
+
+
 _TTL = 40            # scan cache (sec)
 _CACHE: dict = {}    # channel_id -> (ts, {(season, ep): {quality, ...}})
 _LOCKS: dict = {}
@@ -76,7 +84,7 @@ def _qualities(*texts) -> set:
     out = set()
     for t in texts:
         for q in _Q.findall(norm(t)):
-            out.add(f"{q}p")
+            out.add(canon(f"{q}p"))
     return out
 
 
@@ -159,12 +167,13 @@ def _reg_has(channel_id, season, ep, quality) -> bool:
     now = time.time()
     for k in [k for k, t in _REG.items() if now - t > _REG_TTL]:
         _REG.pop(k, None)
-    return (channel_id, season, ep, quality) in _REG
+    return (channel_id, season, ep, canon(quality)) in _REG
 
 
 def record_upload(channel_id: int, season, ep: int, quality: str):
     """Upload ke baad turant cache + registry mein daalo (taaki agla check fresh scan ka wait na kare)."""
     season = season or 1
+    quality = canon(quality)
     _REG[(channel_id, season, ep, quality)] = time.time()
     c = _CACHE.get(channel_id)
     if c:
@@ -201,7 +210,7 @@ def claim(channel_id: int, season, ep: int, quality: str) -> bool:
     now = time.time()
     for k in [k for k, t in _INFLIGHT.items() if now - t > _INFLIGHT_TTL]:
         _INFLIGHT.pop(k, None)
-    key = (channel_id, season or 1, ep, quality)
+    key = (channel_id, season or 1, ep, canon(quality))
     if key in _INFLIGHT:
         return False
     _INFLIGHT[key] = now
@@ -209,11 +218,11 @@ def claim(channel_id: int, season, ep: int, quality: str) -> bool:
 
 
 def release(channel_id: int, season, ep: int, quality: str):
-    _INFLIGHT.pop((channel_id, season or 1, ep, quality), None)
+    _INFLIGHT.pop((channel_id, season or 1, ep, canon(quality)), None)
 
 
 def is_claimed(channel_id: int, season, ep: int, quality: str) -> bool:
-    t = _INFLIGHT.get((channel_id, season or 1, ep, quality))
+    t = _INFLIGHT.get((channel_id, season or 1, ep, canon(quality)))
     return bool(t and time.time() - t <= _INFLIGHT_TTL)
 
 
@@ -248,10 +257,28 @@ async def present_qualities(client, channel_id: int, owner_id, season, ep: int, 
     if data is not None:
         qs = data.get((season, ep))
         if qs is not None:
-            present = {q for q in wanted if q in qs}
+            present = {q for q in wanted if canon(q) in qs}
             if not qs:
                 any_no_q = True
     for q in wanted:
         if _reg_has(channel_id, season, ep, q):
             present.add(q)
     return present, any_no_q, data is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ONCE — ek hi cheez (jaise "update post") RTI aur ADH dono monitor se do baar na jaye
+# ─────────────────────────────────────────────────────────────────────────────
+_ONCE: dict = {}
+_ONCE_TTL = 6 * 3600
+
+
+def once(key) -> bool:
+    """True = pehli baar (karo). False = koi aur source pehle hi kar chuka."""
+    now = time.time()
+    for k in [k for k, t in _ONCE.items() if now - t > _ONCE_TTL]:
+        _ONCE.pop(k, None)
+    if key in _ONCE:
+        return False
+    _ONCE[key] = now
+    return True
