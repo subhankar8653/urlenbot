@@ -182,8 +182,8 @@ def _looks_like_adwall(html: str, expected_markers: list | None = None) -> str |
 # aur "site hi down hai" mein farak pata chale.
 def _http_get(
     url: str,
-    timeout: int = 35,
-    retries: int = 2,
+    timeout: int = 40,
+    retries: int = 3,
     debug: list | None = None,
     step: str = "",
     expected_markers: list | None = None,
@@ -212,7 +212,7 @@ def _http_get(
     r = None
     for attempt in range(1, retries + 2):  # total attempts = retries + 1
         try:
-            r = _SESSION.get(url, timeout=timeout, **kwargs)
+            r = _SESSION.get(url, timeout=(12, timeout), **kwargs)
             break
         except requests.exceptions.ReadTimeout as e:
             last_exc = e
@@ -417,17 +417,30 @@ def discover_adh_series(series_url: str) -> dict:
             _http_get, candidate, debug=cand_debug, step="Derived episode-list URL",
             expected_markers=["Episode", "GDF"],
         )
+    r = None
+    series_err = None
     try:
         r = _http_get(series_url, debug=debug, step="Series page", expected_markers=["Audio Tracks", "Download", "Watch"])
         r.raise_for_status()
-    except Exception:
-        if _cand_ex is not None:
-            _cand_ex.shutdown(wait=False)
-        raise
-    soup = BeautifulSoup(r.text, "html.parser")
+    except Exception as e:
+        series_err = e
+        r = None
+        if not candidate:
+            if _cand_ex is not None:
+                _cand_ex.shutdown(wait=False)
+            raise
+        debug.append(f"⚠️ Series page nahi khula ({type(e).__name__}) — derived episode-list URL se aage badh rahe hain")
+    if r is not None:
+        soup = BeautifulSoup(r.text, "html.parser")
+    else:
+        soup = BeautifulSoup("", "html.parser")
 
     title_tag = soup.find("h1")
-    title = title_tag.get_text(strip=True) if title_tag else "Unknown"
+    title = title_tag.get_text(strip=True) if title_tag else ""
+    if not title:
+        _slug = urlparse(series_url).path.strip("/").split("/")[-1]
+        _slug = re.sub(r"-(hindi-multi-audio|multi-audio|hindi-dubbed|hindi-dub|dual-audio)$", "", _slug, flags=re.I)
+        title = _slug.replace("-", " ").title() or "Unknown"
 
     # ── Languages: "Audio Tracks: Hindi | English | Japanese" field ──
     page_text = soup.get_text("\n")
@@ -467,12 +480,25 @@ def discover_adh_series(series_url: str) -> dict:
             )
 
     # ── Strategy B (fallback): series page ke "Download / Watch" button ──
-    if not episode_list_url:
+    if not episode_list_url and r is not None:
         found = _find_adh_episode_list_url(soup, r.text, debug)
         if found:
             episode_list_url = urljoin(series_url, found)
+    if not episode_list_url and candidate and series_err is not None:
+        episode_list_url = candidate     # series page down tha — derived hi best guess
+
+    # Button-scrape wala URL bhi yaad rakho — derived URL galat nikle to discover_adh_full dusra try karega
+    alt_url = None
+    if r is not None:
+        try:
+            _alt = _find_adh_episode_list_url(soup, r.text, [])
+            if _alt:
+                alt_url = urljoin(series_url, _alt)
+        except Exception:
+            alt_url = None
 
     return {
+        "alt_episode_list_url": alt_url,
         "title": title,
         "languages": languages,
         "episode_list_url": episode_list_url,
@@ -502,42 +528,54 @@ def discover_adh_episodes(episode_list_url: str, html: str | None = None) -> dic
 
     episodes = {}
 
-    def _collect(label_re: str, key: str):
-        for a in soup.find_all("a", string=re.compile(label_re, re.IGNORECASE)):
-            href = a.get("href")
-            if not href:
-                continue
+    _QUAL_RE = re.compile(r'\b(480P|720P|1080P)\b[^[\n]*x26[45]', re.IGNORECASE)
+    _EP_RE = re.compile(r'Episode\s*:?\s*\d+', re.IGNORECASE)
+    _LABELS = {"gdf": "qualities", "fprs": "fprs", "multi": "multi"}
+    seen_labels: dict = {}
 
-            qual_marker = a.find_previous(
-                string=re.compile(r'\b(480P|720P|1080P)\b[^[\n]*x26[45]', re.IGNORECASE)
-            )
-            if not qual_marker:
-                continue
-            quality = _normalize_adh_quality(str(qual_marker))
-            if not quality:
-                continue  # HQ ya unrecognized quality — skip
+    def _label_of(a) -> str | None:
+        # nested <span>/<i>/emoji wale anchors ke liye bhi chalta hai (pehle a.string None ho jaata tha)
+        txt = a.get_text(" ", strip=True)
+        if not txt:
+            return None
+        seen_labels[txt[:25]] = seen_labels.get(txt[:25], 0) + 1
+        cleaned = re.sub(r'[^A-Za-z]+', ' ', txt).strip().lower()
+        if cleaned in _LABELS:
+            return cleaned
+        m = re.match(r'^(gdf|fprs|multi)\b', cleaned)          # "GDF Link", "Multi Server"
+        return m.group(1) if m and len(cleaned) <= 20 else None
 
-            ep_marker = a.find_previous(string=re.compile(r'Episode\s*:?\s*\d+', re.IGNORECASE))
-            if not ep_marker:
-                continue
-            num_m = re.search(r'\d+', ep_marker)
-            if not num_m:
-                continue
-            ep_num = int(num_m.group())
-
-            ep = episodes.setdefault(ep_num, {"num": ep_num, "qualities": {}, "fprs": {}, "multi": {}})
-            ep[key][quality] = urljoin(episode_list_url, href.strip())
-
-    # GDF (purana, ab sirf optional fallback) + Fprs (ab primary)
-    _collect(r'^\s*GDF\s*$', "qualities")
-    _collect(r'^\s*Fprs\s*$', "fprs")
-    _collect(r'^\s*Multi\s*$', "multi")
+    for a in soup.find_all("a", href=True):
+        lab = _label_of(a)
+        if not lab:
+            continue
+        href = (a.get("href") or "").strip()
+        if not href or href == "#":
+            continue
+        qual_marker = a.find_previous(string=_QUAL_RE)
+        if not qual_marker:
+            continue
+        quality = _normalize_adh_quality(str(qual_marker))
+        if not quality:
+            continue  # HQ ya unrecognized quality — skip
+        ep_marker = a.find_previous(string=_EP_RE)
+        if not ep_marker:
+            continue
+        num_m = re.search(r'\d+', ep_marker)
+        if not num_m:
+            continue
+        ep_num = int(num_m.group())
+        ep = episodes.setdefault(ep_num, {"num": ep_num, "qualities": {}, "fprs": {}, "multi": {}})
+        ep[_LABELS[lab]][quality] = urljoin(episode_list_url, href)
 
     if not episodes:
         debug.append(
-            f"❌ Episode-list page pe koi bhi GDF link nahi mila (page length: {len(html)} chars) — "
+            f"❌ Episode-list page pe koi bhi GDF/Multi link nahi mila (page length: {len(html)} chars) — "
             f"ho sakta hai yeh ek ad-page ho, ya site ka HTML structure badal gaya ho"
         )
+        _top = sorted(seen_labels.items(), key=lambda kv: -kv[1])[:8]
+        debug.append("🔎 Page ke anchor-texts: " + (", ".join(f"{k!r}x{v}" for k, v in _top) or "(koi <a> nahi)"))
+        debug.append(f"🔎 'Episode' mentions={len(_EP_RE.findall(html))}, quality-markers={len(_QUAL_RE.findall(html))}")
     else:
         n_m = sum(1 for e in episodes.values() if e["multi"])
         debug.append(f"✅ {len(episodes)} episode(s) mile ({n_m} mein Multi link)")
@@ -805,8 +843,8 @@ _MEDIA_EXT_RE = re.compile(r'\.(mkv|mp4|avi|webm|mov)(\?|#|$)', re.IGNORECASE)
 
 
 def _gdf_fallback_on() -> bool:
-    """GDF ko sirf tab try karo jab env ADH_GDF_FALLBACK=1 ho (default: band)."""
-    return (os.getenv("ADH_GDF_FALLBACK") or "").strip().lower() in ("1", "true", "yes", "on")
+    """GDF fallback default ON (Multi fail ho to). Band karna ho: ADH_GDF_FALLBACK=0."""
+    return (os.getenv("ADH_GDF_FALLBACK") or "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _real_href(h: str | None) -> bool:
@@ -915,7 +953,7 @@ def _fprs_static_resolve(fprs_url: str, debug: list) -> str | None:
 
 
 # ── Path 2: Selenium (real clicks + ad handling) ──
-def _make_adh_driver():
+def _make_adh_driver(no_images=None):
     """
     Stealth headless Chromium: navigator.webdriver hide, "HeadlessChrome" UA
     se "Headless" hata, performance-log ON (network debug ke liye). FilePress jaisi
@@ -931,6 +969,11 @@ def _make_adh_driver():
             "--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
             "--disable-extensions", "--mute-audio", "--no-first-run", "--disable-crash-reporter",
             "--window-size=1366,900", "--lang=en-US",
+            # RAM kam: bot ke saath upload/ffmpeg chal raha hota hai
+            "--renderer-process-limit=2", "--disable-background-networking",
+            "--disable-default-apps", "--disable-sync", "--metrics-recording-only",
+            "--disable-features=TranslateUI,site-per-process,OptimizationHints",
+            "--js-flags=--max-old-space-size=256",
             "--disable-blink-features=AutomationControlled",
             f"--user-data-dir={profile_dir}",
         ):
@@ -946,7 +989,8 @@ def _make_adh_driver():
         }
         # SPEED: images band — buttons text-based hain, ad-heavy pages bahut jaldi load hote hain
         # (band karna ho to env ADH_NO_IMAGES=0)
-        if (os.getenv("ADH_NO_IMAGES") or "1").strip() != "0":
+        _noimg = (os.getenv("ADH_NO_IMAGES") or "1").strip() != "0" if no_images is None else bool(no_images)
+        if _noimg:
             _prefs["profile.managed_default_content_settings.images"] = 2
             options.add_argument("--blink-settings=imagesEnabled=false")
         options.add_experimental_option("prefs", _prefs)
@@ -1338,11 +1382,16 @@ def _resolve_adh_download_link(gdf_url: str | None, debug: list, fprs_url: str |
     fprs_url = urljoin(_base, fprs_url) if fprs_url else fprs_url
     gdf_url = urljoin(_base, gdf_url) if gdf_url else gdf_url
     if multi_url:
-        link = _multi_selenium_resolve(multi_url, debug, cancel)
-        if link:
-            return link
+        for _try in range(1, _resolve_tries() + 1):
+            if cancel is not None and cancel.is_set():
+                return None
+            if _try > 1:
+                debug.append(f"🔁 Multi dobara try ({_try}) — naya browser, images ON")
+            link = _multi_selenium_resolve(multi_url, debug, cancel, no_images=(False if _try > 1 else None))
+            if link:
+                return link
         debug.append("❌ Multi se final link nahi mila")
-    if fprs_url and _env_on("ADH_FPRS_FALLBACK"):
+    if fprs_url and _env_on_default("ADH_FPRS_FALLBACK"):
         debug.append("➡️ ADH_FPRS_FALLBACK on — Fprs try kar rahe hain")
         link = _resolve_adh_fprs_link(fprs_url, debug)
         if link:
@@ -1369,6 +1418,13 @@ _BLANK = ("about:blank", "", "data:,", "chrome://new-tab-page/", "chrome://new-t
 
 def _env_on(name: str) -> bool:
     return (os.getenv(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_on_default(name: str, default: bool = True) -> bool:
+    v = (os.getenv(name) or "").strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "yes", "on")
 
 
 def _body_text(driver) -> str:
@@ -1468,7 +1524,7 @@ def _perf_file_url(driver) -> str | None:
     return best
 
 
-def _multi_selenium_resolve(multi_url: str, debug: list, cancel=None) -> str | None:
+def _multi_selenium_resolve(multi_url: str, debug: list, cancel=None, no_images=None) -> str | None:
     def log(msg):
         debug.append(msg)
         LOGGER.info(f"[Adh] {msg}")
@@ -1485,7 +1541,7 @@ def _multi_selenium_resolve(multi_url: str, debug: list, cancel=None) -> str | N
     driver = None
     try:
         log("🌐 [Multi] Selenium browser khol rahe hain")
-        driver = _make_adh_driver()
+        driver = _make_adh_driver(no_images=no_images)
         try:
             driver.get(multi_url)
         except Exception as e:
@@ -1497,6 +1553,7 @@ def _multi_selenium_resolve(multi_url: str, debug: list, cancel=None) -> str | N
         found = False
         t0 = time.time()
         reloaded = False
+        blank_reloads = 0
         while time.time() - t0 < 70:
             if cancel is not None and cancel.is_set():
                 return None
@@ -1505,6 +1562,16 @@ def _multi_selenium_resolve(multi_url: str, debug: list, cancel=None) -> str | N
                 main = h
                 found = True
                 break
+            if (time.time() - t0) > 12 and int(time.time() - t0) % 12 == 0 and blank_reloads < 3:
+                try:
+                    _cu = (driver.current_url or "").lower()
+                    if any(x in _cu for x in _MULTI_KEEP) and not _body_text(driver).strip():
+                        blank_reloads += 1
+                        log(f"🔄 [Multi] page blank hai — refresh ({blank_reloads}/3)")
+                        driver.refresh()
+                        time.sleep(1.2)
+                except Exception:
+                    pass
             if not reloaded and time.time() - t0 > 30:
                 reloaded = True
                 if not _multi_back_if_ad(driver, log):
@@ -1781,7 +1848,7 @@ def _ep_has_quality(ep: dict, quality: str) -> bool:
 
 def _can_resolve(ep: dict, quality: str) -> bool:
     return bool((ep.get("multi") or {}).get(quality)
-                or ((ep.get("fprs") or {}).get(quality) and _env_on("ADH_FPRS_FALLBACK"))
+                or ((ep.get("fprs") or {}).get(quality) and _env_on_default("ADH_FPRS_FALLBACK"))
                 or ((ep.get("qualities") or {}).get(quality) and _gdf_fallback_on()))
 
 
@@ -1796,10 +1863,29 @@ def _resolve_job_blocking(ep: dict, quality: str, cancel=None):
 
 
 def _resolve_par() -> int:
+    # default 1: ek saath 2 Chrome + download/upload = RAM spike => container OOM-restart
     try:
-        return max(1, int((os.getenv("ADH_RESOLVE_PAR") or "2").strip()))
+        return max(1, int((os.getenv("ADH_RESOLVE_PAR") or "1").strip()))
+    except Exception:
+        return 1
+
+
+def _resolve_tries() -> int:
+    try:
+        return max(1, min(4, int((os.getenv("ADH_RESOLVE_TRIES") or "2").strip())))
     except Exception:
         return 2
+
+
+def _free_mem_mb() -> float:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return 1e9      # pata nahi => rok mat
 
 
 def _prefetch_ahead() -> int:
@@ -1858,7 +1944,7 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
                 f"❌ Final download link nahi mila.\n\n"
                 f"**Multi URL:** `{multi_url or '-'}`\n\n"
                 f"**Debug (kaha atka, step-by-step):**\n```\n{debug_text}\n```\n"
-                f"⛔ Agle items **band** kar diye gaye."
+                f"➡️ Agle item pe ja raha hoon."
             )
         except Exception:
             pass
@@ -1898,7 +1984,7 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
             try:
                 await status_msg.edit(
                     f"🛑 **{ep_label} — Download Error**\n\n❌ `{str(e)[:150]}`\n\n"
-                    f"⛔ Agle items **band** kar diye gaye."
+                    f"➡️ Agle item pe ja raha hoon."
                 )
             except Exception:
                 pass
@@ -1911,7 +1997,7 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
         try:
             await status_msg.edit(
                 f"🛑 **{ep_label} — Filter Error**\n\n❌ `{str(e)[:150]}`\n\n"
-                f"⛔ Agle items **band** kar diye gaye."
+                f"➡️ Agle item pe ja raha hoon."
             )
         except Exception:
             pass
@@ -1955,8 +2041,11 @@ async def _download_adh_items(client, status_msg, orig_message, sess: "AdhSelect
     ahead = _prefetch_ahead()
     pre: dict = {}
 
-    def _start(k: int):
+    def _start(k: int, current: bool = False):
         if k >= total or k in pre:
+            return
+        if not current and _free_mem_mb() < float(os.getenv("ADH_MIN_FREE_MB") or 900):
+            LOGGER.info("[Adh] RAM kam hai — agle item ka prefetch abhi skip")
             return
         ep_k, q_k, _t = jobs[k]
         if not _can_resolve(ep_k, q_k):
@@ -1972,17 +2061,18 @@ async def _download_adh_items(client, status_msg, orig_message, sess: "AdhSelect
         pre[k] = asyncio.ensure_future(_run())
 
     all_ok = True
+    failed: list = []
     try:
         for i, (ep, qfull, tag) in enumerate(jobs):
             for k in range(i, min(total, i + 1 + ahead)):
-                _start(k)
+                _start(k, current=(k == i))
             result = await _process_adh_item(
                 client, orig_message, ep, status_msg, i + 1, total, sess.language, qfull,
                 ep_tag=tag, pre=pre.get(i),
             )
             if result != "ok":
                 all_ok = False
-                break
+                failed.append(f"E{ep['num']:02d} {qfull}")
             if i + 1 < total:
                 status_msg = await orig_message.reply("⏳ Agla episode shuru ho raha hai...")
                 await asyncio.sleep(0.5)
@@ -1997,6 +2087,14 @@ async def _download_adh_items(client, status_msg, orig_message, sess: "AdhSelect
             await status_msg.delete()
         except Exception:
             pass
+    elif failed:
+        try:
+            await orig_message.reply(
+                f"⚠️ **{len(failed)}/{total}** item fail hue:\n" + "\n".join(f"• `{x}`" for x in failed[:30])
+                + "\n\nInhe dobara /adh ya /anime se select karke chala lo."
+            )
+        except Exception:
+            pass
 
 
 def discover_adh_full(series_url: str) -> dict:
@@ -2006,12 +2104,31 @@ def discover_adh_full(series_url: str) -> dict:
     if not sd.get("episode_list_url"):
         raise RuntimeError("'Download / Watch' button ka link nahi mila.\n"
                            + (_safe_debug(sd.get("debug", [])[-8:]) or ""))
-    er = discover_adh_episodes(sd["episode_list_url"], sd.get("episode_list_html"))
+    tried = []
+    er = {"episodes": [], "debug": []}
+    cands = [(sd["episode_list_url"], sd.get("episode_list_html"))]
+    alt = sd.get("alt_episode_list_url")
+    if alt and alt != sd["episode_list_url"]:
+        cands.append((alt, None))
+    used_url = sd["episode_list_url"]
+    for i, (u, h) in enumerate(cands):
+        for attempt in (1, 2):                    # ad-page / timeout ho to ek baar fresh fetch
+            try:
+                er = discover_adh_episodes(u, h if attempt == 1 else None)
+            except Exception as e:
+                er = {"episodes": [], "debug": [f"⚠️ {u} fetch fail: {type(e).__name__}"]}
+            tried.extend(er.get("debug", []))
+            if er["episodes"]:
+                used_url = u
+                break
+            time.sleep(1.5)
+        if er["episodes"]:
+            break
     if not er["episodes"]:
         raise RuntimeError("Episode-list page se koi episode nahi mila (480p/720p/1080p x265).\n"
-                           + (_safe_debug(er.get("debug", [])[-8:]) or ""))
+                           + (_safe_debug(tried[-8:]) or ""))
     return {"title": sd["title"], "languages": sd["languages"], "episodes": er["episodes"],
-            "episode_list_url": sd["episode_list_url"]}
+            "episode_list_url": used_url}
 
 
 # ─────────────────────────────────────────────
