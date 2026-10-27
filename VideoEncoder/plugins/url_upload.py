@@ -11,6 +11,7 @@ Features:
 """
 
 import asyncio
+import contextvars
 import json
 import os
 import re
@@ -52,6 +53,40 @@ _url_sessions: dict = {}
 
 
 # ─── /url command ─────────────────────────────────────────────────────────────
+
+# ── /url argument parser (All-Url-Uploader jaisa: `url | name`, `url * name`, `url | name | user | pass`) ──
+_BASIC_AUTH = contextvars.ContextVar("url_basic_auth", default=None)
+
+
+def _parse_url_args(raw: str):
+    """-> (url, custom_name|None, (user, pass)|None, show_buttons, extract_zip).
+    Flags (-vt / -e) sirf alag token hone par maane jaate hain — pehle `raw.replace("-e", "")` URL ke
+    andar ke '-e' (jaise ...-episode-...) bhi kaat deta tha."""
+    show_buttons = extract_zip = False
+    keep = []
+    for tok in raw.split():
+        if tok == "-vt":
+            show_buttons = True
+        elif tok == "-e":
+            extract_zip = True
+        else:
+            keep.append(tok)
+    rest = " ".join(keep).strip()
+    url, name, auth = rest, None, None
+    if "|" in rest:
+        parts = [p.strip() for p in rest.split("|")]
+        url = parts[0]
+        if len(parts) >= 4:
+            name = parts[1] or None
+            auth = (parts[2], parts[3])
+        else:
+            name = "|".join(parts[1:]).strip() or None
+    elif " * " in rest:
+        url, name = [p.strip() for p in rest.split(" * ", 1)]
+        name = name or None
+    return url, name, auth, show_buttons, extract_zip
+
+
 @Client.on_message(filters.command("url"))
 async def url_upload_cmd(bot: Client, message: Message):
     """
@@ -74,27 +109,26 @@ async def url_upload_cmd(bot: Client, message: Message):
             "• <code>/url &lt;link&gt; -vt</code> – Show manual option buttons\n"
             "• <code>/url &lt;link&gt; -e</code> – Unzip then auto-process ALL files\n"
             "• <code>/url &lt;link&gt; -e -vt</code> – Unzip then show buttons\n"
-            "• <code>/url &lt;link&gt; | &lt;filename&gt;</code> – Custom filename\n\n"
+            "• <code>/url &lt;link&gt; | &lt;filename&gt;</code> – Custom filename (ya <code>&lt;link&gt; * &lt;filename&gt;</code>)\n"
+            "• <code>/url &lt;link&gt; | &lt;filename&gt; | &lt;user&gt; | &lt;pass&gt;</code> – Login wale link\n"
+            "• Sirf link bhejo (bina /url) — private chat mein auto-process\n\n"
             "Auto-settings configure karo: /urlpreset"
         )
         return
 
     raw = message.text.split(None, 1)[1].strip()
 
-    # ── Flags parse karo ──
-    show_buttons = "-vt" in raw
-    extract_zip  = "-e"  in raw
+    # ── Flags / custom name / credentials parse karo ──
+    url, custom_name, basic_auth, show_buttons, extract_zip = _parse_url_args(raw)
+    if not url or ("://" not in url and "." not in url and not url.lower().startswith("magnet:")):
+        await message.reply("❌ <b>Valid link nahi mila.</b> Example: <code>/url https://site.com/file.mkv | MyName.mkv</code>")
+        return
 
-    # Flags remove karo
-    raw = raw.replace("-vt", "").replace("-e", "").strip()
-
-    url = raw
-    custom_name = None
-
-    if "|" in raw:
-        parts = raw.split("|", 1)
-        url = parts[0].strip()
-        custom_name = parts[1].strip() if parts[1].strip() else None
+    from ..utils.cooldown import check as _cd_check
+    _wait = _cd_check(message.from_user.id, exempt=bool(await check_chat(message, chat="Sudo")))
+    if _wait:
+        await message.reply(f"⏳ Thoda ruko — agla link <b>{max(1, round(_wait / 60))} min</b> baad bhej sakte ho.")
+        return
 
     # Status message PEHLE — resolve / filename-detect ke dauran user ko turant "Downloading" dikhe
     msg = await message.reply("<b>💠 Downloading...</b>")
@@ -126,6 +160,7 @@ async def url_upload_cmd(bot: Client, message: Message):
             pass
 
         try:
+            _BASIC_AUTH.set(basic_auth)
             filepath = await _download_url(url, custom_name, msg, message)
         except Exception as e:
             await msg.edit(f"❌ Download failed: <code>{e}</code>")
@@ -2143,6 +2178,22 @@ async def _download_url(url: str, filename: str, msg: Message, orig_message: Mes
         headers.update(get_extra_headers(url))
     except Exception:
         pass
+    _ba = _BASIC_AUTH.get()
+    if _ba:
+        import base64 as _b64
+        headers["Authorization"] = "Basic " + _b64.b64encode(f"{_ba[0]}:{_ba[1]}".encode()).decode()
+
+    # ── LIGHT engine (All-Url-Uploader jaisa single-connection stream): RAM pressure / LIGHT_DL=1 ──
+    try:
+        from ..utils import memguard as _mg
+        if _mg.use_light_engine():
+            from ..utils.light_dl import light_download
+            LOGGER.info("[URL] light engine (RAM pressure ya LIGHT_DL)")
+            return await light_download(url, filepath, msg, headers)
+    except asyncio.CancelledError:
+        raise
+    except Exception as _le:
+        LOGGER.warning(f"[URL] light engine fail ({_le!r}) — Turbo pe fallback")
 
     try:
         from ..utils.turbo_download import TurboDL

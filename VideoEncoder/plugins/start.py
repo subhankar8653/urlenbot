@@ -214,6 +214,11 @@ async def font_message(app, message):
     textx = f"Done Restart...✅"
     await reply.edit_text(textx)
     try:
+        from ..utils import memguard as _mg
+        _mg.mark_exit("restart-cmd")
+    except Exception:
+        pass
+    try:
         exit()
     finally:
         osexecl(executable, executable, "-m", "VideoEncoder")

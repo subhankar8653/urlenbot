@@ -2044,7 +2044,12 @@ async def _download_adh_items(client, status_msg, orig_message, sess: "AdhSelect
     def _start(k: int, current: bool = False):
         if k >= total or k in pre:
             return
-        if not current and _free_mem_mb() < float(os.getenv("ADH_MIN_FREE_MB") or 900):
+        try:
+            from ..utils import memguard as _mg
+            _press = _mg.PRESSURE
+        except Exception:
+            _press = False
+        if not current and (_press or _free_mem_mb() < float(os.getenv("ADH_MIN_FREE_MB") or 900)):
             LOGGER.info("[Adh] RAM kam hai — agle item ka prefetch abhi skip")
             return
         ep_k, q_k, _t = jobs[k]
