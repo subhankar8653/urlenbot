@@ -24,6 +24,7 @@ import html
 import io
 import logging
 import time
+from collections import OrderedDict
 
 from types import SimpleNamespace as types_SimpleNamespace
 
@@ -62,6 +63,51 @@ KIND_INFO = {
 _S: dict = {}                 # user_id -> session
 _LAST_TOUCH: dict = {}
 _busy: set = set()
+
+# ── SPEED: render ki hui previews yaad rakho (style/button/brand/art/anime ke hisaab se) ──
+# Back/Next se purane style pe wapas aane par preview INSTANT (dobara render nahi hota).
+_PCACHE: "OrderedDict[tuple, tuple]" = OrderedDict()   # key -> (ts, jpg_bytes)
+_PCACHE_MAX = 40
+_PCACHE_TTL = 15 * 60.0
+_WARM_AT = 0.0
+
+
+def _pc_get(key):
+    hit = _PCACHE.get(key)
+    if not hit:
+        return None
+    if time.time() - hit[0] > _PCACHE_TTL:
+        _PCACHE.pop(key, None)
+        return None
+    _PCACHE.move_to_end(key)
+    return hit[1]
+
+
+def _pc_put(key, data: bytes):
+    _PCACHE[key] = (time.time(), data)
+    _PCACHE.move_to_end(key)
+    while len(_PCACHE) > _PCACHE_MAX:
+        _PCACHE.popitem(last=False)
+
+
+async def warm(kind: str = "video"):
+    """Thumbnail menu khulte hi background mein fonts + sample anime + art garam kar lo,
+    taaki 'Video/Main Channel Thumbnail Design' dabate hi preview jaldi aaye."""
+    global _WARM_AT
+    now = time.time()
+    if now - _WARM_AT < 120:
+        return
+    _WARM_AT = now
+    try:
+        api = _api()
+        await api._prepare()
+        from ..utils.poster_engine import config as _pc
+        a = await api.load_by_id(_pc.SAMPLE_ANIME_ID)
+        st = poster_cfg.style_of(kind) or 1
+        if st <= _n_new():
+            await _dataset().ensure_art(a, st, {"pic": 0, "char": 0})
+    except Exception as e:
+        LOGGER.debug(f"[PosterPanel] warm skipped: {e!r}")
 
 
 def _is_auth(user_id: int) -> bool:
@@ -292,10 +338,44 @@ async def _show_photo(client: Client, cb_msg: Message, data: bytes, caption: str
         pass
 
 
-async def _render_view(client: Client, cb_msg: Message, s: dict, uid: int, note: str = ""):
+async def _loading(client: Client, cb_msg: Message, kind: str, label: str = ""):
+    """Button dabate hi TURANT screen badal do (⏳ loading) — preview ready hone par ye usse replace ho jaata hai."""
+    info = KIND_INFO[kind]
+    text = (f"<b>{info['title']}</b>\n\n"
+            f"⏳ <b>Preview ban raha hai...</b> {html.escape(label)}\n"
+            f"<i>2-3 second lagte hain — ready hote hi yahin aa jaayega.</i>")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="cmz:cat:thumb"),
+                                InlineKeyboardButton("🏠 Menu", callback_data="cmz:menu")]])
+    try:
+        if cb_msg.photo:
+            await cb_msg.edit_caption(text, reply_markup=kb, parse_mode=HTML)
+        else:
+            await cb_msg.edit_text(text, reply_markup=kb, parse_mode=HTML)
+    except Exception as e:
+        if "MESSAGE_NOT_MODIFIED" not in str(e):
+            LOGGER.debug(f"[PosterPanel] loading edit skipped: {e!r}")
+
+
+async def _settle(pre):
+    """Loading-edit (agar chal raha hai) khatam hone do, taaki wo baad mein preview ko overwrite na kare."""
+    if pre is not None:
+        try:
+            await pre
+        except Exception:
+            pass
+
+
+def _pkey(s: dict, brand: str, aid) -> tuple:
+    o = s["opts"]
+    return (s["style"], o.get("button") or "", brand, o.get("pic", 0), o.get("char", 0),
+            o.get("color") or "", aid or 0)
+
+
+async def _render_view(client: Client, cb_msg: Message, s: dict, uid: int, note: str = "", pre=None):
     """Current style/options ka preview render karke dikhao."""
     api = _api()
     if uid in _busy:
+        await _settle(pre)
         return
     _busy.add(uid)
     try:
@@ -305,25 +385,34 @@ async def _render_view(client: Client, cb_msg: Message, s: dict, uid: int, note:
             pass
         try:
             a = await _ensure_anime(s)
-            if s["style"] > _n_new():
-                r = types_SimpleNamespace(jpg=await _render_old(s, a))
-            else:
-                r = await api.render(a, s["style"], button=s["opts"].get("button"), brand=await _brand_text(s),
-                                     pic=s["opts"].get("pic", 0), char=s["opts"].get("char", 0))
+            brand = await _brand_text(s)
+            key = _pkey(s, brand, (getattr(a, "raw", None) or {}).get("id") or s.get("aid"))
+            jpg = _pc_get(key)
+            if jpg is None:
+                if s["style"] > _n_new():
+                    jpg = await _render_old(s, a)
+                else:
+                    r = await api.render(a, s["style"], button=s["opts"].get("button"), brand=brand,
+                                         pic=s["opts"].get("pic", 0), char=s["opts"].get("char", 0))
+                    jpg = r.jpg
+                _pc_put(key, jpg)
         except api.NoArt as e:
             kind_ = e.args[0] if e.args else "art"
+            await _settle(pre)
             await _view_error(client, cb_msg, s,
                               f"😕 Is anime ka <b>{kind_}</b> nahi mila aur Style {s['style']} ko chahiye. "
                               f"Dusra style ya dusra anime try karo.")
             return
         except Exception as e:
             LOGGER.exception(f"[PosterPanel] preview render failed: {e}")
+            await _settle(pre)
             await _view_error(client, cb_msg, s, "😕 Preview render nahi ho paaya (internet/AniList?). Dobara try karo.")
             return
         cap = await _caption(s)
         if note:
             cap = note + "\n\n" + cap
-        await _show_photo(client, cb_msg, r.jpg, cap, _viewer_kb(s), s)
+        await _settle(pre)
+        await _show_photo(client, cb_msg, jpg, cap, _viewer_kb(s), s)
     finally:
         _busy.discard(uid)
 
@@ -395,7 +484,9 @@ async def open_panel(client: Client, cb: CallbackQuery, kind: str):
     if s["style"] > _n_new():
         col = _ts().get_current_color()
         s["opts"]["color"] = col
-    await _render_view(client, cb.message, s, uid)
+    # Turant ⏳ screen (edit parallel chalta hai, render ruka nahi), phir preview aate hi replace
+    pre = asyncio.ensure_future(_loading(client, cb.message, kind))
+    await _render_view(client, cb.message, s, uid, pre=pre)
 
 
 # ───────────────────────── callbacks ─────────────────────────

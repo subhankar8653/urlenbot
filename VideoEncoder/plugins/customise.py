@@ -248,6 +248,14 @@ async def customise_callback(client: Client, cb: CallbackQuery):
             await cb.answer()
             return
         await cb.answer()
+        if key == "thumb":
+            # Thumbnail menu khulte hi background mein preview engine garam kar lo (fonts/AniList/art)
+            try:
+                import asyncio as _aio
+                from .poster_panel import warm as _pz_warm
+                _aio.ensure_future(_pz_warm("video"))
+            except Exception:
+                pass
         await _safe_edit(client, cb, _category_text(key), _category_keyboard(key))
         return
 
@@ -266,7 +274,12 @@ async def customise_callback(client: Client, cb: CallbackQuery):
 
     if action == "open":
         section = parts[2]
-        await cb.answer()
+        # Poster sections ka preview banne mein 2-3 sec lagte hain — button dabate hi turant
+        # toast + ⏳ screen dikhao (poster_panel.open_panel khud loading screen lagata hai).
+        if section in ("poster_video", "poster_post"):
+            await cb.answer("⏳ Preview ban raha hai...")
+        else:
+            await cb.answer()
         await _open_section(client, cb, section)
         return
 

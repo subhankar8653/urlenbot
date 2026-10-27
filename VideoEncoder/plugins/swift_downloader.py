@@ -1041,7 +1041,7 @@ async def _prewarm_all_custompics(user_id: int):
             if len(seen) > 8:
                 break
             t0 = time.time()
-            await _get_custom_thumb(fid, os.path.join(_THUMB_CACHE_DIR, f"pre_{len(seen)}.jpg"))
+            await _warm_custom_thumb(fid)
             LOGGER.info(f"[Swift] custompic prewarm {len(seen)} {time.time() - t0:.1f}s")
     except Exception as e:
         LOGGER.warning(f"[Swift] custompic prewarm skipped: {e!r}")
@@ -1080,46 +1080,25 @@ _THUMB_CACHE: dict = {}   # file_id -> local path
 _THUMB_CACHE_DIR = os.path.join(download_dir, "_thumbcache")   # episode khatam hone par bhi bacha rahe
 
 
+async def _swift_dl_media(fid, path):
+    return await app.download_media(fid, file_name=path)
+
+
 async def _get_custom_thumb(file_id: str, dest_path: str):
     """
-    Custom pic ko EK baar download karo, baaki files same copy use karein.
-    Parallel uploads mein 3 download_media ek saath chalne se Telegram
-    AUTH_BYTES_INVALID deta tha (thumb 'not found' + lamba stuck). Lock + retry se fix.
+    Custom pic ko EK baar download karo (disk pe stable cache), baaki saari qualities uski
+    local copy lein. Cache hit = koi lock/network nahi => 360p/720p/1080p ek saath bhi
+    thumbnail error nahi aata (pehle: global lock + upload ke time download_media => AUTH_BYTES_INVALID).
+    Returns apni alag copy ka path (dest_path ki directory mein) ya None.
     """
-    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
-    async with _THUMB_LOCK:
-        cached = _THUMB_CACHE.get(file_id)
-        if cached and os.path.isfile(cached) and os.path.getsize(cached) > 0:
-            try:
-                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                shutil.copyfile(cached, dest_path)
-                return dest_path
-            except Exception:
-                pass
-        for attempt in range(2):
-            try:
-                got = await asyncio.wait_for(
-                    app.download_media(file_id, file_name=dest_path), timeout=25)
-                if got and str(got).endswith(".temp"):
-                    fixed = str(got).replace(".temp", ".jpg")
-                    try:
-                        os.rename(got, fixed)
-                        got = fixed
-                    except Exception:
-                        pass
-                if got and os.path.isfile(got) and os.path.getsize(got) > 0:
-                    keep = os.path.join(_THUMB_CACHE_DIR, f"cache_{abs(hash(file_id))}.jpg")
-                    try:
-                        os.makedirs(_THUMB_CACHE_DIR, exist_ok=True)
-                        shutil.copyfile(got, keep)
-                        _THUMB_CACHE[file_id] = keep
-                    except Exception:
-                        pass
-                    return got
-            except Exception as e:
-                LOGGER.warning(f"[Swift] custom thumb download attempt {attempt + 1}/2: {e!r}")
-                await asyncio.sleep(1)
-        return None
+    from ..utils.thumb_source import fetch_custom_thumb
+    dest_dir = os.path.dirname(dest_path) or "."
+    return await fetch_custom_thumb(file_id, dest_dir, _swift_dl_media)
+
+
+async def _warm_custom_thumb(file_id: str):
+    from ..utils.thumb_source import warm_custom_thumb
+    return await warm_custom_thumb(file_id, _swift_dl_media)
 
 
 async def _send_cover_photo(path):
@@ -1401,7 +1380,9 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
                 except Exception:
                     pass
 
-        if not custom_thumb_used and thumb and os.path.isfile(thumb):
+        # Auto-thumb ya custom thumb ki apni per-file copy (cthumb_*) — upload ke baad hata do (master safe rehta hai)
+        if thumb and os.path.isfile(thumb) and (
+                not custom_thumb_used or os.path.basename(thumb).startswith("cthumb_")):
             try:
                 os.remove(thumb)
             except Exception:
@@ -1871,7 +1852,7 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
                     _tp = os.path.join(dl_dir, "thumbs", f"warm_{len(_seen)}.jpg")
                     os.makedirs(os.path.dirname(_tp), exist_ok=True)
                     _t0 = time.time()
-                    await _get_custom_thumb(_cp, _tp)
+                    await _warm_custom_thumb(_cp)
                     LOGGER.info(f"[Swift] thumb prewarm {time.time() - _t0:.1f}s")
         except Exception as _e:
             LOGGER.warning(f"[Swift] thumb prewarm skipped: {_e}")
