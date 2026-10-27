@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import os
 import re
 import subprocess
@@ -412,6 +413,35 @@ async def apply_swap(caption, user_id):
 # ─────────────────────────────────────────────
 #  upload_to_tg
 # ─────────────────────────────────────────────
+# Parallel qualities (jaise /adh All): (gate, key) set karo to bytes SAB ek saath upload honge,
+# lekin message "send" hone se pehle apni baari ka wait (480p -> 720p -> 1080p) — swift jaisa.
+ORDER_GATE = contextvars.ContextVar("upload_order_gate", default=None)
+
+
+def _gate_install(uc, path: str, gate, key: str, msg):
+    reg = getattr(uc, "_gate_reg", None)
+    if reg is None:
+        reg = {}
+        uc._gate_reg = reg
+        orig_save = uc.save_file
+
+        async def _save_then_wait(p, *a, **kw):
+            ent = reg.get(p) if isinstance(p, str) else None
+            res = await orig_save(p, *a, **kw)
+            if ent and ent[0] is not None:
+                g, q, m, pf, ql = ent
+                try:
+                    await m.edit(f"{pf}⏳ <b>{ql} upload ho gaya — order ka wait...</b>")
+                except Exception:
+                    pass
+                await g.wait_turn(q)
+            return res
+
+        uc.save_file = _save_then_wait
+    reg[str(path)] = (gate, key, msg, "", key)
+    return reg
+
+
 async def _send_cover_photo(path):
     """Auto-thumb ko log channel pe photo bhejke uska file_id (video cover) lo."""
     sent = await app.send_photo(log, photo=path)
@@ -503,6 +533,18 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
     width = probe.get("width") or 1280
     height = probe.get("height") or 720
 
+    _gate_info = ORDER_GATE.get()
+    _gate = _gkey = _greg = None
+    if _gate_info:
+        _gate, _gkey = _gate_info
+        try:
+            if uc is not None:
+                _greg = _gate_install(uc, new_file, _gate, _gkey, msg)
+            else:
+                await _gate.wait_turn(_gkey)     # user-session nahi => parallel nahi, order bachao
+        except Exception as _ge:
+            LOGGER.warning(f"[Upload] order-gate install fail: {_ge!r}")
+
     _resp = None
     _cover = custom_thumb if custom_thumb else None
     # FIX: custom thumb na ho to bhi auto poster-thumb ko cover banao (/adh, /url, /anime sab
@@ -532,6 +574,10 @@ async def upload_to_tg(new_file, message, msg, resolution='480'):
             )
             link = _resp.link if _resp else None
     finally:
+        if _greg is not None:
+            _greg.pop(str(new_file), None)
+        if _gate is not None:
+            _gate.done(_gkey)        # send ho gaya (ya fail) — agli quality chale
         if uc:
             try:
                 await uc.disconnect()
