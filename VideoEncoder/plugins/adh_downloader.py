@@ -59,9 +59,11 @@ khud bataya gaya "pehle testing ke liye karna, dikkat ho to bata dena"):
 import asyncio
 import os
 import re
+import threading
 import time
 import uuid
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qsl, unquote, urljoin, urlparse
 
 import requests
@@ -260,6 +262,10 @@ def _http_get(
 
 # Sirf yehi 3 qualities dikhani hain (4 available hain page pe, HQ skip)
 ADH_QUALITIES = ["480p x264", "720p x264", "1080p x265 10bit"]
+# Quality row (Haz jaisa): 480p / 720p / 1080p / All
+ADH_Q_OPTS = [("480", "480p x264", "480p"), ("720", "720p x264", "720p"), ("1080", "1080p x265 10bit", "1080p")]
+ADH_Q_FULL = {k: f for k, f, _ in ADH_Q_OPTS}
+ADH_Q_SHORT = {k: sh for k, _, sh in ADH_Q_OPTS}
 
 PER_PAGE = 10
 
@@ -400,8 +406,24 @@ def discover_adh_series(series_url: str) -> dict:
               "episode_list_html": str|None, "debug": list}
     """
     debug = []
-    r = _http_get(series_url, debug=debug, step="Series page", expected_markers=["Audio Tracks", "Download", "Watch"])
-    r.raise_for_status()
+    # SPEED: derived episode-list URL ka fetch series page ke SAATH hi parallel shuru (pehle ek ke baad ek)
+    candidate = _derive_adh_episode_list_url(series_url)
+    cand_debug: list = []
+    cand_fut = None
+    _cand_ex = None
+    if candidate:
+        _cand_ex = ThreadPoolExecutor(max_workers=1)
+        cand_fut = _cand_ex.submit(
+            _http_get, candidate, debug=cand_debug, step="Derived episode-list URL",
+            expected_markers=["Episode", "GDF"],
+        )
+    try:
+        r = _http_get(series_url, debug=debug, step="Series page", expected_markers=["Audio Tracks", "Download", "Watch"])
+        r.raise_for_status()
+    except Exception:
+        if _cand_ex is not None:
+            _cand_ex.shutdown(wait=False)
+        raise
     soup = BeautifulSoup(r.text, "html.parser")
 
     title_tag = soup.find("h1")
@@ -421,13 +443,13 @@ def discover_adh_series(series_url: str) -> dict:
     episode_list_html = None
 
     # ── Strategy A (fast, confirmed): URL-slug se seedha derive karo ──
-    candidate = _derive_adh_episode_list_url(series_url)
     if candidate:
         try:
-            r2 = _http_get(
-                candidate, debug=debug, step="Derived episode-list URL",
-                expected_markers=["Episode", "GDF"],
-            )
+            try:
+                r2 = cand_fut.result()
+            finally:
+                debug.extend(cand_debug)
+                _cand_ex.shutdown(wait=False)
             if r2.status_code == 200 and (
                 re.search(r'Episode\s*:?\s*\d+', r2.text, re.IGNORECASE) or "gdf" in r2.text.lower()
             ):
@@ -918,10 +940,16 @@ def _make_adh_driver():
         options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
         dl_dir = os.path.join(profile_dir, "dl")
         os.makedirs(dl_dir, exist_ok=True)
-        options.add_experimental_option("prefs", {
+        _prefs = {
             "download.default_directory": dl_dir,
             "download.prompt_for_download": False,
-        })
+        }
+        # SPEED: images band — buttons text-based hain, ad-heavy pages bahut jaldi load hote hain
+        # (band karna ho to env ADH_NO_IMAGES=0)
+        if (os.getenv("ADH_NO_IMAGES") or "1").strip() != "0":
+            _prefs["profile.managed_default_content_settings.images"] = 2
+            options.add_argument("--blink-settings=imagesEnabled=false")
+        options.add_experimental_option("prefs", _prefs)
         options.page_load_strategy = "none"   # SPA: DOMContentLoaded ka wait nahi, hum khud poll karte hain
 
         for binary in ("/usr/bin/chromium", "/usr/bin/chromium-browser",
@@ -1303,14 +1331,14 @@ def _resolve_adh_fprs_link(fprs_url: str, debug: list) -> str | None:
 
 
 def _resolve_adh_download_link(gdf_url: str | None, debug: list, fprs_url: str | None = None,
-                               multi_url: str | None = None) -> str | None:
+                               multi_url: str | None = None, cancel=None) -> str | None:
     """Multi primary. Fprs = env ADH_FPRS_FALLBACK=1, GDF = env ADH_GDF_FALLBACK=1 hone pe fallback."""
     _base = "https://new.adhlinks.com/"
     multi_url = urljoin(_base, multi_url) if multi_url else multi_url
     fprs_url = urljoin(_base, fprs_url) if fprs_url else fprs_url
     gdf_url = urljoin(_base, gdf_url) if gdf_url else gdf_url
     if multi_url:
-        link = _multi_selenium_resolve(multi_url, debug)
+        link = _multi_selenium_resolve(multi_url, debug, cancel)
         if link:
             return link
         debug.append("❌ Multi se final link nahi mila")
@@ -1440,7 +1468,7 @@ def _perf_file_url(driver) -> str | None:
     return best
 
 
-def _multi_selenium_resolve(multi_url: str, debug: list) -> str | None:
+def _multi_selenium_resolve(multi_url: str, debug: list, cancel=None) -> str | None:
     def log(msg):
         debug.append(msg)
         LOGGER.info(f"[Adh] {msg}")
@@ -1470,6 +1498,8 @@ def _multi_selenium_resolve(multi_url: str, debug: list) -> str | None:
         t0 = time.time()
         reloaded = False
         while time.time() - t0 < 70:
+            if cancel is not None and cancel.is_set():
+                return None
             h = _multi_sweep(driver, main, has_cloud)
             if h:
                 main = h
@@ -1483,7 +1513,7 @@ def _multi_selenium_resolve(multi_url: str, debug: list) -> str | None:
                         driver.get(multi_url)
                     except Exception:
                         pass
-            time.sleep(1)
+            time.sleep(0.4)
         if not found:
             log(f"❌ [Multi] FilesForever page pe 'Cloud Download' nahi mila (url: {(driver.current_url or '')[:80]})")
             _sel_diag(driver, debug, "Multi-A")
@@ -1539,6 +1569,8 @@ def _multi_selenium_resolve(multi_url: str, debug: list) -> str | None:
         t0 = time.time()
         last_log = 0
         while time.time() - t0 < wait_total:
+            if cancel is not None and cancel.is_set():
+                return None
             btn = _sel_find(driver, "download file")
             if btn is not None:
                 break
@@ -1547,7 +1579,7 @@ def _multi_selenium_resolve(multi_url: str, debug: list) -> str | None:
                 last_log = el_s
                 t = re.sub(r"\s+", " ", _body_text(driver))[:90]
                 log(f"⏳ [Multi] {el_s}s: transfer chal raha hai… ({t})")
-            time.sleep(2)
+            time.sleep(0.7)
         if btn is None:
             log(f"❌ [Multi] {wait_total}s mein 'Download File' button nahi aaya")
             _sel_diag(driver, debug, "Multi-C")
@@ -1641,6 +1673,8 @@ def _multi_selenium_resolve(multi_url: str, debug: list) -> str | None:
 #  Selector UI: Language -> Quality -> Episode list (multi-select)
 # ─────────────────────────────────────────────
 class AdhSelector:
+    """Haz jaisa single view: episode grid + Quality row (480p/720p/1080p/All) + Language row (har language + All)."""
+
     def __init__(self, series_url: str, title: str, languages: list, episodes: list, orig_message: Message):
         self.series_url = series_url
         self.title = title
@@ -1649,13 +1683,17 @@ class AdhSelector:
         self.orig_message = orig_message
         self.sid = None
         self.msg = None
-        self.stage = "lang" if len(self.languages) > 1 else "quality"
-        self.language = self.languages[0] if len(self.languages) == 1 else None
-        self.quality = None
+        # Defaults: 720p + Hindi (agar page pe Hindi hai, warna pehli language)
+        self.quality_key = "720"                       # 480 | 720 | 1080 | all
+        self.language = next((l for l in self.languages if l.lower() == "hindi"), self.languages[0])
         self.page = 0
         self.multi = False
         self.selected = set()
         self.created = time.time()
+
+    @property
+    def quality_label(self):
+        return "All" if self.quality_key == "all" else ADH_Q_SHORT.get(self.quality_key, self.quality_key)
 
     @property
     def total_pages(self):
@@ -1666,69 +1704,59 @@ class AdhSelector:
         return list(enumerate(self.episodes))[start:start + PER_PAGE]
 
     def header_text(self):
-        lines = ["📂 **Select**", "━━━━━━━━━━━━━━━━━━", f"🎬 **{self.title}**", "🌐 Website: 🍥 Anime Dub Hindi"]
-        if self.stage == "lang":
-            lines.append("👇 Pehle Language chuno:")
-        elif self.stage == "quality":
-            if self.language:
-                lines.append(f"🗣️ Language: **{self.language}**")
-            lines.append("👇 Ab Quality chuno:")
-        else:
-            lines.append(f"🗣️ Language: **{self.language}** • 🎞️ Quality: **{self.quality}**")
-            lines.append(f"📖 Episodes: {len(self.episodes)}")
-            lines.append("━━━━━━━━━━━━━━━━━━")
-            lines.append(f"👇 Tap an episode to download:  (Page {self.page + 1}/{self.total_pages})")
-            if self.multi:
-                lines.append(f"\n☑️ **Multi-select ON** — chosen: `{len(self.selected)}`")
+        lines = ["📂 **Select Episode**", "━━━━━━━━━━━━━━━━━━", f"🎬 **{self.title}**",
+                 "🌐 Website: 🍥 Anime Dub Hindi [multi]",
+                 f"📖 Episodes: {len(self.episodes)} • 🎚 Quality: {self.quality_label}"]
+        if len(self.languages) > 1:
+            lines.append(f"🗣 Language: {self.language}")
+        lines.append("━━━━━━━━━━━━━━━━━━")
+        lines.append(f"👇 Tap an episode to download:  (Page {self.page + 1}/{self.total_pages})")
+        if self.multi:
+            lines.append(f"\n☑️ **Multi-select ON** — chosen: `{len(self.selected)}`")
         return "\n".join(lines)
 
     def build_markup(self):
         sid = self.sid
         rows = []
 
-        if self.stage == "lang":
-            row = []
-            for lang in self.languages:
-                row.append((f"🗣️ {lang}", f"adh_lang_{sid}_{lang}"))
-                if len(row) == 2:
-                    rows.append(row)
-                    row = []
-            if row:
+        row = []
+        for idx, ep in self.page_items():
+            mark = "✅ " if idx in self.selected else ""
+            row.append((f"{mark}E{ep['num']:02d}", f"adh_ep_{sid}_{idx}"))
+            if len(row) == 3:
                 rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
 
-        elif self.stage == "quality":
-            for q in ADH_QUALITIES:
-                rows.append([(f"🎞️ {q}", f"adh_qual_{sid}_{q}")])
-            if len(self.languages) > 1:
-                rows.append([("🔙 Back to Language", f"adh_back_{sid}")])
+        if self.total_pages > 1:
+            nav = []
+            if self.page > 0:
+                nav.append(("◀️ Prev", f"adh_pg_{sid}_{self.page - 1}"))
+            nav.append((f"📄 {self.page + 1}/{self.total_pages}", f"adh_noop_{sid}"))
+            if self.page < self.total_pages - 1:
+                nav.append(("Next ▶️", f"adh_pg_{sid}_{self.page + 1}"))
+            rows.append(nav)
 
+        # Quality row: 480p / 720p / 1080p / All
+        rows.append(
+            [((("✅ " if self.quality_key == k else "") + short), f"adh_q_{sid}_{k}") for k, _f, short in ADH_Q_OPTS]
+            + [((("✅ " if self.quality_key == "all" else "") + "All"), f"adh_q_{sid}_all")]
+        )
+
+        # Language row: har language + All (= saare audio tracks rakho)
+        if len(self.languages) > 1:
+            lang_btns = [((("✅ " if self.language == l else "") + l), f"adh_lg_{sid}_{i}")
+                         for i, l in enumerate(self.languages)]
+            lang_btns.append(((("✅ " if self.language == "All" else "") + "All"), f"adh_lg_{sid}_all"))
+            for i in range(0, len(lang_btns), 3):
+                rows.append(lang_btns[i:i + 3])
+
+        if self.multi:
+            rows.append([(f"⬇️ Download Selected ({len(self.selected)})", f"adh_dl_{sid}")])
+            rows.append([("☑️ Multi-select: ON (tap to turn off)", f"adh_toggle_{sid}")])
         else:
-            row = []
-            for idx, ep in self.page_items():
-                mark = "✅ " if idx in self.selected else ""
-                row.append((f"{mark}E{ep['num']:02d}", f"adh_ep_{sid}_{idx}"))
-                if len(row) == 3:
-                    rows.append(row)
-                    row = []
-            if row:
-                rows.append(row)
-
-            if self.total_pages > 1:
-                nav = []
-                if self.page > 0:
-                    nav.append(("◀️ Prev", f"adh_pg_{sid}_{self.page - 1}"))
-                nav.append((f"📄 {self.page + 1}/{self.total_pages}", f"adh_noop_{sid}"))
-                if self.page < self.total_pages - 1:
-                    nav.append(("Next ▶️", f"adh_pg_{sid}_{self.page + 1}"))
-                rows.append(nav)
-
-            if self.multi:
-                rows.append([(f"⬇️ Download Selected ({len(self.selected)})", f"adh_dl_{sid}")])
-                rows.append([("☑️ Multi-select: ON (tap to turn off)", f"adh_toggle_{sid}")])
-            else:
-                rows.append([("☑️ Select Multiple", f"adh_toggle_{sid}")])
-
-            rows.append([("🔙 Back to Quality", f"adh_backq_{sid}")])
+            rows.append([("☑️ Select Multiple", f"adh_toggle_{sid}")])
 
         rows.append([("❌ Close", f"adh_close_{sid}")])
         return _kb(rows)
@@ -1739,20 +1767,57 @@ class AdhSelector:
         try:
             await self.msg.edit(self.header_text(), reply_markup=self.build_markup())
         except Exception as e:
-            LOGGER.error(f"[Adh] selector render error: {e}")
+            if "MESSAGE_NOT_MODIFIED" not in str(e):
+                LOGGER.error(f"[Adh] selector render error: {e}")
 
 
 # ─────────────────────────────────────────────
 #  Ek episode: Multi link -> resolve -> download -> filter -> upload
 # ─────────────────────────────────────────────
+def _ep_has_quality(ep: dict, quality: str) -> bool:
+    return bool((ep.get("multi") or {}).get(quality) or (ep.get("fprs") or {}).get(quality)
+                or (ep.get("qualities") or {}).get(quality))
+
+
+def _can_resolve(ep: dict, quality: str) -> bool:
+    return bool((ep.get("multi") or {}).get(quality)
+                or ((ep.get("fprs") or {}).get(quality) and _env_on("ADH_FPRS_FALLBACK"))
+                or ((ep.get("qualities") or {}).get(quality) and _gdf_fallback_on()))
+
+
+def _resolve_job_blocking(ep: dict, quality: str, cancel=None):
+    """Thread mein chalta hai. -> (final_url | None, debug_lines)"""
+    debug: list = []
+    final = _resolve_adh_download_link(
+        (ep.get("qualities") or {}).get(quality), debug,
+        (ep.get("fprs") or {}).get(quality), (ep.get("multi") or {}).get(quality), cancel,
+    )
+    return final, debug
+
+
+def _resolve_par() -> int:
+    try:
+        return max(1, int((os.getenv("ADH_RESOLVE_PAR") or "2").strip()))
+    except Exception:
+        return 2
+
+
+def _prefetch_ahead() -> int:
+    try:
+        return max(0, int((os.getenv("ADH_PREFETCH") or "1").strip()))
+    except Exception:
+        return 1
+
+
 async def _process_adh_item(client, message, ep: dict, status_msg, index: int, total: int,
-                             language: str, quality: str):
-    ep_label = f"E{ep['num']:02d}"
+                             language: str, quality: str, ep_tag: str = "", pre=None):
+    """pre = background mein pehle se chal rahi link-resolve ka asyncio future -> (final_url, debug, resolved_at)."""
+    ep_label = f"E{ep['num']:02d}" + (f" {ep_tag}" if ep_tag else "")
     loop = asyncio.get_event_loop()
     gdf_url = (ep.get("qualities") or {}).get(quality)
     fprs_url = (ep.get("fprs") or {}).get(quality)
     multi_url = (ep.get("multi") or {}).get(quality)
-    if not multi_url and not (fprs_url and _env_on("ADH_FPRS_FALLBACK")) and not (gdf_url and _gdf_fallback_on()):
+    if not _can_resolve(ep, quality):
         try:
             await status_msg.edit(f"🛑 **{ep_label}** — is episode mein `{quality}` ka Multi link available nahi hai.")
         except Exception:
@@ -1764,8 +1829,18 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
     except Exception:
         pass
 
-    debug = []
-    final_url = await loop.run_in_executor(None, _resolve_adh_download_link, gdf_url, debug, fprs_url, multi_url)
+    if pre is not None:
+        try:
+            res = await pre
+        except asyncio.CancelledError:
+            res = None
+        except Exception as e:
+            LOGGER.warning(f"[Adh] prefetch resolve error: {e!r}")
+            res = None
+        final_url, debug, resolved_at = res if res else (None, [], 0.0)
+    else:
+        final_url, debug = await loop.run_in_executor(None, _resolve_job_blocking, ep, quality)
+        resolved_at = time.time()
 
     shot_paths = [str(x)[len("__SHOT__:"):] for x in debug if str(x).startswith("__SHOT__:")]
     debug[:] = [x for x in debug if not str(x).startswith("__SHOT__:")]
@@ -1799,19 +1874,35 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
     except Exception:
         pass
 
-    try:
-        filename = await _get_filename_from_url(final_url)
-        filepath = await _download_url(final_url, filename, status_msg, message)
-    except Exception as e:
-        LOGGER.error(f"[Adh] {ep_label} download error: {e}")
+    filepath = None
+    for attempt in (1, 2):
         try:
-            await status_msg.edit(
-                f"🛑 **{ep_label} — Download Error**\n\n❌ `{str(e)[:150]}`\n\n"
-                f"⛔ Agle items **band** kar diye gaye."
-            )
-        except Exception:
-            pass
-        return "error"
+            filename = await _get_filename_from_url(final_url)
+            filepath = await _download_url(final_url, filename, status_msg, message)
+            break
+        except Exception as e:
+            # Pehle se resolve kiya hua link purana (expire) ho sakta hai — ek baar fresh link nikaal ke retry
+            stale = (time.time() - resolved_at) > 90
+            if attempt == 1 and stale:
+                LOGGER.warning(f"[Adh] {ep_label} prefetched link fail ({e!r}) — fresh resolve")
+                try:
+                    await status_msg.edit(f"🔄 **{ep_label}** — link purana tha, naya nikal raha hoon...")
+                except Exception:
+                    pass
+                fresh, _dbg = await loop.run_in_executor(None, _resolve_job_blocking, ep, quality)
+                resolved_at = time.time()
+                if fresh:
+                    final_url = fresh
+                    continue
+            LOGGER.error(f"[Adh] {ep_label} download error: {e}")
+            try:
+                await status_msg.edit(
+                    f"🛑 **{ep_label} — Download Error**\n\n❌ `{str(e)[:150]}`\n\n"
+                    f"⛔ Agle items **band** kar diye gaye."
+                )
+            except Exception:
+                pass
+            return "error"
 
     try:
         filepath, has_eng_sub = await _apply_language_filter(filepath, language, status_msg)
@@ -1837,25 +1928,90 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
 
 
 async def _download_adh_items(client, status_msg, orig_message, sess: "AdhSelector", idxs: list):
-    total = len(idxs)
-    all_ok = True
-    for i, idx in enumerate(idxs, 1):
+    # Quality "All" => har episode ki jo-jo qualities page pe hain (480p -> 720p -> 1080p)
+    jobs = []
+    for idx in idxs:
         ep = sess.episodes[idx]
-        result = await _process_adh_item(
-            client, orig_message, ep, status_msg, i, total, sess.language, sess.quality,
-        )
-        if result != "ok":
-            all_ok = False
-            break
-        if i < total:
-            status_msg = await orig_message.reply("⏳ Agla episode shuru ho raha hai...")
-            await asyncio.sleep(1)
+        if sess.quality_key == "all":
+            for k, full, short in ADH_Q_OPTS:
+                if _ep_has_quality(ep, full):
+                    jobs.append((ep, full, short))
+        else:
+            jobs.append((ep, ADH_Q_FULL[sess.quality_key], ""))
+    if not jobs:
+        try:
+            await status_msg.edit("❌ Chuni hui episodes mein koi quality available nahi hai.")
+        except Exception:
+            pass
+        return
+    total = len(jobs)
+
+    # ── SPEED: agle episode/quality ka link (Multi transfer 1-2 min leta hai) PEHLE SE background mein
+    # resolve hota rehta hai jab tak current wala download+upload ho raha hai. Ek saath max
+    # ADH_RESOLVE_PAR (default 2) browsers, ADH_PREFETCH (default 1) agle jobs tak aage. ──
+    loop = asyncio.get_event_loop()
+    cancel = threading.Event()
+    sem = asyncio.Semaphore(_resolve_par())
+    ahead = _prefetch_ahead()
+    pre: dict = {}
+
+    def _start(k: int):
+        if k >= total or k in pre:
+            return
+        ep_k, q_k, _t = jobs[k]
+        if not _can_resolve(ep_k, q_k):
+            return
+
+        async def _run():
+            async with sem:
+                if cancel.is_set():
+                    return None
+                final, dbg = await loop.run_in_executor(None, _resolve_job_blocking, ep_k, q_k, cancel)
+                return final, dbg, time.time()
+
+        pre[k] = asyncio.ensure_future(_run())
+
+    all_ok = True
+    try:
+        for i, (ep, qfull, tag) in enumerate(jobs):
+            for k in range(i, min(total, i + 1 + ahead)):
+                _start(k)
+            result = await _process_adh_item(
+                client, orig_message, ep, status_msg, i + 1, total, sess.language, qfull,
+                ep_tag=tag, pre=pre.get(i),
+            )
+            if result != "ok":
+                all_ok = False
+                break
+            if i + 1 < total:
+                status_msg = await orig_message.reply("⏳ Agla episode shuru ho raha hai...")
+                await asyncio.sleep(0.5)
+    finally:
+        cancel.set()                       # bacha hua prefetch (browser) band
+        for f in pre.values():
+            if not f.done():
+                f.cancel()
 
     if all_ok:
         try:
             await status_msg.delete()
         except Exception:
             pass
+
+
+def discover_adh_full(series_url: str) -> dict:
+    """Series page -> episode-list page -> episodes. /anime ke liye ek call mein.
+    Fail pe RuntimeError(user-readable text)."""
+    sd = discover_adh_series(series_url)
+    if not sd.get("episode_list_url"):
+        raise RuntimeError("'Download / Watch' button ka link nahi mila.\n"
+                           + (_safe_debug(sd.get("debug", [])[-8:]) or ""))
+    er = discover_adh_episodes(sd["episode_list_url"], sd.get("episode_list_html"))
+    if not er["episodes"]:
+        raise RuntimeError("Episode-list page se koi episode nahi mila (480p/720p/1080p x265).\n"
+                           + (_safe_debug(er.get("debug", [])[-8:]) or ""))
+    return {"title": sd["title"], "languages": sd["languages"], "episodes": er["episodes"],
+            "episode_list_url": sd["episode_list_url"]}
 
 
 # ─────────────────────────────────────────────
@@ -1886,33 +2042,21 @@ async def adh_callback_handler(client: Client, cb: CallbackQuery):
                 pass
             return
 
-        if action == "lang":
-            sess.language = "_".join(parts[3:])
-            sess.stage = "quality"
-            await cb.answer()
+        if action == "q":
+            key = parts[3] if len(parts) > 3 else ""
+            if key == "all" or key in ADH_Q_FULL:
+                sess.quality_key = key
+            await cb.answer(f"Quality: {sess.quality_label}")
             await sess.render()
             return
 
-        if action == "back":
-            sess.stage = "lang"
-            sess.quality = None
-            await cb.answer()
-            await sess.render()
-            return
-
-        if action == "qual":
-            sess.quality = "_".join(parts[3:]).replace("_", " ")
-            sess.stage = "episodes"
-            sess.page = 0
-            sess.multi = False
-            sess.selected.clear()
-            await cb.answer()
-            await sess.render()
-            return
-
-        if action == "backq":
-            sess.stage = "quality"
-            await cb.answer()
+        if action == "lg":
+            key = parts[3] if len(parts) > 3 else ""
+            if key == "all":
+                sess.language = "All"
+            elif key.isdigit() and int(key) < len(sess.languages):
+                sess.language = sess.languages[int(key)]
+            await cb.answer(f"Language: {sess.language}")
             await sess.render()
             return
 

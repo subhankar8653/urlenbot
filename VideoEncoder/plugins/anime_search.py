@@ -46,6 +46,7 @@ from .. import LOGGER
 from ..utils.helper import check_chat
 from . import rti_downloader as rti
 from . import haz_downloader as haz
+from . import adh_downloader as adh
 from . import toono_downloader as toono
 from . import aniwatch_downloader as aniw
 from . import aniabyss_downloader as aby
@@ -56,6 +57,7 @@ import os
 SITE = os.getenv("ANIME_SITE", "https://www.rareanimes.mov").rstrip("/")
 HAZ_SITE = os.getenv("HAZ_SITE", "https://hindianimeszone.com").rstrip("/")
 TOONO_SITE = os.getenv("TOONO_SITE", "https://toono.app").rstrip("/")
+ADH_SITE = os.getenv("ADH_SITE", "https://www.animedubhindi.link").rstrip("/")
 
 
 def _host(u: str) -> str:
@@ -440,6 +442,35 @@ def fetch_haz_page(url: str):
     return parse_haz_results(_http_get_html(url), url)
 
 
+# ---- Anime Dub Hindi [multi] (animedubhindi.link, WordPress) ----
+def parse_adh_results(page_html: str, base_url: str):
+    soup = BeautifulSoup(page_html, "html.parser")
+    host = _host(ADH_SITE)
+    anchors = soup.select("article h1 a, article h2 a, article h3 a, .entry-title a, .post-title a, "
+                          "h2 a, h3 a, a[rel='bookmark']")
+    results, seen = [], set()
+    for a in anchors:
+        href = _join(base_url, a.get("href", ""))
+        title = _clean(a.get("title") or a.get_text(" ", strip=True))
+        if not title or _host(href) != host:
+            continue
+        path = _path(href)
+        if path in ("", "/") or _GENERIC_SKIP.search(path) or "?s=" in href or href in seen:
+            continue
+        seen.add(href)
+        results.append({"title": title, "url": href, "label": _haz_label(title)})
+    return results, _next_link(soup, base_url)
+
+
+def search_adh(query: str):
+    url = f"{ADH_SITE}/?s={quote_plus(query)}"
+    return parse_adh_results(_http_get_html(url), url)
+
+
+def fetch_adh_page(url: str):
+    return parse_adh_results(_http_get_html(url), url)
+
+
 # ---- Toono (sirf /series/ — /toono movies support nahi karta) ----
 def parse_toono_results(page_html: str, base_url: str):
     soup = BeautifulSoup(page_html, "html.parser")
@@ -524,6 +555,7 @@ def search_aniw(source: str, query: str):
 SITES = [
     ("rti", "Raretoon [Hindi]"),
     ("haz", "Hindi anime zone [multi language]"),
+    ("adh", "Anime dub hindi [multi]"),
     ("toono", "Toono [hindi]"),
     ("aniwatch", "Aniwatch [ dual eng-jap ]"),
     ("animetsu", "Animetsu [ dual eng-jap ]"),
@@ -537,6 +569,8 @@ def _site_search(site: str, query: str):
         return search_anime(query)
     if site == "haz":
         return search_haz(query)
+    if site == "adh":
+        return search_adh(query)
     if site == "toono":
         return search_toono(query)
     if site == "aniabyss":
@@ -549,6 +583,8 @@ def _site_next(site: str, url: str):
         return parse_results(fetch_page(url), url)
     if site == "haz":
         return fetch_haz_page(url)
+    if site == "adh":
+        return fetch_adh_page(url)
     return [], None
 
 
@@ -727,6 +763,16 @@ async def _open_item(client, cb: CallbackQuery, s: AnimeSearch, item: dict):
             s.child = (haz.HAZ_SESSIONS, sess.sid)
             drop = ()
 
+        elif site == "adh":
+            data = await loop.run_in_executor(None, adh.discover_adh_full, item["url"])
+            adh._prune_adh_sessions()
+            sess = adh.AdhSelector(item["url"], data["title"], data["languages"], data["episodes"],
+                                   orig_message=s.orig)
+            sess.sid = uuid.uuid4().hex[:10]
+            adh.ADH_SESSIONS[sess.sid] = sess
+            s.child = (adh.ADH_SESSIONS, sess.sid)
+            drop = ()
+
         elif site == "toono":
             data = await loop.run_in_executor(None, toono.discover_toono_items, item["url"])
             if not data["seasons"]:
@@ -815,6 +861,9 @@ async def anime_callback(client: Client, cb: CallbackQuery):
             site = parts[3]
             if site not in SITE_LABEL:
                 await cb.answer()
+                return
+            if site == "adh" and not adh.SELENIUM_OK:
+                await cb.answer("❌ Selenium install nahi hai (Anime Dub Hindi ke Multi link ko chahiye).", show_alert=True)
                 return
             if site == "toono" and not toono.SELENIUM_OK:
                 await cb.answer("❌ Selenium install nahi hai (Toono ko chahiye).", show_alert=True)
