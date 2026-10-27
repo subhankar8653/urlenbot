@@ -312,11 +312,13 @@ def _in_progress(dl_dir: str) -> list:
 # ─────────────────────────────────────────────
 #  Auto rename — mega jaise
 # ─────────────────────────────────────────────
-async def _auto_rename(filepath: str, dl_dir: str, user_id: int = None) -> str:
+async def _auto_rename(filepath: str, dl_dir: str, user_id: int = None, brand_tracks: bool = False) -> str:
     """
     build_auto_caption se proper naam banao aur ffmpeg se metadata SET karo.
     - title tag = clean filename (external player mein dikhega)
     - Parallel uploads ke liye unique temp paths
+    brand_tracks=True (ADH): audio/subtitle tracks ke "[ Hindi ] by sbanime" naam pehle se lage hain —
+    unhe saaf NAHI karna (warna audio title khali ho jaata hai).
     Returns renamed filepath.
     """
     import random
@@ -353,10 +355,13 @@ async def _auto_rename(filepath: str, dl_dir: str, user_id: int = None) -> str:
         '-metadata', 'encoder=',
         '-metadata:s:v:0', 'title=',
         '-metadata:s:v:0', 'handler_name=VideoHandler',
-        '-metadata:s:a:0', 'title=',
-        '-metadata:s:a:0', 'handler_name=SoundHandler',
-        temp_out
     ]
+    if not brand_tracks:
+        cmd += [
+            '-metadata:s:a:0', 'title=',
+            '-metadata:s:a:0', 'handler_name=SoundHandler',
+        ]
+    cmd += [temp_out]
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -1171,7 +1176,7 @@ async def _drop_uc_task(t):
 async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, encode: bool,
                            on_half: asyncio.Event = None, skip_forward: bool = False,
                            uploader_client=None, label_prefix: str = "",
-                           gate: "_OrderedGate" = None):
+                           gate: "_OrderedGate" = None, brand_tracks: bool = False):
     """
     Ek file upload karo.
     Returns: (success: bool, sent_message: Message | None, quality: str)
@@ -1188,7 +1193,7 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
     size_mb = os.path.getsize(filepath) / (1024 * 1024)
     prefix = f"🎬 **{label_prefix}**\n" if label_prefix else ""
 
-    filepath = await _auto_rename(filepath, dl_dir, user_id=message.from_user.id)
+    filepath = await _auto_rename(filepath, dl_dir, user_id=message.from_user.id, brand_tracks=brand_tracks)
     fname = os.path.basename(filepath)
     quality = _quality_from(fname)
 

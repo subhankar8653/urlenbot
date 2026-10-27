@@ -80,7 +80,9 @@ from .. import LOGGER, download_dir
 from ..utils.helper import check_chat
 from .rti_downloader import _kb, SELENIUM_OK, _kill_driver_tree
 from .haz_downloader import _apply_language_filter
-from .url_upload import _get_filename_from_url, _download_url, _do_upload
+from .url_upload import _get_filename_from_url, _download_url, _do_upload, _safe_filename
+from ..utils import job_ctl
+from ..utils.track_branding import brand_file
 
 try:
     from selenium import webdriver
@@ -1027,6 +1029,10 @@ def _make_adh_driver(no_images=None):
             )})
         except Exception as e:
             LOGGER.warning(f"[Adh] stealth CDP setup fail: {e}")
+        try:
+            job_ctl.register_driver(driver)       # ❌ Cancel pe Chrome bhi band
+        except Exception:
+            pass
         return driver
     except Exception as e:
         LOGGER.warning(f"[Adh] stealth driver fail ({e}), toono driver pe fallback")
@@ -1895,9 +1901,14 @@ def _prefetch_ahead() -> int:
         return 1
 
 
+def _fail_line(ep_label: str, what: str) -> str:
+    return f"🛑 **{ep_label}** — {what}\n➡️ Agle item pe ja raha hoon."
+
+
 async def _process_adh_item(client, message, ep: dict, status_msg, index: int, total: int,
                              language: str, quality: str, ep_tag: str = "", pre=None, gate=None, gate_key: str = ""):
-    """pre = background mein pehle se chal rahi link-resolve ka asyncio future -> (final_url, debug, resolved_at)."""
+    """pre = background mein pehle se chal rahi link-resolve ka asyncio future -> (final_url, debug, resolved_at).
+    status_msg = card ka ek hissa (Slot) — saara process (link -> download -> filter -> upload) usi mein dikhta hai."""
     ep_label = f"E{ep['num']:02d}" + (f" {ep_tag}" if ep_tag else "")
     loop = asyncio.get_event_loop()
     gdf_url = (ep.get("qualities") or {}).get(quality)
@@ -1925,7 +1936,7 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
             res = None
         final_url, debug, resolved_at = res if res else (None, [], 0.0)
     else:
-        final_url, debug = await loop.run_in_executor(None, _resolve_job_blocking, ep, quality)
+        final_url, debug = await job_ctl.run_in_thread(_resolve_job_blocking, ep, quality)
         resolved_at = time.time()
 
     shot_paths = [str(x)[len("__SHOT__:"):] for x in debug if str(x).startswith("__SHOT__:")]
@@ -1937,15 +1948,10 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
                 await message.reply_photo(sp, caption=f"🩺 {ep_label} — bot ke browser ne yeh page dekha")
             except Exception as e:
                 LOGGER.warning(f"[Adh] debug screenshot bhej nahi paye: {e}")
-        debug_text = _safe_debug(debug[-18:]) if debug else "(koi debug info nahi mili)"
+        LOGGER.warning(f"[Adh] {ep_label} link resolve fail | multi={multi_url or '-'} | debug:\n"
+                       + (_safe_debug(debug[-18:]) if debug else "(koi debug info nahi mili)"))
         try:
-            await status_msg.edit(
-                f"🛑 **{ep_label} — Link Resolve Fail**\n\n"
-                f"❌ Final download link nahi mila.\n\n"
-                f"**Multi URL:** `{multi_url or '-'}`\n\n"
-                f"**Debug (kaha atka, step-by-step):**\n```\n{debug_text}\n```\n"
-                f"➡️ Agle item pe ja raha hoon."
-            )
+            await status_msg.edit(_fail_line(ep_label, "link resolve fail (final download link nahi mila)"))
         except Exception:
             pass
         return "error"
@@ -1964,6 +1970,9 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
     for attempt in (1, 2):
         try:
             filename = await _get_filename_from_url(final_url)
+            _jb = job_ctl.CURRENT.get()
+            if _jb is not None:       # cancel pe adhoori file bhi delete ho
+                _jb.dirs.add(os.path.join(download_dir, _safe_filename(filename)))
             filepath = await _download_url(final_url, filename, status_msg, message)
             break
         except Exception as e:
@@ -1975,17 +1984,14 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
                     await status_msg.edit(f"🔄 **{ep_label}** — link purana tha, naya nikal raha hoon...")
                 except Exception:
                     pass
-                fresh, _dbg = await loop.run_in_executor(None, _resolve_job_blocking, ep, quality)
+                fresh, _dbg = await job_ctl.run_in_thread(_resolve_job_blocking, ep, quality)
                 resolved_at = time.time()
                 if fresh:
                     final_url = fresh
                     continue
             LOGGER.error(f"[Adh] {ep_label} download error: {e}")
             try:
-                await status_msg.edit(
-                    f"🛑 **{ep_label} — Download Error**\n\n❌ `{str(e)[:150]}`\n\n"
-                    f"➡️ Agle item pe ja raha hoon."
-                )
+                await status_msg.edit(_fail_line(ep_label, f"download error `{str(e)[:90]}`"))
             except Exception:
                 pass
             return "error"
@@ -1995,13 +2001,19 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
     except Exception as e:
         LOGGER.error(f"[Adh] {ep_label} audio/sub filter error: {e}")
         try:
-            await status_msg.edit(
-                f"🛑 **{ep_label} — Filter Error**\n\n❌ `{str(e)[:150]}`\n\n"
-                f"➡️ Agle item pe ja raha hoon."
-            )
+            await status_msg.edit(_fail_line(ep_label, f"filter error `{str(e)[:90]}`"))
         except Exception:
             pass
         return "error"
+
+    # Audio / subtitle track ke naam: "[ Hindi ] by sbanime" (community naam automatic)
+    try:
+        await status_msg.edit(f"🏷 **{ep_label}** — track names set ho rahe hain...")
+        filepath = await brand_file(filepath, audio_fallback=("" if language.lower() == "all" else language))
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        LOGGER.warning(f"[Adh] {ep_label} track branding fail (ignore): {e!r}")
 
     # Parallel qualities: bytes ek saath upload, delivery 480p -> 720p -> 1080p order mein
     _tok = None
@@ -2020,7 +2032,11 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
 
 
 async def _download_adh_items(client, status_msg, orig_message, sess: "AdhSelector", idxs: list):
-    # Quality "All" => har episode ki jo-jo qualities page pe hain. Ab ek episode ki SAARI qualities
+    """
+    Poora process EK hi card message mein (RTI jaisa): header (episode), har quality ka apna hissa
+    (link -> download -> filter -> upload), neeche ❌ Cancel button. Alag-alag 3 messages nahi bante.
+    """
+    # Quality "All" => har episode ki jo-jo qualities page pe hain. Ek episode ki SAARI qualities
     # EK SAATH (resolve + download + upload) chalti hain; channel mein delivery 480p -> 720p -> 1080p order mein.
     groups = []                     # [[(ep, qfull, short), ...], ...]  (ek group = ek episode)
     for idx in idxs:
@@ -2031,7 +2047,7 @@ async def _download_adh_items(client, status_msg, orig_message, sess: "AdhSelect
                 if _ep_has_quality(ep, full):
                     grp.append((ep, full, short))
         else:
-            grp.append((ep, ADH_Q_FULL[sess.quality_key], ""))
+            grp.append((ep, ADH_Q_FULL[sess.quality_key], ADH_Q_SHORT.get(sess.quality_key, "")))
         if grp:
             groups.append(grp)
     if not groups:
@@ -2044,8 +2060,13 @@ async def _download_adh_items(client, status_msg, orig_message, sess: "AdhSelect
     total = len(jobs)
     job_index = {id(j): n for n, j in enumerate(jobs)}
 
+    job = job_ctl.Job(status_msg, orig_message.from_user.id, title=(sess.title or "ADH")[:55])
+    job.quota_count = len(groups)
+    state = {"ok": 0}
+    failed: list = []
+
     loop = asyncio.get_event_loop()
-    cancel = threading.Event()
+    cancel = job.cancel_ev                    # ❌ Cancel dabane par Chrome resolve bhi ruk jaye
     sem = asyncio.Semaphore(_resolve_par())
     ahead = _prefetch_ahead()          # agle EPISODE-group tak itna aage resolve
     pre: dict = {}
@@ -2080,24 +2101,21 @@ async def _download_adh_items(client, status_msg, orig_message, sess: "AdhSelect
                 await _ram_ok_wait(current)
                 if cancel.is_set():
                     return None
-                final, dbg = await loop.run_in_executor(None, _resolve_job_blocking, ep_k, q_k, cancel)
+                final, dbg = await job_ctl.run_in_thread(_resolve_job_blocking, ep_k, q_k, cancel)
                 return final, dbg, time.time()
 
-        pre[k] = asyncio.ensure_future(_run())
+        pre[k] = job_ctl.track_task(asyncio.ensure_future(_run()))
 
-    failed: list = []
-    first_status = True
-    try:
+    async def _body():
         for gi, grp in enumerate(groups):
             # is group ki saari qualities + agle `ahead` groups ki resolve abhi shuru
             for g2 in range(gi, min(len(groups), gi + 1 + ahead)):
                 for j in groups[g2]:
                     _start(job_index[id(j)], current=(g2 == gi))
 
-            if not first_status:
-                status_msg = await orig_message.reply("⏳ Agla episode shuru ho raha hai...")
-                await asyncio.sleep(0.3)
-            first_status = False
+            ep0 = grp[0][0]
+            job.header = f"📺 **E{ep0['num']:02d}** • `{gi + 1}/{len(groups)}`"
+            job.reset_slots(keep=())
 
             gate = None
             if len(grp) > 1:
@@ -2109,16 +2127,15 @@ async def _download_adh_items(client, status_msg, orig_message, sess: "AdhSelect
                     LOGGER.warning(f"[Adh] ordered gate ban nahi paya: {e!r}")
                     gate = None
 
-            async def _one(n_in_grp: int, job):
-                ep, qfull, tag = job
+            async def _one(job_item):
+                ep, qfull, tag = job_item
                 key = ADH_Q_SHORT.get(next(kk for kk, ff, _s in ADH_Q_OPTS if ff == qfull), qfull)
-                sm = status_msg
-                if n_in_grp > 0:
-                    sm = await orig_message.reply(f"⏳ **E{ep['num']:02d} {key}** — shuru ho raha hai...")
+                order = 20 + [f for _k, f, _s in ADH_Q_OPTS].index(qfull)
+                sm = job.slot(f"up_{key}", order=order, label=key)       # card ka ek hissa, naya message nahi
                 try:
                     return await _process_adh_item(
-                        client, orig_message, ep, sm, job_index[id(job)] + 1, total, sess.language, qfull,
-                        ep_tag=tag or key, pre=pre.get(job_index[id(job)]), gate=gate, gate_key=key,
+                        client, orig_message, ep, sm, job_index[id(job_item)] + 1, total, sess.language, qfull,
+                        ep_tag=tag or key, pre=pre.get(job_index[id(job_item)]), gate=gate, gate_key=key,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -2129,29 +2146,44 @@ async def _download_adh_items(client, status_msg, orig_message, sess: "AdhSelect
                     if gate is not None:
                         gate.done(key)
 
-            results = await asyncio.gather(*[_one(n, j) for n, j in enumerate(grp)])
+            results = await asyncio.gather(*[_one(j) for j in grp])
             for j, r in zip(grp, results):
-                if r != "ok":
+                if r == "ok":
+                    state["ok"] += 1
+                else:
                     failed.append(f"E{j[0]['num']:02d} {j[1]}")
+            if all(r == "ok" for r in results):
+                job.done_eps.append(f"E{ep0['num']:02d}")
+
+    try:
+        await job.run(_body)
+    except Exception as e:
+        LOGGER.error(f"[Adh] _download_adh_items error: {e}")
+        job.slot("stage", order=0).text = f"❌ `{str(e)[:150]}`"
+        failed.append("(process error)")
     finally:
         cancel.set()                       # bacha hua prefetch (browser) band
         for f in pre.values():
             if not f.done():
                 f.cancel()
 
+    if job.cancelled:
+        return                              # cancel() ne card final kar diya
     if not failed:
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
+        job.reset_slots(keep=())
+        await job.finish(
+            f"🎉 **Complete!** — {job.title}\n\n"
+            f"✅ `{state['ok']}/{total}` upload ho gaye\n"
+            f"📋 {' '.join(job.done_eps[-12:])}"
+        )
     else:
-        try:
-            await orig_message.reply(
-                f"⚠️ **{len(failed)}/{total}** item fail hue:\n" + "\n".join(f"• `{x}`" for x in failed[:30])
-                + "\n\nInhe dobara /adh ya /anime se select karke chala lo."
-            )
-        except Exception:
-            pass
+        job.finished = False
+        body = job.render()
+        await job.finish(
+            body + f"\n\n⚠️ **{len(failed)}/{total}** item fail hue:\n"
+            + "\n".join(f"• `{x}`" for x in failed[:20])
+            + "\n\nInhe dobara /adh ya /anime se select karke chala lo."
+        )
 
 
 def discover_adh_full(series_url: str) -> dict:

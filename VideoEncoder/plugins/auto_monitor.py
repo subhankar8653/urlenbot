@@ -544,6 +544,7 @@ async def _episode_quality_poller(
     stats: dict = None,
     page_url: str = None,
     target_qualities: set = None,
+    source=None,
 ) -> bool:
     """Wrapper: card pe '🔄 Re-check' button lagata hai (poll chalte waqt), phir asli poller chalata hai."""
     _job = job_ctl.CURRENT.get()
@@ -560,6 +561,7 @@ async def _episode_quality_poller(
             update_post_sent=update_post_sent, update_post_mode=update_post_mode,
             season_intro=season_intro, season_hint=season_hint, stats=stats,
             page_url=page_url, target_qualities=target_qualities, _recheck_ev=ev, _live=_live,
+            source=source,
         )
     finally:
         try:
@@ -634,6 +636,7 @@ async def _episode_quality_poller_impl(
     target_qualities: set = None,
     _recheck_ev: asyncio.Event = None,
     _live: "_ChannelLive" = None,
+    source=None,
 ) -> bool:
     """
     update_post_mode: "auto" (global /updatechannel toggle follow kare — /Rtic aur
@@ -751,7 +754,8 @@ async def _episode_quality_poller_impl(
 
     # Poll schedule module-level constants se aata hai (POLL_* upar dekho):
     #   15 × 45s (⚡ Fast) → 10 × 120s (🐢 Slow) → nahi mila to auto-cancel
-    TARGET_QUALITIES_SET = set(target_qualities) if target_qualities else set(TARGET_QUALITIES)
+    TARGET_QUALITIES_SET = (set(target_qualities) if target_qualities
+                            else set(getattr(source, "qualities", None) or TARGET_QUALITIES))
 
     remaining = set(TARGET_QUALITIES_SET)
     poll_start = time.time()
@@ -845,7 +849,7 @@ async def _episode_quality_poller_impl(
         os.makedirs(poll_dl_dir, exist_ok=True)
 
         # Jo qualities pehle upload ho chuki hain unhe dobara download nahi karna (time bachta hai)
-        _poll_prog = {"phase": "scan", "dls": {}, "skip_q": (_ALL_QUALITIES - remaining)}
+        _poll_prog = {"phase": "scan", "dls": {}, "skip_q": (_ALL_QUALITIES - remaining), "done_q": set()}
         if _job is not None:
             _job.dirs.add(poll_dl_dir)
             _poll_prog["cancel"] = _job.cancel_ev
@@ -886,15 +890,23 @@ async def _episode_quality_poller_impl(
             if _job is not None:
                 _job.cleanups.append(functools.partial(_drop_pre_task, _pre_task))
 
-        scrape_fut = loop.run_in_executor(
-            None, functools.partial(
-                _scrape_and_download, swift_url, poll_dl_dir, None, None,
-                fast=True, progress=_poll_prog, on_file=_on_file,
+        if source is None:
+            scrape_fut = loop.run_in_executor(
+                None, functools.partial(
+                    _scrape_and_download, swift_url, poll_dl_dir, None, None,
+                    fast=True, progress=_poll_prog, on_file=_on_file,
+                )
             )
-        )
+        else:
+            # Alag source (ADH monitor): source(dl_dir, on_file, prog, remaining) -> {"files": [...], "error": ...}
+            # prog["cancel"] = job/episode cancel, prog["done_q"] = jo qualities channel mein pehle se hain,
+            # prog["live_txt"] = channel pe dikhne wali download line.
+            scrape_fut = job_ctl.track_task(asyncio.ensure_future(
+                source(poll_dl_dir, _on_file, _poll_prog, set(remaining))))
 
         # Download ka live status (pehle sirf "scan ho raha hai" dikhta tha => stuck jaisa lagta tha)
         _live_txt = {"dl": ""}            # destination channel ke liye download bar
+        _poll_prog["live_txt"] = _live_txt
         _live_ups: dict = {}              # quality -> upload slot (uska bar channel pe dikhega)
 
         async def _dl_status_updater():
@@ -1020,7 +1032,9 @@ async def _episode_quality_poller_impl(
                         except (TypeError, ValueError):
                             _sn = None
                         _sn = _sn or season_hint or 1
-                        await _send_season_intro(client, channel_id, anime_name, _sn)
+                        from ..utils import episode_guard as _egi      # RTI + ADH dono se ek hi baar
+                        if _egi.once(("season_intro", channel_id, _sn)):
+                            await _send_season_intro(client, channel_id, anime_name, _sn)
                     except Exception as _ie:
                         LOGGER.error(f"[Deco] season intro error: {_ie}")
 
@@ -1046,6 +1060,7 @@ async def _episode_quality_poller_impl(
                     skip_forward=_bot_mode_active,
                     gate=gate,
                     uploader_client=(_poll_ucs[0] if (gate is not None and _poll_ucs) else None),
+                    brand_tracks=(source is not None),
                 )
             finally:
                 _live_ups.pop(q, None)
@@ -1081,9 +1096,18 @@ async def _episode_quality_poller_impl(
                     pass
                 if stats is not None:
                     stats["uploaded"] = stats.get("uploaded", 0) + 1
-            if success and sent_msg and quality == "360p":
+            if success and sent_msg and quality in ("360p", "480p"):
                 is_first_ep = (start_ep is not None and episode_num == start_ep)
                 already_sent = (update_post_sent is not None and update_post_sent[0])
+                if is_first_ep and not already_sent:
+                    try:   # RTI + ADH dono monitor ek hi episode pe chalein to update post ek hi baar jaye
+                        from ..utils import episode_guard as _egu
+                        if not _egu.once(("update_post", channel_id, episode_num, end_ep or episode_num)):
+                            already_sent = True
+                            if update_post_sent is not None:
+                                update_post_sent[0] = True
+                    except Exception:
+                        pass
                 if is_first_ep and not already_sent:
                     try:
                         from .update_channel import send_update_post
@@ -1216,7 +1240,7 @@ async def _episode_quality_poller_impl(
             _live_ups.clear()
             await _live.clear()
 
-        _dl_upd = asyncio.ensure_future(_dl_status_updater())
+        _dl_upd = asyncio.ensure_future(_dl_status_updater() if source is None else asyncio.sleep(0))
         _cl_task = asyncio.ensure_future(_chan_live_loop() if _live is not None else asyncio.sleep(0))
         if _job is not None:
             _job.tasks.add(_dl_upd)
@@ -1277,6 +1301,14 @@ async def _episode_quality_poller_impl(
         # Jo file callback se miss ho gayi (safety) — ab start karo
         for _f in _sort_by_size(poll_result.get("files", []) or []):
             await _start(_f)
+
+        # Source ne bataya: ye qualities channel mein pehle se hain (RTI/ADH/Direct ne daal di) — complete maano
+        for _dq in list(_poll_prog.get("done_q") or ()):
+            if _dq in remaining:
+                remaining.discard(_dq)
+                started_q.add(_dq)
+                if stats is not None:
+                    stats.setdefault("dups", set()).add(_dq)
 
         # Jo quality kabhi aayi hi nahi (download fail) — uske peeche wale na atkein
         _g = _st["gate"]
@@ -1375,7 +1407,9 @@ async def _episode_quality_poller_impl(
     if _real_up and target_qualities is None:
         # Episode ki saari qualities ke baad border line (duplicate-skip pe nahi)
         # (Re-check run mein border dobara nahi — pehle hi ja chuka hota hai)
-        await _send_border(client, channel_id)
+        from ..utils import episode_guard as _egb      # RTI + ADH dono source se ek hi border
+        if _egb.once(("border", channel_id, episode_num)):
+            await _send_border(client, channel_id)
     return len(uploaded_qualities) > 0
 
 
@@ -2115,6 +2149,14 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
         from .direct_channel import get_direct_channel
         _dc = await get_direct_channel()
         if _dc and message.chat.id == _dc:
+            return
+    except Exception:
+        pass
+
+    # ADH-format post ("Audio Tracks:" wali) ko alag plugin (adh_monitor.py) sambhalta hai — yahan ignore
+    try:
+        from .adh_monitor import is_adh_post
+        if is_adh_post(message, text):
             return
     except Exception:
         pass
