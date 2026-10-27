@@ -15,6 +15,7 @@ python-dotenv
 hachoir
 beautifulsoup4==4.9.1
 Pillow>=10.1.0
+numpy   # poster_engine (Anime-Poster-Bot styles)
 
 # DDL
 pySmartDL
