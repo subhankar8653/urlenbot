@@ -463,6 +463,11 @@ async def soft_restart(reason: str):
     # execv ke baad bhi yaad rahe ki abhi restart hua tha (cooldown ke liye)
     os.environ[_LAST_RESTART_ENV] = str(time.time())
     try:
+        from . import memguard as _mg
+        _mg.mark_exit("janitor-soft-restart")
+    except Exception:
+        pass
+    try:
         for uid in owner[:1]:
             await app.send_message(uid, f"<b>♻️ Auto-refresh:</b> {reason}\nBot 5 sec mein wapas aa raha hai.")
     except Exception:
