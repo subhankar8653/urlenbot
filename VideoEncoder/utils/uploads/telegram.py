@@ -60,7 +60,59 @@ async def progress_nonblocking(current, total, ud_type, prog_msg, start):
 #  karta hai — kabhi bhi crash nahi hoga, chahe library 'cover'
 #  support kare ya na kare.
 # ─────────────────────────────────────────────
+_THUMB_ERR_HINTS = (
+    "THUMB", "COVER", "FILE_REFERENCE", "PHOTO_INVALID", "PHOTO_EXT", "PHOTO_SAVE", "MEDIA_INVALID",
+    "MEDIA_EMPTY", "FILE_ID_INVALID", "IMAGE_PROCESS", "INPUTFILE", "INPUT_FILE", "WEBPAGE_MEDIA",
+)
+_NEVER_RETRY = ("StopTransmission", "FloodWait", "SlowmodeWait", "ChatWriteForbidden", "ChatAdminRequired",
+                "ChannelPrivate", "PeerIdInvalid", "UserBannedInChannel")
+
+
+def _is_thumb_error(e: BaseException) -> bool:
+    name = type(e).__name__
+    if name in _NEVER_RETRY:
+        return False
+    blob = (name + " " + str(e)).upper()
+    return any(h in blob for h in _THUMB_ERR_HINTS)
+
+
 async def _send_video_cover_safe(send_fn, **kwargs):
+    """
+    Thumbnail/cover ki wajah se upload kabhi fail nahi hona chahiye (360p/720p/1080p ek saath bhi).
+    Order: (1) jaisa diya waisa  ->  (2) thumb/cover error aaye to cover hata ke  ->  (3) thumb bhi hata ke.
+    Video bina thumbnail ke bhi jaa jaata hai, failed upload se behtar hai.
+    """
+    try:
+        return await _send_video_cover_safe_inner(send_fn, **dict(kwargs))
+    except asyncio.CancelledError:
+        raise
+    except TypeError:
+        raise
+    except Exception as e:
+        if not _is_thumb_error(e):
+            raise
+        err = e
+    steps = []
+    if kwargs.get("cover"):
+        steps.append(("cover", {k: v for k, v in kwargs.items() if k != "cover"}))
+    if kwargs.get("thumb"):
+        steps.append(("cover+thumb", {k: v for k, v in kwargs.items() if k not in ("cover", "thumb")}))
+    for label, kw in steps:
+        LOGGER.warning(f"[Upload] thumbnail error ({type(err).__name__}: {str(err)[:120]}) — {label} hata ke dobara try")
+        try:
+            return await _send_video_cover_safe_inner(send_fn, **dict(kw))
+        except asyncio.CancelledError:
+            raise
+        except TypeError:
+            raise
+        except Exception as e2:
+            if not _is_thumb_error(e2):
+                raise
+            err = e2
+    raise err
+
+
+async def _send_video_cover_safe_inner(send_fn, **kwargs):
     # kurigram/pyrogram ke send_video mein 'file_name' aur 'cover'
     # kwargs support nahi hote — pehle with all kwargs try karo,
     # TypeError aane pe unsupported kwarg strip karke retry karo.
