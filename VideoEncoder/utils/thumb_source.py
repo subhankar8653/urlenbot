@@ -258,73 +258,118 @@ async def cached_cover_id(thumb_path: str, sender):
 
 
 # ── Custom thumb (/setpic, /thumb ka Telegram file_id) cache ────────────────────
-# Har upload pe app.download_media() => Telegram se wahi chhoti image baar-baar.
-# Ab ek baar download, baaki local copy (+ parallel calls ek hi download share karti hain).
+# Problem (pehle): har quality (360p/720p/1080p) upload ke time Telegram se thumb download karti thi
+# — bade upload ke saath cross-DC download_media => AUTH_BYTES_INVALID / timeout => thumbnail ki jagah
+# error. Ab:
+#   * thumb disk pe STABLE naam se rehta hai (restart ke baad bhi network nahi jaata)
+#   * ek file_id ke liye ek hi download (in-flight share), network download global lock se EK-EK karke
+#   * 3 attempts + backoff, valid image check, Telegram ke 200 KB thumb-limit ke andar re-encode
+#   * cache hit pe koi lock/network nahi — sirf local copy
 _CUSTOM = {}            # file_id -> master path
 _CUSTOM_INFLIGHT = {}   # file_id -> Future
+_DL_LOCK = None         # sirf asli network download ke liye (lazy: event loop ban jaane ke baad)
+_TG_THUMB_MAX = 190 * 1024
 
 
-async def fetch_custom_thumb(file_id: str, dest_dir: str, downloader):
-    """
-    downloader: async callable(file_id, path) -> path | None
-    Returns apni ALAG copy ka path (caller delete kar sakta hai) ya None.
-    """
-    if not file_id:
-        return None
-    os.makedirs(dest_dir, exist_ok=True)
-    dest = os.path.join(dest_dir, f"cthumb_{time.time_ns()}.jpg")
+def _normalize_thumb(path: str) -> bool:
+    """JPEG validate karo; Telegram ke thumb limit (~200 KB) se bada ho to chhota re-encode karo. Bad image => False."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            im.load()
+            img = im.convert("RGB")
+        if os.path.getsize(path) <= _TG_THUMB_MAX and (im.format or "").upper() == "JPEG":
+            return True
+        w, h = img.size
+        for max_side, q in ((1280, 85), (1280, 75), (960, 75), (640, 80), (320, 85)):
+            cur = img
+            if max(w, h) > max_side:
+                r = max_side / float(max(w, h))
+                cur = img.resize((max(1, int(w * r)), max(1, int(h * r))), Image.LANCZOS)
+            cur.save(path, "JPEG", quality=q, optimize=True)
+            if os.path.getsize(path) <= _TG_THUMB_MAX:
+                break
+        return os.path.getsize(path) > 0
+    except Exception as e:
+        LOGGER.warning(f"[ThumbSource] custom thumb invalid/unreadable: {e!r}")
+        return False
 
-    async def _copy_from(master):
-        await asyncio.to_thread(shutil.copyfile, master, dest)
-        return dest
 
-    master = _CUSTOM.get(file_id)
-    if master and os.path.isfile(master) and os.path.getsize(master) > 0:
+def _custom_keep_path(file_id: str) -> str:
+    try:
+        from .. import download_dir as _dd
+        keep_dir = os.path.join(_dd, "_thumbcache", "custom")
+    except Exception:
+        keep_dir = os.path.join(".", ".custom_master")
+    os.makedirs(keep_dir, exist_ok=True)
+    return os.path.join(keep_dir, f"c_{hashlib.sha1(file_id.encode()).hexdigest()[:20]}.jpg")
+
+
+async def _download_custom(file_id: str, keep: str, downloader):
+    global _DL_LOCK
+    if _DL_LOCK is None:
+        _DL_LOCK = asyncio.Lock()
+    tmp = keep + f".{time.time_ns()}.dl.jpg"
+    last = None
+    for attempt in range(3):
         try:
-            return await _copy_from(master)
+            async with _DL_LOCK:                       # cross-DC auth conflict se bachne ke liye ek-ek download
+                got = await asyncio.wait_for(downloader(file_id, tmp), timeout=25)
+            if got and str(got).endswith(".temp"):
+                fixed = str(got).replace(".temp", ".jpg")
+                try:
+                    os.rename(got, fixed)
+                    got = fixed
+                except Exception:
+                    pass
+            got = str(got) if got else None
+            if got and os.path.isfile(got) and os.path.getsize(got) > 0:
+                ok = await asyncio.to_thread(_normalize_thumb, got)
+                if ok:
+                    os.replace(got, keep)              # atomic: adhoori file kabhi cache nahi banti
+                    return keep
+            last = RuntimeError("empty/invalid thumb download")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            last = e
+        LOGGER.warning(f"[ThumbSource] custom thumb download {attempt + 1}/3 failed: {last!r}")
+        await asyncio.sleep(1.0 * (attempt + 1))
+    for junk in (tmp, tmp.replace(".jpg", ".temp")):
+        try:
+            if os.path.isfile(junk):
+                os.remove(junk)
         except Exception:
             pass
+    return None
+
+
+async def _ensure_custom_master(file_id: str, downloader):
+    """Custom thumb ka master (disk) path ya None. Cache hit = instant."""
+    if not file_id:
+        return None
+    master = _CUSTOM.get(file_id)
+    if master and os.path.isfile(master) and os.path.getsize(master) > 0:
+        return master
+    keep = _custom_keep_path(file_id)
+    if os.path.isfile(keep) and os.path.getsize(keep) > 0:      # restart ke baad bhi disk se
+        _CUSTOM[file_id] = keep
+        return keep
     fut = _CUSTOM_INFLIGHT.get(file_id)
     if fut is not None:
         try:
-            master = await asyncio.shield(fut)
-            return await _copy_from(master) if master else None
+            return await asyncio.shield(fut)
         except Exception:
             return None
     fut = asyncio.get_running_loop().create_future()
     _CUSTOM_INFLIGHT[file_id] = fut
-    master = None
     try:
-        try:
-            from .. import download_dir as _dd
-            keep_dir = os.path.join(_dd, "_thumbcache", "custom")
-        except Exception:
-            keep_dir = os.path.join(dest_dir, ".custom_master")
-        os.makedirs(keep_dir, exist_ok=True)
-        keep = os.path.join(keep_dir, f"c_{abs(hash(file_id))}.jpg")
-        got = None
-        for attempt in range(2):
-            try:
-                got = await asyncio.wait_for(downloader(file_id, keep), timeout=25)
-                if got and str(got).endswith(".temp"):
-                    fixed = str(got).replace(".temp", ".jpg")
-                    try:
-                        os.rename(got, fixed)
-                        got = fixed
-                    except Exception:
-                        pass
-                if got and os.path.isfile(got) and os.path.getsize(got) > 0:
-                    break
-                got = None
-            except Exception as e:
-                LOGGER.warning(f"[ThumbSource] custom thumb download {attempt + 1}/2: {e!r}")
-                await asyncio.sleep(0.5)
-        if got:
-            master = str(got)
+        master = await _download_custom(file_id, keep, downloader)
+        if master:
             _CUSTOM[file_id] = master
         if not fut.done():
             fut.set_result(master)
-        return await _copy_from(master) if master else None
+        return master
     except BaseException as e:
         if not fut.done():
             fut.set_exception(e if isinstance(e, Exception) else RuntimeError("cancelled"))
@@ -334,3 +379,28 @@ async def fetch_custom_thumb(file_id: str, dest_dir: str, downloader):
         return None
     finally:
         _CUSTOM_INFLIGHT.pop(file_id, None)
+
+
+async def warm_custom_thumb(file_id: str, downloader) -> bool:
+    """Sirf cache garam karo (copy nahi banti) — download ke dauran background mein."""
+    return bool(await _ensure_custom_master(file_id, downloader))
+
+
+async def fetch_custom_thumb(file_id: str, dest_dir: str, downloader):
+    """
+    downloader: async callable(file_id, path) -> path | None
+    Returns apni ALAG copy ka path (caller delete kar sakta hai) ya None.
+    """
+    if not file_id:
+        return None
+    master = await _ensure_custom_master(file_id, downloader)
+    if not master:
+        return None
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, f"cthumb_{time.time_ns()}.jpg")
+        await asyncio.to_thread(shutil.copyfile, master, dest)
+        return dest
+    except Exception as e:
+        LOGGER.warning(f"[ThumbSource] custom thumb copy failed: {e!r}")
+        return None
