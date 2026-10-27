@@ -2482,7 +2482,8 @@ async def _apply_full_metadata(filepath: str, meta: dict, msg: Message) -> str |
     return await _ffmpeg_process(filepath, out, meta_args, msg)
 
 
-async def _do_upload(bot: Client, filepath: str, message: Message, msg: Message, has_eng_sub: bool = False):
+async def _do_upload(bot: Client, filepath: str, message: Message, msg: Message, has_eng_sub: bool = False,
+                     quiet: bool = False) -> bool:
     """Upload the processed file to Telegram.
     
     upload_worker filename se caption leta hai, isliye:
@@ -2495,6 +2496,7 @@ async def _do_upload(bot: Client, filepath: str, message: Message, msg: Message,
     from ..utils.community import get_community_tag
     await msg.edit("<b>📤 Uploading...</b>")
     renamed_path = None
+    ok = False
     try:
         # URL uploads mein encoding nahi hoti — actual quality hamesha
         # ffprobe/metadata se detect karo (resolution=None).
@@ -2520,15 +2522,26 @@ async def _do_upload(bot: Client, filepath: str, message: Message, msg: Message,
             filepath = renamed_path
         
         link = await upload_worker(filepath, message, msg, resolution=None)
-        if link:
+        ok = True
+        if quiet:
+            # quiet mode (/adh): "✅ Uploaded! Link: ..." wala faltu message nahi — status hata do
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+        elif link:
             await msg.edit(f"✅ <b>Uploaded!</b>\nLink: {link}")
         else:
             await msg.edit("✅ <b>Uploaded!</b>")
     except Exception as e:
-        await msg.edit(f"❌ Upload failed: <code>{e}</code>")
+        try:
+            await msg.edit(f"❌ Upload failed: <code>{e}</code>")
+        except Exception:
+            pass
         LOGGER.error(f"URL upload failed: {e}")
     finally:
         try:
             os.remove(filepath)
         except Exception:
             pass
+    return ok

@@ -1751,7 +1751,7 @@ class AdhSelector:
         self.sid = None
         self.msg = None
         # Defaults: 720p + Hindi (agar page pe Hindi hai, warna pehli language)
-        self.quality_key = "720"                       # 480 | 720 | 1080 | all
+        self.quality_key = "all"                       # 480 | 720 | 1080 | all  (default: sab)
         self.language = next((l for l in self.languages if l.lower() == "hindi"), self.languages[0])
         self.page = 0
         self.multi = False
@@ -1863,11 +1863,11 @@ def _resolve_job_blocking(ep: dict, quality: str, cancel=None):
 
 
 def _resolve_par() -> int:
-    # default 1: ek saath 2 Chrome + download/upload = RAM spike => container OOM-restart
+    # default 2: ek episode ki qualities parallel resolve; naya Chrome RAM-gate (_ram_ok_wait) ke baad hi khulta hai
     try:
-        return max(1, int((os.getenv("ADH_RESOLVE_PAR") or "1").strip()))
+        return max(1, int((os.getenv("ADH_RESOLVE_PAR") or "2").strip()))
     except Exception:
-        return 1
+        return 2
 
 
 def _resolve_tries() -> int:
@@ -1896,7 +1896,7 @@ def _prefetch_ahead() -> int:
 
 
 async def _process_adh_item(client, message, ep: dict, status_msg, index: int, total: int,
-                             language: str, quality: str, ep_tag: str = "", pre=None):
+                             language: str, quality: str, ep_tag: str = "", pre=None, gate=None, gate_key: str = ""):
     """pre = background mein pehle se chal rahi link-resolve ka asyncio future -> (final_url, debug, resolved_at)."""
     ep_label = f"E{ep['num']:02d}" + (f" {ep_tag}" if ep_tag else "")
     loop = asyncio.get_event_loop()
@@ -2003,54 +2003,71 @@ async def _process_adh_item(client, message, ep: dict, status_msg, index: int, t
             pass
         return "error"
 
-    await _do_upload(client, filepath, message, status_msg, has_eng_sub=has_eng_sub)
+    # Parallel qualities: bytes ek saath upload, delivery 480p -> 720p -> 1080p order mein
+    _tok = None
+    if gate is not None:
+        try:
+            from ..utils.uploads.telegram import ORDER_GATE
+            _tok = ORDER_GATE.set((gate, gate_key))
+        except Exception:
+            _tok = None
     try:
-        final_text = status_msg.text or ""
-    except Exception:
-        final_text = ""
-    if "failed" in final_text.lower():
-        return "error"
-    return "ok"
+        ok = await _do_upload(client, filepath, message, status_msg, has_eng_sub=has_eng_sub, quiet=True)
+    finally:
+        if gate is not None:
+            gate.done(gate_key)          # fail pe bhi baaki qualities na atkein
+    return "ok" if ok else "error"
 
 
 async def _download_adh_items(client, status_msg, orig_message, sess: "AdhSelector", idxs: list):
-    # Quality "All" => har episode ki jo-jo qualities page pe hain (480p -> 720p -> 1080p)
-    jobs = []
+    # Quality "All" => har episode ki jo-jo qualities page pe hain. Ab ek episode ki SAARI qualities
+    # EK SAATH (resolve + download + upload) chalti hain; channel mein delivery 480p -> 720p -> 1080p order mein.
+    groups = []                     # [[(ep, qfull, short), ...], ...]  (ek group = ek episode)
     for idx in idxs:
         ep = sess.episodes[idx]
+        grp = []
         if sess.quality_key == "all":
             for k, full, short in ADH_Q_OPTS:
                 if _ep_has_quality(ep, full):
-                    jobs.append((ep, full, short))
+                    grp.append((ep, full, short))
         else:
-            jobs.append((ep, ADH_Q_FULL[sess.quality_key], ""))
-    if not jobs:
+            grp.append((ep, ADH_Q_FULL[sess.quality_key], ""))
+        if grp:
+            groups.append(grp)
+    if not groups:
         try:
             await status_msg.edit("❌ Chuni hui episodes mein koi quality available nahi hai.")
         except Exception:
             pass
         return
+    jobs = [j for g in groups for j in g]
     total = len(jobs)
+    job_index = {id(j): n for n, j in enumerate(jobs)}
 
-    # ── SPEED: agle episode/quality ka link (Multi transfer 1-2 min leta hai) PEHLE SE background mein
-    # resolve hota rehta hai jab tak current wala download+upload ho raha hai. Ek saath max
-    # ADH_RESOLVE_PAR (default 2) browsers, ADH_PREFETCH (default 1) agle jobs tak aage. ──
     loop = asyncio.get_event_loop()
     cancel = threading.Event()
     sem = asyncio.Semaphore(_resolve_par())
-    ahead = _prefetch_ahead()
+    ahead = _prefetch_ahead()          # agle EPISODE-group tak itna aage resolve
     pre: dict = {}
+
+    async def _ram_ok_wait(current: bool):
+        """Naya Chrome kholne se pehle RAM check — kam ho to thoda ruko (skip nahi), taaki OOM-restart na ho."""
+        t0 = time.time()
+        while not cancel.is_set():
+            try:
+                from ..utils import memguard as _mg
+                press = _mg.PRESSURE
+            except Exception:
+                press = False
+            low = _free_mem_mb() < float(os.getenv("ADH_MIN_FREE_MB") or 900)
+            if not (press or low):
+                return
+            if current and time.time() - t0 > 90:
+                return                  # current item ko hamesha chalne do (90s ke baad)
+            await asyncio.sleep(3)
 
     def _start(k: int, current: bool = False):
         if k >= total or k in pre:
-            return
-        try:
-            from ..utils import memguard as _mg
-            _press = _mg.PRESSURE
-        except Exception:
-            _press = False
-        if not current and (_press or _free_mem_mb() < float(os.getenv("ADH_MIN_FREE_MB") or 900)):
-            LOGGER.info("[Adh] RAM kam hai — agle item ka prefetch abhi skip")
             return
         ep_k, q_k, _t = jobs[k]
         if not _can_resolve(ep_k, q_k):
@@ -2060,39 +2077,74 @@ async def _download_adh_items(client, status_msg, orig_message, sess: "AdhSelect
             async with sem:
                 if cancel.is_set():
                     return None
+                await _ram_ok_wait(current)
+                if cancel.is_set():
+                    return None
                 final, dbg = await loop.run_in_executor(None, _resolve_job_blocking, ep_k, q_k, cancel)
                 return final, dbg, time.time()
 
         pre[k] = asyncio.ensure_future(_run())
 
-    all_ok = True
     failed: list = []
+    first_status = True
     try:
-        for i, (ep, qfull, tag) in enumerate(jobs):
-            for k in range(i, min(total, i + 1 + ahead)):
-                _start(k, current=(k == i))
-            result = await _process_adh_item(
-                client, orig_message, ep, status_msg, i + 1, total, sess.language, qfull,
-                ep_tag=tag, pre=pre.get(i),
-            )
-            if result != "ok":
-                all_ok = False
-                failed.append(f"E{ep['num']:02d} {qfull}")
-            if i + 1 < total:
+        for gi, grp in enumerate(groups):
+            # is group ki saari qualities + agle `ahead` groups ki resolve abhi shuru
+            for g2 in range(gi, min(len(groups), gi + 1 + ahead)):
+                for j in groups[g2]:
+                    _start(job_index[id(j)], current=(g2 == gi))
+
+            if not first_status:
                 status_msg = await orig_message.reply("⏳ Agla episode shuru ho raha hai...")
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
+            first_status = False
+
+            gate = None
+            if len(grp) > 1:
+                try:
+                    from .swift_downloader import _OrderedGate
+                    gate = _OrderedGate([ADH_Q_SHORT.get(k, k) + "" for k in
+                                         [next(kk for kk, ff, _s in ADH_Q_OPTS if ff == q) for _e, q, _t in grp]])
+                except Exception as e:
+                    LOGGER.warning(f"[Adh] ordered gate ban nahi paya: {e!r}")
+                    gate = None
+
+            async def _one(n_in_grp: int, job):
+                ep, qfull, tag = job
+                key = ADH_Q_SHORT.get(next(kk for kk, ff, _s in ADH_Q_OPTS if ff == qfull), qfull)
+                sm = status_msg
+                if n_in_grp > 0:
+                    sm = await orig_message.reply(f"⏳ **E{ep['num']:02d} {key}** — shuru ho raha hai...")
+                try:
+                    return await _process_adh_item(
+                        client, orig_message, ep, sm, job_index[id(job)] + 1, total, sess.language, qfull,
+                        ep_tag=tag or key, pre=pre.get(job_index[id(job)]), gate=gate, gate_key=key,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    LOGGER.error(f"[Adh] item crash E{ep['num']:02d} {key}: {e!r}")
+                    return "error"
+                finally:
+                    if gate is not None:
+                        gate.done(key)
+
+            results = await asyncio.gather(*[_one(n, j) for n, j in enumerate(grp)])
+            for j, r in zip(grp, results):
+                if r != "ok":
+                    failed.append(f"E{j[0]['num']:02d} {j[1]}")
     finally:
         cancel.set()                       # bacha hua prefetch (browser) band
         for f in pre.values():
             if not f.done():
                 f.cancel()
 
-    if all_ok:
+    if not failed:
         try:
             await status_msg.delete()
         except Exception:
             pass
-    elif failed:
+    else:
         try:
             await orig_message.reply(
                 f"⚠️ **{len(failed)}/{total}** item fail hue:\n" + "\n".join(f"• `{x}`" for x in failed[:30])
