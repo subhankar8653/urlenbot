@@ -61,11 +61,10 @@ _CATEGORIES = [
      ]),
     ("thumb", "🖼 Thumbnail",
      "🖼 **Thumbnail Edit**",
-     "_Video thumbnail, Main Channel post thumbnail ka design (14 poster styles + live preview) aur keyword-wise thumbnail_",
+     "_Video thumbnail, Main Channel post thumbnail ka design (14 poster styles + purane band styles, live preview) aur keyword-wise thumbnail_",
      [
          ("🎬 Video Thumbnail Design", "poster_video"),
          ("📣 Main Channel Post Thumbnail Design", "poster_post"),
-         ("🖼 Thumbnail Band Design", "setpic_style"),
          ("🖼 Keyword-wise Thumbnail", "custompic"),
      ]),
     ("monitor", "🤖 Auto Monitor",

@@ -25,6 +25,8 @@ import io
 import logging
 import time
 
+from types import SimpleNamespace as types_SimpleNamespace
+
 from pyrogram import Client, StopPropagation, filters
 from pyrogram.enums import ParseMode
 from pyrogram.types import (
@@ -71,6 +73,43 @@ def clear_session(user_id: int):
     _busy.discard(user_id)
 
 
+def _ts():
+    from ..utils import thumb_style
+    return thumb_style
+
+
+def _n_new() -> int:
+    return len(_api().STYLE_IDS)
+
+
+def _n_old(kind: str) -> int:
+    """Purane band styles (/setpic_style wale) sirf VIDEO thumbnail ke liye hain."""
+    return len(_ts().STYLE_ORDER) if kind == "video" else 0
+
+
+def _total(kind: str) -> int:
+    return _n_new() + _n_old(kind)
+
+
+def _old_id(kind: str, n: int):
+    """Viewer index n (15..) -> purana band style id, warna None."""
+    i = n - _n_new() - 1
+    order = _ts().STYLE_ORDER
+    return order[i] if kind == "video" and 0 <= i < len(order) else None
+
+
+def _start_index(kind: str) -> int:
+    """Panel hamesha naye styles se shuru: laga hua naya style, warna Style 1 (purane band styles last mein)."""
+    return poster_cfg.style_of(kind) or 1
+
+
+def _is_applied(kind: str, n: int) -> bool:
+    if n <= _n_new():
+        return poster_cfg.style_of(kind) == n
+    oid = _old_id(kind, n)
+    return bool(oid) and poster_cfg.style_of(kind) == 0 and _ts().get_current_style_id() == oid
+
+
 def _api():
     from ..utils.poster_engine import api
     return api
@@ -111,41 +150,6 @@ async def _ensure_anime(s: dict):
 
 
 # ───────────────────────── keyboards / texts ─────────────────────────
-def _main_text(kind: str) -> str:
-    info = KIND_INFO[kind]
-    cfg = poster_cfg.get(kind)
-    st = cfg.get("style")
-    api = _api()
-    if st:
-        cur = f"✅ <b>Style {st}</b> — {html.escape(api.POSTERS[st].blurb)}"
-    else:
-        cur = "🚫 <b>OFF</b> — " + info["off_note"]
-    btn_txt = cfg.get("button") or api.BUTTON_PRESETS[0]
-    brand = cfg.get("brand") or "community naam (auto)"
-    return (
-        f"<b>{info['title']}</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"{info['about']}\n\n"
-        f"🎨 <b>Abhi:</b> {cur}\n"
-        f"🔘 Button text: <code>{html.escape(btn_txt)}</code>\n"
-        f"🏷 Branding: <code>{html.escape(brand)}</code>\n\n"
-        "<i>Neeche se styles ka live preview dekho aur jo pasand aaye use laga do.</i>"
-    )
-
-
-def _main_kb(kind: str) -> InlineKeyboardMarkup:
-    cur = poster_cfg.style_of(kind)
-    rows = [[InlineKeyboardButton("👀 Preview & Choose Style", callback_data=f"pz:v:{kind}:{cur or 1}")]]
-    if cur:
-        rows.append([InlineKeyboardButton("🚫 Turn OFF (purana design)", callback_data=f"pz:off:{kind}")])
-    if kind == "video":
-        rows.append([InlineKeyboardButton("🎨 Old Band Styles (@SBANIME band)", callback_data="cmz:open:setpic_style")])
-    rows.append([
-        InlineKeyboardButton("🔙 Back", callback_data="cmz:cat:thumb"),
-        InlineKeyboardButton("🏠 Menu", callback_data="cmz:menu"),
-    ])
-    return InlineKeyboardMarkup(rows)
-
-
 def _art_label(s: dict) -> str:
     ds, a, n = _dataset(), s["anime"], s["style"]
     st = ds.POSTERS[n]
@@ -162,46 +166,79 @@ def _art_label(s: dict) -> str:
 def _viewer_kb(s: dict) -> InlineKeyboardMarkup:
     kind, n = s["kind"], s["style"]
     api = _api()
-    total = len(api.STYLE_IDS)
-    st = api.POSTERS[n]
+    total = _total(kind)
     rows = [[
         InlineKeyboardButton("⏪ Back", callback_data=f"pz:v:{kind}:{(n - 2) % total + 1}"),
         InlineKeyboardButton(f"{n}/{total}", callback_data="pz:noop"),
         InlineKeyboardButton("Next ⏩", callback_data=f"pz:v:{kind}:{n % total + 1}"),
     ]]
-    if s.get("anime") is not None:
+    if n <= _n_new():
+        st = api.POSTERS[n]
+        if s.get("anime") is not None:
+            rows.append([
+                InlineKeyboardButton("◀️", callback_data=f"pz:ap:{kind}"),
+                InlineKeyboardButton("🖼 " + _art_label(s), callback_data="pz:noop"),
+                InlineKeyboardButton("▶️", callback_data=f"pz:an:{kind}"),
+            ])
+        if st.button:
+            rows.append([
+                InlineKeyboardButton("🔘 " + (s["opts"].get("button") or "")[:18], callback_data=f"pz:bt:{kind}"),
+                InlineKeyboardButton("✏️ Custom", callback_data=f"pz:bc:{kind}"),
+            ])
         rows.append([
-            InlineKeyboardButton("◀️", callback_data=f"pz:ap:{kind}"),
-            InlineKeyboardButton("🖼 " + _art_label(s), callback_data="pz:noop"),
-            InlineKeyboardButton("▶️", callback_data=f"pz:an:{kind}"),
+            InlineKeyboardButton("🏷 Branding", callback_data=f"pz:br:{kind}"),
+            InlineKeyboardButton("🔍 Other Anime", callback_data=f"pz:sr:{kind}"),
         ])
-    if st.button:
+    else:                                                # purana band style
         rows.append([
-            InlineKeyboardButton("🔘 " + (s["opts"].get("button") or "")[:18], callback_data=f"pz:bt:{kind}"),
-            InlineKeyboardButton("✏️ Custom", callback_data=f"pz:bc:{kind}"),
+            InlineKeyboardButton("🎨 Change Color", callback_data=f"pz:cl:{kind}"),
+            InlineKeyboardButton("🔍 Other Anime", callback_data=f"pz:sr:{kind}"),
         ])
-    rows.append([
-        InlineKeyboardButton("🏷 Branding", callback_data=f"pz:br:{kind}"),
-        InlineKeyboardButton("🔍 Other Anime", callback_data=f"pz:sr:{kind}"),
-    ])
-    cur = poster_cfg.style_of(kind)
-    rows.append([InlineKeyboardButton("✅ Applied (tap = dobara save)" if cur == n else "✅ Use This Style",
+    rows.append([InlineKeyboardButton("✅ Applied (tap = dobara save)" if _is_applied(kind, n) else "✅ Use This Style",
                                       callback_data=f"pz:use:{kind}:{n}")])
-    rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"pz:m:{kind}"),
+    rows.append([InlineKeyboardButton("🚫 Disable (No Style)" if kind == "video" else "🚫 Turn OFF (saved image)",
+                                      callback_data=f"pz:off:{kind}")])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="cmz:cat:thumb"),
                  InlineKeyboardButton("🏠 Menu", callback_data="cmz:menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _color_kb(s: dict) -> InlineKeyboardMarkup:
+    kind, n = s["kind"], s["style"]
+    presets = _ts().COLOR_PRESETS
+    rows = []
+    for i in range(0, len(presets), 2):
+        rows.append([InlineKeyboardButton(label, callback_data=f"pz:col:{kind}:{idx}")
+                     for idx, (label, _hex) in list(enumerate(presets))[i:i + 2]])
+    rows.append([InlineKeyboardButton("🔙 Back to preview", callback_data=f"pz:v:{kind}:{n}")])
     return InlineKeyboardMarkup(rows)
 
 
 async def _caption(s: dict) -> str:
     api = _api()
     n = s["style"]
-    st = api.POSTERS[n]
     a = s["anime"]
-    info = KIND_INFO[s["kind"]]
-    cur = poster_cfg.style_of(s["kind"])
+    kind = s["kind"]
+    info = KIND_INFO[kind]
+    total = _total(kind)
+    ap = " ✅ <i>applied</i>" if _is_applied(kind, n) else ""
+    if n > _n_new():
+        oid = _old_id(kind, n)
+        name = html.escape(_ts().STYLES.get(oid, {}).get("name", oid))
+        col = s["opts"].get("color")
+        lines = [
+            f"<b>{info['title']}</b>",
+            f"🎨 <b>Style {n}/{total}</b> — purana band style: <b>{name}</b>{ap}",
+            f"🔎 Preview anime: <b>{html.escape(a.title) if a else '?'}</b>",
+            f"🏷 Band text: <code>{html.escape(await _brand_text(s))}</code>"
+            + (f" • color <code>{col}</code>" if col else ""),
+            "<i>Ye wahi /setpic_style wale purane band styles hain</i>",
+        ]
+        return "\n".join(lines)
+    st = api.POSTERS[n]
     lines = [
         f"<b>{info['title']}</b>",
-        f"🎨 <b>Style {n}/{len(api.STYLE_IDS)}</b> — {html.escape(st.blurb)}" + ("  ✅ <i>applied</i>" if cur == n else ""),
+        f"🎨 <b>Style {n}/{total}</b> — {html.escape(st.blurb)}{ap}",
         f"🔎 Preview anime: <b>{html.escape(a.title) if a else '?'}</b>",
         f"🏷 Branding: <code>{html.escape(await _brand_text(s))}</code>",
     ]
@@ -268,8 +305,11 @@ async def _render_view(client: Client, cb_msg: Message, s: dict, uid: int, note:
             pass
         try:
             a = await _ensure_anime(s)
-            r = await api.render(a, s["style"], button=s["opts"].get("button"), brand=await _brand_text(s),
-                                 pic=s["opts"].get("pic", 0), char=s["opts"].get("char", 0))
+            if s["style"] > _n_new():
+                r = types_SimpleNamespace(jpg=await _render_old(s, a))
+            else:
+                r = await api.render(a, s["style"], button=s["opts"].get("button"), brand=await _brand_text(s),
+                                     pic=s["opts"].get("pic", 0), char=s["opts"].get("char", 0))
         except api.NoArt as e:
             kind_ = e.args[0] if e.args else "art"
             await _view_error(client, cb_msg, s,
@@ -286,6 +326,48 @@ async def _render_view(client: Client, cb_msg: Message, s: dict, uid: int, note:
         await _show_photo(client, cb_msg, r.jpg, cap, _viewer_kb(s), s)
     finally:
         _busy.discard(uid)
+
+
+async def _viewer_ready(s: dict) -> dict:
+    await _ensure_anime(s)
+    return s
+
+
+def _color_hex(s: dict):
+    return s["opts"].get("color")
+
+
+async def _render_old(s: dict, a) -> bytes:
+    """Purana band style, anime ki asli image (banner, warna poster) pe — bilkul video thumbnail jaisa."""
+    from PIL import Image
+    ds = _dataset()
+    base = None
+    for which in ("banner", "cover"):
+        try:
+            await ds._need_image(a, which)
+            raw = getattr(a, f"{which}_bytes")
+            if raw:
+                base = Image.open(io.BytesIO(raw)).convert("RGB")
+                break
+        except Exception:
+            continue
+    if base is None:
+        base = Image.new("RGB", (1280, 720), (40, 42, 48))
+    W, H = 1280, 720                                     # 16:9 centre-crop (thumbnail jaisa)
+    ar = W / H
+    w, h = base.size
+    if w / h > ar:
+        cw, ch = int(h * ar), h
+    else:
+        cw, ch = w, int(w / ar)
+    l, t = (w - cw) // 2, (h - ch) // 2
+    img = base.crop((l, t, l + cw, t + ch)).resize((W, H), Image.LANCZOS)
+    ts = _ts()
+    style = ts.resolve_style(_old_id(s["kind"], s["style"]), _color_hex(s))
+    ts.render_band(img, await _brand_text(s), style)
+    out = io.BytesIO()
+    img.save(out, "JPEG", quality=90)
+    return out.getvalue()
 
 
 async def _view_error(client: Client, cb_msg: Message, s: dict, text: str):
@@ -305,8 +387,15 @@ async def _view_error(client: Client, cb_msg: Message, s: dict, text: str):
 
 # ───────────────────────── entry (customise se) ─────────────────────────
 async def open_panel(client: Client, cb: CallbackQuery, kind: str):
-    clear_session(cb.from_user.id)
-    await _to_text(client, cb, _main_text(kind), _main_kb(kind))
+    """Seedha viewer (naye 14 styles, phir purane band styles) — beech mein koi old/new choice nahi."""
+    uid = cb.from_user.id
+    clear_session(uid)
+    s = await _sess(uid, kind)
+    s["style"] = _start_index(kind)
+    if s["style"] > _n_new():
+        col = _ts().get_current_color()
+        s["opts"]["color"] = col
+    await _render_view(client, cb.message, s, uid)
 
 
 # ───────────────────────── callbacks ─────────────────────────
@@ -329,22 +418,50 @@ async def poster_panel_cb(client: Client, cb: CallbackQuery):
 
     if act == "m":
         await cb.answer()
-        clear_session(uid)
-        await _to_text(client, cb, _main_text(kind), _main_kb(kind))
-        return
-
-    if act == "off":
-        await poster_cfg.save(kind, style=0)
-        await cb.answer("🚫 OFF kar diya — purana design wapas.", show_alert=False)
-        await _to_text(client, cb, _main_text(kind), _main_kb(kind))
+        await open_panel(client, cb, kind)
         return
 
     s = await _sess(uid, kind)
     s["wait"] = None
 
+    if act == "off":
+        await poster_cfg.save(kind, style=0)
+        if kind == "video":
+            await _ts().set_style("none")
+            note = "🚫 <b>Disabled</b> — ab video thumbnail pe koi style/band nahi lagega (sirf anime ka poster)."
+        else:
+            note = "🚫 <b>OFF</b> — ab Main Channel post pe /update_post wali saved image jayegi."
+        await cb.answer("🚫 Disable ho gaya")
+        try:
+            cap = note + "\n\n" + await _caption(await _viewer_ready(s))
+            if cb.message.photo:
+                await cb.message.edit_caption(cap, reply_markup=_viewer_kb(s), parse_mode=HTML)
+            else:
+                await _render_view(client, cb.message, s, uid, note=note)
+        except Exception as e:
+            if "MESSAGE_NOT_MODIFIED" not in str(e):
+                LOGGER.warning(f"[PosterPanel] off caption failed: {e}")
+        return
+
+    if act == "cl":                                      # purane style ka color picker
+        await cb.answer()
+        try:
+            await cb.message.edit_reply_markup(_color_kb(s))
+        except Exception:
+            pass
+        return
+
+    if act == "col":
+        idx = int(parts[3])
+        presets = _ts().COLOR_PRESETS
+        s["opts"]["color"] = presets[idx][1] if 0 <= idx < len(presets) else None
+        await cb.answer("⏳ Color lagake preview ban raha hai...")
+        await _render_view(client, cb.message, s, uid)
+        return
+
     if act == "v":                                       # style n ka preview
         n = int(parts[3])
-        if n not in api.POSTERS:
+        if not (1 <= n <= _total(kind)):
             await cb.answer()
             return
         if uid in _busy:
@@ -353,17 +470,27 @@ async def poster_panel_cb(client: Client, cb: CallbackQuery):
         s["style"] = n
         s["opts"]["pic"] = 0
         s["opts"]["char"] = 0
+        if n > _n_new() and "color" not in s["opts"]:
+            s["opts"]["color"] = _ts().get_current_color()
         await cb.answer("⏳ Preview ban raha hai...")
         await _render_view(client, cb.message, s, uid)
         return
 
     if act == "use":
         n = int(parts[3])
-        await poster_cfg.save(kind, style=n, button=s["opts"].get("button") or "", brand=s.get("brand") or "")
-        await cb.answer(f"✅ Style {n} apply ho gaya!", show_alert=False)
-        where = ("ab se naye video thumbnails / covers is style mein banenge"
-                 if kind == "video" else "ab se Main Channel update posts ki image is style mein banegi")
-        note = f"✅ <b>Style {n} applied</b> — {where}."
+        if n > _n_new():                                 # purana band style
+            oid = _old_id(kind, n)
+            await poster_cfg.save(kind, style=0)
+            await _ts().set_style(oid)
+            await _ts().set_color(s["opts"].get("color"))
+            await cb.answer("✅ Apply ho gaya!", show_alert=False)
+            note = f"✅ <b>Style {n} applied</b> — ab se video thumbnails pe ye purana band style lagega."
+        else:
+            await poster_cfg.save(kind, style=n, button=s["opts"].get("button") or "", brand=s.get("brand") or "")
+            await cb.answer(f"✅ Style {n} apply ho gaya!", show_alert=False)
+            where = ("ab se naye video thumbnails / covers is style mein banenge"
+                     if kind == "video" else "ab se Main Channel update posts ki image is style mein banegi")
+            note = f"✅ <b>Style {n} applied</b> — {where}."
         try:
             s["style"] = n
             cap = note + "\n\n" + await _caption(s)
