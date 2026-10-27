@@ -55,9 +55,15 @@ def _style_sig():
     try:
         from .thumb_style import get_current_style
         st = get_current_style()
-        return "off" if st is None else repr(st)
+        sig = "off" if st is None else repr(st)
     except Exception:
-        return "?"
+        sig = "?"
+    try:
+        from . import poster_cfg
+        sig += "|poster:" + poster_cfg.signature("video")
+    except Exception:
+        pass
+    return sig
 
 
 def _cache_dir(dl_dir):
@@ -72,7 +78,30 @@ def _cache_dir(dl_dir):
     return d
 
 
+async def _build_poster_master(anime_name, dl_dir, band_text):
+    """/customise -> Thumbnail -> Video Thumbnail Design: Anime-Poster-Bot ke 14 styles mein se jo select hai
+    uska poster (AniList data) master banao. Kuch bhi fail ho to None — caller purane TMDB+band tareeke pe jaata hai."""
+    from . import poster_cfg
+    cfg = poster_cfg.get("video")
+    if not cfg.get("style"):
+        return None
+    from .poster_engine import api as _pe
+    master = os.path.join(_cache_dir(dl_dir), f"p_{time.time_ns()}.jpg")
+    brand = cfg.get("brand") or band_text or DEFAULT_THUMB_BAND_TEXT
+    ok = await _pe.render_to_file(anime_name, cfg, master, brand=brand)
+    if ok and os.path.isfile(master) and os.path.getsize(master) > 0:
+        LOGGER.info(f"[ThumbSource] Poster style {cfg['style']} thumbnail built for '{anime_name}'")
+        return master
+    return None
+
+
 async def _build_master(anime_name, dl_dir, band_text):
+    try:
+        pm = await _build_poster_master(anime_name, dl_dir, band_text)
+        if pm:
+            return pm
+    except Exception as e:
+        LOGGER.warning(f"[ThumbSource] poster-style thumbnail failed for '{anime_name}', purane tareeke pe: {e}")
     details = await fetch_anime_details(anime_name)
     if not details or not details.get("image"):
         return None
