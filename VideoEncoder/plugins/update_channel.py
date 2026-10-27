@@ -378,6 +378,15 @@ async def send_update_post(
 
     # ── Entry completeness check — image REQUIRED ──
     image = entry.get("image")
+    # /customise -> Thumbnail -> Main Channel Post Thumbnail Design: style select ho to poster auto-generate
+    # (fail/OFF => wahi purani saved image; saved image na ho tab bhi poster se post chala jaata hai)
+    try:
+        from ..utils.post_poster import make_post_poster as _mk_poster
+        _gen = await _mk_poster(entry.get("display_name") or anime_name)
+        if _gen:
+            image = _gen
+    except Exception as _pe:
+        LOGGER.warning(f"[UpdateChannel] post poster error (saved image use hogi): {_pe}")
     if not image:
         LOGGER.info(
             f"[UpdateChannel] '{anime_name}' ka entry incomplete hai (image missing) — post skip kiya."

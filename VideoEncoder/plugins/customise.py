@@ -61,8 +61,10 @@ _CATEGORIES = [
      ]),
     ("thumb", "🖼 Thumbnail",
      "🖼 **Thumbnail Edit**",
-     "_Video thumbnail ka design aur keyword-wise thumbnail_",
+     "_Video thumbnail, Main Channel post thumbnail ka design (14 poster styles + live preview) aur keyword-wise thumbnail_",
      [
+         ("🎬 Video Thumbnail Design", "poster_video"),
+         ("📣 Main Channel Post Thumbnail Design", "poster_post"),
          ("🖼 Thumbnail Band Design", "setpic_style"),
          ("🖼 Keyword-wise Thumbnail", "custompic"),
      ]),
@@ -212,6 +214,10 @@ async def customise_callback(client: Client, cb: CallbackQuery):
         _uc_clear(cb.from_user.id)
         _hs_clear(cb.from_user.id)
 
+    if action in ("menu", "cat", "open", "close"):
+        from .poster_panel import clear_session as _pz_clear
+        _pz_clear(cb.from_user.id)
+
     if action == "hs":
         from .hindi_schedule import handle as _hs_handle
         await _hs_handle(client, cb, parts[2:])
@@ -318,6 +324,11 @@ async def _open_section(client: Client, cb: CallbackQuery, section: str):
     if section == "hindi_schedule":
         from .hindi_schedule import render as _hs_render
         await _hs_render(client, cb)
+        return
+
+    if section in ("poster_video", "poster_post"):
+        from .poster_panel import open_panel as _pz_open
+        await _pz_open(client, cb, "video" if section == "poster_video" else "post")
         return
 
     if section == "border_panel":
