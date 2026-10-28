@@ -589,7 +589,7 @@ async def rtimega_command(client: Client, message: Message):
             "`/rtimega <rti_page_url> <ep> [mega|hubcloud|watchnow|dlbeta|all] [debug]`\n"
             "`/rtimega <codedew_zipper_url> [mega|hubcloud|watchnow|dlbeta] [debug]`\n\n"
             "• default = `mega` • `all` = chaaron ek saath • `debug` = har step ka screenshot\n"
-            "• Links milne ke baad mega/dlbeta/hubcloud se **download + Telegram upload** bhi hota hai "
+            "• Links milne ke baad (hubcloud: 10Gbps/FSL/Pixel server, watchnow: Download v1-v3) **download + Telegram upload** bhi hota hai "
             "(`noup` likho to sirf links)\n"
             "Poora process (trace) yahin dikhega."
         )
@@ -616,7 +616,15 @@ async def rtimega_command(client: Client, message: Message):
     workdir = os.path.join(download_dir, "_rtimega", uuid.uuid4().hex[:8])
     tr = Trace(workdir, debug=debug)
     msg = await message.reply("🧪 **RTI test shuru...**")
-    fut = job_ctl.run_in_thread(resolve_blocking, arg, ep, kinds, tr)
+    # post hook (rti_bypass): hubcloud -> servers (10Gbps/FSL/Pixel), watchnow -> Download v1..v3, dlbeta -> pixeldrain API
+    from . import rti_bypass as rb
+    dests: dict = {}
+
+    def _post(kind_, dest_, driver_, tr_):
+        dests[kind_] = dest_
+        return rb.post_hop(kind_, dest_, driver_, tr_)
+
+    fut = job_ctl.run_in_thread(resolve_blocking, arg, ep, kinds, tr, _post)
 
     async def _live():
         last = ""
@@ -634,7 +642,7 @@ async def rtimega_command(client: Client, message: Message):
     live = asyncio.ensure_future(_live())
     results: dict = {}
     try:
-        results = await asyncio.wait_for(fut, timeout=ZIPPER_TOTAL_TIMEOUT * len(kinds) + 90)
+        results = await asyncio.wait_for(fut, timeout=ZIPPER_TOTAL_TIMEOUT * 3 * len(kinds) + 120)
     except asyncio.TimeoutError:
         tr.add("⏰ poora test timeout")
     except Exception as e:
@@ -642,23 +650,37 @@ async def rtimega_command(client: Client, message: Message):
     finally:
         live.cancel()
 
-    # Result summary
+    # Result summary (links chhote dikhte hain — poore links trace.txt mein)
+    def _short(u, n=170):
+        u = u or ""
+        return _html.escape(u if len(u) <= n else u[:n] + "…")
+
+    def _final(v):
+        return v[1] if isinstance(v, tuple) else v
+
     lines = []
     for k in kinds:
-        u = results.get(k)
-        lines.append(f"{'✅' if u else '❌'} <b>{k}</b>: " + (f"<code>{_html.escape(u)}</code>" if u else "nahi mila"))
+        v = results.get(k)
+        d = dests.get(k)
+        if v:
+            row = f"✅ <b>{k}</b>"
+            if d and d != _final(v):
+                row += f": <code>{_short(d)}</code>\n    ↳ final: <code>{_short(_final(v))}</code>"
+            else:
+                row += f": <code>{_short(_final(v))}</code>"
+            lines.append(row)
+        elif d:
+            lines.append(f"⚠️ <b>{k}</b>: destination mila (<code>{_short(d, 90)}</code>) par final direct link nahi")
+        else:
+            lines.append(f"❌ <b>{k}</b>: nahi mila")
     head = "\n".join(lines)
-    mega = results.get("mega")
-    if mega:
-        head += (f"\n\nDownload: <code>/mega {_html.escape(mega)}</code>"
-                 f"\nURL-style upload: <code>/megaurl {_html.escape(mega)}</code>")
     if not all(results.get(k) for k in kinds):
         head += "\n\nTrace + screenshots neeche — wahi bhej do."
     try:
-        await msg.edit(f"{head}\n\n<pre>{_html.escape(tr.tail(12)[-2500:])}</pre>", parse_mode=ParseMode.HTML,
+        await msg.edit(f"{head}\n\n<pre>{_html.escape(tr.tail(8)[-1300:])}</pre>"[:4000], parse_mode=ParseMode.HTML,
                        disable_web_page_preview=True)
     except Exception:
-        await message.reply(head, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        await message.reply(head[:4000], parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
     try:
         tp = os.path.join(workdir, "trace.txt")
@@ -684,20 +706,19 @@ async def rtimega_command(client: Client, message: Message):
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
-    # ── REAL TEST: mile hue links se download -> Telegram upload (ek-ek karke, alag status msg) ──
+    # ── REAL TEST: final links se download -> Telegram upload (ek-ek karke, alag status msg) ──
     if noup:
         return
-    from .mega_url import run_source_upload
-    todo = [(k, results.get(k)) for k in ("mega", "dlbeta", "hubcloud") if results.get(k)]
-    if results.get("watchnow"):
-        await message.reply("ℹ️ <b>watchnow</b> sirf streaming page hai (direct file nahi) — upload skip.",
-                            parse_mode=ParseMode.HTML)
+    todo = [(k, results[k]) for k in kinds if isinstance(results.get(k), tuple)]
     if not todo:
-        await message.reply("⚠️ Upload test ke liye koi mega / dlbeta / hubcloud link nahi mila.")
+        await message.reply("⚠️ Upload test ke liye koi final download link nahi mila.")
         return
     summary = []
-    for k, u in todo:
-        ok = await run_source_upload(client, message, k, u)
-        summary.append(f"{'✅' if ok else '❌'} {k}")
-    if len(todo) > 1:
-        await message.reply("🧪 <b>Upload test result</b>\n" + "\n".join(summary), parse_mode=ParseMode.HTML)
+    for k, (ftype, furl) in todo:
+        t_up = time.time()
+        ok = await rb.upload_final(client, message, k, ftype, furl)
+        summary.append(f"{'✅' if ok else '❌'} {k} ({time.time() - t_up:.0f}s)")
+    for k in kinds:
+        if not isinstance(results.get(k), tuple):
+            summary.append(f"❌ {k}: final link nahi mila")
+    await message.reply("🧪 <b>Upload test result</b>\n" + "\n".join(summary), parse_mode=ParseMode.HTML)

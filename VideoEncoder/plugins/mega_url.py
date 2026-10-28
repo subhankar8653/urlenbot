@@ -1,11 +1,10 @@
 """
-mega_url.py — Mega / DLBeta(Pixeldrain) / HubCloud link -> /url jaisa flow -> Telegram upload (TEST)
+mega_url.py — Mega / direct (Pixeldrain, HubCloud server, ...) link -> /url jaisa flow -> Telegram upload (TEST)
 ===================================================================================================
 Do jagah se use hota hai:
 
  1. /megaurl <mega_link> [-vt] [| name]     (seedha command)
- 2. /rtimega ... (rti_mega.py)              -> links nikalne ke baad har source se download + upload
-                                               (`run_source_upload`), taaki real upload test ho sake.
+ 2. rti_bypass.upload_final (/rtimega, /rtiup)  -> `run_pipeline` se har source ka real upload test.
 
 Flow (sab /url jaisa): ❌ Cancel -> uploader prewarm -> download (progress) -> /urlpreset auto-settings
 -> smart caption -> Telegram upload.
@@ -16,7 +15,7 @@ import os
 import re
 import shutil
 import time
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -37,8 +36,6 @@ from .url_upload import (
 )
 
 _MEGA_URL_RE = re.compile(r"https?://mega\.(?:nz|co\.nz)/\S+", re.I)
-_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 
 def _bar(done: int, total: int, width: int = 12) -> str:
@@ -60,73 +57,12 @@ def _pixeldrain_direct(url: str):
     return f"https://{host}/api/file/{m.group(1)}?download"
 
 
-def _is_html(resp) -> bool:
-    return "text/html" in (resp.headers.get("content-type") or "").lower()
-
-
-def _hubcloud_direct(url: str):
-    """BEST-EFFORT: hubcloud.*/drive/<id> -> direct download URL ya (None, html_text_for_debug).
-    Page structure badalta rehta hai, isliye 2 hop tak follow karke 'download' buttons dhoondte hain."""
-    import requests
-    from bs4 import BeautifulSoup
-
-    s = requests.Session()
-    s.headers.update({"User-Agent": _UA})
-    last_html = ""
-    cur = url
-    prefer = ("pixel", "fsl", "10gbps", "download file", "direct")
-    for _hop in range(3):
-        r = s.get(cur, timeout=30, allow_redirects=True)
-        last_html = r.text
-        if not _is_html(r):
-            return cur, None                       # seedha file nikli
-        soup = BeautifulSoup(r.text, "html.parser")
-        cands = []
-        for a in soup.find_all("a", href=True):
-            href = urljoin(r.url, a["href"].strip())
-            text = a.get_text(" ", strip=True).lower()
-            if not href.startswith("http") or href.startswith("javascript"):
-                continue
-            score = None
-            for i, p in enumerate(prefer):
-                if p in text:
-                    score = i
-                    break
-            if score is None and re.search(r"hubcloud\.php|gamerxyt|/dl/|\.mkv|\.mp4", href, re.I):
-                score = 50
-            if score is not None:
-                cands.append((score, href))
-        if not cands:
-            break
-        cands.sort(key=lambda x: x[0])
-        for _sc, href in cands[:6]:
-            try:
-                h = s.head(href, timeout=20, allow_redirects=True)
-                if h.status_code < 400 and not _is_html(h):
-                    return h.url, None
-            except Exception:
-                pass
-        cur = cands[0][1]                          # agle hop pe wahi page kholo
-    return None, last_html
-
-
-async def _download_any(url: str, kind: str, dest_dir: str, msg, message, notes: list):
-    """kind: mega | dlbeta | hubcloud | other -> downloaded filepath ya None."""
+async def _download_any(url: str, kind: str, dest_dir: str, msg, message):
+    """mega link ya direct file URL -> downloaded filepath ya None."""
     if is_mega_link(url):
         return await _download_mega_progress(url, dest_dir, msg)
-
-    direct = url
-    if "pixeldrain" in url:
-        direct = _pixeldrain_direct(url) or url
-    elif kind == "hubcloud" or "hubcloud" in url:
-        await msg.edit("<b>🔎 HubCloud page se direct link dhoondh raha hoon...</b>")
-        direct, html = await asyncio.get_event_loop().run_in_executor(None, _hubcloud_direct, url)
-        if not direct:
-            notes.append(("hubcloud_page.html", html or ""))
-            await msg.edit("❌ <b>HubCloud:</b> direct download link auto nahi mila "
-                           "(JS / captcha / naya layout). Page HTML debug ke liye bhej raha hoon.")
-            return None
-
+    direct = _pixeldrain_direct(url) if "pixeldrain" in url and "/api/file/" not in url else url
+    direct = direct or url
     LOGGER.info(f"[MegaURL] {kind} direct: {direct[:120]}")
     name = _safe_filename(await _get_filename_from_url(direct))
     return await _download_url(direct, name, msg, message)      # download_dir mein save
@@ -184,18 +120,23 @@ async def run_pipeline(bot: Client, message: Message, msg, url: str, kind: str =
 
     dest = os.path.join(download_dir, f"megaurl_{message.from_user.id}_{int(time.time())}")
     os.makedirs(dest, exist_ok=True)
-    notes: list = []
     try:
-        filepath = await _download_any(url, kind, dest, msg, message, notes)
+        try:
+            filepath = await _download_any(url, kind, dest, msg, message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            LOGGER.error(f"[MegaURL] {kind} download error: {e!r}")
+            try:
+                await msg.edit(f"❌ <b>[{kind}] Download failed:</b> <code>{str(e)[:250]}</code>")
+            except Exception:
+                pass
+            return False
         if not filepath or not os.path.isfile(filepath):
-            for fname, content in notes:                    # debug attachments (hubcloud html)
-                try:
-                    p = os.path.join(dest, fname)
-                    with open(p, "w", encoding="utf-8") as f:
-                        f.write(content)
-                    await message.reply_document(p, caption=f"📄 {kind} debug")
-                except Exception:
-                    pass
+            try:
+                await msg.edit(f"❌ <b>[{kind}]</b> Download failed or file not found.")
+            except Exception:
+                pass
             return False
 
         # Mega file dest_dir mein aati hai; /url jaisa download_dir mein le aao (+ optional custom name)
@@ -228,26 +169,6 @@ async def run_pipeline(bot: Client, message: Message, msg, url: str, kind: str =
         return True
     finally:
         shutil.rmtree(dest, ignore_errors=True)
-
-
-async def run_source_upload(bot: Client, message: Message, kind: str, url: str) -> bool:
-    """/rtimega se: ek resolved source (mega/dlbeta/hubcloud) ko alag status msg + Cancel button ke saath
-    download karke Telegram pe upload karo."""
-    msg = await message.reply(f"<b>🧪 [{kind}] download → upload test</b>\n<code>{url[:150]}</code>")
-    ok = {"v": False}
-
-    async def _body(pmsg):
-        ok["v"] = await run_pipeline(bot, message, pmsg, url, kind=kind)
-
-    try:
-        await job_ctl.run_cancelable(msg, message.from_user.id, f"RTI test: {kind}", _body)
-    except Exception as e:  # noqa: BLE001
-        LOGGER.error(f"[MegaURL] {kind} test error: {e!r}")
-        try:
-            await msg.edit(f"❌ <b>[{kind}]</b> <code>{type(e).__name__}: {str(e)[:250]}</code>")
-        except Exception:
-            pass
-    return ok["v"]
 
 
 # ─────────────────────────────────────────────

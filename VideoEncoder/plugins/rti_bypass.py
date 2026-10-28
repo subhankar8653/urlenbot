@@ -61,6 +61,29 @@ def pixeldrain_direct(url: str):
     return f"https://pixeldrain.dev/api/file/{m.group(1)}?download" if m else None
 
 
+# wrapper links: https://cryptonewz.online/dl.php?link=<REAL_URL>  ->  <REAL_URL>
+_WRAP_RE = re.compile(r"^https?://[^/?#]+/[^?#]*\?(?:[^#]*?&)?link=((?:https?:|https?%3A)[^\s]+)$", re.I)
+
+
+def unwrap_link(href: str) -> str:
+    """Server button ka link kisi redirector (dl.php?link=...) ke andar ho to asli link nikaalo."""
+    m = _WRAP_RE.match(href or "")
+    if not m:
+        return href
+    inner = m.group(1)
+    if inner.lower().startswith(("http%3a", "https%3a")):
+        from urllib.parse import unquote
+        inner = unquote(inner)
+    outer_host = urlparse(href).netloc.lower()
+    if urlparse(inner).netloc.lower() == outer_host:
+        return href
+    return inner
+
+
+# inspect ke baad bacha hua alternate direct links: {primary_url: [backup1, backup2]}
+_ALT: dict = {}
+
+
 # ─────────────────────────────────────────────
 #  HubCloud: drive page -> servers
 # ─────────────────────────────────────────────
@@ -151,6 +174,7 @@ def hubcloud_servers(driver, drive_url: str, tr: rm.Trace) -> list:
 
 def inspect_link(href: str, tr: rm.Trace, referer: str = "") -> dict:
     """Server button ka link follow karo (redirects) — final URL + kya wo file hai? (body download nahi)"""
+    href = unwrap_link(href)
     info = {"href": href, "final": href, "is_file": False, "ctype": "", "size": 0, "status": 0, "name": ""}
     try:
         hdr = dict(_UA)
@@ -183,18 +207,23 @@ def inspect_link(href: str, tr: rm.Trace, referer: str = "") -> dict:
     return info
 
 
-def pick_best(servers: list, tr: rm.Trace, referer: str = ""):
-    """Priority order mein har downloadable server inspect karo, pehla jo file de wahi."""
+def pick_best(servers: list, tr: rm.Trace, referer: str = "", alts_out: list = None):
+    """Priority order (10Gbps > FSL > Pixel > Buzz) mein servers inspect karo. Pehla jo file de wahi best;
+    baaki file-servers alts_out mein (download fail ho to unpe fallback)."""
     cand = [s for s in servers if s["downloadable"]]
     cand.sort(key=lambda s: next((i for i, k in enumerate(SERVER_PRIORITY) if k in s["name"].lower()), 99))
-    for s in cand:
+    best = (None, None)
+    for s in cand[:5]:
         info = inspect_link(s["href"], tr, referer)
         s["info"] = info
         tr.add(f"  • {s['name']}: status={info['status']} file={'✅' if info['is_file'] else '❌'} "
                f"{info['ctype'] or '?'} {info['size'] / 1048576:.0f}MB -> {info['final'][:90]}")
         if info["is_file"]:
-            return s, info
-    return None, None
+            if best[0] is None:
+                best = (s, info)
+            elif alts_out is not None:
+                alts_out.append(info["final"])
+    return best
 
 
 # ─────────────────────────────────────────────
@@ -215,8 +244,13 @@ def finalize(url: str, driver, tr: rm.Trace):
             tr.add("❌ hubcloud ke liye Chrome chahiye")
             return None, None
         servers = hubcloud_servers(driver, url, tr)
-        s, info = pick_best(servers, tr, referer=url)
+        alts: list = []
+        s, info = pick_best(servers, tr, referer=url, alts_out=alts)
         if s:
+            if alts:
+                _ALT[info["final"]] = alts
+                tr.add(f"  backup servers: {len(alts)}")
+            tr.add(f"✅ HUBCLOUD best: {s['name']}")
             return "direct", info["final"]
         return None, None
     return "direct", url
@@ -277,30 +311,23 @@ def post_hop(kind: str, dest: str, driver, tr: rm.Trace):
 #  Upload (same pipeline jo /url aur /mega use karte hain)
 # ─────────────────────────────────────────────
 async def upload_final(client: Client, message: Message, kind: str, ftype: str, furl: str):
-    from .url_upload import (_auto_process_and_upload, _download_url, _get_filename_from_url,
-                             _safe_filename, _url_sessions)
+    """Download (mega / direct) -> /url jaisa auto-process -> Telegram upload.
+    Primary link fail ho to HubCloud ke backup servers (FSL / Pixel) try hote hain."""
+    from .mega_url import run_pipeline
     uid = message.from_user.id
     um = await message.reply(f"<b>💠 [{kind}] Downloading...</b>", parse_mode=ParseMode.HTML)
+    cands = [furl] + [a for a in _ALT.get(furl, []) if a != furl]
 
     async def _body(pm):
-        try:
-            if ftype == "mega":
-                from .mega_download import download_mega
-                dest = os.path.join(download_dir, f"rtiup_{int(time.time())}_{kind}")
-                filepath = await download_mega(furl, dest, pm)
-            else:
-                name = _safe_filename(await _get_filename_from_url(furl))
-                filepath = await _download_url(furl, name, pm, message)
-        except Exception as e:
-            await pm.edit(f"❌ [{kind}] Download failed: <code>{_html.escape(str(e)[:200])}</code>")
-            return False
-        if not filepath or not os.path.isfile(filepath):
-            await pm.edit(f"❌ [{kind}] Download failed or file not found.")
-            return False
-        _url_sessions[uid] = {"filepath": filepath, "msg": pm, "orig_name": os.path.basename(filepath),
-                              "message": message}
-        await _auto_process_and_upload(client, uid, pm, message)
-        return True
+        for i, u in enumerate(cands):
+            if i:
+                try:
+                    await pm.edit(f"🔁 <b>[{kind}]</b> pichla server fail — backup #{i} try kar raha hoon...")
+                except Exception:
+                    pass
+            if await run_pipeline(client, message, pm, u, kind=kind):
+                return True
+        return False
 
     try:
         _job, res = await job_ctl.run_cancelable(um, uid, f"RTI {kind} test", _body)
