@@ -18,7 +18,7 @@ from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
 
-from .. import app, download_dir, encode_dir
+from .. import app, download_dir, encode_dir, LOGGER
 from ..utils.database.access_db import db
 from ..utils.uploads import upload_worker
 from ..utils.auto_caption import build_auto_caption
@@ -34,30 +34,76 @@ def is_mega_link(url: str) -> bool:
 
 # ─── Mega downloader ──────────────────────────────────────────────────────────
 
+def _find_tool():
+    """megadl ya megatools — jo install ho. Returns argv-prefix list ya None."""
+    import shutil
+    if shutil.which("megadl"):
+        return ["megadl"]
+    if shutil.which("megatools"):
+        return ["megatools", "dl"]          # megatools >=1.11: `megatools dl`
+    return None
+
+
+def _newest_file(dest_dir: str):
+    files = []
+    for root, _, fnames in os.walk(dest_dir):
+        for f in fnames:
+            full = os.path.join(root, f)
+            if os.path.isfile(full):
+                files.append(full)
+    files.sort(key=os.path.getmtime, reverse=True)
+    return files[0] if files else None
+
+
+def _bar(done: int, total: int, width: int = 12) -> str:
+    pct = (done / total) if total else 0
+    fill = int(pct * width)
+    return "▓" * fill + "░" * (width - fill) + f" {pct * 100:.1f}%"
+
+
+async def _download_mega_python(url: str, dest_dir: str, msg) -> str | None:
+    """megatools nahi hai to pure-Python (utils/mega_py.py) — single file links ke liye."""
+    from ..utils.mega_py import download_public_file, MegaError
+    last = [0.0]
+
+    async def _prog(done, total, speed, name):
+        if time.time() - last[0] < 4:
+            return
+        last[0] = time.time()
+        try:
+            await msg.edit(
+                f"📥 **Mega se download ho raha hai** (python mode)\n"
+                f"📄 `{name[:60]}`\n"
+                f"{_bar(done, total)}\n"
+                f"📦 {done / 1048576:.0f} / {total / 1048576:.0f} MB • ⚡ {speed / 1048576:.1f} MB/s"
+            )
+        except Exception:
+            pass
+
+    try:
+        return await download_public_file(url, dest_dir, progress=_prog)
+    except MegaError as e:
+        await msg.edit(f"❌ **Mega download failed!**\n`{str(e)[:300]}`")
+    except Exception as e:
+        await msg.edit(f"❌ **Mega download failed!**\n`{type(e).__name__}: {str(e)[:250]}`")
+    return None
+
+
 async def download_mega(url: str, dest_dir: str, msg) -> str | None:
-    """megadl tool se mega download karo, progress update karo"""
+    """
+    Mega download: pehle megadl/megatools (agar installed), warna ya fail hone par pure-Python fallback.
+    (Ab 'megatools install nahi hai' error nahi aata.)
+    """
     os.makedirs(dest_dir, exist_ok=True)
+    tool = _find_tool()
 
-    # Tool check
-    check = subprocess.run(['which', 'megadl'], capture_output=True)
-    tool = 'megadl' if check.returncode == 0 else None
-    if not tool:
-        check2 = subprocess.run(['which', 'megatools'], capture_output=True)
-        tool = 'megatools' if check2.returncode == 0 else None
-
-    if not tool:
-        await msg.edit(
-            "❌ **Mega downloader install nahi hai!**\n\n"
-            "Dockerfile mein `megatools` add karo:\n"
-            "`RUN apt-get install -y megatools`"
-        )
-        return None
+    if tool is None:
+        await msg.edit("📥 **Mega se download ho raha hai...**\n(megatools nahi mila — python downloader use ho raha hai)")
+        return await _download_mega_python(url, dest_dir, msg)
 
     await msg.edit("📥 **Mega se download ho raha hai...**\n⏳ Please wait...")
-
-    cmd = ['megadl', '--path', dest_dir, url]
     proc = await asyncio.create_subprocess_exec(
-        *cmd,
+        *tool, '--path', dest_dir, url,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
@@ -89,24 +135,19 @@ async def download_mega(url: str, dest_dir: str, msg) -> str | None:
         progress_task.cancel()
 
     if proc.returncode != 0:
-        err = stderr.decode().strip()
+        err = (stderr.decode(errors="replace") or stdout.decode(errors="replace")).strip()
+        if re.search(r"mega\.(?:nz|co\.nz)/(?:file/|#!)", url):
+            LOGGER.warning(f"[Mega] megatools fail ({err[:150]}) — python fallback try")
+            await msg.edit("⚠️ megatools fail hua — python downloader se try kar raha hoon...")
+            return await _download_mega_python(url, dest_dir, msg)
         await msg.edit(f"❌ **Mega download failed!**\n`{err[:300]}`")
         return None
 
-    # Downloaded file dhundo
-    files = []
-    for root, _, fnames in os.walk(dest_dir):
-        for f in fnames:
-            full = os.path.join(root, f)
-            if os.path.isfile(full):
-                files.append(full)
-
-    if not files:
+    f = _newest_file(dest_dir)
+    if not f:
         await msg.edit("❌ Koi file nahi mili download folder mein!")
         return None
-
-    files.sort(key=os.path.getmtime, reverse=True)
-    return files[0]
+    return f
 
 
 # ─── Metadata cleaner ─────────────────────────────────────────────────────────
