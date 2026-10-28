@@ -53,7 +53,8 @@ MAX_SHOTS = 10
 KINDS = {
     "mega":     (("mega",), None),
     "hubcloud": (("hubcloud",), re.compile(r"https?://[^\s\"'<>]*hubcloud[^\s\"'<>]*", re.I)),
-    "watchnow": (("watchnow", "watch now"), re.compile(r"https?://[^\s\"'<>]*(?:m3u8|player|stream|embed|watch)[^\s\"'<>]*", re.I)),
+    "watchnow": (("watchnow", "watch now"), None),      # destination = codedew.com/streambeta/ (Download v1-v3 page)
+    "generic":  ((), None),                              # 2nd hop (streambeta -> Download vN -> zipper -> final)
     "dlbeta":   (("dlbeta", "dl beta"), re.compile(r"https?://[^\s\"'<>]*dl-?beta[^\s\"'<>]*", re.I)),
 }
 _OWN_HOSTS = ("codedew.com", "rareanimes.", "google", "gstatic", "cloudflare", "fonts.", "doubleclick")
@@ -265,12 +266,31 @@ def _mega_in(text: str):
     return None
 
 
-def _dest_in(kind: str, text: str):
+_STREAMBETA_RE = re.compile(r"https?://(?:www\.)?codedew\.com/streambeta[^\s\"'<>]*", re.I)
+_PIXEL_RE = re.compile(r"https?://pixeldrain\.(?:net|dev|com)/(?:u|api/file)/[A-Za-z0-9]+[^\s\"'<>]*", re.I)
+_HUBDRIVE_RE = re.compile(r"https?://[^\s\"'<>/]*hubcloud[^\s\"'<>/]*/drive/[A-Za-z0-9]+", re.I)
+_VIDEO_URL_RE = re.compile(r"https?://[^\s\"'<>]+\.(?:mkv|mp4|m4v|webm)(?:\?[^\s\"'<>]*)?", re.I)
+
+
+def _dest_in(kind: str, text: str, url_only: bool = False):
     """kind ka destination URL text mein? (mega: mega.nz; baaki: unka hint regex, apni sites chhodke)"""
     if not text:
         return None
     if kind == "mega":
         return _mega_in(text)
+    if kind == "watchnow":
+        m = _STREAMBETA_RE.search(text)
+        return m.group(0) if m else None
+    if kind == "generic":
+        mg = _mega_in(text)
+        if mg:
+            return mg
+        for rx in ((_PIXEL_RE, _HUBDRIVE_RE) + ((_VIDEO_URL_RE,) if url_only else ())):
+            for cand in (text, unquote(text)):
+                m = rx.search(cand)
+                if m:
+                    return m.group(0)
+        return None
     rx = KINDS[kind][1]
     for cand in (text, unquote(text)):
         for m in rx.finditer(cand):
@@ -348,8 +368,10 @@ def _pick_button(btns: list):
     return best
 
 
-def _sweep_windows(driver, main: str, kind: str, tr: Trace):
-    """Popup/ad tabs band karo; destination wala tab mile to uska URL return karo."""
+def _sweep_windows(driver, holder: list, kind: str, tr: Trace):
+    """Popup/ad tabs band karo; naya codedew tab aaye to wahi main ban jaata hai;
+    destination wala tab mile to uska URL return karo."""
+    main = holder[0]
     try:
         handles = list(driver.window_handles)
     except Exception:
@@ -358,27 +380,36 @@ def _sweep_windows(driver, main: str, kind: str, tr: Trace):
         return None
     hit = None
     for h in handles:
-        if h == main:
+        if h == main or h == holder[0] and h != main:
             continue
         try:
             driver.switch_to.window(h)
             u = driver.current_url or ""
-            d = _dest_in(kind, u)
+            d = _dest_in(kind, u, url_only=True)
             if d:
                 hit = d
                 tr.add(f"🎯 naye tab mein destination: {d[:90]}")
                 continue
             if "codedew" in u:
+                tr.add(f"codedew naya tab adopt: {u[:70]}")
+                holder[0] = h
                 continue
             tr.add(f"popup tab band: {u[:70]}")
             driver.close()
         except Exception:
             pass
+    if holder[0] != main:                      # purana main band (flip-flop na ho)
+        try:
+            driver.switch_to.window(main)
+            driver.close()
+        except Exception:
+            pass
     try:
-        driver.switch_to.window(main)
+        driver.switch_to.window(holder[0])
     except Exception:
         try:
-            driver.switch_to.window(driver.window_handles[0])
+            holder[0] = driver.window_handles[0]
+            driver.switch_to.window(holder[0])
         except Exception:
             pass
     return hit
@@ -399,21 +430,23 @@ def _dump_destination(driver, kind: str, tr: Trace):
     tr.shot(driver, f"{kind} destination page", force=True)
 
 
-def zipper_flow(driver, start_url: str, kind: str, tr: Trace):
-    """driver pe start_url kholo, codedew ke steps guzar ke `kind` ka destination URL return karo."""
+def zipper_flow(driver, start_url: str, kind: str, tr: Trace, navigate: bool = True):
+    """driver pe start_url kholo (navigate=False: jahan hai wahin se), codedew ke steps guzar ke
+    `kind` ka destination URL return karo."""
     t_start = time.time()
-    try:
-        driver.get(start_url)
-    except Exception as e:
-        tr.add(f"(page load warning: {type(e).__name__} — aage badh raha hoon)")
-    main = driver.current_window_handle
-    tr.add(f"zipper open: {start_url[:80]}")
+    if navigate:
+        try:
+            driver.get(start_url)
+        except Exception as e:
+            tr.add(f"(page load warning: {type(e).__name__} — aage badh raha hoon)")
+    holder = [driver.current_window_handle]
+    tr.add(f"zipper {'open: ' + start_url[:80] if navigate else 'continue (click ke baad)'}")
     tr.shot(driver, f"{kind}: start")
 
     deadline = time.time() + ZIPPER_TOTAL_TIMEOUT
     last_sig, clicked_at, clicks = None, {}, 0
     while time.time() < deadline:
-        hit = _sweep_windows(driver, main, kind, tr)
+        hit = _sweep_windows(driver, holder, kind, tr)
         if hit:
             tr.add(f"✅ {kind.upper()} LINK ({time.time() - t_start:.1f}s): {hit}")
             return hit
@@ -421,17 +454,19 @@ def zipper_flow(driver, start_url: str, kind: str, tr: Trace):
         st = _page_state(driver)
         # destination page_source / url / anchors mein?
         for where, blob in (("url", st["url"]), ("page", _safe_source(driver))):
-            d = _dest_in(kind, blob)
+            d = _dest_in(kind, blob, url_only=(where == "url"))
             if d:
                 tr.add(f"✅ {kind.upper()} LINK ({where}, {time.time() - t_start:.1f}s): {d}")
                 tr.shot(driver, f"{kind}: link mila")
-                if kind != "mega":
+                if kind not in ("mega", "generic"):
                     _dump_destination(driver, kind, tr)
                 return d
         # zipper se bahar nikal gaye (redirect) — non-mega ke liye yahi destination
-        if kind != "mega" and st["url"] and "codedew.com" not in st["url"] and not st["url"].startswith(("about:", "data:", "chrome")):
+        if kind not in ("mega", "watchnow") and st["url"] and "codedew.com" not in st["url"] \
+                and not st["url"].startswith(("about:", "data:", "chrome")):
             tr.add(f"✅ {kind.upper()} redirect ({time.time() - t_start:.1f}s): {st['url']}")
-            _dump_destination(driver, kind, tr)
+            if kind != "generic":
+                _dump_destination(driver, kind, tr)
             return st["url"]
 
         btn_txt = " | ".join(f"{b['text']}{'(disabled)' if b['dis'] else ''}" for b in st["btns"]
@@ -476,8 +511,9 @@ def zipper_flow(driver, start_url: str, kind: str, tr: Trace):
     return None
 
 
-def resolve_blocking(arg: str, episode_num, kinds: list, tr: Trace) -> dict:
-    """arg = RTI page url (+episode) ya seedha zipper url. Returns {kind: url|None}."""
+def resolve_blocking(arg: str, episode_num, kinds: list, tr: Trace, post=None) -> dict:
+    """arg = RTI page url (+episode) ya seedha zipper url. Returns {kind: url|None}.
+    post(kind, dest_url, driver, tr) -> value : same Chrome mein agla hop (hubcloud servers / streambeta Download vN)."""
     out = {k: None for k in kinds}
     dfut = None
     try:
@@ -494,7 +530,7 @@ def resolve_blocking(arg: str, episode_num, kinds: list, tr: Trace) -> dict:
                     continue
                 direct = _dest_in(k, found[0]["href"])
                 if direct:
-                    out[k] = direct
+                    out[k] = post(k, direct, None, tr) if post is not None else direct
                     tr.add(f"{k}: href seedha destination hai")
                     continue
                 starts[k] = found[0]["href"]
@@ -504,7 +540,7 @@ def resolve_blocking(arg: str, episode_num, kinds: list, tr: Trace) -> dict:
             t_k = time.time()
             hit = _static_try(url, k, tr) if k == "mega" else None
             if hit:
-                out[k] = hit
+                out[k] = post(k, hit, None, tr) if post is not None else hit
                 tr.add(f"⏱ {k}: {time.time() - t_k:.1f}s (Chrome ke bina)")
                 continue
             try:
@@ -516,6 +552,13 @@ def resolve_blocking(arg: str, episode_num, kinds: list, tr: Trace) -> dict:
             except Exception:
                 pass
             out[k] = zipper_flow(drv, url, k, tr)
+            if out[k] and post is not None:
+                try:
+                    out[k] = post(k, out[k], drv, tr)
+                except Exception as pe:
+                    tr.add(f"💥 {k} next-hop error: {type(pe).__name__}: {str(pe)[:150]}")
+                    LOGGER.error(f"[RTI-Mega] post {k}: {traceback.format_exc()}")
+                    out[k] = None
             tr.add(f"⏱ {k}: {time.time() - t_k:.1f}s")
     except Exception as e:
         tr.add(f"💥 ERROR: {type(e).__name__}: {str(e)[:200]}")
