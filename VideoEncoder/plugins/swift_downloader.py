@@ -766,6 +766,7 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
                     f"❌ `{quality_filter}` page pe missing hai!\n"
                     f"Page pe sirf yeh qualities hain: `{' | '.join(available) or 'none'}`"
                 )
+                result["quality_missing"] = True       # caller mirror-fallback try kar sake
                 LOGGER.warning(f"[Swift] Quality `{quality_filter}` missing. Available: {available}")
                 return result
 
@@ -1516,7 +1517,8 @@ async def _reorder_if_needed(client, message, uploaded_results: list):
 #  Core command logic
 # ─────────────────────────────────────────────
 async def _pipeline_run(client, message, msg, prefix, swift_url, dl_dir, episode_label,
-                        fast, driver, progress, prog_task, pre_task):
+                        fast, driver, progress, prog_task, pre_task,
+                        fb_page=None, fb_ep=None):
     """
     PIPELINE MODE: har quality download hote hi turant upload shuru.
       * 360p pehle download hua  -> uska upload start (720p/1080p ka wait nahi)
@@ -1598,9 +1600,62 @@ async def _pipeline_run(client, message, msg, prefix, swift_url, dl_dir, episode
         LOGGER.info(f"[Swift] ▶ upload start (download baaki ho sakta hai): {os.path.basename(path)}")
         tasks[path] = job_ctl.track_task(asyncio.ensure_future(_one_upload(path)))
 
+    # ── MIRROR FALLBACK: Swift pe 1080p nahi (360p/720p aa gaye) to RTI page ke Mega/HubCloud/
+    #    WatchNow/DLBeta mein se sabse tez se 1080p (fail pe agla) — rti_fallback.py ──
+    _fb_on, _fb_qs, _rtifb = False, (), None
+    if fb_page and fb_ep:
+        try:
+            from . import rti_fallback as _rtifb
+            if _rtifb.enabled():
+                _fb_qs, _fb_on = tuple(_rtifb.fallback_qualities()), True
+        except Exception as _fe:
+            LOGGER.warning(f"[Swift] rti_fallback load fail: {_fe!r}")
+    fb_tasks: dict = {}
+
+    def _fb_missing_on_swift() -> list:
+        if not _fb_on:
+            return []
+        want = [q for q in _fb_qs if q not in started_q and q not in fb_tasks]
+        if not want:
+            return []
+        exp = progress.get("expected")
+        if exp:
+            return [q for q in want if q not in exp]
+        if scrape_fut.done():
+            try:
+                _r = scrape_fut.result() or {}
+            except BaseException:
+                return []
+            if _r.get("files") or _r.get("qualities"):
+                return [q for q in want if q not in (_r.get("qualities") or [])]
+        return []
+
+    async def _fb_run(_q):
+        try:
+            _fp = await _rtifb.fetch_missing(
+                fb_page, fb_ep, _q, dl_dir, prog=progress,
+                note=lambda t: LOGGER.info(f"[Swift] Ep {fb_ep} {t}"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as _fe2:
+            LOGGER.error(f"[Swift] mirror fallback {_q} error: {_fe2!r}")
+            return None
+        if _fp:
+            await _start(_fp)
+        return _fp
+
+    def _fb_kick():
+        for _q in _fb_missing_on_swift():
+            LOGGER.info(f"[Swift] Ep {fb_ep}: {_q} Swift pe nahi — mirror fallback shuru")
+            fb_tasks[_q] = job_ctl.track_task(asyncio.ensure_future(_fb_run(_q)))
+
+    def _fb_pending() -> bool:
+        return any(not t.done() for t in fb_tasks.values())
+
     # ── pump: jaise-jaise files ready hon, upload start karo ──
     while True:
-        if scrape_fut.done() and file_q.empty():
+        _fb_kick()
+        if scrape_fut.done() and file_q.empty() and not _fb_pending():
             break
         try:
             path, _q = await asyncio.wait_for(file_q.get(), timeout=0.5)
@@ -1670,7 +1725,8 @@ async def _pipeline_run(client, message, msg, prefix, swift_url, dl_dir, episode
 
 async def _run_swift(client, message, swift_url: str, encode: bool, quality_filter: str = None,
                       episode_label: str = None, show_url: bool = True,
-                      fast: bool = False, driver=None):
+                      fast: bool = False, driver=None,
+                      fb_page: str = None, fb_ep: int = None):
     """
     episode_label: status messages ke upar dikhne wala label (e.g. "Ep 5") — optional,
                    RTI flow (/rti, /rtic) se pass hota hai taaki pata chale kaunsa
@@ -1798,6 +1854,7 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
         return await _pipeline_run(
             client, message, msg, prefix, swift_url, dl_dir, episode_label,
             fast, driver, progress, prog_task, _pre_task,
+            fb_page=fb_page, fb_ep=fb_ep,
         )
 
     async def _drop_pre():
@@ -1820,6 +1877,18 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
         await prog_task
     except asyncio.CancelledError:
         pass
+
+    # Quality filter (jaise 1080p) Swift page pe nahi mili -> RTI mirrors (Mega/HubCloud/WatchNow/DLBeta)
+    if (fb_page and fb_ep and quality_filter and result.get("quality_missing") and not result["files"]):
+        try:
+            from . import rti_fallback as _rtifb
+            if _rtifb.enabled() and quality_filter.lower() in _rtifb.fallback_qualities():
+                await msg.edit(f"{prefix}🔁 **{quality_filter} Swift pe nahi** — mirror servers se try ho raha hai...")
+                _fp = await _rtifb.fetch_missing(fb_page, fb_ep, quality_filter.lower(), dl_dir, prog=progress)
+                if _fp:
+                    result = {"files": [_fp], "qualities": [quality_filter.lower()], "error": None}
+        except Exception as _fe:
+            LOGGER.error(f"[Swift] mirror fallback ({quality_filter}) error: {_fe!r}")
 
     if result["error"] and not result["files"]:
         await _drop_pre()

@@ -545,6 +545,7 @@ async def _episode_quality_poller(
     page_url: str = None,
     target_qualities: set = None,
     source=None,
+    fb_page_url: str = None,
 ) -> bool:
     """Wrapper: card pe '🔄 Re-check' button lagata hai (poll chalte waqt), phir asli poller chalata hai."""
     _job = job_ctl.CURRENT.get()
@@ -561,7 +562,7 @@ async def _episode_quality_poller(
             update_post_sent=update_post_sent, update_post_mode=update_post_mode,
             season_intro=season_intro, season_hint=season_hint, stats=stats,
             page_url=page_url, target_qualities=target_qualities, _recheck_ev=ev, _live=_live,
-            source=source,
+            source=source, fb_page_url=fb_page_url,
         )
     finally:
         try:
@@ -637,6 +638,7 @@ async def _episode_quality_poller_impl(
     _recheck_ev: asyncio.Event = None,
     _live: "_ChannelLive" = None,
     source=None,
+    fb_page_url: str = None,
 ) -> bool:
     """
     update_post_mode: "auto" (global /updatechannel toggle follow kare — /Rtic aur
@@ -1247,6 +1249,66 @@ async def _episode_quality_poller_impl(
             _job.tasks.add(_cl_task)
         poll_result = {"files": [], "error": None}
         _cancelled_mid = False
+
+        # ══════════ MIRROR FALLBACK: Swift pe 1080p nahi (360p/720p aa gaye) ══════════
+        # RTI page ke Mega / HubCloud / WatchNow / DLBeta mein se jo sabse tez ho usse 1080p download
+        # (fail pe agla server — rti_fallback.py). Download khatam hote hi normal upload pipeline mein.
+        _fb_page = fb_page_url or page_url
+        _fb_on = False
+        _fb_qs: tuple = ()
+        if _fb_page and source is None and episode_num:
+            try:
+                from . import rti_fallback as _rtifb
+                if _rtifb.enabled():
+                    _fb_qs = tuple(_rtifb.fallback_qualities())
+                    _fb_on = True
+            except Exception as _fe:
+                LOGGER.warning(f"[AutoMonitor] rti_fallback load fail: {_fe!r}")
+        fb_tasks: dict = {}               # quality -> asyncio task
+
+        def _fb_missing_on_swift() -> list:
+            """Fallback-qualities jo abhi baaki hain aur Swift page ke links mein nahi hain."""
+            if not _fb_on:
+                return []
+            want = [q for q in _fb_qs if q in remaining and q not in started_q and q not in fb_tasks]
+            if not want:
+                return []
+            exp = _poll_prog.get("expected")
+            if exp:                                   # Swift page live — uske links jo hain wahi
+                return [q for q in want if q not in exp]
+            if scrape_fut.done():
+                try:
+                    _r = scrape_fut.result() or {}
+                except BaseException:
+                    return []
+                if _r.get("nothing_new"):             # sirf already-uploaded mile => baaki Swift pe hai hi nahi
+                    return want
+                if _r.get("files") or _r.get("qualities"):
+                    return [q for q in want if q not in (_r.get("qualities") or [])]
+            return []
+
+        async def _fb_run(_q: str):
+            try:
+                _fp = await _rtifb.fetch_missing(
+                    _fb_page, episode_num, _q, poll_dl_dir, prog=_poll_prog,
+                    note=lambda t: LOGGER.info(f"[AutoMonitor] Ep {episode_num} {t}"))
+            except asyncio.CancelledError:
+                raise
+            except Exception as _fe2:
+                LOGGER.error(f"[AutoMonitor] mirror fallback {_q} error: {_fe2!r}")
+                return None
+            if _fp and not should_stop(anime_name, episode_num):
+                await _start(_fp)
+            return _fp
+
+        def _fb_kick():
+            for _q in _fb_missing_on_swift():
+                LOGGER.info(f"[AutoMonitor] Ep {episode_num}: {_q} Swift pe nahi — mirror fallback shuru")
+                fb_tasks[_q] = job_ctl.track_task(asyncio.ensure_future(_fb_run(_q)))
+
+        def _fb_pending() -> bool:
+            return any(not t.done() for t in fb_tasks.values())
+
         try:
             # pump: jaise-jaise files ready hon, upload start karo
             _getter = None
@@ -1255,21 +1317,31 @@ async def _episode_quality_poller_impl(
                     _cancelled_mid = True
                     _local_cancel.set()
                     break
+                _fb_kick()
                 if _getter is None:
                     _getter = asyncio.ensure_future(file_q.get())
-                # nayi file ya scrape khatam — jo pehle ho, turant jaag jao (polling delay nahi)
-                await asyncio.wait({_getter, scrape_fut}, timeout=1.0,
-                                   return_when=asyncio.FIRST_COMPLETED)
+                # nayi file / scrape khatam / mirror fallback khatam — jo pehle ho, turant jaag jao
+                _ws = {_getter}
+                if not scrape_fut.done():
+                    _ws.add(scrape_fut)
+                _ws.update(t for t in fb_tasks.values() if not t.done())
+                await asyncio.wait(_ws, timeout=1.0, return_when=asyncio.FIRST_COMPLETED)
                 if _getter.done():
                     _path, _qq = _getter.result()
                     _getter = None
                     await _start(_path)
                     continue
                 if scrape_fut.done():
+                    _fb_kick()
+                    if _fb_pending():
+                        continue
                     _getter.cancel()
                     break
             if _getter is not None and not _getter.done():
                 _getter.cancel()
+            for _t in fb_tasks.values():          # cancel/exit pe fallback download bhi rokna
+                if not _t.done():
+                    _t.cancel()
             try:
                 poll_result = await scrape_fut
             except Exception as e:

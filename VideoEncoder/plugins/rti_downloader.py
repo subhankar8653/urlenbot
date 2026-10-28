@@ -840,9 +840,11 @@ async def _run_rti_swift(client, message: Message, swift_url: str, status_msg, e
     # uploading/quality/episode) — episode_label se pata chalega kaunsa episode chal raha hai
     _lbl = None if job_ctl.CURRENT.get() is not None else ep_label
     _qf = sess.quality_filter if sess is not None else None     # Quality row ka chuna hua
+    _fb_page = page_url or (getattr(sess, "page_url", "") if sess is not None else "")
     uploaded_results = await _run_swift(
         client, message, swift_url, encode=False, episode_label=_lbl, show_url=False,
         quality_filter=_qf,
+        fb_page=_fb_page or None, fb_ep=ep_num or None,       # 1080p Swift pe na ho to mirror servers
     )
     await _forward_to_channel_if_enabled(client, message, uploaded_results, sess=sess, page_url=page_url)
     await _send_update_post_if_enabled(client, sess, ep_num, uploaded_results)
@@ -1203,6 +1205,7 @@ async def _download_items(client, status_msg, orig_message, sess: "RTISelector",
                 update_post_mode=up_mode,
                 season_intro=season_intro_state,
                 season_hint=sess.season,
+                fb_page_url=sess.page_url,                 # 1080p Swift pe na ho to mirror servers
             )
             if not ok:
                 state["last"] = "error"
