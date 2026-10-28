@@ -589,12 +589,15 @@ async def rtimega_command(client: Client, message: Message):
             "`/rtimega <rti_page_url> <ep> [mega|hubcloud|watchnow|dlbeta|all] [debug]`\n"
             "`/rtimega <codedew_zipper_url> [mega|hubcloud|watchnow|dlbeta] [debug]`\n\n"
             "• default = `mega` • `all` = chaaron ek saath • `debug` = har step ka screenshot\n"
+            "• Links milne ke baad mega/dlbeta/hubcloud se **download + Telegram upload** bhi hota hai "
+            "(`noup` likho to sirf links)\n"
             "Poora process (trace) yahin dikhega."
         )
         return
     arg = parts[0]
     debug = any(p.lower() == "debug" for p in parts)
-    rest = [p for p in parts[1:] if p.lower() != "debug"]
+    noup = any(p.lower() == "noup" for p in parts)          # noup = sirf links, upload nahi
+    rest = [p for p in parts[1:] if p.lower() not in ("debug", "noup")]
     ep = None
     if "codedew.com" not in arg and "zipper" not in arg:
         if not rest or not rest[0].isdigit():
@@ -647,7 +650,8 @@ async def rtimega_command(client: Client, message: Message):
     head = "\n".join(lines)
     mega = results.get("mega")
     if mega:
-        head += f"\n\nDownload: <code>/mega {_html.escape(mega)}</code>"
+        head += (f"\n\nDownload: <code>/mega {_html.escape(mega)}</code>"
+                 f"\nURL-style upload: <code>/megaurl {_html.escape(mega)}</code>")
     if not all(results.get(k) for k in kinds):
         head += "\n\nTrace + screenshots neeche — wahi bhej do."
     try:
@@ -679,3 +683,21 @@ async def rtimega_command(client: Client, message: Message):
         LOGGER.warning(f"[RTI-Mega] result bhejne mein error: {e!r}")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+    # ── REAL TEST: mile hue links se download -> Telegram upload (ek-ek karke, alag status msg) ──
+    if noup:
+        return
+    from .mega_url import run_source_upload
+    todo = [(k, results.get(k)) for k in ("mega", "dlbeta", "hubcloud") if results.get(k)]
+    if results.get("watchnow"):
+        await message.reply("ℹ️ <b>watchnow</b> sirf streaming page hai (direct file nahi) — upload skip.",
+                            parse_mode=ParseMode.HTML)
+    if not todo:
+        await message.reply("⚠️ Upload test ke liye koi mega / dlbeta / hubcloud link nahi mila.")
+        return
+    summary = []
+    for k, u in todo:
+        ok = await run_source_upload(client, message, k, u)
+        summary.append(f"{'✅' if ok else '❌'} {k}")
+    if len(todo) > 1:
+        await message.reply("🧪 <b>Upload test result</b>\n" + "\n".join(summary), parse_mode=ParseMode.HTML)
