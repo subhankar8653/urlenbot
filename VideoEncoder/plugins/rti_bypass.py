@@ -26,7 +26,8 @@ import shutil
 import time
 import traceback
 import uuid
-from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urljoin, urlparse
 
 import requests
 from pyrogram import Client, filters
@@ -56,9 +57,25 @@ _UA = {"User-Agent": rd.HEADERS.get("User-Agent", "Mozilla/5.0")}
 # ─────────────────────────────────────────────
 #  pixeldrain
 # ─────────────────────────────────────────────
+# pixeldrain ke mirror domains: pixeldrain.net/.com/.dev/.in aur pixeldra.in (WatchNow v3 yahi deta hai)
+_PX_RE = re.compile(r"pixeldra(?:in)?\.(?:net|dev|com|in)/(?:u|api/file)/([A-Za-z0-9]+)", re.I)
+_PX_HOSTS = ("pixeldrain.dev", "pixeldrain.net", "pixeldrain.com")    # pehla = preferred (API), baaki backup
+
+
+def pixeldrain_id(url: str):
+    m = _PX_RE.search(url or "")
+    return m.group(1) if m else None
+
+
 def pixeldrain_direct(url: str):
-    m = re.search(r"pixeldrain\.(?:net|dev|com)/(?:u|api/file)/([A-Za-z0-9]+)", url or "", re.I)
-    return f"https://pixeldrain.dev/api/file/{m.group(1)}?download" if m else None
+    """Kisi bhi pixeldrain mirror ka /u/<id> -> https://pixeldrain.dev/api/file/<id>?download"""
+    fid = pixeldrain_id(url)
+    return f"https://{_PX_HOSTS[0]}/api/file/{fid}?download" if fid else None
+
+
+def pixeldrain_backups(url: str) -> list:
+    fid = pixeldrain_id(url)
+    return [f"https://{h}/api/file/{fid}?download" for h in _PX_HOSTS[1:]] if fid else []
 
 
 # wrapper links: https://cryptonewz.online/dl.php?link=<REAL_URL>  ->  <REAL_URL>
@@ -172,24 +189,40 @@ def hubcloud_servers(driver, drive_url: str, tr: rm.Trace) -> list:
     return []
 
 
+def _name_from_cd(cd: str) -> str:
+    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', cd or "", re.I)
+    return m.group(1).strip() if m else ""
+
+
 def inspect_link(href: str, tr: rm.Trace, referer: str = "") -> dict:
-    """Server button ka link follow karo (redirects) — final URL + kya wo file hai? (body download nahi)"""
+    """Server button ka link follow karo — final URL + kya wo file hai? (body download nahi).
+    Redirects MANUAL follow hote hain taaki `.../dl.php?link=<REAL>` jaisa wrapper har hop pe seedha
+    unwrap ho jaaye (wrapper page load karne mein 15s tak lagte the)."""
     href = unwrap_link(href)
     info = {"href": href, "final": href, "is_file": False, "ctype": "", "size": 0, "status": 0, "name": ""}
     try:
         hdr = dict(_UA)
         if referer:
             hdr["Referer"] = referer
-        r = requests.get(href, headers=hdr, allow_redirects=True, stream=True, timeout=20)
+        cur = href
+        r = None
+        for _hop in range(7):
+            cur = unwrap_link(cur)
+            r = requests.get(cur, headers=hdr, allow_redirects=False, stream=True, timeout=(6, 14))
+            loc = r.headers.get("Location")
+            if r.status_code in (301, 302, 303, 307, 308) and loc:
+                r.close()
+                cur = urljoin(cur, loc)
+                continue
+            break
+        info["final"] = cur
         info["status"] = r.status_code
-        info["final"] = r.url
         info["ctype"] = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         info["size"] = int(r.headers.get("Content-Length") or 0)
         cd = r.headers.get("Content-Disposition") or ""
-        m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', cd, re.I)
-        info["name"] = m.group(1) if m else ""
+        info["name"] = _name_from_cd(cd)
         is_html = info["ctype"] in ("text/html", "application/xhtml+xml", "")
-        info["is_file"] = r.status_code == 200 and (not is_html or "attachment" in cd.lower()) \
+        info["is_file"] = r.status_code in (200, 206) and (not is_html or "attachment" in cd.lower()) \
             and (info["size"] > 5_000_000 or "video" in info["ctype"] or "octet" in info["ctype"]
                  or "attachment" in cd.lower() or "matroska" in info["ctype"])
         if is_html and r.status_code == 200 and not info["is_file"]:
@@ -202,19 +235,35 @@ def inspect_link(href: str, tr: rm.Trace, referer: str = "") -> dict:
             elif vm:
                 info["final"], info["is_file"] = vm.group(0), True
         r.close()
+        if info["is_file"] and info["name"]:               # caption/thumbnail ke liye asli filename yaad rakho
+            try:
+                from .mega_url import _NAME_HINTS
+                _NAME_HINTS[info["final"]] = info["name"]
+            except Exception:
+                pass
     except Exception as e:
         tr.add(f"    inspect fail {type(e).__name__}: {str(e)[:80]}")
     return info
 
 
 def pick_best(servers: list, tr: rm.Trace, referer: str = "", alts_out: list = None):
-    """Priority order (10Gbps > FSL > Pixel > Buzz) mein servers inspect karo. Pehla jo file de wahi best;
-    baaki file-servers alts_out mein (download fail ho to unpe fallback)."""
+    """Saare downloadable servers (max 5) EK SAATH inspect karo; priority (10Gbps > FSL > Pixel > Buzz)
+    mein pehla jo file de wahi best, baaki file-servers alts_out mein (download fail ho to unpe fallback)."""
     cand = [s for s in servers if s["downloadable"]]
     cand.sort(key=lambda s: next((i for i, k in enumerate(SERVER_PRIORITY) if k in s["name"].lower()), 99))
+    cand = cand[:5]
+    if not cand:
+        return None, None
+    tag = getattr(tr._tl, "tag", None)
+
+    def _one(s):
+        tr.set_tag(tag)
+        return inspect_link(s["href"], tr, referer)
+
+    with ThreadPoolExecutor(max_workers=len(cand)) as ex:
+        infos = list(ex.map(_one, cand))
     best = (None, None)
-    for s in cand[:5]:
-        info = inspect_link(s["href"], tr, referer)
+    for s, info in zip(cand, infos):
         s["info"] = info
         tr.add(f"  • {s['name']}: status={info['status']} file={'✅' if info['is_file'] else '❌'} "
                f"{info['ctype'] or '?'} {info['size'] / 1048576:.0f}MB -> {info['final'][:90]}")
@@ -238,6 +287,7 @@ def finalize(url: str, driver, tr: rm.Trace):
     px = pixeldrain_direct(url)
     if px:
         tr.add(f"pixeldrain -> {px}")
+        _ALT[px] = pixeldrain_backups(url)
         return "direct", px
     if rm._HUBDRIVE_RE.search(url):
         if driver is None:
@@ -258,7 +308,9 @@ def finalize(url: str, driver, tr: rm.Trace):
 
 def watchnow_second_hop(driver, streambeta_url: str, tr: rm.Trace):
     """streambeta page: Download v1 -> (v2 -> v3) click -> zipper steps -> final URL."""
-    for label in ("download v1", "download v2", "download v3"):
+    # v3 = "Get Secure Link" -> redirect (pixeldrain) 13s mein; v1/v2 = "Direct Download Ready" (browser-download,
+    # link nahi deta, pehle yahan 2x120s barbaad hote the) — isliye v3 pehle, baaki sirf backup ke taur par.
+    for label in ("download v3", "download v1", "download v2"):
         tr.add(f"WATCHNOW: '{label}' try")
         st = rm._page_state(driver)
         btn = next((b for b in st["btns"] if label in (b["text"] or "").lower() and not b["dis"]), None)
@@ -281,7 +333,8 @@ def watchnow_second_hop(driver, streambeta_url: str, tr: rm.Trace):
             tr.add(f"    ❌ click fail: {type(e).__name__}")
             continue
         time.sleep(0.5)
-        res = rm.zipper_flow(driver, None, "generic", tr, navigate=False)
+        res = rm.zipper_flow(driver, None, "generic", tr, navigate=False, timeout=60,
+                             abort_phrases=("direct download ready",), abort_after=8)
         if res:
             return res
         try:      # fail hua — streambeta page pe wapas, agla version

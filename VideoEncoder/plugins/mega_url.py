@@ -15,7 +15,7 @@ import os
 import re
 import shutil
 import time
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -48,23 +48,85 @@ def _bar(done: int, total: int, width: int = 12) -> str:
 #  Resolvers: source link -> direct file URL
 # ─────────────────────────────────────────────
 
+# rti_bypass.inspect_link yahan {final_url: asli_filename} likhta hai (Content-Disposition se)
+_NAME_HINTS: dict = {}
+_PX_RE = re.compile(r"(pixeldra(?:in)?\.(?:net|dev|com|in))/(?:u|api/file)/([A-Za-z0-9]+)", re.I)
+_VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".mov", ".webm", ".m4v", ".ts", ".flv", ".wmv")
+
+
 def _pixeldrain_direct(url: str):
-    """pixeldrain.net / .com /u/<id> -> API file url (direct bytes)."""
-    m = re.search(r"pixeldrain\.[a-z]+/(?:u|l)/([A-Za-z0-9]+)", url)
+    """Kisi bhi pixeldrain mirror (net/dev/com/in, pixeldra.in) ka /u/<id> -> API file url."""
+    m = _PX_RE.search(url)
+    return f"https://pixeldrain.dev/api/file/{m.group(2)}?download" if m else None
+
+
+def _name_from_query(url: str):
+    """Presigned links (R2/S3) mein filename query mein hota hai: response-content-disposition=attachment; filename="..." """
+    try:
+        q = parse_qs(urlparse(url).query)
+    except Exception:
+        return None
+    for key in ("response-content-disposition", "rcd"):
+        for v in q.get(key, []):
+            m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', v, re.I)
+            if m:
+                return unquote(m.group(1)).strip().strip('"')
+    for key in ("filename", "fn"):
+        v = (q.get(key) or [""])[0].strip()
+        if v.lower().endswith(_VIDEO_EXTS):
+            return v
+    return None
+
+
+def _name_pixeldrain_sync(url: str):
+    m = _PX_RE.search(url)
     if not m:
         return None
-    host = urlparse(url).netloc or "pixeldrain.net"
-    return f"https://{host}/api/file/{m.group(1)}?download"
+    import requests
+    r = requests.get(f"https://{m.group(1)}/api/file/{m.group(2)}/info", timeout=10)
+    return (r.json().get("name") or "").strip() or None if r.status_code == 200 else None
+
+
+def _name_range_sync(url: str):
+    """GET Range 0-0: kuch servers HEAD pe 403 dete hain (presigned URL GET ke liye sign hota hai)."""
+    import requests
+    r = requests.get(url, headers={"Range": "bytes=0-0"}, stream=True, timeout=(6, 10))
+    try:
+        cd = r.headers.get("Content-Disposition") or ""
+        m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', cd, re.I)
+        return unquote(m.group(1)).strip() if m else None
+    finally:
+        r.close()
+
+
+async def _best_filename(direct: str) -> str:
+    """Asli filename: hint -> URL query -> pixeldrain info API -> HEAD (url_upload) -> Range-GET.
+    ('downloaded_file' aane se caption/thumbnail (TMDB lookup) galat ho jaate the.)"""
+    loop = asyncio.get_event_loop()
+    name = _NAME_HINTS.get(direct) or _name_from_query(direct)
+    if not name and _PX_RE.search(direct):
+        try:
+            name = await loop.run_in_executor(None, _name_pixeldrain_sync, direct)
+        except Exception as e:  # noqa: BLE001
+            LOGGER.warning(f"[MegaURL] pixeldrain info fail: {e!r}")
+    if not name:
+        name = await _get_filename_from_url(direct)
+    if not name or name.startswith("downloaded_file"):
+        try:
+            name = await loop.run_in_executor(None, _name_range_sync, direct) or name
+        except Exception as e:  # noqa: BLE001
+            LOGGER.warning(f"[MegaURL] range filename fail: {e!r}")
+    LOGGER.info(f"[MegaURL] filename: {name}")
+    return name or "downloaded_file"
 
 
 async def _download_any(url: str, kind: str, dest_dir: str, msg, message):
     """mega link ya direct file URL -> downloaded filepath ya None."""
     if is_mega_link(url):
         return await _download_mega_progress(url, dest_dir, msg)
-    direct = _pixeldrain_direct(url) if "pixeldrain" in url and "/api/file/" not in url else url
-    direct = direct or url
+    direct = _pixeldrain_direct(url) if (_PX_RE.search(url) and "/api/file/" not in url) else url
     LOGGER.info(f"[MegaURL] {kind} direct: {direct[:120]}")
-    name = _safe_filename(await _get_filename_from_url(direct))
+    name = _safe_filename(await _best_filename(direct))
     return await _download_url(direct, name, msg, message)      # download_dir mein save
 
 

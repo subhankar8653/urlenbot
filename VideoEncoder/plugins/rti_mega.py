@@ -17,6 +17,7 @@ Command (sirf Sudo):
 """
 
 import asyncio
+import contextvars
 import html as _html
 import os
 import re
@@ -26,6 +27,8 @@ import time
 import traceback
 import uuid
 from urllib.parse import unquote, urlparse
+
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from bs4 import BeautifulSoup
@@ -93,10 +96,15 @@ class Trace:
         self.workdir = workdir
         self.debug = debug
         self._lock = threading.Lock()
+        self._tl = threading.local()          # parallel mode: har thread ka apna <kind> tag
         os.makedirs(workdir, exist_ok=True)
 
+    def set_tag(self, tag):
+        self._tl.tag = tag
+
     def add(self, msg: str):
-        line = f"[{time.time() - self.t0:6.1f}s] {msg}"
+        tag = getattr(self._tl, "tag", None)
+        line = f"[{time.time() - self.t0:6.1f}s] " + (f"<{tag}> " if tag else "") + msg
         with self._lock:
             self.lines.append(line)
         LOGGER.info(f"[RTI-Mega] {msg}")
@@ -114,7 +122,7 @@ class Trace:
         if driver is None or not (self.debug or force) or len(self.shots) >= MAX_SHOTS:
             return
         try:
-            path = os.path.join(self.workdir, f"shot_{len(self.shots) + 1:02d}.png")
+            path = os.path.join(self.workdir, f"shot_{time.time_ns()}.png")
             driver.save_screenshot(path)
             with self._lock:
                 self.shots.append((path, f"{len(self.shots) + 1}. {label}"))
@@ -430,10 +438,16 @@ def _dump_destination(driver, kind: str, tr: Trace):
     tr.shot(driver, f"{kind} destination page", force=True)
 
 
-def zipper_flow(driver, start_url: str, kind: str, tr: Trace, navigate: bool = True):
+def zipper_flow(driver, start_url: str, kind: str, tr: Trace, navigate: bool = True,
+                timeout: float = None, abort_phrases: tuple = (), abort_after: float = 10.0):
     """driver pe start_url kholo (navigate=False: jahan hai wahin se), codedew ke steps guzar ke
-    `kind` ka destination URL return karo."""
+    `kind` ka destination URL return karo.
+    timeout: is flow ka max time (default ZIPPER_TOTAL_TIMEOUT).
+    abort_phrases: page title/text mein ye phrase `abort_after` sec tak dikhta rahe to flow chhod do
+    (jaise WatchNow v1/v2 ka 'Direct Download Ready' — wo browser-download flow hai, link nahi deta)."""
     t_start = time.time()
+    total_timeout = timeout or ZIPPER_TOTAL_TIMEOUT
+    abort_t0 = None
     if navigate:
         try:
             driver.get(start_url)
@@ -443,7 +457,7 @@ def zipper_flow(driver, start_url: str, kind: str, tr: Trace, navigate: bool = T
     tr.add(f"zipper {'open: ' + start_url[:80] if navigate else 'continue (click ke baad)'}")
     tr.shot(driver, f"{kind}: start")
 
-    deadline = time.time() + ZIPPER_TOTAL_TIMEOUT
+    deadline = time.time() + total_timeout
     last_sig, clicked_at, clicks = None, {}, 0
     while time.time() < deadline:
         hit = _sweep_windows(driver, holder, kind, tr)
@@ -468,6 +482,16 @@ def zipper_flow(driver, start_url: str, kind: str, tr: Trace, navigate: bool = T
             if kind != "generic":
                 _dump_destination(driver, kind, tr)
             return st["url"]
+
+        if abort_phrases:
+            blob_l = f"{st['title']} {st['head']}".lower()
+            if any(p in blob_l for p in abort_phrases):
+                abort_t0 = abort_t0 or time.time()
+                if time.time() - abort_t0 > abort_after:
+                    tr.add(f"⏭ '{abort_phrases[0]}' flow — link nahi deta (browser-download), skip ({time.time() - t_start:.0f}s)")
+                    return None
+            else:
+                abort_t0 = None
 
         btn_txt = " | ".join(f"{b['text']}{'(disabled)' if b['dis'] else ''}" for b in st["btns"]
                              if b["text"] and "theme" not in b["text"].lower())[:200]
@@ -499,7 +523,7 @@ def zipper_flow(driver, start_url: str, kind: str, tr: Trace, navigate: bool = T
                 continue
         time.sleep(TICK)
 
-    tr.add(f"⏰ {ZIPPER_TOTAL_TIMEOUT}s mein {kind} link nahi mila")
+    tr.add(f"⏰ {int(total_timeout)}s mein {kind} link nahi mila")
     tr.shot(driver, f"{kind}: TIMEOUT", force=True)
     st = _page_state(driver)
     tr.add(f"FINAL url={st['url'][:100]} | {st['step']} | text: {st['head']}")
@@ -511,17 +535,69 @@ def zipper_flow(driver, start_url: str, kind: str, tr: Trace, navigate: bool = T
     return None
 
 
+def _pool_size(n_kinds: int) -> int:
+    """Kitne Chrome ek saath. Env RTI_PARALLEL (default 4); container RAM kam ho to apne aap kam."""
+    try:
+        want = int(os.getenv("RTI_PARALLEL") or 4)
+    except ValueError:
+        want = 4
+    want = max(1, min(want, n_kinds))
+    try:
+        from ..utils import janitor
+        used, limit = janitor.container_mem()
+        if limit and limit > 0:
+            fit = int((limit - used - 500 * 1024 * 1024) // (350 * 1024 * 1024))
+            want = min(want, max(1, fit))
+    except Exception:
+        pass
+    return want
+
+
+_KIND_WEIGHT = {"hubcloud": 3, "watchnow": 3, "dlbeta": 2, "mega": 1}      # roughly kitna time lagta hai
+
+
+def _resolve_one(k: str, url: str, dfut, tr: Trace, post):
+    """Ek kind: zipper (ya static) -> destination -> post hop. Returns value ya None."""
+    tr.add(f"━━ {k.upper()} ━━")
+    t_k = time.time()
+    hit = _static_try(url, k, tr) if k == "mega" else None
+    if hit:
+        val = post(k, hit, None, tr) if post is not None else hit
+        tr.add(f"⏱ {k}: {time.time() - t_k:.1f}s (Chrome ke bina)")
+        return val
+    drv = dfut.get()
+    try:
+        drv.delete_all_cookies()
+    except Exception:
+        pass
+    val = zipper_flow(drv, url, k, tr)
+    if val and post is not None:
+        try:
+            val = post(k, val, drv, tr)
+        except Exception as pe:
+            tr.add(f"💥 {k} next-hop error: {type(pe).__name__}: {str(pe)[:150]}")
+            LOGGER.error(f"[RTI-Mega] post {k}: {traceback.format_exc()}")
+            val = None
+    tr.add(f"⏱ {k}: {time.time() - t_k:.1f}s")
+    return val
+
+
 def resolve_blocking(arg: str, episode_num, kinds: list, tr: Trace, post=None) -> dict:
     """arg = RTI page url (+episode) ya seedha zipper url. Returns {kind: url|None}.
-    post(kind, dest_url, driver, tr) -> value : same Chrome mein agla hop (hubcloud servers / streambeta Download vN)."""
+    post(kind, dest_url, driver, tr) -> value : same Chrome mein agla hop (hubcloud servers / streambeta Download vN).
+
+    PARALLEL: har kind ka zipper ~6-15s ka server-side timer hai, isliye alag-alag Chrome mein ek saath
+    chalate hain (total time = sabse lamba kind, jod nahi). Env RTI_PARALLEL=1 se purana sequential mode."""
     out = {k: None for k in kinds}
-    dfut = None
+    direct_arg = "codedew.com" in arg or "zipper" in arg
+    n = 1 if direct_arg else _pool_size(len(kinds))
+    dfuts = [_DriverFuture(tr) for _ in range(n)]            # saare Chrome ek saath boot (page fetch ke saath)
+    if n > 1:
+        tr.add(f"⚡ parallel mode: {n} Chrome")
     try:
-        if "codedew.com" in arg or "zipper" in arg:
+        if direct_arg:
             starts = {kinds[0]: arg}
-            dfut = _DriverFuture(tr)
         else:
-            dfut = _DriverFuture(tr)                       # Chrome page fetch ke saath-saath start
             starts = {}
             for k in kinds:
                 found = find_links(arg, episode_num, k, tr)
@@ -535,39 +611,46 @@ def resolve_blocking(arg: str, episode_num, kinds: list, tr: Trace, post=None) -
                     continue
                 starts[k] = found[0]["href"]
 
-        for k, url in starts.items():
-            tr.add(f"━━ {k.upper()} ━━")
-            t_k = time.time()
-            hit = _static_try(url, k, tr) if k == "mega" else None
-            if hit:
-                out[k] = post(k, hit, None, tr) if post is not None else hit
-                tr.add(f"⏱ {k}: {time.time() - t_k:.1f}s (Chrome ke bina)")
-                continue
-            try:
-                drv = dfut.get()
-            except Exception:
-                break
-            try:
-                drv.delete_all_cookies()
-            except Exception:
-                pass
-            out[k] = zipper_flow(drv, url, k, tr)
-            if out[k] and post is not None:
+        # kinds ko Chrome mein baanto (bhaari pehle, jo sabse kam loaded ho usme)
+        buckets = [[] for _ in range(n)]
+        loads = [0] * n
+        for k, u in sorted(starts.items(), key=lambda kv: -_KIND_WEIGHT.get(kv[0], 2)):
+            i = loads.index(min(loads))
+            buckets[i].append((k, u))
+            loads[i] += _KIND_WEIGHT.get(k, 2)
+
+        def _run_bucket(i: int):
+            for k, u in buckets[i]:
+                if n > 1:
+                    tr.set_tag(k)
                 try:
-                    out[k] = post(k, out[k], drv, tr)
-                except Exception as pe:
-                    tr.add(f"💥 {k} next-hop error: {type(pe).__name__}: {str(pe)[:150]}")
-                    LOGGER.error(f"[RTI-Mega] post {k}: {traceback.format_exc()}")
-                    out[k] = None
-            tr.add(f"⏱ {k}: {time.time() - t_k:.1f}s")
+                    out[k] = _resolve_one(k, u, dfuts[i], tr, post)
+                except Exception as e:
+                    tr.add(f"💥 {k}: {type(e).__name__}: {str(e)[:200]}")
+                    LOGGER.error(f"[RTI-Mega] {k}: {traceback.format_exc()}")
+                    try:
+                        tr.shot(dfuts[i].driver, f"{k}: error pe page", force=True)
+                    except Exception:
+                        pass
+                finally:
+                    tr.set_tag(None)
+
+        if n == 1:
+            _run_bucket(0)
+        else:
+            with ThreadPoolExecutor(max_workers=n) as ex:
+                futs = [ex.submit(contextvars.copy_context().run, _run_bucket, i)
+                        for i in range(n) if buckets[i]]
+                for f in futs:
+                    f.result()
     except Exception as e:
         tr.add(f"💥 ERROR: {type(e).__name__}: {str(e)[:200]}")
         LOGGER.error(f"[RTI-Mega] {traceback.format_exc()}")
-        if dfut is not None and dfut.driver is not None:
-            tr.shot(dfut.driver, "error pe page", force=True)
+        if dfuts and dfuts[0].driver is not None:
+            tr.shot(dfuts[0].driver, "error pe page", force=True)
     finally:
-        if dfut is not None:
-            dfut.kill()
+        for d in dfuts:
+            d.kill()
     return out
 
 
