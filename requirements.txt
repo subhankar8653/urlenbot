@@ -59,5 +59,8 @@ captchaai
 curl_cffi
 pycryptodome
 
+# Anime News (RSS feeds)
+feedparser
+
 # /ytdl (YouTube + 1000 sites)
 yt-dlp
