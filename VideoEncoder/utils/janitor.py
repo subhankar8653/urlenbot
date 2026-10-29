@@ -553,3 +553,8 @@ def start_janitor():
         loop.create_task(schedule_loop())
     except Exception as e:
         LOGGER.error(f"[Janitor] hindi schedule loop start failed: {e}")
+    try:   # Anime news — RSS se channel mein auto-post
+        from ..plugins.anime_news import news_loop
+        loop.create_task(news_loop())
+    except Exception as e:
+        LOGGER.error(f"[Janitor] anime news loop start failed: {e}")
