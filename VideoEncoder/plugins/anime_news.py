@@ -4,6 +4,7 @@ anime_news.py
 Anime News ko RSS se channel mein auto-post karo (Anime-News-Bot ka logic, ab urlenbot ke andar).
 
   Source : RSS feeds (default: Anime News Network) — panel/commands se add/remove
+           Site 403 de to auto-fallback: direct → rss2json proxy → Google News RSS (AniNewsAPI wali trick)
   Image  : 🥇 AniList poster  →  🥈 article ka figure/og:image  →  🥉 text-only
   Post   : photo + title + chhota summary + "Read it fully" button — set kiye channel mein
   Check  : har N minute (default 10). Sirf NAYE links post hote hain, duplicate kabhi nahi.
@@ -51,6 +52,15 @@ SEEN = db.db["anime_news_seen"]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 DEFAULT_FEEDS = ["https://www.animenewsnetwork.com/all/rss.xml"]
+FEED_PRESETS = [             # 📚 Popular feeds button (AniNewsAPI ke sources)
+    ("Anime News Network", "https://www.animenewsnetwork.com/all/rss.xml"),
+    ("Anime Corner", "https://animecorner.me/feed/"),
+    ("Anime Herald", "https://www.animeherald.com/feed/"),
+    ("ComicBook Anime", "https://comicbook.com/anime/feed/"),
+    ("Otaku USA", "https://otakuusamagazine.com/feed/"),
+]
+RSS2JSON = "https://api.rss2json.com/v1/api.json?rss_url={u}"
+GNEWS = "https://news.google.com/rss/search?q=site:{h}+when:7d&hl=en-US&gl=US&ceid=US:en"
 MAX_FEEDS = 3
 ENTRIES_PER_FEED = 3         # har feed ke latest itne items dekhe jaate hain
 DEFAULT_INTERVAL = 10        # minute
@@ -156,6 +166,25 @@ async def _release(link: str):
         await SEEN.delete_one({"_id": _hash(link)})
     except Exception:
         pass
+
+
+def _tkey(title: str) -> str:
+    return "t:" + re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
+
+
+async def _claim_item(it: dict) -> bool:
+    """
+    Link ke saath TITLE bhi claim hota hai — taaki same news fallback (Google link) aur direct feed
+    (asli link) dono se aaye to bhi double post na ho.
+    """
+    if not await _claim(it["link"]):
+        return False
+    return await _claim(_tkey(it["title"]))
+
+
+async def _release_item(it: dict):
+    await _release(it["link"])
+    await _release(_tkey(it["title"]))
 
 
 # ───────────────────────── text helpers ─────────────────────────
@@ -327,15 +356,23 @@ async def _pick_image(session: aiohttp.ClientSession, item: dict):
     img = await get_anilist_poster(session, item["title"])
     if img:
         return img
-    return await fetch_image_from_article(session, item["link"])
+    if not item.get("via_google"):          # google redirect link se article page scrape nahi hota
+        img = await fetch_image_from_article(session, item["link"])
+        if img:
+            return img
+    return item.get("thumb")
 
 
 # ───────────────────────── feed fetch ─────────────────────────
-async def fetch_feed(session: aiohttp.ClientSession, url: str) -> list:
-    """Feed ke latest ENTRIES_PER_FEED items (newest pehle). Fail hone par exception."""
-    raw = await _http_get(session, url, 20,
-                          "application/rss+xml, application/atom+xml, application/xml, text/xml, */*")
-    feed = await asyncio.get_running_loop().run_in_executor(None, feedparser.parse, raw)
+_RSS_ACCEPT = "application/rss+xml, application/atom+xml, application/xml, text/xml, */*"
+
+
+def _site_of(url: str) -> str:
+    u = urlparse(url)
+    return f"{u.scheme}://{u.netloc}" if u.netloc else url
+
+
+def _items_from_feedparser(feed, url: str, site: str, google: bool = False) -> list:
     items = []
     for ent in feed.entries[:ENTRIES_PER_FEED]:
         link = (ent.get("link") or "").strip()
@@ -345,17 +382,88 @@ async def fetch_feed(session: aiohttp.ClientSession, url: str) -> list:
         raw_sum = ent.get("summary") or ent.get("description") or ""
         if not raw_sum and ent.get("content"):
             raw_sum = ent["content"][0].get("value", "")
-        items.append({"title": title, "link": link, "summary": clean_summary(raw_sum), "feed": url})
+        summary = clean_summary(raw_sum)
+        if google:
+            # Google News title: "News title - Site Name"; summary sirf title ki copy hoti hai → hata do
+            title = re.sub(r"\s+-\s+[^-]{2,60}$", "", title).strip() or title
+            low = summary.lower()
+            if not summary or low.startswith(title.lower()[:40]):
+                summary = ""
+        items.append({"title": title, "link": link, "summary": summary, "feed": url,
+                      "site": site, "via_google": google})
+    return items
+
+
+async def _feed_direct(session, url: str) -> list:
+    raw = await _http_get(session, url, 20, _RSS_ACCEPT)
+    feed = await asyncio.get_running_loop().run_in_executor(None, feedparser.parse, raw)
+    items = _items_from_feedparser(feed, url, _site_of(url))
     if not items and feed.bozo:
         raise RuntimeError("RSS parse nahi hua (feed valid nahi lagti)")
     return items
+
+
+async def _feed_rss2json(session, url: str) -> list:
+    """rss2json unke server se feed lata hai (hamare IP pe block ho to bhi chal jaata hai). Asli link + summary milti hai."""
+    import json
+    from urllib.parse import quote
+    raw = await _http_get(session, RSS2JSON.format(u=quote(url, safe="")), 25, "application/json")
+    data = json.loads(raw.decode("utf-8", "ignore"))
+    if data.get("status") != "ok":
+        raise RuntimeError(f"rss2json: {str(data.get('message') or data.get('status'))[:80]}")
+    items = []
+    for ent in (data.get("items") or [])[:ENTRIES_PER_FEED]:
+        link = (ent.get("link") or "").strip()
+        title = re.sub(r"\s+", " ", (ent.get("title") or "")).strip()
+        if not link or not title:
+            continue
+        thumb = ent.get("thumbnail") or (ent.get("enclosure") or {}).get("link") or ""
+        items.append({"title": _html.unescape(title), "link": link,
+                      "summary": clean_summary(ent.get("description") or ent.get("content") or ""),
+                      "feed": url, "site": _site_of(url), "via_google": False,
+                      "thumb": thumb if is_valid_img(thumb) else None})
+    return items
+
+
+async def _feed_google(session, url: str) -> list:
+    """Aakhri fallback: Google News RSS (site:<host>). Link google redirect hota hai, par button se asli article khulta hai."""
+    host = urlparse(url).netloc
+    if not host or "google." in host:
+        raise RuntimeError("google fallback is feed pe lagu nahi")
+    raw = await _http_get(session, GNEWS.format(h=host), 20, _RSS_ACCEPT)
+    feed = await asyncio.get_running_loop().run_in_executor(None, feedparser.parse, raw)
+    items = _items_from_feedparser(feed, url, _site_of(url), google=True)
+    if not items:
+        raise RuntimeError("google news mein bhi kuch nahi mila")
+    return items
+
+
+async def fetch_feed(session: aiohttp.ClientSession, url: str) -> list:
+    """
+    Feed ke latest ENTRIES_PER_FEED items (newest pehle).
+    Chain: direct → rss2json → Google News. Teeno fail hone par hi exception.
+    """
+    errs = []
+    for name, fn in (("direct", _feed_direct), ("rss2json", _feed_rss2json), ("google", _feed_google)):
+        try:
+            items = await fn(session, url)
+            if items:
+                if errs:
+                    LOGGER.info(f"[AnimeNews] {_host(url)}: '{name}' se mili ({'; '.join(errs)})")
+                return items
+            errs.append(f"{name}: khaali")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            errs.append(f"{name}: {type(e).__name__}: {e}"[:120])
+    raise RuntimeError(errs[0] + (" | fallback bhi fail: " + " ; ".join(errs[1:]) if len(errs) > 1 else ""))
 
 
 # ───────────────────────── post building / sending ─────────────────────────
 def build_caption(item: dict, footer: str = "") -> str:
     title = _e(item["title"][:200])
     u = urlparse(item["link"])
-    site = f"{u.scheme}://{u.netloc}" if u.netloc else item.get("feed", "")
+    site = item.get("site") or (f"{u.scheme}://{u.netloc}" if u.netloc else item.get("feed", ""))
     site_attr = _html.escape(site, quote=True)
 
     def make(summary: str) -> str:
@@ -448,7 +556,7 @@ async def run_cycle(client: Client, manual: bool = False):
             fresh = []
             for items in per_feed:
                 for it in reversed(items):          # purani news pehle, nayi baad mein
-                    if await _claim(it["link"]):
+                    if await _claim_item(it):
                         fresh.append(it)
             forced = False
             if not fresh and manual:
@@ -467,7 +575,7 @@ async def run_cycle(client: Client, manual: bool = False):
                     LOGGER.error(f"[AnimeNews] send fail '{it['title']}': {e}")
                     if not forced:                  # bheji nahi gayi → agli baar dobara try ho
                         for left in fresh[idx:]:
-                            await _release(left["link"])
+                            await _release_item(left)
                     break                           # channel hi problem hai to baaki bhi fail honge
                 posted += 1
                 LOGGER.info(f"[AnimeNews] posted: {it['title']}")
@@ -770,7 +878,8 @@ async def _render_feeds(client: Client, cb: CallbackQuery):
     rows = [[InlineKeyboardButton(f"🗑 {i}. {_host(f)[:30]}", callback_data=f"cmz:an:frm:{i - 1}")]
             for i, f in enumerate(feeds, 1)]
     if len(feeds) < MAX_FEEDS:
-        rows.append([InlineKeyboardButton("➕ Feed add karo", callback_data="cmz:an:fadd")])
+        rows.append([InlineKeyboardButton("➕ Feed add karo", callback_data="cmz:an:fadd"),
+                     InlineKeyboardButton("📚 Popular feeds", callback_data="cmz:an:fpre")])
     if cfg.get("feeds") is not None:
         rows.append([InlineKeyboardButton("♻️ Default feed par reset", callback_data="cmz:an:frst")])
     rows.append(_back())
@@ -853,6 +962,29 @@ async def handle(client: Client, cb: CallbackQuery, args: list):
                     "Feed ka URL bhejo, jaise `https://www.animenewsnetwork.com/all/rss.xml`\n\n"
                     "Bot pehle check karega ki feed chal rahi hai.",
                     InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmz:an:fds")]]))
+        return
+
+    if sub == "fpre":
+        await cb.answer()
+        have = _feeds(await _cfg())
+        rows = [[InlineKeyboardButton(("✅ " if u in have else "➕ ") + n, callback_data=f"cmz:an:fpa:{i}")]
+                for i, (n, u) in enumerate(FEED_PRESETS)]
+        rows.append([InlineKeyboardButton("⬅️ Feeds", callback_data="cmz:an:fds"),
+                     InlineKeyboardButton("🏠 Menu", callback_data="cmz:menu")])
+        await _edit(client, cb,
+                    "**📚 Popular anime news feeds**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"Tap karke add karo (max {MAX_FEEDS}). Site block kare to bot khud fallback use karta hai.",
+                    InlineKeyboardMarkup(rows))
+        return
+
+    if sub == "fpa" and len(args) > 1 and args[1].isdigit() and int(args[1]) < len(FEED_PRESETS):
+        name, url = FEED_PRESETS[int(args[1])]
+        ok, msg = await _add_feed(url)
+        try:
+            await cb.answer(("✅ " + name) if ok else ("❌ " + msg)[:190], show_alert=not ok)
+        except Exception:
+            pass
+        await _render_feeds(client, cb)
         return
 
     if sub == "frm" and len(args) > 1 and args[1].isdigit():
