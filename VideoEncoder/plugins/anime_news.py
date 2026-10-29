@@ -514,10 +514,11 @@ async def _make_photo(session: aiohttp.ClientSession, url: str):
 
 
 # ───────────────────────── article page (full text + image) ─────────────────────────
-async def _gnews_real_url(session: aiohttp.ClientSession, link: str):
+async def _gnews_real_url(session: aiohttp.ClientSession, link: str, dbg: list):
     """Google News redirect link → asli article URL (purana base64 format + naya batchexecute format). Fail → None."""
-    m = re.search(r"/articles/([^/?]+)", link)
+    m = re.search(r"/(?:articles|read)/([^/?]+)", link)
     if not m:
+        dbg.append("dec:noid")
         return None
     gid = m.group(1)
     try:
@@ -525,34 +526,45 @@ async def _gnews_real_url(session: aiohttp.ClientSession, link: str):
         if "AU_yqL" not in raw:
             u = re.search(r"https?://[\x21-\x7e]+", raw)
             if u:
+                dbg.append("dec:b64")
                 return u.group(0)
     except Exception:
         pass
+    hdr = {"User-Agent": UA, "Cookie": "CONSENT=YES+cb.20230101-00-p0.en+FX+000; SOCS=CAI"}
     try:
-        page = ""
+        sg = ts = None
         for pu in (f"https://news.google.com/rss/articles/{gid}", f"https://news.google.com/articles/{gid}"):
-            async with session.get(pu, headers={"User-Agent": UA}, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                page = await r.text()
-            if "data-n-a-sg" in page:
+            async with session.get(pu, headers=hdr, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                final, page = str(r.url), await r.text()
+            if "news.google." not in urlparse(final).netloc:       # redirect seedha publisher pe ho gaya
+                dbg.append("dec:redirect")
+                return final
+            ms, mt = re.search(r'data-n-a-sg="([^"]+)"', page), re.search(r'data-n-a-ts="([^"]+)"', page)
+            if ms and mt:
+                sg, ts = ms.group(1), mt.group(1)
                 break
-        div = BeautifulSoup(page, "html.parser").select_one("c-wiz > div[jscontroller]")
-        sg, ts = div.get("data-n-a-sg"), div.get("data-n-a-ts")
-        ts = int(ts) if str(ts).isdigit() else ts        # timestamp number hona chahiye (string nahi)
+        if not sg:
+            dbg.append("dec:noparams")
+            return None
+        ts = int(ts) if str(ts).isdigit() else ts          # timestamp number hona chahiye (string nahi)
         inner = ["garturlreq", [["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1, None, None, None, None,
                                  None, 0, 1], "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0], gid, ts, sg]
         freq = json.dumps([[["Fbv4je", json.dumps(inner), None, "generic"]]])
         async with session.post("https://news.google.com/_/DotsSplashUi/data/batchexecute",
                                 data="f.req=" + quote(freq),
-                                headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-                                         "User-Agent": UA},
+                                headers={**hdr, "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"},
                                 timeout=aiohttp.ClientTimeout(total=15)) as r:
             body = await r.text()
         parsed = json.loads(body.split("\n\n")[1])[:-2]
         url = json.loads(parsed[0][2])[1]
-        return url if str(url).startswith("http") else None
+        if str(url).startswith("http"):
+            dbg.append("dec:batch")
+            return url
+        dbg.append("dec:badurl")
     except Exception as e:
-        LOGGER.info(f"[AnimeNews] google link decode fail: {type(e).__name__}")
-        return None
+        dbg.append(f"dec:err-{type(e).__name__}")
+        LOGGER.warning(f"[AnimeNews] google link decode fail: {type(e).__name__}: {e}")
+    return None
 
 
 def _text_from_html(soup) -> str:
@@ -604,7 +616,22 @@ def _from_markdown(md: str):
     return re.sub(r"\s+([,.;:!?])", r"\1", " ".join(paras)), img
 
 
-async def _article_info(session: aiohttp.ClientSession, url: str) -> dict:
+async def _article_via_reader(session: aiohttp.ClientSession, url: str, dbg: list) -> dict:
+    """r.jina.ai reader (headless browser) — block wali site ya Google redirect page ke liye."""
+    try:
+        md = (await _http_get(session, "https://r.jina.ai/" + url, 40, "text/plain")).decode("utf-8", "ignore")
+        text, img = _from_markdown(md)
+        dbg.append(f"jina:{len(text)}c")
+        return {"text": text, "image": img}
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        dbg.append(f"jina:err-{str(e)[:25]}")
+        LOGGER.info(f"[AnimeNews] article reader fail ({_host(url)}): {e}")
+    return {}
+
+
+async def _article_info(session: aiohttp.ClientSession, url: str, dbg: list) -> dict:
     """Asli article se {text, image}. Pehle direct; site block kare to reader proxy (r.jina.ai)."""
     try:
         html_text = (await _http_get(session, url, 15, "text/html,*/*")).decode("utf-8", "ignore")
@@ -619,35 +646,42 @@ async def _article_info(session: aiohttp.ClientSession, url: str) -> dict:
             if tag:
                 src = urljoin(url, tag.get("data-src") or tag.get("src") or "")
                 img = src if is_valid_img(src) else None
-        return {"text": _text_from_html(soup), "image": img}
+        text = _text_from_html(soup)
+        dbg.append(f"direct:{len(text)}c")
+        if len(text) >= 80:
+            return {"text": text, "image": img}
+        # page khula par text nahi mila (JS page) → reader se bhi try, image direct wali rakho
+        rd = await _article_via_reader(session, url, dbg)
+        return {"text": rd.get("text") or text, "image": img or rd.get("image")}
     except asyncio.CancelledError:
         raise
     except Exception as e:
+        dbg.append(f"direct:err-{str(e)[:25]}")
         LOGGER.info(f"[AnimeNews] article direct fail ({_host(url)}): {e}")
-    try:
-        md = (await _http_get(session, "https://r.jina.ai/" + url, 30, "text/plain")).decode("utf-8", "ignore")
-        text, img = _from_markdown(md)
-        return {"text": text, "image": img}
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        LOGGER.info(f"[AnimeNews] article reader fail ({_host(url)}): {e}")
-    return {}
+    return await _article_via_reader(session, url, dbg)
 
 
 async def _prepare_inner(session: aiohttp.ClientSession, it: dict):
-    real = it["link"]
-    if "news.google." in urlparse(real).netloc:
-        real = await _gnews_real_url(session, real) or ""
+    dbg = it.setdefault("dbg", [])
+    link = it["link"]
+    is_g = "news.google." in urlparse(link).netloc
+    real = (await _gnews_real_url(session, link, dbg) or "") if is_g else link
     it["real"] = real
-    if real and (len(it.get("summary") or "") < 200 or not it.get("image")):
-        info = await _article_info(session, real)
-        if len(it.get("summary") or "") < 200 and info.get("text"):
-            it["summary"] = _trim(info["text"], BODY_MAX)
-        if not it.get("image") and info.get("image"):
-            it["image"] = info["image"]
+    info = {}
+    if len(it.get("summary") or "") < 200 or not it.get("image"):
+        if real:
+            info = await _article_info(session, real, dbg)
+        elif is_g:                                   # decode nahi hua → reader se Google link hi kholo (JS redirect follow karta hai)
+            info = await _article_via_reader(session, link, dbg)
+            if re.search(r"(?i)before you continue|sign in|consent\.google", info.get("text", "")[:300]):
+                info = {}
+    if len(it.get("summary") or "") < 200 and len(info.get("text") or "") >= 80:
+        it["summary"] = _trim(info["text"], BODY_MAX)
+    if not it.get("image") and info.get("image"):
+        it["image"] = info["image"]
     al = await get_anilist_info(session, it["title"])
     it["al"] = al
+    dbg.append("al:" + ("ok" if al else "no"))
     if al:
         if not it.get("image") and al.get("image"):
             it["image"] = al["image"]
@@ -655,6 +689,9 @@ async def _prepare_inner(session: aiohttp.ClientSession, it: dict):
             it["about"] = al["desc"]
     if it.get("image"):
         it["photo"] = await _make_photo(session, it["image"])
+        dbg.append("img:" + ("16x9" if it.get("photo") else "url"))
+    else:
+        dbg.append("img:none")
 
 
 async def _prepare(session: aiohttp.ClientSession, it: dict):
@@ -882,7 +919,7 @@ async def run_cycle(client: Client, manual: bool = False):
             return 0, "Koi RSS feed nahi hai. /add_news_rss <url>"
         await _ensure_index()
         footer = await _footer(cfg)
-        errors, per_feed, routes = [], [], []
+        errors, per_feed, routes, dbg_lines = [], [], [], []
         posted = 0
 
         async with aiohttp.ClientSession() as session:
@@ -923,6 +960,7 @@ async def run_cycle(client: Client, manual: bool = False):
                             await _release_item(left)
                     break                           # channel hi problem hai to baaki bhi fail honge
                 posted += 1
+                dbg_lines.append(f"{it['title'][:24]}… → " + " ".join(it.get('dbg', [])))
                 LOGGER.info(f"[AnimeNews] posted: {it['title']}")
                 await asyncio.sleep(POST_GAP)
 
@@ -948,6 +986,8 @@ async def run_cycle(client: Client, manual: bool = False):
             info += "\n⚠️ " + "\n⚠️ ".join(errors[:3])
         if routes:
             info += "\n🛣 Route: " + ", ".join(routes)
+        if manual and dbg_lines:
+            info += "\n🔎 " + "\n🔎 ".join(dbg_lines[:3])
         return posted, info
 
 
