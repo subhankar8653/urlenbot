@@ -843,8 +843,10 @@ async def bot_upload_cmd(bot: Client, message: Message):
 
     # ── Default auto-upload end message(s) ──
     try:
-        from .schedule_notify import _send_end_messages_to_channel
-        await _send_end_messages_to_channel(channel_id)
+        from .schedule_notify import _send_end_messages_to_channel, _save_last_posted_msg_ids
+        _eids = await _send_end_messages_to_channel(channel_id)
+        if _eids:
+            await _save_last_posted_msg_ids(channel_id, _eids)
     except Exception as e:
         LOGGER.error(f"[bot_upload] Default end messages send failed: {e}")
 

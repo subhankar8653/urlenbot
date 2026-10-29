@@ -318,6 +318,7 @@ async def _send_end_messages_to_channel(channel_id: int, channel_key: str = DEFA
     LOGGER.info(f"[EndMsg] Sending {len(messages)} end messages to {channel_id}")
 
     posted_ids = []
+    sent_objs = []
     for item in messages:
         try:
             msg_type = item.get('type')
@@ -352,11 +353,19 @@ async def _send_end_messages_to_channel(channel_id: int, channel_key: str = DEFA
 
             if sent and hasattr(sent, 'id'):
                 posted_ids.append(sent.id)
+                sent_objs.append(sent)
 
             await asyncio.sleep(0.5)
 
         except Exception as e:
             LOGGER.error(f"[EndMsg] Failed to send end message item {item}: {e}")
+
+    # Signatures DB mein save — restart ke baad bhi channel scan se pehchaan sakein
+    try:
+        from ..utils.old_msgs import remember_sent
+        await remember_sent(sent_objs)
+    except Exception as e:
+        LOGGER.warning(f"[EndMsg] sig save fail: {e!r}")
 
     return posted_ids
 
@@ -373,12 +382,23 @@ async def _save_last_posted_msg_ids(channel_id: int, msg_ids: list):
     if not oid:
         return
     key = f"last_ep_msgs_{channel_id}"
+    # Purane IDs (jo kisi wajah se delete nahi hue) ke saath MERGE karo, overwrite nahi —
+    # warna woh message hamesha ke liye channel pe reh jaate the.
+    try:
+        user = await db._get_user(oid)
+        old_ids = [int(i) for i in (user.get(key, []) or [])]
+    except Exception:
+        old_ids = []
+    merged = []
+    for i in list(old_ids) + [int(i) for i in msg_ids]:
+        if i not in merged:
+            merged.append(i)
     await db.col.update_one(
         {'id': oid},
-        {'$set': {key: msg_ids}},
+        {'$set': {key: merged}},
         upsert=True
     )
-    LOGGER.info(f"[Schedule] Saved {len(msg_ids)} msg IDs for channel {channel_id}: {msg_ids}")
+    LOGGER.info(f"[Schedule] Saved {len(merged)} msg IDs for channel {channel_id}: {merged}")
 
 
 async def get_last_posted_msg_ids(channel_id: int) -> list:
@@ -418,6 +438,13 @@ async def send_schedule_notification(
       3. Saare posted message IDs DB mein save karo (delete ke liye)
     channel_key: channel-specific end messages ke liye (default = DEFAULT_END_KEY)
     """
+    # Naye schedule/end msgs se pehle koi purana bacha ho (restart / miss) to hata do
+    try:
+        from ..utils.old_msgs import purge_old_bot_msgs
+        await purge_old_bot_msgs(client, channel_id, scan=False)
+    except Exception as e:
+        LOGGER.warning(f"[Schedule] pre-purge fail: {e!r}")
+
     schedule = await _get_schedule_for_anime(anime_name)
     posted_ids = []  # Yahan saare posted msg IDs collect karenge
 

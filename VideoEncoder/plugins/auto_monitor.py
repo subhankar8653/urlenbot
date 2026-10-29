@@ -665,20 +665,8 @@ async def _episode_quality_poller_impl(
     # ── Delete old bot messages from channel ──
     async def _delete_old_bot_msgs(ch_id: int):
         try:
-            from .schedule_notify import get_last_posted_msg_ids, clear_last_posted_msg_ids
-            saved_ids = await get_last_posted_msg_ids(ch_id)
-            if not saved_ids:
-                return
-            try:
-                await client.delete_messages(ch_id, saved_ids)
-            except Exception:
-                for mid in saved_ids:
-                    try:
-                        await client.delete_messages(ch_id, mid)
-                        await asyncio.sleep(0.2)
-                    except Exception:
-                        pass
-            await clear_last_posted_msg_ids(ch_id)
+            from ..utils.old_msgs import purge_old_bot_msgs
+            await purge_old_bot_msgs(client, ch_id)   # DB ids + channel scan (restart-proof)
         except Exception as _e:
             LOGGER.warning(f"[AutoMonitor] _delete_old_bot_msgs error: {_e}")
 

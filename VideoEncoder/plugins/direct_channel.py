@@ -422,12 +422,8 @@ async def _delete_ids(client, ch: int, ids: list):
 async def _delete_old_bot_msgs(client, ch: int):
     """Pichhle episode ke end/schedule messages (naye episode ki pehli file se pehle)."""
     try:
-        from .schedule_notify import get_last_posted_msg_ids, clear_last_posted_msg_ids
-        ids = await get_last_posted_msg_ids(ch)
-        if not ids:
-            return
-        await _delete_ids(client, ch, ids)
-        await clear_last_posted_msg_ids(ch)
+        from ..utils.old_msgs import purge_old_bot_msgs
+        await purge_old_bot_msgs(client, ch)   # DB ids + channel scan (restart-proof)
     except Exception as e:
         LOGGER.warning(f"[Direct] old msgs delete error: {e!r}")
 
