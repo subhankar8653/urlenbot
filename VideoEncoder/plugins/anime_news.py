@@ -28,12 +28,14 @@ Data:
 """
 
 import asyncio
+import base64
 import hashlib
 import html as _html
+import json
 import re
 import time as _time
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import aiohttp
 import feedparser
@@ -280,8 +282,59 @@ async def fetch_image_from_article(session: aiohttp.ClientSession, article_url: 
     return None
 
 
+# ───────────────────────── text trimming / body cleaning ─────────────────────────
+BODY_MAX = 650               # news body (caption mein) — build_caption limit ke hisaab se aur chhota karta hai
+
+
+def _trim(text: str, limit: int) -> str:
+    """Limit ke andar poora sentence kaat ke rakho (beech mein word na tute)."""
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    m = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "), cut.rfind("。"))
+    if m >= limit * 0.5:
+        return cut[:m + 1]
+    return cut.rsplit(" ", 1)[0].rstrip(",;:- ") + "…"
+
+
+def clean_body(raw: str, limit: int = BODY_MAX) -> str:
+    """HTML/feed content se readable news paragraph(s) — 'The post ... appeared first on' jaisa kachra hata ke."""
+    soup = BeautifulSoup(raw or "", "html.parser")
+    for t in soup(["script", "style", "figure", "iframe", "table"]):
+        t.decompose()
+    paras = [re.sub(r"\s+", " ", p.get_text(" ")).strip() for p in soup.find_all("p")]
+    paras = [p for p in paras if len(p) >= 25 and "appeared first on" not in p]
+    text = " ".join(paras) if paras else re.sub(r"\s+", " ", soup.get_text(" ")).strip()
+    text = re.sub(r"The post .*? appeared first on .*$", "", text).strip()
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    return _trim(text, limit)
+
+
+def _entry_image(ent, raw_html: str):
+    """Feed entry ki apni image: media:content / thumbnail / enclosure / content ka pehla <img>."""
+    for k in ("media_content", "media_thumbnail"):
+        for m in ent.get(k) or []:
+            if is_valid_img(m.get("url")):
+                return m["url"]
+    for l in ent.get("links") or []:
+        if str(l.get("type", "")).startswith("image") and is_valid_img(l.get("href")):
+            return l["href"]
+    for tag in BeautifulSoup(raw_html or "", "html.parser").find_all("img"):
+        src = tag.get("src") or tag.get("data-src")
+        if is_valid_img(src):
+            return src
+    return None
+
+
+# ───────────────────────── anime name + AniList info ─────────────────────────
+_NEWS_VERBS = (r"announces?|announced|reveals?|revealed|unveils?|gets|confirms?|confirmed|streams?|premieres?|adds?|"
+               r"casts?|launches|launched|teases?|ends|reports?|sets|delays?|delayed|debuts?|returns?|wins|shares?|"
+               r"releases?|opens?|hits|crosses|reaches|will|stars?|previews?|streaming|film|movie|new|full|special")
+
+
 def extract_anime_names(title: str) -> list:
-    """Title se anime/manga ke possible naam (priority order): quotes → ':' se pehle → '-' se pehle → season/media word se pehle."""
+    """Title se anime/manga ke possible naam (priority order): quotes → ':' → '-' → season/media word → news-verb se pehle."""
     title = (title or "").strip()
     out, seen = [], set()
 
@@ -307,19 +360,54 @@ def extract_anime_names(title: str) -> list:
                  title, re.IGNORECASE)
     if m:
         add(m.group(1))
-    return out[:3]
+    v = re.match(rf"^(.+?)\s+(?:{_NEWS_VERBS})\b", title, re.IGNORECASE)
+    if v:
+        add(v.group(1))
+    return out[:4]
+
+
+def _norm(s) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+def _similar(term: str, names: list) -> bool:
+    """AniList ka result sach mein usi naam ka hai? (galat series ka poster/info na lage)"""
+    t = _norm(term)
+    if not t:
+        return False
+    tt = set(t.split())
+    for n in names:
+        n = _norm(n)
+        if not n:
+            continue
+        if t in n or (len(n) > 3 and n in t):
+            return True
+        nt = set(n.split())
+        if nt and len(tt & nt) / max(len(tt), len(nt)) >= 0.6:
+            return True
+    return False
 
 
 _ANILIST_Q = """
 query ($search: String) {
-  anime: Media (search: $search, type: ANIME, sort: POPULARITY_DESC) { bannerImage coverImage { extraLarge } }
-  manga: Media (search: $search, type: MANGA, sort: POPULARITY_DESC) { bannerImage coverImage { extraLarge } }
+  anime: Media (search: $search, type: ANIME, sort: POPULARITY_DESC) { ...F }
+  manga: Media (search: $search, type: MANGA, sort: POPULARITY_DESC) { ...F }
+}
+fragment F on Media {
+  title { romaji english } synonyms bannerImage coverImage { extraLarge }
+  description(asHtml: false) genres averageScore status format episodes seasonYear
+  studios(isMain: true) { nodes { name } }
 }
 """
+_STATUS = {"FINISHED": "Finished", "RELEASING": "Airing", "NOT_YET_RELEASED": "Upcoming",
+           "CANCELLED": "Cancelled", "HIATUS": "Hiatus"}
 
 
-async def get_anilist_poster(session: aiohttp.ClientSession, title: str, retries: int = 2):
-    """Har candidate naam AniList pe dhundo; pehla match (cover > banner, anime > manga) return."""
+async def get_anilist_info(session: aiohttp.ClientSession, title: str, retries: int = 2):
+    """
+    Har candidate naam AniList pe dhundo. Pehla *sahi match* (anime > manga) return:
+    {name, image, desc, genres, score, status, format, episodes, year, studio}  — nahi mila to None.
+    """
     for term in extract_anime_names(title):
         for attempt in range(1, retries + 1):
             try:
@@ -337,13 +425,30 @@ async def get_anilist_poster(session: aiohttp.ClientSession, title: str, retries
                         continue
                     data = (await r.json()).get("data") or {}
                 for kind in ("anime", "manga"):
-                    media = data.get(kind)
-                    if not media:
+                    md = data.get(kind)
+                    if not md:
                         continue
-                    img = (media.get("coverImage") or {}).get("extraLarge") or media.get("bannerImage")
-                    if img:
-                        return img
-                break   # is naam pe kuch nahi mila → agla candidate
+                    t = md.get("title") or {}
+                    names = [t.get("romaji"), t.get("english")] + list(md.get("synonyms") or [])
+                    if not _similar(term, names):
+                        continue
+                    desc = BeautifulSoup(md.get("description") or "", "html.parser").get_text(" ")
+                    desc = re.sub(r"\(Source:.*?\)|\[Written by.*?\]", "", desc, flags=re.I)
+                    studios = ((md.get("studios") or {}).get("nodes") or [])
+                    return {
+                        "name": t.get("english") or t.get("romaji") or term,
+                        "image": (md.get("coverImage") or {}).get("extraLarge") or md.get("bannerImage"),
+                        "desc": _trim(desc, 450),
+                        "genres": list(md.get("genres") or [])[:3],
+                        "score": md.get("averageScore"),
+                        "status": _STATUS.get(md.get("status") or "", ""),
+                        "format": re.sub(r"\b(Tv|Ova|Ona)\b", lambda m_: m_.group(1).upper(),
+                                         (md.get("format") or "").replace("_", " ").title()),
+                        "episodes": md.get("episodes") if kind == "anime" else None,
+                        "year": md.get("seasonYear"),
+                        "studio": studios[0].get("name") if studios else "",
+                    }
+                break   # is naam pe sahi match nahi → agla candidate
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -352,15 +457,131 @@ async def get_anilist_poster(session: aiohttp.ClientSession, title: str, retries
     return None
 
 
-async def _pick_image(session: aiohttp.ClientSession, item: dict):
-    img = await get_anilist_poster(session, item["title"])
-    if img:
-        return img
-    if not item.get("via_google"):          # google redirect link se article page scrape nahi hota
-        img = await fetch_image_from_article(session, item["link"])
-        if img:
-            return img
-    return item.get("thumb")
+# ───────────────────────── article page (full text + image) ─────────────────────────
+async def _gnews_real_url(session: aiohttp.ClientSession, link: str):
+    """Google News redirect link → asli article URL (purana base64 format + naya batchexecute format). Fail → None."""
+    m = re.search(r"/articles/([^/?]+)", link)
+    if not m:
+        return None
+    gid = m.group(1)
+    try:
+        raw = base64.urlsafe_b64decode(gid + "=" * (-len(gid) % 4)).decode("latin1")
+        if "AU_yqL" not in raw:
+            u = re.search(r"https?://[\x21-\x7e]+", raw)
+            if u:
+                return u.group(0)
+    except Exception:
+        pass
+    try:
+        async with session.get(f"https://news.google.com/articles/{gid}", headers={"User-Agent": UA},
+                               timeout=aiohttp.ClientTimeout(total=15)) as r:
+            page = await r.text()
+        div = BeautifulSoup(page, "html.parser").select_one("c-wiz > div[jscontroller]")
+        sg, ts = div.get("data-n-a-sg"), div.get("data-n-a-ts")
+        inner = ["garturlreq", [["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1, None, None, None, None,
+                                 None, 0, 1], "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0], gid, ts, sg]
+        freq = json.dumps([[["Fbv4je", json.dumps(inner), None, "generic"]]])
+        async with session.post("https://news.google.com/_/DotsSplashUi/data/batchexecute",
+                                data="f.req=" + quote(freq),
+                                headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                                         "User-Agent": UA},
+                                timeout=aiohttp.ClientTimeout(total=15)) as r:
+            body = await r.text()
+        parsed = json.loads(body.split("\n\n")[1])[:-2]
+        url = json.loads(parsed[0][2])[1]
+        return url if str(url).startswith("http") else None
+    except Exception as e:
+        LOGGER.info(f"[AnimeNews] google link decode fail: {type(e).__name__}")
+        return None
+
+
+def _text_from_html(soup) -> str:
+    root = soup.select_one(".meat") or soup.find("article") or soup.find("main") or soup
+    paras = [re.sub(r"\s+", " ", p.get_text(" ")).strip() for p in root.find_all("p")]
+    paras = [p for p in paras if len(p) >= 60 and "cookie" not in p.lower()]
+    text = " ".join(paras)
+    if not text:
+        og = soup.find("meta", attrs={"property": "og:description"})
+        text = (og.get("content") if og else "") or ""
+    return re.sub(r"\s+([,.;:!?])", r"\1", text)
+
+
+def _from_markdown(md: str):
+    """r.jina.ai (reader proxy) ka markdown → (text, image)."""
+    img = None
+    for m in re.finditer(r"!\[[^\]]*\]\((https?://[^)\s]+)", md):
+        if is_valid_img(m.group(1)):
+            img = m.group(1)
+            break
+    paras = []
+    for line in md.splitlines():
+        line = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", line.strip())
+        line = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", line).strip()
+        if len(line) < 60 or line[0] in "#|>*-" or re.match(r"(Title|URL Source|Published Time|Markdown Content):", line):
+            continue
+        paras.append(line)
+    return re.sub(r"\s+([,.;:!?])", r"\1", " ".join(paras)), img
+
+
+async def _article_info(session: aiohttp.ClientSession, url: str) -> dict:
+    """Asli article se {text, image}. Pehle direct; site block kare to reader proxy (r.jina.ai)."""
+    try:
+        html_text = (await _http_get(session, url, 15, "text/html,*/*")).decode("utf-8", "ignore")
+        soup = BeautifulSoup(html_text, "html.parser")
+        img = None
+        og = soup.find("meta", attrs={"property": "og:image"})
+        if og and is_valid_img(urljoin(url, og.get("content") or "")):
+            img = urljoin(url, og["content"])
+        else:
+            fig = soup.find("figure")
+            tag = fig.find("img") if fig else None
+            if tag:
+                src = urljoin(url, tag.get("data-src") or tag.get("src") or "")
+                img = src if is_valid_img(src) else None
+        return {"text": _text_from_html(soup), "image": img}
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        LOGGER.info(f"[AnimeNews] article direct fail ({_host(url)}): {e}")
+    try:
+        md = (await _http_get(session, "https://r.jina.ai/" + url, 30, "text/plain")).decode("utf-8", "ignore")
+        text, img = _from_markdown(md)
+        return {"text": text, "image": img}
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        LOGGER.info(f"[AnimeNews] article reader fail ({_host(url)}): {e}")
+    return {}
+
+
+async def _prepare_inner(session: aiohttp.ClientSession, it: dict):
+    real = it["link"]
+    if "news.google." in urlparse(real).netloc:
+        real = await _gnews_real_url(session, real) or ""
+    it["real"] = real
+    if real and (len(it.get("summary") or "") < 200 or not it.get("image")):
+        info = await _article_info(session, real)
+        if len(it.get("summary") or "") < 200 and info.get("text"):
+            it["summary"] = _trim(info["text"], BODY_MAX)
+        if not it.get("image") and info.get("image"):
+            it["image"] = info["image"]
+    al = await get_anilist_info(session, it["title"])
+    it["al"] = al
+    if al:
+        if not it.get("image") and al.get("image"):
+            it["image"] = al["image"]
+        if len(it.get("summary") or "") < 120 and al.get("desc"):
+            it["about"] = al["desc"]
+
+
+async def _prepare(session: aiohttp.ClientSession, it: dict):
+    """Post ke liye sab jama karo: poori news text, image (feed → article → AniList), AniList info. Kuch fail ho to chalta hai."""
+    try:
+        await asyncio.wait_for(_prepare_inner(session, it), 90)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        LOGGER.warning(f"[AnimeNews] prepare adhoori ({type(e).__name__}: {e})")
 
 
 # ───────────────────────── feed fetch ─────────────────────────
@@ -380,17 +601,22 @@ def _items_from_feedparser(feed, url: str, site: str, google: bool = False) -> l
         if not link or not title:
             continue
         raw_sum = ent.get("summary") or ent.get("description") or ""
-        if not raw_sum and ent.get("content"):
-            raw_sum = ent["content"][0].get("value", "")
-        summary = clean_summary(raw_sum)
+        raw_full = (ent["content"][0].get("value", "") if ent.get("content") else "") or raw_sum
+        if len(BeautifulSoup(raw_sum, "html.parser").get_text()) > len(BeautifulSoup(raw_full, "html.parser").get_text()):
+            raw_full = raw_sum
+        body, image = clean_body(raw_full), _entry_image(ent, raw_full)
         if google:
             # Google News title: "News title - Site Name"; summary sirf title ki copy hoti hai → hata do
-            title = re.sub(r"\s+-\s+[^-]{2,60}$", "", title).strip() or title
-            low = summary.lower()
-            if not summary or low.startswith(title.lower()[:40]):
-                summary = ""
-        items.append({"title": title, "link": link, "summary": summary, "feed": url,
-                      "site": site, "via_google": google})
+            src = ((ent.get("source") or {}).get("title") or "").strip()
+            if src and title.endswith(src):
+                title = title[:-len(src)].rstrip(" -–—|").strip() or title
+            else:
+                title = re.sub(r"\s+-\s+Anime News Network$", "", title).strip() or title
+            if not body or body.lower().startswith(title.lower()[:40]):
+                body = ""
+            image = None
+        items.append({"title": title, "link": link, "summary": body, "feed": url,
+                      "site": site, "via_google": google, "image": image})
     return items
 
 
@@ -418,10 +644,10 @@ async def _feed_rss2json(session, url: str) -> list:
         if not link or not title:
             continue
         thumb = ent.get("thumbnail") or (ent.get("enclosure") or {}).get("link") or ""
-        items.append({"title": _html.unescape(title), "link": link,
-                      "summary": clean_summary(ent.get("description") or ent.get("content") or ""),
+        raw = ent.get("content") or ent.get("description") or ""
+        items.append({"title": _html.unescape(title), "link": link, "summary": clean_body(raw),
                       "feed": url, "site": _site_of(url), "via_google": False,
-                      "thumb": thumb if is_valid_img(thumb) else None})
+                      "image": thumb if is_valid_img(thumb) else _entry_image({}, raw)})
     return items
 
 
@@ -448,6 +674,8 @@ async def fetch_feed(session: aiohttp.ClientSession, url: str) -> list:
         try:
             items = await fn(session, url)
             if items:
+                for _i in items:
+                    _i['via'] = name
                 if errs:
                     LOGGER.info(f"[AnimeNews] {_host(url)}: '{name}' se mili ({'; '.join(errs)})")
                 return items
@@ -460,43 +688,70 @@ async def fetch_feed(session: aiohttp.ClientSession, url: str) -> list:
 
 
 # ───────────────────────── post building / sending ─────────────────────────
+def _info_line(al) -> str:
+    """AniList se chhota info card: 🎬 naam (format, saal) / ⭐ score • 🎭 genres • 🏢 studio • 📺 eps • 📌 status."""
+    if not al:
+        return ""
+    head = f"🎬 <b>{_e(al.get('name'))}</b>"
+    sub = ", ".join(str(x) for x in (al.get("format"), al.get("year")) if x)
+    if sub:
+        head += f" <i>({_e(sub)})</i>"
+    bits = []
+    if al.get("score"):
+        bits.append(f"⭐ {al['score'] / 10:.1f}/10")
+    if al.get("genres"):
+        bits.append("🎭 " + _e(", ".join(al["genres"])))
+    if al.get("studio"):
+        bits.append("🏢 " + _e(al["studio"]))
+    if al.get("episodes"):
+        bits.append(f"📺 {al['episodes']} eps")
+    if al.get("status"):
+        bits.append("📌 " + _e(al["status"]))
+    return head + ("\n" + "  •  ".join(bits) if bits else "")
+
+
 def build_caption(item: dict, footer: str = "") -> str:
+    """
+    📰 Title  →  poori news (blockquote)  →  🎬 series info  →  SOURCE / Powered By.
+    Website pe jaana na pade isliye news text caption mein; 1024 limit ke andar sentence pe kaata jaata hai.
+    """
     title = _e(item["title"][:200])
-    u = urlparse(item["link"])
+    u = urlparse(item.get("real") or item["link"])
     site = item.get("site") or (f"{u.scheme}://{u.netloc}" if u.netloc else item.get("feed", ""))
     site_attr = _html.escape(site, quote=True)
+    info = _info_line(item.get("al"))
+    body = item.get("summary") or ""
+    text = body or item.get("about") or ""
+    label = "" if body else "<b>📝 About:</b> "
+    tail = [f"──── 📖 <a href='{site_attr}'><b>SOURCE</b></a> ────"]
+    if footer:
+        tail.append(f"<b>💜 Powered By : {_e(footer)}</b>")
 
-    def make(summary: str) -> str:
-        head = [f"<blockquote><b>{title}</b></blockquote>"]
-        if summary:
-            head.append(f"<blockquote><b>{_e(summary)}</b></blockquote>")
-        tail = [f"──── 📖 <a href='{site_attr}'><b>SOURCE</b></a> ────"]
-        if footer:
-            tail.append(f"<b>💜 Powered By : {_e(footer)}</b>")
-        return "\n\n".join(head) + "\n\n" + "\n".join(tail)
+    def make(t: str) -> str:
+        parts = [f"📰 <b>{title}</b>"]
+        if t:
+            parts.append(f"<blockquote>{label}{_e(t)}</blockquote>")
+        if info:
+            parts.append(info)
+        parts.append("\n".join(tail))
+        return "\n\n".join(parts)
 
-    summary = item.get("summary") or ""
-    cap = make(summary)
-    while len(cap) > CAPTION_MAX and summary:        # caption limit: summary chhota karte jao
-        summary = summary[:max(0, len(summary) - 60)].rstrip()
-        cap = make(summary)
+    cap = make(text)
+    while len(cap) > CAPTION_MAX and text:
+        text = _trim(text, len(text) - 80) if len(text) > 120 else ""
+        cap = make(text)
     return cap
 
 
 async def _send(client: Client, ch, item: dict, footer: str):
-    caption = build_caption(item, footer)
-    markup = None
-    if item["link"].startswith("http"):
-        markup = InlineKeyboardMarkup([[InlineKeyboardButton("Rᴇᴀᴅ ɪᴛ ғᴜʟʟʏ...", url=item["link"])]])
+    caption = build_caption(item, footer)         # koi button nahi — news caption mein hi poori hai
     if item.get("image"):
         try:
-            await client.send_photo(ch, item["image"], caption=caption,
-                                    parse_mode=ParseMode.HTML, reply_markup=markup)
+            await client.send_photo(ch, item["image"], caption=caption, parse_mode=ParseMode.HTML)
             return
         except Exception as e:      # Telegram ko image URL pasand nahi aaya → text-only fallback
             LOGGER.warning(f"[AnimeNews] photo send fail, text fallback: {type(e).__name__}: {e}")
-    await client.send_message(ch, caption, parse_mode=ParseMode.HTML, reply_markup=markup,
-                              disable_web_page_preview=True)
+    await client.send_message(ch, caption, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 async def _footer(cfg: dict) -> str:
@@ -540,13 +795,16 @@ async def run_cycle(client: Client, manual: bool = False):
             return 0, "Koi RSS feed nahi hai. /add_news_rss <url>"
         await _ensure_index()
         footer = await _footer(cfg)
-        errors, per_feed = [], []
+        errors, per_feed, routes = [], [], []
         posted = 0
 
         async with aiohttp.ClientSession() as session:
             for url in feeds:
                 try:
-                    per_feed.append(await fetch_feed(session, url))
+                    its = await fetch_feed(session, url)
+                    per_feed.append(its)
+                    if its:
+                        routes.append(f"{_host(url)}→{its[0].get('via', '?')}")
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -565,7 +823,7 @@ async def run_cycle(client: Client, manual: bool = False):
                     fresh, forced = [first], True
 
             for idx, it in enumerate(fresh):
-                it["image"] = await _pick_image(session, it)
+                await _prepare(session, it)
                 try:
                     await _send(client, ch, it, footer)
                 except asyncio.CancelledError:
@@ -601,6 +859,8 @@ async def run_cycle(client: Client, manual: bool = False):
             info = "Koi nayi news nahi mili (sab pehle hi post ho chuki hain)."
         if errors:
             info += "\n⚠️ " + "\n⚠️ ".join(errors[:3])
+        if routes:
+            info += "\n🛣 Route: " + ", ".join(routes)
         return posted, info
 
 
