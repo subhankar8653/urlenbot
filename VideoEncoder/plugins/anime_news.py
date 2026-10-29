@@ -172,6 +172,39 @@ def clean_summary(raw: str) -> str:
     return text
 
 
+# ───────────────────────── http (anti-bot safe) ─────────────────────────
+async def _http_get(session: aiohttp.ClientSession, url: str, timeout: int = 20, accept: str = "*/*") -> bytes:
+    """
+    URL ka body (bytes). ANN jaise sites aiohttp ko HTTP 403 dete hain (TLS fingerprint se bot pehchante hain),
+    isliye pehle curl_cffi (Chrome jaisa fingerprint). curl_cffi na ho to aiohttp.
+    """
+    try:
+        from curl_cffi import requests as cr
+    except Exception:
+        cr = None
+
+    if cr is not None:
+        def _do():
+            last = None
+            for imp in ("chrome124", "chrome"):     # purane curl_cffi mein 'chrome124' na ho to 'chrome'
+                try:
+                    r = cr.get(url, impersonate=imp, headers={"Accept": accept, "Accept-Language": "en-US,en;q=0.9"},
+                               timeout=timeout, allow_redirects=True)
+                    return r.status_code, r.content
+                except Exception as e:
+                    last = e
+            raise last
+        status, body = await asyncio.get_running_loop().run_in_executor(None, _do)
+    else:
+        async with session.get(url, headers={"User-Agent": UA, "Accept": accept},
+                               timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            status, body = resp.status, await resp.read()
+    if status != 200:
+        hint = " (site ne block kiya — koi aur RSS feed try karo)" if status in (403, 429) else ""
+        raise RuntimeError(f"HTTP {status}{hint}")
+    return body
+
+
 # ───────────────────────── images ─────────────────────────
 def is_valid_img(src) -> bool:
     """Tracking pixel / placeholder / svg / base64 jaisi nakli images filter."""
@@ -191,9 +224,7 @@ async def fetch_image_from_article(session: aiohttp.ClientSession, article_url: 
     if not article_url:
         return None
     try:
-        async with session.get(article_url, headers={"User-Agent": UA},
-                               timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            html_text = (await resp.read()).decode("utf-8", "ignore")
+        html_text = (await _http_get(session, article_url, 15, "text/html,*/*")).decode("utf-8", "ignore")
         soup = BeautifulSoup(html_text, "html.parser")
 
         fig = soup.find("figure")
@@ -302,14 +333,8 @@ async def _pick_image(session: aiohttp.ClientSession, item: dict):
 # ───────────────────────── feed fetch ─────────────────────────
 async def fetch_feed(session: aiohttp.ClientSession, url: str) -> list:
     """Feed ke latest ENTRIES_PER_FEED items (newest pehle). Fail hone par exception."""
-    async with session.get(
-        url,
-        headers={"User-Agent": UA, "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*"},
-        timeout=aiohttp.ClientTimeout(total=20),
-    ) as resp:
-        if resp.status != 200:
-            raise RuntimeError(f"HTTP {resp.status}")
-        raw = await resp.read()
+    raw = await _http_get(session, url, 20,
+                          "application/rss+xml, application/atom+xml, application/xml, text/xml, */*")
     feed = await asyncio.get_running_loop().run_in_executor(None, feedparser.parse, raw)
     items = []
     for ent in feed.entries[:ENTRIES_PER_FEED]:
