@@ -887,6 +887,13 @@ async def _upload_to_user_channels(
             if not channel_id:
                 continue
 
+            # Naya episode aa raha hai -> pichhle episode ke schedule/end msgs hatao (restart-proof)
+            try:
+                from ..old_msgs import purge_old_bot_msgs
+                await purge_old_bot_msgs(app, channel_id)
+            except Exception as _pe:
+                print(f"[Channel Upload] old msgs purge fail: {_pe}")
+
             try:
                 needs_filter = languages.strip().lower() != 'all'
 
