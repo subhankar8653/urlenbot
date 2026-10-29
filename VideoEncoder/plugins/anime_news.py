@@ -30,6 +30,7 @@ Data:
 import asyncio
 import base64
 import hashlib
+import io
 import html as _html
 import json
 import re
@@ -283,7 +284,7 @@ async def fetch_image_from_article(session: aiohttp.ClientSession, article_url: 
 
 
 # ───────────────────────── text trimming / body cleaning ─────────────────────────
-BODY_MAX = 650               # news body (caption mein) — build_caption limit ke hisaab se aur chhota karta hai
+BODY_MAX = 850               # news body (caption mein) — build_caption limit ke hisaab se aur chhota karta hai
 
 
 def _trim(text: str, limit: int) -> str:
@@ -370,20 +371,27 @@ def _norm(s) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
 
 
+_GENERIC = {"best", "top", "new", "anime", "manga", "list", "watch", "netflix", "crunchyroll", "episodes", "episode",
+            "season", "release", "date", "india", "hindi", "dub", "dubbed", "streaming", "movies", "movie", "series",
+            "updates", "news", "guide", "must", "every", "all", "the", "to", "of", "on", "in", "for", "and", "a"}
+
+
 def _similar(term: str, names: list) -> bool:
-    """AniList ka result sach mein usi naam ka hai? (galat series ka poster/info na lage)"""
+    """
+    AniList ka result sach mein usi naam ka hai? Sakht check — galat series ka poster/info lagne se behtar hai kuch na lage.
+    Term poora kisi title mein (ya title poora term mein) *poore words* ke saath milna chahiye; generic/listicle term reject.
+    """
     t = _norm(term)
-    if not t:
+    words = t.split()
+    if len(t) < 5 or t[0].isdigit() or all(w in _GENERIC or w.isdigit() for w in words):
         return False
-    tt = set(t.split())
+    pt = f" {t} "
     for n in names:
         n = _norm(n)
-        if not n:
+        if len(n) < 4:
             continue
-        if t in n or (len(n) > 3 and n in t):
-            return True
-        nt = set(n.split())
-        if nt and len(tt & nt) / max(len(tt), len(nt)) >= 0.6:
+        pn = f" {n} "
+        if pt in pn or pn in pt:
             return True
     return False
 
@@ -457,6 +465,54 @@ async def get_anilist_info(session: aiohttp.ClientSession, title: str, retries: 
     return None
 
 
+# ───────────────────────── 16:9 (YouTube-thumbnail) photo ─────────────────────────
+THUMB_W, THUMB_H = 1280, 720
+
+
+def _to_16x9(data: bytes):
+    """
+    Kisi bhi image ko 1280x720 (16:9) JPEG banao:
+      • landscape (≈16:9) → seedha center-crop (sharp)
+      • portrait/square/bahut wide poster → blur background + beech mein poori sharp image (dhundhla stretch nahi)
+    Fail hone par None (tab original URL hi bheja jaata hai).
+    """
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+    im = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+    w, h = im.size
+    if w < 200 or h < 150:
+        return None
+    ar = w / h
+    if 1.55 <= ar <= 2.1:
+        tw, th = (int(h * 16 / 9), h) if ar > 16 / 9 else (w, int(w * 9 / 16))
+        l, t = (w - tw) // 2, (h - th) // 2
+        out = im.crop((l, t, l + tw, t + th)).resize((THUMB_W, THUMB_H), Image.LANCZOS)
+    else:
+        bg = ImageOps.fit(im, (THUMB_W, THUMB_H), Image.LANCZOS).filter(ImageFilter.GaussianBlur(30))
+        out = ImageEnhance.Brightness(bg).enhance(0.55)
+        scale = min((THUMB_W - 120) / w, (THUMB_H - 40) / h, 2.0)
+        fg = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+        shadow = Image.new("RGB", (fg.width + 24, fg.height + 24), (0, 0, 0)).filter(ImageFilter.GaussianBlur(12))
+        x, y = (THUMB_W - fg.width) // 2, (THUMB_H - fg.height) // 2
+        out.paste(shadow, (x - 12, y - 12))
+        out.paste(fg, (x, y))
+    buf = io.BytesIO()
+    out.save(buf, "JPEG", quality=92, optimize=True)
+    return buf.getvalue()
+
+
+async def _make_photo(session: aiohttp.ClientSession, url: str):
+    try:
+        raw = await _http_get(session, url, 20, "image/*,*/*")
+        if len(raw) > 12 * 1024 * 1024:
+            return None
+        return await asyncio.get_running_loop().run_in_executor(None, _to_16x9, raw)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        LOGGER.info(f"[AnimeNews] 16:9 photo nahi bani ({type(e).__name__}: {e}) — original URL bhejenge")
+        return None
+
+
 # ───────────────────────── article page (full text + image) ─────────────────────────
 async def _gnews_real_url(session: aiohttp.ClientSession, link: str):
     """Google News redirect link → asli article URL (purana base64 format + naya batchexecute format). Fail → None."""
@@ -473,11 +529,15 @@ async def _gnews_real_url(session: aiohttp.ClientSession, link: str):
     except Exception:
         pass
     try:
-        async with session.get(f"https://news.google.com/articles/{gid}", headers={"User-Agent": UA},
-                               timeout=aiohttp.ClientTimeout(total=15)) as r:
-            page = await r.text()
+        page = ""
+        for pu in (f"https://news.google.com/rss/articles/{gid}", f"https://news.google.com/articles/{gid}"):
+            async with session.get(pu, headers={"User-Agent": UA}, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                page = await r.text()
+            if "data-n-a-sg" in page:
+                break
         div = BeautifulSoup(page, "html.parser").select_one("c-wiz > div[jscontroller]")
         sg, ts = div.get("data-n-a-sg"), div.get("data-n-a-ts")
+        ts = int(ts) if str(ts).isdigit() else ts        # timestamp number hona chahiye (string nahi)
         inner = ["garturlreq", [["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1, None, None, None, None,
                                  None, 0, 1], "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0], gid, ts, sg]
         freq = json.dumps([[["Fbv4je", json.dumps(inner), None, "generic"]]])
@@ -496,13 +556,34 @@ async def _gnews_real_url(session: aiohttp.ClientSession, link: str):
 
 
 def _text_from_html(soup) -> str:
+    # 1) JSON-LD NewsArticle.articleBody (TOI, HT, indiatimes jaisi sites mein poora text yahin hota hai)
+    for sc in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = json.loads(sc.string or sc.get_text() or "")
+        except Exception:
+            continue
+        stack = data if isinstance(data, list) else [data]
+        while stack:
+            d = stack.pop()
+            if isinstance(d, dict):
+                body = d.get("articleBody")
+                if isinstance(body, str) and len(body) > 150:
+                    return re.sub(r"\s+", " ", BeautifulSoup(body, "html.parser").get_text(" ")).strip()
+                stack.extend(v for v in d.values() if isinstance(v, (dict, list)))
+            elif isinstance(d, list):
+                stack.extend(d)
+    # 2) <p> paragraphs
     root = soup.select_one(".meat") or soup.find("article") or soup.find("main") or soup
     paras = [re.sub(r"\s+", " ", p.get_text(" ")).strip() for p in root.find_all("p")]
     paras = [p for p in paras if len(p) >= 60 and "cookie" not in p.lower()]
     text = " ".join(paras)
-    if not text:
-        og = soup.find("meta", attrs={"property": "og:description"})
-        text = (og.get("content") if og else "") or ""
+    # 3) og:description
+    if len(text) < 150:
+        for attrs in ({"property": "og:description"}, {"name": "description"}):
+            m = soup.find("meta", attrs=attrs)
+            d = (m.get("content") if m else "") or ""
+            if len(d) > len(text):
+                text = d
     return re.sub(r"\s+([,.;:!?])", r"\1", text)
 
 
@@ -572,6 +653,8 @@ async def _prepare_inner(session: aiohttp.ClientSession, it: dict):
             it["image"] = al["image"]
         if len(it.get("summary") or "") < 120 and al.get("desc"):
             it["about"] = al["desc"]
+    if it.get("image"):
+        it["photo"] = await _make_photo(session, it["image"])
 
 
 async def _prepare(session: aiohttp.ClientSession, it: dict):
@@ -600,23 +683,25 @@ def _items_from_feedparser(feed, url: str, site: str, google: bool = False) -> l
         title = re.sub(r"\s+", " ", (ent.get("title") or "")).strip()
         if not link or not title:
             continue
+        # Google News ka link (feed seedha Google News ki ho tab bhi) — title mein " - Site" aur summary mein title ki copy hoti hai
+        is_g = google or "news.google." in urlparse(link).netloc
         raw_sum = ent.get("summary") or ent.get("description") or ""
         raw_full = (ent["content"][0].get("value", "") if ent.get("content") else "") or raw_sum
         if len(BeautifulSoup(raw_sum, "html.parser").get_text()) > len(BeautifulSoup(raw_full, "html.parser").get_text()):
             raw_full = raw_sum
         body, image = clean_body(raw_full), _entry_image(ent, raw_full)
-        if google:
-            # Google News title: "News title - Site Name"; summary sirf title ki copy hoti hai → hata do
+        if is_g:
             src = ((ent.get("source") or {}).get("title") or "").strip()
             if src and title.endswith(src):
                 title = title[:-len(src)].rstrip(" -–—|").strip() or title
             else:
-                title = re.sub(r"\s+-\s+Anime News Network$", "", title).strip() or title
-            if not body or body.lower().startswith(title.lower()[:40]):
+                title = re.sub(r"\s+[-–—|]\s+[^-–—|]{2,40}$", "", title).strip() or title
+            nb = _norm(body)
+            if not nb or nb.startswith(_norm(title)[:30]):      # body = sirf title ki copy → hata do
                 body = ""
             image = None
         items.append({"title": title, "link": link, "summary": body, "feed": url,
-                      "site": site, "via_google": google, "image": image})
+                      "site": site, "via_google": is_g, "image": image})
     return items
 
 
@@ -712,18 +797,15 @@ def _info_line(al) -> str:
 
 def build_caption(item: dict, footer: str = "") -> str:
     """
-    📰 Title  →  poori news (blockquote)  →  🎬 series info  →  SOURCE / Powered By.
+    📰 Title  →  poori news (blockquote)  →  🎬 series info  →  Powered By.
     Website pe jaana na pade isliye news text caption mein; 1024 limit ke andar sentence pe kaata jaata hai.
     """
     title = _e(item["title"][:200])
-    u = urlparse(item.get("real") or item["link"])
-    site = item.get("site") or (f"{u.scheme}://{u.netloc}" if u.netloc else item.get("feed", ""))
-    site_attr = _html.escape(site, quote=True)
     info = _info_line(item.get("al"))
     body = item.get("summary") or ""
     text = body or item.get("about") or ""
     label = "" if body else "<b>📝 About:</b> "
-    tail = [f"──── 📖 <a href='{site_attr}'><b>SOURCE</b></a> ────"]
+    tail = []
     if footer:
         tail.append(f"<b>💜 Powered By : {_e(footer)}</b>")
 
@@ -733,7 +815,8 @@ def build_caption(item: dict, footer: str = "") -> str:
             parts.append(f"<blockquote>{label}{_e(t)}</blockquote>")
         if info:
             parts.append(info)
-        parts.append("\n".join(tail))
+        if tail:
+            parts.append("\n".join(tail))
         return "\n\n".join(parts)
 
     cap = make(text)
@@ -745,9 +828,13 @@ def build_caption(item: dict, footer: str = "") -> str:
 
 async def _send(client: Client, ch, item: dict, footer: str):
     caption = build_caption(item, footer)         # koi button nahi — news caption mein hi poori hai
-    if item.get("image"):
+    if item.get("photo") or item.get("image"):
         try:
-            await client.send_photo(ch, item["image"], caption=caption, parse_mode=ParseMode.HTML)
+            photo = item["image"]
+            if item.get("photo"):                      # 1280x720 (16:9) banai hui photo
+                photo = io.BytesIO(item["photo"])
+                photo.name = "news.jpg"
+            await client.send_photo(ch, photo, caption=caption, parse_mode=ParseMode.HTML)
             return
         except Exception as e:      # Telegram ko image URL pasand nahi aaya → text-only fallback
             LOGGER.warning(f"[AnimeNews] photo send fail, text fallback: {type(e).__name__}: {e}")
