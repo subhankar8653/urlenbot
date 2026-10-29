@@ -91,12 +91,13 @@ _CATEGORIES = [
      ]),
     ("cleanup", "⏰ Cleanup & Schedule",
      "⏰ **Cleanup & Schedule**",
-     "_Purane messages hatana, next-episode message, end message_",
+     "_Purane messages hatana, next-episode message, end message, Hindi schedule, anime news_",
      [
          ("🗑 Auto-Delete Old Messages", "delete_message"),
          ("📅 Next-Episode / End Message", "schedule"),
          ("🏁 Upload Extras (end template/stickers)", "bot_upload_extras"),
          ("📅 Hindi Anime Schedule", "hindi_schedule"),
+         ("📰 Anime News", "anime_news"),
      ]),
     ("other", "⚙️ Other Settings",
      "⚙️ **Other Settings**",
@@ -208,10 +209,12 @@ async def customise_callback(client: Client, cb: CallbackQuery):
         from .post_buttons_panel import clear_session as _pb_clear
         from .update_channels_panel import clear_session as _uc_clear
         from .hindi_schedule import clear_session as _hs_clear
+        from .anime_news import clear_session as _an_clear
         _deco_clear(cb.from_user.id)
         _pb_clear(cb.from_user.id)
         _uc_clear(cb.from_user.id)
         _hs_clear(cb.from_user.id)
+        _an_clear(cb.from_user.id)
 
     if action in ("menu", "cat", "open", "close"):
         from .poster_panel import clear_session as _pz_clear
@@ -220,6 +223,11 @@ async def customise_callback(client: Client, cb: CallbackQuery):
     if action == "hs":
         from .hindi_schedule import handle as _hs_handle
         await _hs_handle(client, cb, parts[2:])
+        return
+
+    if action == "an":
+        from .anime_news import handle as _an_handle
+        await _an_handle(client, cb, parts[2:])
         return
 
     if action == "uc":
@@ -336,6 +344,11 @@ async def _open_section(client: Client, cb: CallbackQuery, section: str):
     if section == "hindi_schedule":
         from .hindi_schedule import render as _hs_render
         await _hs_render(client, cb)
+        return
+
+    if section == "anime_news":
+        from .anime_news import render as _an_render
+        await _an_render(client, cb)
         return
 
     if section in ("poster_video", "poster_post"):
