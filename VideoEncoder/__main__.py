@@ -29,6 +29,11 @@ async def main():
     except Exception as _e:
         print(f"memguard start fail: {_e!r}")
     await app.send_message(chat_id=log, text=f'<b>Bot Started! @{(await app.get_me()).username}</b>')
+    try:
+        from .plugins.database_rti import autostart_monitor
+        await autostart_monitor(app)
+    except Exception as _e:
+        print(f"database_rti monitor autostart fail: {_e!r}")
     await idle()
     await app.stop()
 
