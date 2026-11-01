@@ -86,7 +86,8 @@ CATALOG = [
         ("/monitor_blacklist", "/monitor_blacklist [add w1|w2 | remove w | clear]",
          "🚫 Blacklist panel (alias /mbl). Post ke text mein blacklisted word ho to wo post upload nahi hoti. "
          "➕ Add Word / ➖ Remove Word buttons."),
-        ("/set_direct", "/set_direct <-100id|off>", "Direct FILE channel set karo (post nahi, seedha file aati hai)."),
+        ("/automonitor", "/automonitor on|off", "Monitor channel ka auto download/upload on/off (OFF = link aaye to bhi kuch nahi)."),
+        ("/set_direct", "/set_direct <-100id|off>", "Direct FILE channel set karo. Pehle text (Naruto S01 episode 01), phir video forward — bot bina download/upload ke cover+caption lagake upload karta hai."),
         ("/cancel_season", "/cancel_season [Anime Name]", "Us anime ka chal raha poora auto-upload rok do."),
         ("/cancel_episode", "/cancel_episode [Anime Name] [Ep]", "Sirf ek episode ka process cancel."),
         ("/active_uploads", "/active_uploads", "Abhi chal rahe auto-uploads (anime + episode + kitni der se)."),

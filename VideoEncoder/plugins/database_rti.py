@@ -1296,7 +1296,8 @@ async def _monitor_scan(client, q: asyncio.Queue):
     ST.dl_page = prev_page
 
 
-async def run_crawl(client, cfg: dict, start: int, end, single_url: str = None, monitor: bool = False):
+async def run_crawl(client, cfg: dict, start: int, end, single_url: str = None, monitor: bool = False,
+                    post_urls: list = None):
     ST.running, ST.stop, ST.started = True, False, time.time()
     ST.cancel_ev.clear()
     ST.uploaded = ST.skipped = ST.failed = ST.posts_done = ST.nonhindi = 0
@@ -1326,7 +1327,9 @@ async def run_crawl(client, cfg: dict, start: int, end, single_url: str = None, 
             ST.dl_title, ST.dl_item, ST.dl_dir = "", "", ""
             ST.dl_step = f"📚 Listing page {page}"
             code, posts, nxt = None, [], None
-            for attempt in range(3):
+            if post_urls:                       # seedha post link(s) — listing fetch nahi
+                code, posts, nxt = 200, [u.rstrip("/") + "/" for u in post_urls], None
+            for attempt in range(0 if post_urls else 3):
                 try:
                     code, posts, nxt = await loop.run_in_executor(None, fetch_listing, url)
                     break
@@ -1352,7 +1355,7 @@ async def run_crawl(client, cfg: dict, start: int, end, single_url: str = None, 
                     ST.dl_page = page
                 seen_posts.add(p)
                 await produce_post(client, q, p, page, monitor=monitor)
-            if single_url:
+            if single_url or post_urls:
                 break
             page += 1
             url = nxt or listing_url(page)          # 'NEXT PAGE' button ka link, warna /home/page/N/
@@ -1371,7 +1374,8 @@ async def run_crawl(client, cfg: dict, start: int, end, single_url: str = None, 
         ST.dl_step = "⏹ Stopped" if ST.stop else "✅ Finished"
         ST.dl_dir = ""
         if not monitor:
-            await _cfg_set(resume_page=ST.resume_page)
+            if not post_urls:                 # seedha post link se resume page na bigde
+                await _cfg_set(resume_page=ST.resume_page)
             await _render(cfg)
         if not monitor or ST.uploaded or ST.failed:
             tag = "👁 Monitor pass" if monitor else ST.dl_step
@@ -1441,6 +1445,7 @@ _HELP = (
     "<code>/database_rti file &lt;channel_id&gt;</code> — DB-2 (file)\n"
     "<code>/database_rti start [from] [to]</code> — crawl shuru\n"
     "<code>/database_rti start resume</code> — last page se aage\n"
+    "<code>/database_rti &lt;RTI anime/movie link&gt;</code> — bas ek anime ka RTI link do, wahi database mein upload (kai links space se)\n"
     "<code>/database_rti start &lt;listing_url&gt;</code> — ek listing page\n"
     "<code>/database_rti monitor on [minutes]</code> / <code>off</code> — page 1 auto-upload (RSS jaisa)\n"
     "<code>/database_rti list</code> — complete hui saari seasons/movies ki list (txt)\n"
@@ -1459,6 +1464,8 @@ async def database_rti_cmd(client: Client, message):
 
     if not args:
         return await message.reply(f"{_status_text(cfg)}\n\n{_HELP}", parse_mode=ParseMode.HTML)
+    if args[0].lower().startswith("http"):     # /database_rti <RTI link> == /database_rti start <RTI link>
+        args = ["start"] + args
     sub = args[0].lower()
 
     if sub in ("video", "file"):
@@ -1548,10 +1555,17 @@ async def database_rti_cmd(client: Client, message):
                 return await message.reply(f"❌ Channel <code>{cid}</code> access nahi: "
                                            f"<code>{html.escape(str(e))}</code>", parse_mode=ParseMode.HTML)
 
-        single, start, end = None, 1, None
+        single, start, end, post_urls = None, 1, None, None
         rest = args[1:]
-        if rest and rest[0].startswith("http"):
-            single = rest[0]
+        urls = [x for x in rest if x.lower().startswith("http")]
+        if urls:
+            def _is_listing(u: str) -> bool:
+                path = urlparse(u).path
+                return (not path.strip("/")) or bool(_SKIP_PATH.search(path)) or "?s=" in u
+            if all(not _is_listing(u) for u in urls):
+                post_urls = list(dict.fromkeys(urls))          # anime/movie ka seedha RTI post link(s)
+            else:
+                single = urls[0]                                # listing page
         elif rest and rest[0].lower() == "resume":
             start = int(cfg.get("resume_page") or 1)
         else:
@@ -1561,7 +1575,10 @@ async def database_rti_cmd(client: Client, message):
             if len(nums) > 1:
                 end = nums[1]
         ST.notify_chat = message.chat.id
-        ST.task = asyncio.create_task(run_crawl(client, cfg, start, end, single))
+        ST.task = asyncio.create_task(run_crawl(client, cfg, start, end, single, post_urls=post_urls))
+        if post_urls:
+            await message.reply(f"📥 {len(post_urls)} RTI post database mein upload hone ja rahi hai "
+                                f"(sirf Hindi, 360p/720p/1080p — jo pehle se done hai wo skip).")
         return
 
     await message.reply(_HELP, parse_mode=ParseMode.HTML)

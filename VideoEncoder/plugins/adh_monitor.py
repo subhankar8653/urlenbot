@@ -473,6 +473,11 @@ async def _handle_post(client: Client, message: Message, edited: bool = False):
     monitor_ch = await am._get_monitor_channel()
     if not monitor_ch or message.chat.id != monitor_ch:
         return                                           # sirf monitor channel
+    try:
+        if not await am._am_enabled():
+            return                                       # /automonitor off
+    except Exception:
+        pass
     if "━━━━━━━━━━━━━━" in text:
         return                                           # bot ka apna card
 

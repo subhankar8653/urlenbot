@@ -155,6 +155,39 @@ async def _save_monitor_channel(channel_id: int):
     await db.col.update_one({'id': oid}, {'$set': {'monitor_channel_id': channel_id}}, upsert=True)
 
 
+# ─────────────────────────────────────────────
+#  AutoMonitor ON / OFF  (/automonitor on|off|status)
+#  OFF hone par monitor channel mein link/post aaye to bot KUCH nahi karta
+#  (na download, na upload, na progress card).  Default = ON (purana behaviour).
+#  Direct File Channel (/set_direct) is switch se alag hai — woh hamesha chalta hai.
+# ─────────────────────────────────────────────
+_AM_CACHE = {"ts": 0.0, "val": True}
+
+
+async def _am_enabled() -> bool:
+    now = time.time()
+    if now - _AM_CACHE["ts"] < 5:
+        return _AM_CACHE["val"]
+    oid = await _owner_id()
+    val = True
+    if oid:
+        try:
+            user = await db._get_user(oid)
+            val = bool(user.get('auto_monitor_enabled', True))
+        except Exception as e:
+            LOGGER.warning(f"[AutoMonitor] enabled-flag read fail: {e!r}")
+            return _AM_CACHE["val"]
+    _AM_CACHE.update(ts=now, val=val)
+    return val
+
+
+async def _am_set_enabled(val: bool):
+    oid = await _owner_id()
+    if oid:
+        await db.col.update_one({'id': oid}, {'$set': {'auto_monitor_enabled': bool(val)}}, upsert=True)
+    _AM_CACHE.update(ts=time.time(), val=bool(val))
+
+
 def _is_authorized(user_id: int) -> bool:
     return user_id in owner or user_id in sudo_users
 
@@ -2181,7 +2214,23 @@ async def _handle_channel_post(client: Client, message: Message, edited: bool = 
         _mc = await _get_monitor_channel()
     except Exception:
         _mc = None
+    # Direct File Channel (direct_channel.py) ka text/caption yahan process nahi hota
+    try:
+        from .direct_channel import get_direct_channel
+        _dc0 = await get_direct_channel()
+        if _dc0 and message.chat.id == _dc0:
+            return
+    except Exception:
+        pass
     _admin_chat = message.chat.id if (_mc and message.chat.id == _mc) else None
+    # /automonitor off => monitor channel ki posts ignore (card bhi nahi banta)
+    if _admin_chat is not None:
+        try:
+            if not await _am_enabled():
+                LOGGER.info(f"[AutoMonitor] OFF — monitor channel post ignore (msg {message.id})")
+                return
+        except Exception:
+            pass
     job, _ = await job_ctl.run_with_card(
         message, "AutoMonitor",
         lambda: _handle_channel_post_impl(client, message, edited),
@@ -4407,6 +4456,31 @@ async def cmd_monitor_status(client: Client, message: Message):
     if not _is_authorized(message.from_user.id):
         return
     await _send_status(client, message)
+
+
+@Client.on_message(filters.command(["automonitor", "auto_monitor", "amon"]) & filters.private)
+async def cmd_automonitor(client: Client, message: Message):
+    """/automonitor on|off|status — monitor channel ka auto-download/upload on/off."""
+    if not _is_authorized(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) >= 2 and parts[1].lower() in ("on", "off"):
+        await _am_set_enabled(parts[1].lower() == "on")
+    cur = await _am_enabled()
+    mc = await _get_monitor_channel()
+    try:
+        from .direct_channel import get_direct_channel
+        dc = await get_direct_channel()
+    except Exception:
+        dc = None
+    await message.reply(
+        f"🎌 <b>AutoMonitor: {'🟢 ON' if cur else '🔴 OFF'}</b>\n"
+        f"📡 Monitor channel: <code>{mc}</code>\n"
+        f"📥 Direct file channel: <code>{dc or 'set nahi'}</code>\n\n"
+        f"{'Monitor channel mein link/post aate hi download + upload shuru hoga.' if cur else 'Monitor channel mein link/post aaye to bhi kuch NAHI hoga (resource bachega).'}\n"
+        f"Direct file channel is switch se alag hai — woh hamesha kaam karta hai.\n\n"
+        f"<code>/automonitor on</code> • <code>/automonitor off</code>",
+        parse_mode=ParseMode.HTML)
 
 
 @Client.on_message(filters.command("monitor_notify") & filters.private)
