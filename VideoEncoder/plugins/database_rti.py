@@ -420,6 +420,38 @@ AUDIO_ALLOWED = [a.strip().lower() for a in os.getenv("DB_RTI_AUDIO", "hindi").s
 VERIFY_AUDIO = os.getenv("DB_RTI_VERIFY_AUDIO", "1") != "0"
 
 
+_SUB_RE = re.compile(r"\bsubs?\b|subbed|subtitles?|\besubs?\b", re.I)
+
+
+def _label_before(a) -> str:
+    """Link se theek pehle ka label text ("Hindi Sub – [") — pichhle link / <br> par ruk jaata hai."""
+    parts = []
+    for sib in a.previous_siblings:
+        nm = getattr(sib, "name", None)
+        if nm in ("br", "a"):
+            break
+        parts.append(sib.get_text(" ", strip=True) if hasattr(sib, "get_text") else str(sib))
+        if len(" ".join(parts)) > 80:
+            break
+    return " ".join(reversed(parts)).strip().lower()
+
+
+def _wmq_links(element, rd) -> list:
+    """rd._find_wmq_links jaisa, par 'Hindi Sub' ko Hindi nahi maanta (audio = 'sub')."""
+    links = []
+    ctx = element.get_text(" ", strip=True)
+    for a in element.find_all("a", href=True):
+        text = a.get_text(strip=True).lower()
+        href = a.get("href", "")
+        if "watchmultquality" in text or "watchmultquality" in href.lower() or "multiquality" in text:
+            audio = rd._detect_audio(a, ctx)
+            before = _label_before(a)
+            if _SUB_RE.search(before):
+                audio = "sub"
+            links.append({"href": href, "audio": audio})
+    return links
+
+
 def _pick_audio_link(links: list, title: str):
     """Sirf allowed audio wala link. 'unknown' tab hi jab post ke title mein Hindi likha ho."""
     for a in AUDIO_ALLOWED:
@@ -453,14 +485,14 @@ def discover_hindi(page_url: str) -> dict:
         if not kind or (kind, num) in seen:
             continue
         key = (kind, num)
-        links = list(rd._find_wmq_links(p))
+        links = list(_wmq_links(p, rd))
         for idx, sib in enumerate(p.find_next_siblings()):
             if idx > 8:
                 break
             sk, sn = rd._match_item(sib.get_text(" ", strip=True))
             if sk and (sk, sn) != key:
                 break
-            links.extend(rd._find_wmq_links(sib))
+            links.extend(_wmq_links(sib, rd))
         if not links:
             continue
         best = _pick_audio_link(links, title)
@@ -484,7 +516,7 @@ def discover_hindi(page_url: str) -> dict:
             season = gseason
 
     if not items and not skipped:                   # MOVIE mode
-        links = rd._find_wmq_links(soup)
+        links = _wmq_links(soup, rd)
         best = _pick_audio_link(links, title)
         if best:
             return {"title": title, "season": season, "mode": "movie", "skipped": [],
