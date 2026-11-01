@@ -351,7 +351,7 @@ async def _set_decl_from_text(client: Client, message: Message, edited: bool = F
                           f"Ab files bhejo: 360p/480p → 720p → 1080p.")
 
 
-@Client.on_message(filters.channel & filters.text, group=-6)
+@Client.on_message(filters.channel & filters.text, group=-7)
 async def direct_text_handler(client: Client, message: Message):
     k = (message.chat.id, message.id)
     _TEXT_PENDING.add(k)                      # sync — taaki file handler ruk kar is text ka wait kare
@@ -367,7 +367,7 @@ async def direct_text_handler(client: Client, message: Message):
         _TEXT_PENDING.discard(k)
 
 
-@Client.on_edited_message(filters.channel & filters.text, group=-6)
+@Client.on_edited_message(filters.channel & filters.text, group=-7)
 async def direct_text_edit_handler(client: Client, message: Message):
     k = (message.chat.id, message.id)
     _TEXT_PENDING.add(k)
@@ -558,7 +558,7 @@ async def _get_state(key, d: dict, ctx: bool) -> _Ep:
 # ─────────────────────────────────────────────
 #  Entry point  (file handler)
 # ─────────────────────────────────────────────
-@Client.on_message(filters.channel & (filters.video | filters.document), group=-6)
+@Client.on_message(filters.channel & (filters.video | filters.document), group=-8)
 async def direct_channel_handler(client: Client, message: Message):
     try:
         dc = await get_direct_channel()
