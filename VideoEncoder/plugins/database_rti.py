@@ -14,7 +14,7 @@ RareAnimes (RTI) ki poori site ko 2 Telegram "database" channels mein bharne ka 
   /database_rti retry                  -> jo items adhure reh gaye the unhe dobara try karne ke liye mark karo
 
 Flow (har post / har episode / har movie ke liye):
-  listing page -> post links -> discover_items() -> WatchMultQuality -> Argon -> Swift
+  listing page -> post links -> discover_hindi() [SIRF Hindi] -> WatchMultQuality -> Argon -> Swift
   -> 360p / 720p / 1080p download (jo Swift pe na mile wo rti_fallback ke mirrors se:
      mega / hubcloud / watchnow / dlbeta)
   -> CLEAN metadata (koi promotion nahi: na RTI, na @sbanime, na website; audio track
@@ -146,6 +146,7 @@ class _State:
         self.skipped = 0
         self.failed = 0
         self.posts_done = 0
+        self.nonhindi = 0
         self.started = 0.0
         self.task = None
         self.status_msg = None
@@ -409,6 +410,99 @@ async def make_thumb(path: str, out_dir: str, duration: float):
 
 
 # ─────────────────────────────────────────────
+#  HINDI-ONLY discovery
+#  (rti_downloader.discover_items Hindi na milne par English/Japanese link utha leta hai —
+#   yahan woh fallback hata diya)
+# ─────────────────────────────────────────────
+# DB_RTI_AUDIO=hindi            -> sirf Hindi (default)
+# DB_RTI_AUDIO=hindi,dual,multi -> Dual/Multi audio posts bhi
+AUDIO_ALLOWED = [a.strip().lower() for a in os.getenv("DB_RTI_AUDIO", "hindi").split(",") if a.strip()] or ["hindi"]
+VERIFY_AUDIO = os.getenv("DB_RTI_VERIFY_AUDIO", "1") != "0"
+
+
+def _pick_audio_link(links: list, title: str):
+    """Sirf allowed audio wala link. 'unknown' tab hi jab post ke title mein Hindi likha ho."""
+    for a in AUDIO_ALLOWED:
+        for l in links:
+            if l["audio"] == a:
+                return l
+    if re.search(r"hindi", title or "", re.I):
+        for l in links:
+            if l["audio"] == "unknown":
+                return l
+    return None
+
+
+def _item_label(kind: str, num: int) -> str:
+    return {"EP": f"EP{num:02d}", "OVA": f"OVA{num}", "SP": f"SP{num}"}.get(kind, f"{kind}{num}")
+
+
+def discover_hindi(page_url: str) -> dict:
+    """discover_items jaisa hi, par sirf Hindi (allowed audio) links. Returns + 'skipped' (non-Hindi labels)."""
+    from . import rti_downloader as rd
+    r = requests.get(page_url, headers=rd.HEADERS, timeout=20)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.content, "html.parser")
+    title = rd._page_title(soup)
+    sm = re.search(r"season\s*(\d+)", title, re.IGNORECASE)
+    season = int(sm.group(1)) if sm else 1
+
+    seen, items, skipped = set(), [], {}
+    for p in soup.find_all("p"):
+        kind, num = rd._match_item(p.get_text(" ", strip=True))
+        if not kind or (kind, num) in seen:
+            continue
+        key = (kind, num)
+        links = list(rd._find_wmq_links(p))
+        for idx, sib in enumerate(p.find_next_siblings()):
+            if idx > 8:
+                break
+            sk, sn = rd._match_item(sib.get_text(" ", strip=True))
+            if sk and (sk, sn) != key:
+                break
+            links.extend(rd._find_wmq_links(sib))
+        if not links:
+            continue
+        best = _pick_audio_link(links, title)
+        if best:
+            seen.add(key)
+            skipped.pop(key, None)
+            items.append({"kind": kind, "num": num, "wmq_link": best["href"]})
+        else:
+            skipped.setdefault(key, [l["audio"] for l in links])
+
+    if not items:                                   # generic "S01E05 Fandub" style pages
+        found, gseason = rd._generic_items(soup)
+        for key, links in found.items():
+            best = _pick_audio_link(links, title)
+            if best:
+                items.append({"kind": key[0], "num": key[1], "wmq_link": best["href"]})
+                skipped.pop(key, None)
+            else:
+                skipped.setdefault(key, [l["audio"] for l in links])
+        if items and not sm and gseason:
+            season = gseason
+
+    if not items and not skipped:                   # MOVIE mode
+        links = rd._find_wmq_links(soup)
+        best = _pick_audio_link(links, title)
+        if best:
+            return {"title": title, "season": season, "mode": "movie", "skipped": [],
+                    "items": [{"kind": "MOVIE", "num": 0, "label": "Movie", "wmq_link": best["href"]}]}
+        if links:
+            return {"title": title, "season": season, "mode": "movie", "items": [],
+                    "skipped": ["Movie"]}
+
+    order = {"EP": 0, "OVA": 1, "SP": 2}
+    items.sort(key=lambda x: (order.get(x["kind"], 9), x["num"]))
+    for it in items:
+        it["label"] = _item_label(it["kind"], it["num"])
+    sk = sorted(skipped, key=lambda k: (order.get(k[0], 9), k[1]))
+    return {"title": title, "season": season, "mode": "episodes", "items": items,
+            "skipped": [_item_label(k, n) for k, n in sk]}
+
+
+# ─────────────────────────────────────────────
 #  Listing crawler
 # ─────────────────────────────────────────────
 _SKIP_PATH = re.compile(
@@ -635,7 +729,8 @@ async def _prepare_quality(post: dict, item: dict, q: str, src: str, dl_dir: str
     dur = float((meta.get("format") or {}).get("duration") or 0)
     thumb = await make_thumb(clean, dl_dir, dur)
     caption = stem + (f"\nAudio: {' + '.join(dict.fromkeys(langs))}" if langs else "")
-    return {"q": q, "path": clean, "meta": meta, "thumb": thumb, "caption": caption, "name": f"{stem}.mp4"}
+    return {"q": q, "path": clean, "meta": meta, "thumb": thumb, "caption": caption,
+            "name": f"{stem}.mp4", "langs": langs}
 
 
 async def prepare_item(post: dict, item: dict):
@@ -673,18 +768,33 @@ async def prepare_item(post: dict, item: dict):
             _prepare_quality(post, item, q, files[q], dl_dir) for q in TARGET_QUALITIES if q in files
         ])
         ready = []
+        wrong_audio = False
         for r in results:
+            if r and VERIFY_AUDIO and r["langs"] and "Hindi" not in r["langs"] \
+                    and AUDIO_ALLOWED == ["hindi"]:
+                # link Hindi bola par file ke saare audio tracks explicitly non-Hindi — upload nahi
+                LOGGER.warning(f"[DB-RTI] {label} {r['q']}: audio {r['langs']} — Hindi nahi, skip")
+                wrong_audio = True
+                try:
+                    os.remove(r["path"])
+                except Exception:
+                    pass
+                continue
             if r and os.path.getsize(r["path"]) <= MAX_BYTES:
                 ready.append(r)
             elif r:
                 LOGGER.warning(f"[DB-RTI] {label} {r['q']}: bot limit se badi file — skip")
+        if wrong_audio:
+            post["wrong"].append(label)
+            if label not in post["nonhindi"]:
+                post["nonhindi"].append(label)
         got = {r["q"] for r in ready}
         for q in need:
-            if q not in got:
+            if q not in got and not wrong_audio:
                 post["missing"].append(f"{label} {q}")
         if not ready:
             shutil.rmtree(dl_dir, ignore_errors=True)
-            if not (_cancelled() and not files):
+            if not wrong_audio and not (_cancelled() and not files):
                 await _item_finish(url, label, list(need))
             return None
         return {"kind": "item", "post": post, "item": item, "files": ready, "dl_dir": dl_dir}
@@ -694,18 +804,22 @@ async def prepare_item(post: dict, item: dict):
 
 
 async def produce_post(client, q: asyncio.Queue, url: str, page: int):
-    from .rti_downloader import discover_items
     loop = asyncio.get_event_loop()
     ST.dl_page, ST.dl_title, ST.dl_item, ST.dl_dir = page, url.rstrip("/").split("/")[-1], "", ""
     ST.dl_step = "📄 Post scan"
     data = None
     for _ in range(2):
         try:
-            data = await loop.run_in_executor(None, discover_items, url)
+            data = await loop.run_in_executor(None, discover_hindi, url)
             break
         except Exception as e:  # noqa: BLE001
             LOGGER.warning(f"[DB-RTI] discover fail {url}: {e!r}")
             await asyncio.sleep(3)
+    if data and not data.get("items") and data.get("skipped"):
+        ST.nonhindi += 1
+        await _notify(client_ref(), ST.notify_chat,
+                      f"⏭ Hindi nahi hai, skip • Page <code>{page}</code>\n{html.escape(clean_title(data['title']))}")
+        return
     if not data or not data.get("items"):
         ST.failed += 1
         await _notify(client_ref(), ST.notify_chat,
@@ -717,6 +831,7 @@ async def produce_post(client, q: asyncio.Queue, url: str, page: int):
         "url": url, "title": title, "season": season, "explicit": explicit, "page": page,
         "hint": "hindi" if re.search(r"hindi", title, re.I) else "",
         "mode": data.get("mode", "episodes"), "missing": [], "failed": [], "uploaded": 0, "own_done": 0,
+        "nonhindi": list(data.get("skipped") or []), "wrong": [],
     }
     ST.dl_title = post_name(post)
     for item in data["items"]:
@@ -819,6 +934,11 @@ async def finish_post(client, post: dict):
         return
     existing = await _post_complete_doc(post["url"])
     if post["uploaded"] == 0 and (existing or post["own_done"] == 0):
+        if post["wrong"] and not existing:
+            ST.nonhindi += 1
+            await _notify(client, ST.notify_chat,
+                          f"🚫 <b>Non-Hindi, upload nahi hua:</b> {html.escape(name)}\n"
+                          f"Page <code>{post['page']}</code> • {html.escape(', '.join(post['wrong']))}")
         return          # kuch naya nahi / sirf duplicate post — list mein dobara mat daalo
     note = ", ".join(post["missing"])
     await _mark_post_complete(post["url"], name, post["page"], note)
@@ -828,6 +948,8 @@ async def finish_post(client, post: dict):
     txt = f"{tag}: <b>{html.escape(name)}</b>\n📄 Page <code>{post['page']}</code>"
     if note:
         txt += f"\n⚠️ Missing: {html.escape(note)}"
+    if post["nonhindi"]:
+        txt += f"\n🚫 Non-Hindi skipped: {html.escape(', '.join(post['nonhindi']))}"
     await _notify(client, ST.notify_chat, txt)
     await _cfg_set(resume_page=post["page"])
 
@@ -880,7 +1002,7 @@ def _status_text(cfg: dict) -> str:
         L.append(f"⏸ Idle ({html.escape(ST.dl_step or '-')})")
     L.append("")
     L.append(f"✅ Posts complete: <code>{ST.posts_done}</code> • 📤 Files: <code>{ST.uploaded}</code> • "
-             f"⏭ Skipped: <code>{ST.skipped}</code> • ❌ Failed: <code>{ST.failed}</code>")
+             f"⏭ Skipped: <code>{ST.skipped}</code> • 🚫 Non-Hindi: <code>{ST.nonhindi}</code> • ❌ Failed: <code>{ST.failed}</code>")
     if ST.last_complete:
         L.append(f"Last complete: {html.escape(ST.last_complete)}")
     rp = ST.resume_page if ST.running or ST.uploaded or ST.posts_done else (cfg.get("resume_page") or 1)
@@ -914,7 +1036,7 @@ async def _status_loop(cfg: dict):
 async def run_crawl(client, cfg: dict, start: int, end, single_url: str = None):
     ST.running, ST.stop, ST.started = True, False, time.time()
     ST.cancel_ev.clear()
-    ST.uploaded = ST.skipped = ST.failed = ST.posts_done = 0
+    ST.uploaded = ST.skipped = ST.failed = ST.posts_done = ST.nonhindi = 0
     ST.last_complete = ""
     ST.resume_page = start
     _CLIENT["c"] = client
