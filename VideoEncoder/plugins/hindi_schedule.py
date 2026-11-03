@@ -692,10 +692,13 @@ async def _post_new_style(client: Client, ch, cfg: dict, day_idx: int, now: date
         handles_list = await get_community_tag(all_names=True)          # '@A @B' — community mein jitne set hain
     except Exception:
         handles_list = ""
+    branding = footer_on(cfg)           # Branding OFF => na link, na community (image + text dono mein)
+    if not branding:
+        handles_list = ""
     handles = " | ".join(handles_list.split())
     rows = schedule_rows(items, now)
-    links = await load_anime_links(await resolve_link_idx(cfg))
-    msgs = build_new_posts(day_idx, now, rows, links, handles if footer_on(cfg) else "")
+    links = await load_anime_links(await resolve_link_idx(cfg)) if branding else []
+    msgs = build_new_posts(day_idx, now, rows, links, handles)
 
     img_path = None
     if rows and cfg.get("image", True):
@@ -978,7 +981,7 @@ def _status_text(cfg: dict) -> str:
         f"🔔 Auto-post: **{'🟢 ON' if cfg.get('enabled', True) else '🔴 OFF'}**\n"
         f"🎨 Style: **{'✨ NEW (image + links)' if style_of(cfg) == 'new' else '📜 OLD (classic list)'}**\n"
         f"🖼 Image: **{'🟢 ON' if cfg.get('image', True) else '🔴 OFF'}** _(NEW style)_\n"
-        f"💜 Powered By line: **{'🟢 ON' if footer_on(cfg) else '🔴 OFF'}**\n"
+        f"💜 Branding (links + community): **{'🟢 ON' if footer_on(cfg) else '🔴 OFF'}**\n"
         f"🔗 Anime links: **{cfg.get('link_ch_title') or 'Link 1 (default)'}**\n"
         f"🗓 Aaj: {today}\n"
         f"📤 Last post: {cfg.get('last_date') or '—'}"
@@ -1014,8 +1017,8 @@ async def render(client: Client, cb: CallbackQuery):
                               else "🎨 Style: 📜 OLD — NEW karo", callback_data="cmz:hs:style")],
         [InlineKeyboardButton("🖼 Image: ON — OFF karo" if cfg.get("image", True)
                               else "🖼 Image: OFF — ON karo", callback_data="cmz:hs:img")],
-        [InlineKeyboardButton("💜 Powered By line: ON — OFF karo" if footer_on(cfg)
-                              else "💜 Powered By line: OFF — ON karo", callback_data="cmz:hs:foot")],
+        [InlineKeyboardButton("💜 Branding: ON — OFF karo" if footer_on(cfg)
+                              else "💜 Branding: OFF — ON karo", callback_data="cmz:hs:foot")],
     ]
     if multi:       # Multi mode ON: anime ke naam pe kis update channel ka link lage — yahan chuno
         rows.append([InlineKeyboardButton("🔗 Anime links: " + (cfg.get("link_ch_title") or "Link 1 (default)"),
@@ -1147,7 +1150,7 @@ async def handle(client: Client, cb: CallbackQuery, args: list):
         cfg = await _cfg()
         cfg["footer"] = not footer_on(cfg)
         await _save(cfg)
-        await cb.answer("💜 Powered By ON" if cfg["footer"] else "Powered By OFF")
+        await cb.answer("💜 Branding ON" if cfg["footer"] else "Branding OFF — links/community nahi lagenge")
         await render(client, cb)
         return
 
