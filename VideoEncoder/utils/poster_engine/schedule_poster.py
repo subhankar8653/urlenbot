@@ -172,8 +172,8 @@ def _brand_row(c: _Canvas, brand: str):
 
 # ------------------------------------------------------------------ art (right side)
 def _grid_rows(n: int) -> list:
-    """Kitne character kis row mein. 4 => 2+2 (upar do, neeche do); 5+ => ek row mein 3."""
-    return {1: [1], 2: [2], 3: [2, 1], 4: [2, 2], 5: [3, 2], 6: [3, 3], 7: [3, 2, 2],
+    """Kitne character kis row mein: 2 => upar 1 neeche 1; 3 => 2+1; 4 => 2+2; 5 => 3+2; 6 => 3+3."""
+    return {1: [1], 2: [1, 1], 3: [2, 1], 4: [2, 2], 5: [3, 2], 6: [3, 3], 7: [3, 2, 2],
             8: [3, 3, 2]}.get(n, [3, 3, 3])
 
 
@@ -504,14 +504,14 @@ def _upscale(im: Image.Image, min_h: int = 900) -> Image.Image:
     return im.resize((int(im.width * k), min_h), Image.LANCZOS)
 
 
-async def _fanart_character(a):
-    """fanart.tv 'characterart' (sirf asli character — logo/clearart nahi). Transparent RGBA ya None."""
+async def _fanart_character(a, kinds=("characterart",)):
+    """fanart.tv transparent image (kinds: 'characterart' = asli character; 'hdclearart'/'clearart' = logo + characters)."""
     import httpx
     from . import dataset
     src = dataset._sources()
     async with httpx.AsyncClient(headers=dataset.HEADERS, timeout=25, follow_redirects=True) as client:
         data = await dataset._fanart_data(client, a)
-        urls = dataset._fanart_urls(data, ("characterart",))[:6]
+        urls = dataset._fanart_urls(data, kinds)[:6]
         random.shuffle(urls)
         for u in urls:
             img = await src.fetch_image(client, u, rgba=True)
@@ -583,7 +583,15 @@ async def _pick_art(titles: list):
                     LOGGER.warning(f"[SchedulePoster] fanart for '{t}' failed: {e!r}")
                 if img is not None:
                     return "cut", img
-                return await _cutout_from_portraits(a)
+                got = await _cutout_from_portraits(a)          # rembg / GrabCut / flood-fill cut-out
+                if got is not None:
+                    return got
+                try:                                           # last: pehle jaisa fanart.tv clearart (logo + characters)
+                    img = await _fanart_character(a, ("hdclearart", "clearart"))
+                except Exception as e:
+                    LOGGER.warning(f"[SchedulePoster] clearart for '{t}' failed: {e!r}")
+                    img = None
+                return ("cut", img) if img is not None else None
             except Exception as e:
                 LOGGER.warning(f"[SchedulePoster] art for '{t}' failed: {e!r}")
                 return None
