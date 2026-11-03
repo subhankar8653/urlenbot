@@ -219,6 +219,55 @@ def _group_art(c: _Canvas, chars: list, bx0, by0, bx1, by1):
     c.refresh()
 
 
+def _avatar_group(c: _Canvas, imgs: list, bx0, by0, bx1, by1):
+    """Cut-out na bane to: character ke gol (circle) avatar, saaf-suthre, ek doosre se atakte nahi."""
+    n = len(imgs)
+    rows = 1 if n <= 3 else 2
+    per = [n] if rows == 1 else [(n + 1) // 2, n // 2]
+    top, bot = by0 + 16, by1 - 52                            # neeche label pill ki jagah
+    avail_w = (bx1 - 40) - (bx0 + 30)
+    gap = 14
+    d = min(230, (bot - top - gap * (rows - 1)) / rows,
+            min((avail_w - gap * (k - 1)) / k for k in per))
+    d = int(d)
+    base = c.img.convert("RGBA")
+    y = top + ((bot - top) - (rows * d + gap * (rows - 1))) / 2
+    it = iter(imgs)
+    ring = 5
+    for k in per:
+        row_w = k * d + gap * (k - 1)
+        x = bx0 + 30 + (avail_w - row_w) / 2
+        for _ in range(k):
+            im = next(it).convert("RGBA")
+            bb = im.getchannel("A").getbbox()
+            if bb:
+                im = im.crop(bb)
+            side = min(im.width, int(im.height * 0.82)) if im.height > im.width else im.width
+            side = max(1, min(side, im.width))
+            left = (im.width - side) // 2
+            im = im.crop((left, 0, left + side, min(im.height, side)))        # chehra upar-beech se
+            big = sp(d)
+            av = im.resize((big, big), Image.LANCZOS)
+            bg = Image.new("RGBA", (big, big), (255, 255, 255, 255))
+            bg.alpha_composite(av)
+            mask = Image.new("L", (big, big), 0)
+            ImageDraw.Draw(mask).ellipse([0, 0, big - 1, big - 1], fill=255)
+            px, py = sp(x), sp(y)
+            sh = Image.new("RGBA", base.size, (0, 0, 0, 0))
+            ImageDraw.Draw(sh).ellipse([px + sp(4), py + sp(6), px + big + sp(4), py + big + sp(6)], fill=(0, 0, 0, 110))
+            sh = sh.filter(ImageFilter.GaussianBlur(sp(7)))
+            base = Image.alpha_composite(base, sh)
+            rd = Image.new("RGBA", base.size, (0, 0, 0, 0))
+            ImageDraw.Draw(rd).ellipse([px - sp(ring), py - sp(ring), px + big + sp(ring), py + big + sp(ring)],
+                                       fill=(255, 255, 255, 255))
+            base = Image.alpha_composite(base, rd)
+            base.paste(bg, (px, py), mask)
+            x += d + gap
+        y += d + gap
+    c.img = base.convert("RGB")
+    c.refresh()
+
+
 def _art_block(c: _Canvas, art, label: str):
     """red block + pink circle + character (RGBA png) ya cover card (RGB)"""
     bx0, by0, bx1, by1 = 730, 372, 1268, 676
@@ -229,7 +278,9 @@ def _art_block(c: _Canvas, art, label: str):
     if art is None:
         return
     kind, img = art
-    if kind == "chars":
+    if kind == "avatars":
+        _avatar_group(c, img, bx0, by0, bx1, by1)
+    elif kind == "chars":
         _group_art(c, img, bx0, by0, bx1, by1)
     elif kind == "char":
         ch = img.convert("RGBA")
@@ -428,8 +479,9 @@ async def _fanart_character(a):
 
 
 async def _cutout_from_portraits(a):
-    """AniList character portrait -> cut-out (rembg > flood-fill > soft fade)."""
-    for im in await _portrait_candidates(a):
+    """AniList character portrait -> ('cut', RGBA cut-out) (rembg > flood-fill) ya ('card', RGB portrait) ya None."""
+    ports = await _portrait_candidates(a)
+    for im in ports:
         cut = None
         try:
             import os
@@ -441,10 +493,9 @@ async def _cutout_from_portraits(a):
         if cut is None:
             cut = await asyncio.to_thread(_flood_cutout, im)
         if cut is not None:
-            return await asyncio.to_thread(_upscale, cut)
-    ports = await _portrait_candidates(a)
+            return "cut", await asyncio.to_thread(_upscale, cut)
     if ports:
-        return await asyncio.to_thread(lambda: _feathered(_upscale(ports[0])))
+        return "card", await asyncio.to_thread(_upscale, ports[0])
     return None
 
 
@@ -472,17 +523,21 @@ async def _pick_art(titles: list):
                     img = await _fanart_character(a)
                 except Exception as e:
                     LOGGER.warning(f"[SchedulePoster] fanart for '{t}' failed: {e!r}")
-                if img is None:
-                    img = await _cutout_from_portraits(a)
-                return img
+                if img is not None:
+                    return "cut", img
+                return await _cutout_from_portraits(a)
             except Exception as e:
                 LOGGER.warning(f"[SchedulePoster] art for '{t}' failed: {e!r}")
                 return None
 
-    imgs = [im for im in await asyncio.gather(*[one(t) for t in pool]) if im is not None]
-    if not imgs:
+    got = [x for x in await asyncio.gather(*[one(t) for t in pool]) if x is not None]
+    if not got:
         return None, ""
-    return ("chars", imgs), ("TODAY'S LINEUP" if len(imgs) > 1 else pool[0])
+    imgs = [im for _k, im in got]
+    label = "TODAY'S LINEUP" if len(imgs) > 1 else pool[0]
+    if all(k == "cut" for k, _ in got):                       # sab saaf cut-out => khade hue characters
+        return ("chars", imgs), label
+    return ("avatars", imgs), label                           # warna gol avatar (kata-phata/atakta nahi)
 
 
 async def render_schedule_to_file(items: list, day: str, date_str: str, brand: str, dest: str,
