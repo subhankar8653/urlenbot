@@ -30,7 +30,7 @@ def _norm(d) -> dict:
     return {
         "style": style if 1 <= style <= 14 else 0,
         "button": str(d.get("button") or "").strip()[:24],
-        "brand": str(d.get("brand") or "").strip()[:24],
+        "brand": str(d.get("brand") or "").strip()[:48],
     }
 
 

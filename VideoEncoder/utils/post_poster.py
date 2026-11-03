@@ -34,7 +34,7 @@ async def make_post_poster(anime_name: str):
         if not cfg.get("style") or not (anime_name or "").strip():
             return None
         from .community import get_community_tag
-        brand = cfg.get("brand") or await get_community_tag()
+        brand = cfg.get("brand") or await get_community_tag(all_names=True)   # 2 community usernames -> dono poster pe
         key = hashlib.sha1(
             (re.sub(r"[^a-z0-9]+", " ", anime_name.lower()).strip() + "|" + poster_cfg.signature("post") + "|" + str(brand)).encode()
         ).hexdigest()[:16]
