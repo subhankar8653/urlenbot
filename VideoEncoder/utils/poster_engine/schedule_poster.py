@@ -171,6 +171,54 @@ def _brand_row(c: _Canvas, brand: str):
 
 
 # ------------------------------------------------------------------ art (right side)
+def _group_art(c: _Canvas, chars: list, bx0, by0, bx1, by1):
+    """Aaj ke har anime ka ek character — sab saath, right side mein. Jitne zyada character, utne chhote."""
+    imgs = []
+    for im in chars:
+        im = im.convert("RGBA")
+        bb = im.getchannel("A").getbbox()
+        imgs.append(im.crop(bb) if bb else im)
+    if not imgs:
+        return
+    n = len(imgs)
+    area_l, area_r, bottom = 748, 1250, by1                 # character in hudood (red block ke andar chaudai)
+    avail_w = area_r - area_l
+    overlap = 0.0 if n == 1 else (0.28 if n <= 3 else 0.38)
+    h = {1: 640, 2: 600, 3: 560, 4: 520, 5: 480}.get(n, 450)
+    for _ in range(40):                                     # width fit hone tak chhota karo
+        ws = [im.width * h / im.height for im in imgs]
+        total = sum(ws) - overlap * sum(ws[1:])
+        if total <= avail_w or h <= 200:
+            break
+        h *= 0.95
+    ws = [max(1, int(im.width * h / im.height)) for im in imgs]
+    hs = [int(h)] * n
+    total = sum(ws) - int(overlap * sum(ws[1:]))
+    x = area_l + (avail_w - total) / 2
+    cx = x + total / 2
+    r = min(215, total * 0.5 + 20)
+    cy = bottom - h * 0.55
+    c.d.ellipse([sp(cx - r), sp(cy - r), sp(cx + r), sp(cy + r)], fill=PILL_FILL)
+    c.d.rectangle([sp(bx0), sp(by0), sp(bx1), sp(by1)], fill=RED)           # block halo ke neeche solid rahe
+    # draw order: kinare pehle, beech wala upar (center character sabse aage)
+    order = sorted(range(n), key=lambda i: -abs(i - (n - 1) / 2))
+    pos, xx = [], x
+    for i in range(n):
+        pos.append(xx)
+        xx += ws[i] * (1 - overlap)
+    base = c.img.convert("RGBA")
+    for i in order:
+        ch = imgs[i].resize((sp(ws[i]), sp(hs[i])), Image.LANCZOS)
+        px, py = sp(pos[i]), sp(bottom - hs[i])
+        sh = Image.new("RGBA", base.size, (0, 0, 0, 0))
+        sh.paste((0, 0, 0, 110), (px + sp(6), py + sp(6)), ch.getchannel("A"))
+        sh = sh.filter(ImageFilter.GaussianBlur(sp(8)))
+        base = Image.alpha_composite(base, sh)
+        base.alpha_composite(ch, (px, py))
+    c.img = base.convert("RGB")
+    c.refresh()
+
+
 def _art_block(c: _Canvas, art, label: str):
     """red block + pink circle + character (RGBA png) ya cover card (RGB)"""
     bx0, by0, bx1, by1 = 730, 372, 1268, 676
@@ -181,7 +229,9 @@ def _art_block(c: _Canvas, art, label: str):
     if art is None:
         return
     kind, img = art
-    if kind == "char":
+    if kind == "chars":
+        _group_art(c, img, bx0, by0, bx1, by1)
+    elif kind == "char":
         ch = img.convert("RGBA")
         bbox = ch.getchannel("A").getbbox()
         if bbox:
@@ -220,7 +270,7 @@ def _art_block(c: _Canvas, art, label: str):
     # "FEATURING" label (small, on the red block)
     if label:
         f = _font("Poppins-Bold.ttf", 12.5)
-        txt = c.fit_text("FEATURING · " + label.upper(), f, 330)
+        txt = c.fit_text(("" if label.startswith("TODAY") else "FEATURING · ") + label.upper(), f, 330)
         tw = c.spaced_w(txt, f, 1.2)
         px0, py0 = bx1 - 24 - tw - 28, by1 - 14 - 30
         c.d.rounded_rectangle([sp(px0), sp(py0), sp(bx1 - 24), sp(py0 + 30)], radius=sp(15), fill="white")
@@ -361,65 +411,78 @@ def _upscale(im: Image.Image, min_h: int = 900) -> Image.Image:
     return im.resize((int(im.width * k), min_h), Image.LANCZOS)
 
 
+async def _fanart_character(a):
+    """fanart.tv 'characterart' (sirf asli character — logo/clearart nahi). Transparent RGBA ya None."""
+    import httpx
+    from . import dataset
+    src = dataset._sources()
+    async with httpx.AsyncClient(headers=dataset.HEADERS, timeout=25, follow_redirects=True) as client:
+        data = await dataset._fanart_data(client, a)
+        urls = dataset._fanart_urls(data, ("characterart",))[:6]
+        random.shuffle(urls)
+        for u in urls:
+            img = await src.fetch_image(client, u, rgba=True)
+            if img is not None and src.has_transparency(img):
+                return img
+    return None
+
+
+async def _cutout_from_portraits(a):
+    """AniList character portrait -> cut-out (rembg > flood-fill > soft fade)."""
+    for im in await _portrait_candidates(a):
+        cut = None
+        try:
+            import os
+            from rembg import new_session, remove              # optional (pip install rembg onnxruntime)
+            sess = await asyncio.to_thread(new_session, os.environ.get("REMBG_MODEL", "isnet-anime"))
+            cut = await asyncio.to_thread(lambda: remove(im, session=sess).convert("RGBA"))
+        except Exception:
+            cut = None
+        if cut is None:
+            cut = await asyncio.to_thread(_flood_cutout, im)
+        if cut is not None:
+            return await asyncio.to_thread(_upscale, cut)
+    ports = await _portrait_candidates(a)
+    if ports:
+        return await asyncio.to_thread(lambda: _feathered(_upscale(ports[0])))
+    return None
+
+
+MAX_CHARS = 6
+
+
 async def _pick_art(titles: list):
-    """(('char', RGBA) | None, anime title). Aaj ke anime mein se random ek ka CHARACTER (cover card kabhi nahi).
-    1) fanart.tv transparent PNG (saare anime try)  2) rembg cut-out (agar installed)  3) AniList portrait ka cut-out
-    4) portrait soft-fade."""
-    from . import api, dataset
+    """(('chars', [RGBA, ...]) | None, label). Aaj ke HAR anime ka ek character (max 6), sab right side mein.
+    Har anime: fanart.tv characterart -> AniList character cut-out. Cover / logo kabhi nahi."""
+    from . import api
     pool = [t for t in dict.fromkeys(titles) if t]
-    random.shuffle(pool)
-    pool = pool[:7]
+    if len(pool) > MAX_CHARS:                                   # zyada anime: random 6 (time ka order same)
+        keep = set(random.sample(range(len(pool)), MAX_CHARS))
+        pool = [t for i, t in enumerate(pool) if i in keep]
     sem = asyncio.Semaphore(3)
 
-    async def load(t):
+    async def one(t):
         async with sem:
             try:
                 a = await api.find_anime(t)
                 if a is None:
                     return None
-                await dataset._ensure_character(a)
-                return t, a
+                img = None
+                try:
+                    img = await _fanart_character(a)
+                except Exception as e:
+                    LOGGER.warning(f"[SchedulePoster] fanart for '{t}' failed: {e!r}")
+                if img is None:
+                    img = await _cutout_from_portraits(a)
+                return img
             except Exception as e:
                 LOGGER.warning(f"[SchedulePoster] art for '{t}' failed: {e!r}")
                 return None
 
-    loaded = [x for x in await asyncio.gather(*[load(t) for t in pool]) if x]
-
-    # 1) transparent character PNGs
-    with_png = [(t, a) for t, a in loaded if a.characters]
-    if with_png:
-        t, a = random.choice(with_png)
-        _label, img = random.choice(a.characters)
-        return ("char", img), a.title or t
-
-    # 2/3/4) AniList character portrait -> cut-out (rembg > flood-fill > soft fade)
-    fallback = None
-    for t, a in loaded:
-        try:
-            portraits = await _portrait_candidates(a)
-        except Exception as e:
-            LOGGER.warning(f"[SchedulePoster] portraits for '{t}' failed: {e!r}")
-            continue
-        for im in portraits:
-            cut = None
-            try:
-                from rembg import new_session, remove          # optional (pip install rembg onnxruntime)
-                import os
-                sess = await asyncio.to_thread(new_session, os.environ.get("REMBG_MODEL", "isnet-anime"))
-                cut = await asyncio.to_thread(lambda: remove(im, session=sess).convert("RGBA"))
-            except Exception:
-                cut = None
-            if cut is None:
-                cut = await asyncio.to_thread(_flood_cutout, im)
-            if cut is not None:
-                return ("char", await asyncio.to_thread(_upscale, cut)), a.title or t
-            if fallback is None:
-                fallback = (im, a.title or t)
-    if fallback:
-        im, label = fallback
-        feathered = await asyncio.to_thread(lambda: _feathered(_upscale(im)))
-        return ("char", feathered), label
-    return None, ""
+    imgs = [im for im in await asyncio.gather(*[one(t) for t in pool]) if im is not None]
+    if not imgs:
+        return None, ""
+    return ("chars", imgs), ("TODAY'S LINEUP" if len(imgs) > 1 else pool[0])
 
 
 async def render_schedule_to_file(items: list, day: str, date_str: str, brand: str, dest: str,
