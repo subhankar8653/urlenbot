@@ -15,7 +15,14 @@ Commands (owner/sudo):
   /hindi_schedule_now [mon..sun]           — abhi post karo (aaj ka, ya koi din)
   /hindi_schedule_debug                    — page ka raw text file (parser tune karne ke liye)
 
+  /hindi_schedule_style [new|old]          — post ka style: NEW (image + clickable anime links) / OLD (purana list)
+
 /customise → ⏰ Cleanup & Schedule → 📅 Hindi Anime Schedule  (sab buttons se bhi)
+
+NEW style : upar stylish image (poster-11 design: aaj ki date, anime list + time, community ke 1/2 username,
+            aaj ke anime mein se kisi ek ka character) + neeche caption list — har anime ka naam us anime ke
+            channel ka join link hota hai (SIRF agar anime /add_anime se add hai; warna plain text).
+OLD style : purana banner + box wali list (koi badlav nahi).
 
 Data: db.col2 {'id': 'hindi_schedule_cfg'} → {'cfg': {channel_id, channel_title, enabled,
       time 'HH:MM' (IST 24h), last_date 'YYYY-MM-DD', last_try ISO}}
@@ -29,6 +36,7 @@ import re
 import shutil
 import tempfile
 import time as _time
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 
 from pyrogram import Client, filters, StopPropagation, ContinuePropagation
@@ -443,6 +451,154 @@ def build_posts(day_idx: int, now: datetime, items: list, footer: str = "") -> l
     return msgs
 
 
+
+# ───────────────────────── NEW style (image + clickable titles) ─────────────────────────
+CAPTION_LIMIT = 1000        # Telegram photo-caption limit 1024 (visible text) — thoda margin
+
+_BOLD_SANS = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+    "𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭𝗮𝗯𝗰𝗱𝗲𝗳𝗴𝗵𝗶𝗷𝗸𝗹𝗺𝗻𝗼𝗽𝗾𝗿𝘀𝘁𝘂𝘃𝘄𝘅𝘆𝘇")
+_SMALLCAPS = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ᴀʙᴄᴅᴇғɢʜɪᴊᴋʟᴍɴᴏᴘǫʀsᴛᴜᴠᴡxʏᴢ")
+
+
+def style_of(cfg: dict) -> str:
+    return "old" if (cfg or {}).get("style") == "old" else "new"
+
+
+def footer_on(cfg: dict) -> bool:
+    """Powered-By line: NEW style mein default ON, OLD style mein default OFF (toggle se badal sakte ho)."""
+    if "footer" in (cfg or {}):
+        return bool(cfg["footer"])
+    return style_of(cfg) == "new"
+
+
+def _visible_len(html_text: str) -> int:
+    return len(_html.unescape(re.sub(r"<[^>]+>", "", html_text)))
+
+
+def _title_key(s: str) -> str:
+    """Anime naam ko compare karne layak banao (season/part/dub jaise shabd hata ke)."""
+    s = (s or "").lower()
+    s = re.sub(r"\b(the\s+)?final\s+season\b|\bseason\s*\d+\b|\b\d+(?:st|nd|rd|th)\s+season\b|"
+               r"\bpart\s*\d+\b|\bcour\s*\d+\b|\bs\d+\b|\b(?:hindi|dubbed|dub|sub|tv)\b", " ", s)
+    return re.sub(r"[^a-z0-9]", "", s)
+
+
+def match_link(title: str, pairs: list):
+    """pairs = [(anime_name, link)] (/add_anime se add anime). Title match ho to us anime ka channel link, warna None."""
+    t = _title_key(title)
+    if not t:
+        return None
+    best, best_link = 0.0, None
+    for name, link in pairs:
+        k = _title_key(name)
+        if not k or not link:
+            continue
+        score = 1.0 if k == t else SequenceMatcher(None, k, t).ratio()
+        if score > best:
+            best, best_link = score, link
+    return best_link if best >= 0.9 else None
+
+
+async def load_anime_links() -> list:
+    """/add_anime se add har anime ka [(naam, channel join link)]. Link nahi => list mein nahi => link nahi lagega."""
+    pairs = []
+    try:
+        if owner:
+            user = await db._get_user(owner[0])
+            for e in (user.get("anime_monitor_list") or []):
+                link = (e.get("channel_link") or "").strip()
+                if e.get("anime_name") and link.startswith(("http://", "https://", "t.me/")):
+                    pairs.append((e["anime_name"], link if link.startswith("http") else "https://" + link))
+    except Exception as e:
+        LOGGER.warning(f"[HindiSchedule] anime_monitor_list read failed: {e}")
+    try:
+        doc = await db.col2.find_one({"id": "update_post_map"})
+        for key, v in ((doc or {}).get("map") or {}).items():
+            if not isinstance(v, dict):
+                continue
+            link = (v.get("invite_link") or (v.get("invite_links") or [""])[0] or "").strip()
+            if link.startswith(("http://", "https://")):
+                pairs.append((v.get("display_name") or key, link))
+    except Exception as e:
+        LOGGER.warning(f"[HindiSchedule] update_post_map read failed: {e}")
+    return pairs
+
+
+def _ep_code_new(it) -> str:
+    """'S06 • E07' / 'S04 • E05—E08' / 'E361' (season na ho) / 'Upcoming Dub'  (+ pehla episode => [ɴᴇᴡ])"""
+    if it["next"] is None:
+        return "Upcoming Dub" if it["upcoming"] else "TBA"
+
+    def f(n):
+        return f"{n:02d}" if n < 100 else str(n)
+    ep = f"E{f(it['next'])}"
+    if it["next_end"] and it["next_end"] != it["next"]:
+        ep += f"—E{f(it['next_end'])}"
+    elif it["per_release"] and it["per_release"] > 1:
+        ep += "+"
+    return f"S{it['season']:02d} • {ep}" if it["season"] else ep
+
+
+def _item_time(it, today) -> str:
+    t = it["next_time"] if it["next_date"] == today and it["next_time"] else it["time"]
+    return _time12(t)
+
+
+def schedule_rows(items: list, now: datetime) -> list:
+    """Aaj ke anime -> [{title, ep, time, new}] (image + caption dono isse bante hain)."""
+    today = now.date()
+    out = []
+    for it in items:
+        if not _is_today(it, today):
+            continue
+        out.append({"title": it["title"], "ep": _ep_code_new(it), "time": _item_time(it, today),
+                    "new": it["next"] == 1})
+    return out
+
+
+def build_new_posts(day_idx: int, now: datetime, rows: list, links: list, handles: str = "") -> list:
+    """
+    NEW style caption(s) (HTML). msgs[0] image ke saath caption banta hai (<= CAPTION_LIMIT), baaki text msgs.
+
+        ⟣──────────⟢ / 𝗙𝗥𝗜𝗗𝗔𝗬 / ⟣──────────⟢
+        ‣ <a href=channel-link>Anime</a>          ← link SIRF /add_anime wale anime pe
+          ↳ S06 • E07 [ɴᴇᴡ]  ⏰ 07:40 PM
+        ⟣────────⟢
+        ❝ ᴘᴏᴡᴇʀᴇᴅ ʙʏ : @A | @B ❞
+    """
+    E = lambda s: _html.escape(str(s), quote=False)
+    A = lambda s: _html.escape(str(s), quote=True)
+    line = "⟣────────────────────⟢"
+    name = DAY_FULL[day_idx].upper().translate(_BOLD_SANS)
+    pad = " " * max(0, int(20 * (20 - 1.3 * len(name)) / (20 - 1.3 * 9)))
+    banner = f"{line}\n{pad}<b>{name}</b>\n{line}"
+    closing = "⟣────────────⟢"
+    if handles:
+        closing += "\n<blockquote><b>" + "ᴘᴏᴡᴇʀᴇᴅ ʙʏ".translate(_SMALLCAPS) + f" : {E(handles)}</b></blockquote>"
+
+    if not rows:
+        return [banner + "\n\n😴 Aaj koi Hindi anime nahi aa raha.\n" + closing]
+
+    blocks = []
+    for r in rows:
+        link = match_link(r["title"], links)
+        title = f'<a href="{A(link)}">{E(r["title"])}</a>' if link else E(r["title"])
+        tag = " [ɴᴇᴡ]" if r["new"] else ""
+        blocks.append(f"‣ {title}\n  ↳ {E(r['ep'])}{tag}  ⏰ {E(r['time'])}")
+
+    msgs, cur = [], banner
+    limit_first = CAPTION_LIMIT - _visible_len(closing) - 4
+    for b in blocks:
+        lim = limit_first if not msgs else MAX_MSG_LEN - len(closing) - 20
+        if cur != banner and _visible_len(cur) + _visible_len(b) + 2 > lim and cur.strip():
+            msgs.append(cur)
+            cur = ""
+        cur = (cur + ("\n" if cur == banner else "\n\n") + b) if cur else b
+    msgs.append(cur + "\n" + closing)
+    return msgs
+
+
 # ───────────────────────── posting ─────────────────────────
 async def _owner_dm(client: Client, text: str):
     for oid in dict.fromkeys(list(owner)):
@@ -450,6 +606,48 @@ async def _owner_dm(client: Client, text: str):
             await client.send_message(oid, text, parse_mode=ParseMode.DISABLED)
         except Exception:
             pass
+
+
+async def _post_new_style(client: Client, ch, cfg: dict, day_idx: int, now: datetime, items: list):
+    """NEW style: stylish image + caption (clickable anime names). Image fail/OFF => sirf text post."""
+    from ..utils.community import get_community_tag
+    try:
+        handles_list = await get_community_tag(all_names=True)          # '@A @B' — community mein jitne set hain
+    except Exception:
+        handles_list = ""
+    handles = " | ".join(handles_list.split())
+    rows = schedule_rows(items, now)
+    links = await load_anime_links()
+    msgs = build_new_posts(day_idx, now, rows, links, handles if footer_on(cfg) else "")
+
+    img_path = None
+    if rows and cfg.get("image", True):
+        try:
+            from ..utils.poster_engine import schedule_poster
+            fd, img_path = tempfile.mkstemp(prefix="hs_img_", suffix=".jpg")
+            os.close(fd)
+            date_str = now.strftime("%d %b %Y")
+            ok = await schedule_poster.render_schedule_to_file(
+                rows, DAY_FULL[day_idx], date_str, handles_list, img_path)
+            if not ok:
+                img_path = None
+        except Exception as e:
+            LOGGER.warning(f"[HindiSchedule] schedule image fail (text post hoga): {e}")
+            img_path = None
+    try:
+        for i, text in enumerate(msgs):
+            if i == 0 and img_path:
+                await client.send_photo(ch, img_path, caption=text, parse_mode=ParseMode.HTML)
+            else:
+                await client.send_message(ch, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            if i < len(msgs) - 1:
+                await asyncio.sleep(2)
+    finally:
+        if img_path:
+            try:
+                os.remove(img_path)
+            except OSError:
+                pass
 
 
 async def post_schedule(client: Client, day_idx: int = None, manual: bool = False):
@@ -481,21 +679,24 @@ async def post_schedule(client: Client, day_idx: int = None, manual: bool = Fals
             if not data["clicked"]:
                 LOGGER.warning(f"[HindiSchedule] day tab '{DAYS[day_idx]}' click nahi hua — page ka default view use hua")
 
-            footer = ""
-            if cfg.get("footer"):      # "Powered By" line — default OFF
-                try:
-                    from ..utils.community import get_community_tag
-                    from ..utils.caption_style import _handles_brackets
-                    footer = _handles_brackets(await get_community_tag(all_names=True), spaced=True)
-                except Exception:
-                    footer = ""
+            if style_of(cfg) == "new":
+                await _post_new_style(client, ch, cfg, day_idx, now, items)
+            else:
+                footer = ""
+                if footer_on(cfg):      # "Powered By" line (OLD style: default OFF)
+                    try:
+                        from ..utils.community import get_community_tag
+                        from ..utils.caption_style import _handles_brackets
+                        footer = _handles_brackets(await get_community_tag(all_names=True), spaced=True)
+                    except Exception:
+                        footer = ""
 
-            msgs = build_posts(day_idx, now, items, footer)
-            for i, text in enumerate(msgs):
-                await client.send_message(ch, text, parse_mode=ParseMode.HTML,
-                                          disable_web_page_preview=True)
-                if i < len(msgs) - 1:
-                    await asyncio.sleep(2)
+                msgs = build_posts(day_idx, now, items, footer)
+                for i, text in enumerate(msgs):
+                    await client.send_message(ch, text, parse_mode=ParseMode.HTML,
+                                              disable_web_page_preview=True)
+                    if i < len(msgs) - 1:
+                        await asyncio.sleep(2)
             LOGGER.info(f"[HindiSchedule] posted {len(items)} anime ({DAYS[day_idx]}) to {ch}")
             if not manual:
                 cfg = await _cfg()
@@ -623,7 +824,25 @@ async def cmd_status(client: Client, message: Message):
         await message.reply("🟢 Hindi schedule auto-post **ON**" if cfg["enabled"] else "🔴 Hindi schedule auto-post **OFF**")
         return
     await message.reply(_status_text(cfg) + "\n\nCommands: `/hindi_schedule on|off`, `/hindi_schedule_time`, "
-                        "`/hindi_schedule_now`, `/add_hindi_anime_schedule`")
+                        "`/hindi_schedule_now`, `/hindi_schedule_style`, `/add_hindi_anime_schedule`")
+
+
+@Client.on_message(filters.command("hindi_schedule_style") & filters.private)
+async def cmd_style(client: Client, message: Message):
+    if not _is_auth(message.from_user.id):
+        return
+    parts = message.text.split()
+    cfg = await _cfg()
+    if len(parts) < 2 or parts[1].lower() not in ("new", "old"):
+        await message.reply(
+            f"🎨 Abhi style: **{style_of(cfg).upper()}**\n\n"
+            "`/hindi_schedule_style new` — image + clickable anime links\n"
+            "`/hindi_schedule_style old` — purana list style")
+        return
+    cfg["style"] = parts[1].lower()
+    await _save(cfg)
+    await message.reply("✨ **NEW** style set — image + anime links." if cfg["style"] == "new"
+                        else "📜 **OLD** style set — purana list.")
 
 
 @Client.on_message(filters.command("hindi_schedule_now") & filters.private)
@@ -680,7 +899,9 @@ def _status_text(cfg: dict) -> str:
         f"📢 Channel: {ch}\n"
         f"⏰ Roz post: **{fmt12(h, m)} IST**\n"
         f"🔔 Auto-post: **{'🟢 ON' if cfg.get('enabled', True) else '🔴 OFF'}**\n"
-        f"💜 Powered By line: **{'🟢 ON' if cfg.get('footer') else '🔴 OFF'}**\n"
+        f"🎨 Style: **{'✨ NEW (image + links)' if style_of(cfg) == 'new' else '📜 OLD (classic list)'}**\n"
+        f"🖼 Image: **{'🟢 ON' if cfg.get('image', True) else '🔴 OFF'}** _(NEW style)_\n"
+        f"💜 Powered By line: **{'🟢 ON' if footer_on(cfg) else '🔴 OFF'}**\n"
         f"🗓 Aaj: {today}\n"
         f"📤 Last post: {cfg.get('last_date') or '—'}"
     )
@@ -709,7 +930,11 @@ async def render(client: Client, cb: CallbackQuery):
          InlineKeyboardButton("⏰ Post Time", callback_data="cmz:hs:time")],
         [InlineKeyboardButton("🟢 Auto-post ON — OFF karo" if on else "🔴 Auto-post OFF — ON karo",
                               callback_data="cmz:hs:tog")],
-        [InlineKeyboardButton("💜 Powered By line: ON — OFF karo" if cfg.get("footer")
+        [InlineKeyboardButton("🎨 Style: ✨ NEW — OLD karo" if style_of(cfg) == "new"
+                              else "🎨 Style: 📜 OLD — NEW karo", callback_data="cmz:hs:style")],
+        [InlineKeyboardButton("🖼 Image: ON — OFF karo" if cfg.get("image", True)
+                              else "🖼 Image: OFF — ON karo", callback_data="cmz:hs:img")],
+        [InlineKeyboardButton("💜 Powered By line: ON — OFF karo" if footer_on(cfg)
                               else "💜 Powered By line: OFF — ON karo", callback_data="cmz:hs:foot")],
         [InlineKeyboardButton("📤 Aaj ka schedule abhi post karo", callback_data="cmz:hs:now")],
         [InlineKeyboardButton("🧪 Debug file", callback_data="cmz:hs:dbg")],
@@ -786,9 +1011,25 @@ async def handle(client: Client, cb: CallbackQuery, args: list):
 
     if sub == "foot":
         cfg = await _cfg()
-        cfg["footer"] = not cfg.get("footer", False)
+        cfg["footer"] = not footer_on(cfg)
         await _save(cfg)
         await cb.answer("💜 Powered By ON" if cfg["footer"] else "Powered By OFF")
+        await render(client, cb)
+        return
+
+    if sub == "style":
+        cfg = await _cfg()
+        cfg["style"] = "old" if style_of(cfg) == "new" else "new"
+        await _save(cfg)
+        await cb.answer("✨ NEW style" if cfg["style"] == "new" else "📜 OLD style")
+        await render(client, cb)
+        return
+
+    if sub == "img":
+        cfg = await _cfg()
+        cfg["image"] = not cfg.get("image", True)
+        await _save(cfg)
+        await cb.answer("🖼 Image ON" if cfg["image"] else "🖼 Image OFF")
         await render(client, cb)
         return
 

@@ -124,6 +124,7 @@ CATALOG = [
         ("/add_hindi_anime_schedule", "/add_hindi_anime_schedule <channel_id>", "Hindi schedule channel set karo."),
         ("/hindi_schedule_time", "/hindi_schedule_time 08:00", "Roz kab post ho (IST)."),
         ("/hindi_schedule_now", "/hindi_schedule_now [mon..sun]", "Abhi schedule post karo."),
+        ("/hindi_schedule_style", "/hindi_schedule_style new|old", "Schedule post ka style: NEW (image + anime links) / OLD (purana)."),
         ("/hindi_schedule_debug", "/hindi_schedule_debug", "Hindi schedule scraper ka debug data."),
         ("/anime_news", "/anime_news [on|off]", "Anime news auto-post ka status / on / off."),
         ("/add_anime_news_channel", "/add_anime_news_channel <channel_id>", "Anime news channel set karo."),

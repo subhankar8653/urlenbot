@@ -183,7 +183,7 @@ async def _brand_text(s: dict) -> str:
         return s["brand"]
     try:
         from ..utils.community import get_community_tag
-        return await get_community_tag()
+        return await get_community_tag(all_names=True)
     except Exception:
         return "@SBANIME"
 
@@ -643,7 +643,7 @@ async def poster_panel_cb(client: Client, cb: CallbackQuery):
         await cb.answer()
         cur = s.get("brand") or "community naam (auto)"
         await _ask(client, cb,
-                   f"🏷 <b>Branding text bhejo</b> (max 24 letters).\nAbhi: <code>{html.escape(cur)}</code>\n\n"
+                   f"🏷 <b>Branding text bhejo</b> (max 48 letters).\nAbhi: <code>{html.escape(cur)}</code>\n\n"
                    "Community naam wapas lagana ho to <code>reset</code> likho.")
         return
 
