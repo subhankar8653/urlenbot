@@ -482,7 +482,7 @@ def _draw(cv, th, meta, character, cover, button):
     cv.circle(X + 39, 72, 39, fill=(0, 0, 0, 255))
     for yy in (60, 72, 84):
         cv.rounded_box((X + 24, yy - 3, X + 56, yy + 3), 3, fill=(255, 255, 255, 255))
-    cv.text((X + 98, 74), BRAND, cv.font("Lilita", 40), DARK, anchor="lm")
+    cv.text((X + 98, 74), BRAND, cv.font("Lilita", 40 if len(BRAND) <= 20 else max(24, int(40 * 20 / len(BRAND)))), DARK, anchor="lm")   # 2 usernames: chhota font
 
     # --- text column ---
     last = draw_title(cv, th, meta, X, MAXW, 290, mode="first", pitch=1.02, font="Lilita", tracking_em=0.0,
