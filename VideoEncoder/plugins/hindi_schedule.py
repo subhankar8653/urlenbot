@@ -363,8 +363,20 @@ def _time12(t) -> str:
     return f"{int(m.group(1)):02d}:{m.group(2)} {m.group(3).upper()}" if m else (t or "TBA")
 
 
+def season_of(it) -> int:
+    """Season number — site ke card se; na ho to title se ('Season 2', '2nd Season', 'Part 3'); phir bhi na mile to 1."""
+    if it.get("season"):
+        return int(it["season"])
+    t = it.get("title") or ""
+    for pat in (r"\bseason\s*(\d{1,2})\b", r"\b(\d{1,2})(?:st|nd|rd|th)\s+season\b", r"\bS(\d{1,2})\b"):
+        m = re.search(pat, t, re.IGNORECASE)
+        if m and 1 <= int(m.group(1)) <= 40:
+            return int(m.group(1))
+    return 1
+
+
 def _ep_code(it) -> str:
-    """'S04 E13' / 'S01 E361–362' / 'E361' (season na ho) / 'Upcoming Dub'."""
+    """'S04 E13' / 'S01 E361–362' / 'Upcoming Dub'. Season HAMESHA dikhta hai (card mein na ho to S01)."""
     if it["next"] is None:
         return "Upcoming Dub" if it["upcoming"] else "TBA"
     def f(n):
@@ -374,7 +386,7 @@ def _ep_code(it) -> str:
         ep += f"–{f(it['next_end'])}"
     elif it["per_release"] and it["per_release"] > 1:
         ep += "+"
-    return f"S{it['season']:02d} {ep}" if it["season"] else ep
+    return f"S{season_of(it):02d} {ep}"
 
 
 def _lang_tags(langs) -> str:
@@ -453,6 +465,7 @@ def build_posts(day_idx: int, now: datetime, items: list, footer: str = "") -> l
 
 
 # ───────────────────────── NEW style (image + clickable titles) ─────────────────────────
+TIME_ICON = "✦"             # time se pehle ka icon (clock emoji hata diya) — theme ke hisaab se: ✦ ◈ ❖ ➤ ✧
 CAPTION_LIMIT = 1000        # Telegram photo-caption limit 1024 (visible text) — thoda margin
 
 _BOLD_SANS = str.maketrans(
@@ -484,45 +497,108 @@ def _title_key(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s)
 
 
+def _tokens(s: str) -> set:
+    s = re.sub(r"\(.*?\)|\[.*?\]", " ", (s or "").lower())
+    s = re.sub(r"\b(the\s+)?final\s+season\b|\bseason\s*\d+\b|\b\d+(?:st|nd|rd|th)\s+season\b|"
+               r"\bpart\s*\d+\b|\bcour\s*\d+\b|\bs\d+\b|\b(?:hindi|dubbed|dub|sub|tv|the|a|an|of|no|wa|ni|to)\b", " ", s)
+    return {w for w in re.findall(r"[a-z0-9]+", s) if w}
+
+
+def _match_score(title: str, name: str) -> float:
+    """0..1 — kitna milta hai. Exact / ek doosre mein shamil / shabdon ka overlap / spelling similarity."""
+    a, b = _title_key(title), _title_key(name)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    best = SequenceMatcher(None, a, b).ratio()
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) >= 8 and short in long_ and len(short) / len(long_) >= 0.6:
+        best = max(best, 0.93)                      # 'jojosbizarreadventuregoldenwind' vs '... goldenwind2018'
+    ta, tb = _tokens(title), _tokens(name)
+    if ta and tb:
+        inter = len(ta & tb)
+        jac = inter / len(ta | tb)
+        if jac >= 0.75:
+            best = max(best, 0.9 + 0.1 * jac)
+        if inter >= 3 and inter / min(len(ta), len(tb)) >= 0.99:   # chhota naam poora bade mein hai
+            best = max(best, 0.9)
+    # subtitle match: 'Show: Subtitle' — dono taraf subtitle same ho
+    sa, sb = (title.split(":", 1) + [""])[:2], (name.split(":", 1) + [""])[:2]
+    if sa[1].strip() and sb[1].strip() and _title_key(sa[1]) == _title_key(sb[1]) and len(_title_key(sa[1])) >= 6:
+        best = max(best, 0.92)
+    return best
+
+
 def match_link(title: str, pairs: list):
     """pairs = [(anime_name, link)] (/add_anime se add anime). Title match ho to us anime ka channel link, warna None."""
-    t = _title_key(title)
-    if not t:
-        return None
-    best, best_link = 0.0, None
+    best, best_link, best_name = 0.0, None, ""
     for name, link in pairs:
-        k = _title_key(name)
-        if not k or not link:
+        if not link:
             continue
-        score = 1.0 if k == t else SequenceMatcher(None, k, t).ratio()
+        score = _match_score(title, name)
         if score > best:
-            best, best_link = score, link
-    return best_link if best >= 0.9 else None
+            best, best_link, best_name = score, link, name
+    if best >= 0.88:
+        return best_link
+    if best_name:
+        LOGGER.info(f"[HindiSchedule] link nahi laga: '{title}' (sabse close: '{best_name}' {best:.2f})")
+    else:
+        LOGGER.info(f"[HindiSchedule] link nahi laga: '{title}' (add_anime list mein koi naam nahi mila)")
+    return None
 
 
-async def load_anime_links() -> list:
-    """/add_anime se add har anime ka [(naam, channel join link)]. Link nahi => list mein nahi => link nahi lagega."""
+def _http(link: str) -> str:
+    link = (link or "").strip()
+    if link.startswith(("http://", "https://")):
+        return link
+    if link.startswith(("t.me/", "telegram.me/")):
+        return "https://" + link
+    return ""
+
+
+async def load_anime_links(link_idx: int = 0) -> list:
+    """/add_anime se add har anime ka [(naam, channel join link)].
+    link_idx: Multi mode mein kaun sa Link (0 = Link 1 / Channel 01, 1 = Link 2 ...). Multi mode OFF ho to hamesha Link 1.
+    Link nahi => list mein nahi => link nahi lagega."""
+    from ..utils import multi_mode as _mm
     pairs = []
-    try:
-        if owner:
-            user = await db._get_user(owner[0])
-            for e in (user.get("anime_monitor_list") or []):
-                link = (e.get("channel_link") or "").strip()
-                if e.get("anime_name") and link.startswith(("http://", "https://", "t.me/")):
-                    pairs.append((e["anime_name"], link if link.startswith("http") else "https://" + link))
-    except Exception as e:
-        LOGGER.warning(f"[HindiSchedule] anime_monitor_list read failed: {e}")
     try:
         doc = await db.col2.find_one({"id": "update_post_map"})
         for key, v in ((doc or {}).get("map") or {}).items():
             if not isinstance(v, dict):
                 continue
-            link = (v.get("invite_link") or (v.get("invite_links") or [""])[0] or "").strip()
-            if link.startswith(("http://", "https://")):
+            link = _http(_mm.link_for(v, link_idx) or v.get("invite_link") or "")
+            if link:
                 pairs.append((v.get("display_name") or key, link))
     except Exception as e:
         LOGGER.warning(f"[HindiSchedule] update_post_map read failed: {e}")
+    if not link_idx:        # monitor list mein sirf Link 1 saved hota hai
+        try:
+            if owner:
+                user = await db._get_user(owner[0])
+                for e in (user.get("anime_monitor_list") or []):
+                    link = _http(e.get("channel_link") or "")
+                    if e.get("anime_name") and link:
+                        pairs.append((e["anime_name"], link))
+        except Exception as e:
+            LOGGER.warning(f"[HindiSchedule] anime_monitor_list read failed: {e}")
     return pairs
+
+
+async def resolve_link_idx(cfg: dict) -> int:
+    """Settings mein chuna hua update channel -> uska Link number (0-based). Multi mode OFF / kuch chuna nahi => 0."""
+    try:
+        from ..utils.multi_mode import is_multi, ch_link_idx
+        if not await is_multi() or not cfg.get("link_ch"):
+            return 0
+        from .update_channel import _get_update_channels
+        for pos, ch in enumerate(await _get_update_channels()):
+            if ch.get("channel_id") == cfg["link_ch"]:
+                return ch_link_idx(ch, pos)
+    except Exception as e:
+        LOGGER.warning(f"[HindiSchedule] link channel resolve failed: {e}")
+    return 0
 
 
 def _ep_code_new(it) -> str:
@@ -537,7 +613,7 @@ def _ep_code_new(it) -> str:
         ep += f"—E{f(it['next_end'])}"
     elif it["per_release"] and it["per_release"] > 1:
         ep += "+"
-    return f"S{it['season']:02d} • {ep}" if it["season"] else ep
+    return f"S{season_of(it):02d} • {ep}"
 
 
 def _item_time(it, today) -> str:
@@ -561,9 +637,9 @@ def build_new_posts(day_idx: int, now: datetime, rows: list, links: list, handle
     """
     NEW style caption(s) (HTML). msgs[0] image ke saath caption banta hai (<= CAPTION_LIMIT), baaki text msgs.
 
-        ⟣──────────⟢ / 𝗙𝗥𝗜𝗗𝗔𝗬 / ⟣──────────⟢
+        ⟣──────────⟢ / 𝗙𝗥𝗜𝗗𝗔𝗬 / ⟣──────────⟢          (sab kuch BOLD)
         ‣ <a href=channel-link>Anime</a>          ← link SIRF /add_anime wale anime pe
-          ↳ S06 • E07 [ɴᴇᴡ]  ⏰ 07:40 PM
+          ↳ S06 • E07 [𝗡𝗘𝗪]  ✦ 07:40 PM          (season hamesha; clock emoji nahi)
         ⟣────────⟢
         ❝ ᴘᴏᴡᴇʀᴇᴅ ʙʏ : @A | @B ❞
     """
@@ -572,20 +648,21 @@ def build_new_posts(day_idx: int, now: datetime, rows: list, links: list, handle
     line = "⟣────────────────────⟢"
     name = DAY_FULL[day_idx].upper().translate(_BOLD_SANS)
     pad = " " * max(0, int(20 * (20 - 1.3 * len(name)) / (20 - 1.3 * 9)))
-    banner = f"{line}\n{pad}<b>{name}</b>\n{line}"
-    closing = "⟣────────────⟢"
+    banner = f"<b>{line}\n{pad}{name}\n{line}</b>"
+    closing = "<b>⟣────────────⟢</b>"
     if handles:
         closing += "\n<blockquote><b>" + "ᴘᴏᴡᴇʀᴇᴅ ʙʏ".translate(_SMALLCAPS) + f" : {E(handles)}</b></blockquote>"
 
     if not rows:
-        return [banner + "\n\n😴 Aaj koi Hindi anime nahi aa raha.\n" + closing]
+        return [banner + "\n\n<b>😴 Aaj koi Hindi anime nahi aa raha.</b>\n" + closing]
 
     blocks = []
     for r in rows:
         link = match_link(r["title"], links)
         title = f'<a href="{A(link)}">{E(r["title"])}</a>' if link else E(r["title"])
-        tag = " [ɴᴇᴡ]" if r["new"] else ""
-        blocks.append(f"‣ {title}\n  ↳ {E(r['ep'])}{tag}  ⏰ {E(r['time'])}")
+        tag = " [𝗡𝗘𝗪]" if r["new"] else ""
+        # poora block BOLD (link wala naam bhi)
+        blocks.append(f"<b>‣ {title}\n  ↳ {E(r['ep'])}{tag}  {TIME_ICON} {E(r['time'])}</b>")
 
     msgs, cur = [], banner
     limit_first = CAPTION_LIMIT - _visible_len(closing) - 4
@@ -617,7 +694,7 @@ async def _post_new_style(client: Client, ch, cfg: dict, day_idx: int, now: date
         handles_list = ""
     handles = " | ".join(handles_list.split())
     rows = schedule_rows(items, now)
-    links = await load_anime_links()
+    links = await load_anime_links(await resolve_link_idx(cfg))
     msgs = build_new_posts(day_idx, now, rows, links, handles if footer_on(cfg) else "")
 
     img_path = None
@@ -902,6 +979,7 @@ def _status_text(cfg: dict) -> str:
         f"🎨 Style: **{'✨ NEW (image + links)' if style_of(cfg) == 'new' else '📜 OLD (classic list)'}**\n"
         f"🖼 Image: **{'🟢 ON' if cfg.get('image', True) else '🔴 OFF'}** _(NEW style)_\n"
         f"💜 Powered By line: **{'🟢 ON' if footer_on(cfg) else '🔴 OFF'}**\n"
+        f"🔗 Anime links: **{cfg.get('link_ch_title') or 'Link 1 (default)'}**\n"
         f"🗓 Aaj: {today}\n"
         f"📤 Last post: {cfg.get('last_date') or '—'}"
     )
@@ -924,6 +1002,8 @@ async def render(client: Client, cb: CallbackQuery):
     clear_session(cb.from_user.id)
     cfg = await _cfg()
     on = cfg.get("enabled", True)
+    from ..utils.multi_mode import is_multi
+    multi = await is_multi()
     rows = [
         [InlineKeyboardButton("✏️ Channel badlo" if cfg.get("channel_id") else "➕ Channel set karo",
                               callback_data="cmz:hs:chan"),
@@ -936,6 +1016,11 @@ async def render(client: Client, cb: CallbackQuery):
                               else "🖼 Image: OFF — ON karo", callback_data="cmz:hs:img")],
         [InlineKeyboardButton("💜 Powered By line: ON — OFF karo" if footer_on(cfg)
                               else "💜 Powered By line: OFF — ON karo", callback_data="cmz:hs:foot")],
+    ]
+    if multi:       # Multi mode ON: anime ke naam pe kis update channel ka link lage — yahan chuno
+        rows.append([InlineKeyboardButton("🔗 Anime links: " + (cfg.get("link_ch_title") or "Link 1 (default)"),
+                                          callback_data="cmz:hs:lnk")])
+    rows += [
         [InlineKeyboardButton("📤 Aaj ka schedule abhi post karo", callback_data="cmz:hs:now")],
         [InlineKeyboardButton("🧪 Debug file", callback_data="cmz:hs:dbg")],
     ]
@@ -951,6 +1036,55 @@ _PRESETS = ["0600", "0700", "0800", "0900", "1000", "1200", "1800", "2100"]
 async def handle(client: Client, cb: CallbackQuery, args: list):
     sub = args[0] if args else ""
     uid = cb.from_user.id
+
+    if sub == "lnk":
+        from ..utils.multi_mode import is_multi, ch_link_idx
+        from .update_channel import _get_update_channels
+        await cb.answer()
+        cfg = await _cfg()
+        chans = await _get_update_channels()
+        if not await is_multi() or not chans:
+            await _edit(client, cb,
+                        "**🔗 Anime links**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+                        "Ye option **Multi mode ON** aur kam se kam 1 update channel hone par kaam karta hai.\n"
+                        "Abhi har anime pe **Link 1** lagega.",
+                        InlineKeyboardMarkup([_back()]))
+            return
+        cur = cfg.get("link_ch")
+        rows = [[InlineKeyboardButton(("✅ " if not cur else "") + "Link 1 (default)", callback_data="cmz:hs:lset:0")]]
+        for pos, ch in enumerate(chans):
+            title = (ch.get("channel_title") or "Channel")[:24]
+            rows.append([InlineKeyboardButton(
+                ("✅ " if cur == ch.get("channel_id") else "") + f"Channel {pos + 1:02d} · {title} (Link {ch_link_idx(ch, pos) + 1})",
+                callback_data=f"cmz:hs:lset:{pos + 1}")])
+        rows.append(_back())
+        await _edit(client, cb,
+                    "**🔗 Anime ke naam pe kaunsa link lage?**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "Multi mode mein har update channel ka alag Watch link hota hai. "
+                    "Schedule post mein anime ke naam pe jis channel ka link chahiye wo chuno.",
+                    InlineKeyboardMarkup(rows))
+        return
+
+    if sub == "lset" and len(args) > 1:
+        from .update_channel import _get_update_channels
+        cfg = await _cfg()
+        try:
+            n = int(args[1])
+        except ValueError:
+            n = 0
+        chans = await _get_update_channels()
+        if n and 1 <= n <= len(chans):
+            ch = chans[n - 1]
+            cfg["link_ch"] = ch.get("channel_id")
+            cfg["link_ch_title"] = f"Channel {n:02d} · {(ch.get('channel_title') or 'Channel')[:24]}"
+            await cb.answer(f"✅ Channel {n:02d} ke links")
+        else:
+            cfg.pop("link_ch", None)
+            cfg.pop("link_ch_title", None)
+            await cb.answer("✅ Link 1 (default)")
+        await _save(cfg)
+        await render(client, cb)
+        return
 
     if sub == "chan":
         _SESS[uid] = {"mode": "channel"}
