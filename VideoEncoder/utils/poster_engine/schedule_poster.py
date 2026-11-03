@@ -2,12 +2,12 @@
 schedule_poster.py
 ===================
 Hindi anime schedule ki image (NEW style) — poster 11 jaisa design:
-  • upar-left : hamburger + community username(s)  (2 username => dono, chhote karke stacked)
+  • upar-left : hamburger + community username(s)  (2 username => dono SIDE-BY-SIDE, chhote, telegram icon ke saath)
   • pill      : DIN · aaj ki date
   • heading   : HINDI ANIME / SCHEDULE
   • list      : har anime ka  TIME | naam | S04 • E23   (max 7 row, baaki "+N more")
   • right side: aaj ke aane wale anime mein se random ek ka CHARACTER art (fanart.tv transparent PNG;
-                na mile to AniList cover card) — red block + dots ke saath
+                na mile to AniList character ka cut-out) — red block + dots ke saath. COVER CARD kabhi nahi.
 
 Use:
     ok = await render_schedule_to_file(items, "Friday", "03 Nov 2026", "@A @B", "/tmp/x.jpg")
@@ -128,6 +128,48 @@ def _decorations(c: _Canvas):
             c.d.ellipse([sp(cx - 3), sp(cy - 3), sp(cx + 3), sp(cy + 3)], fill=DOT_PINK)
 
 
+# ------------------------------------------------------------------ community handles (top-left, side by side)
+def _plane(c: _Canvas, x, cy, size, color):
+    """chhota telegram paper-plane icon (x = left, cy = vertical centre, 1x px)"""
+    w, h = size, size * 0.86
+    pts = [(0.0, 0.46), (1.0, 0.0), (0.80, 1.0), (0.50, 0.68), (0.31, 0.92), (0.30, 0.62)]
+    top = cy - h / 2
+    c.d.polygon([(sp(x + px * w), sp(top + py * h)) for px, py in pts], fill=color)
+
+
+def _brand_row(c: _Canvas, brand: str):
+    """@A | @B  — dono community ek line mein side-by-side, chhote (aankhon mein na chubhe). 1 ho to sirf ek."""
+    toks = [t for t in (brand or "").split() if t.startswith("@") and len(t) > 1][:2]
+    if not toks:
+        t = chname.clean(brand)
+        toks = [t] if t else []
+    if not toks:
+        return
+    x0, cy = MARGIN + 62, 42
+    size, gap, icon = 14.5, 8, 15
+    max_total = 470
+    while True:
+        f = _font("Poppins-Bold.ttf", size)
+        widths = [c.d.textlength(t, font=f) / SCALE for t in toks]
+        total = sum(icon + gap + w for w in widths) + (26 if len(toks) > 1 else 0)
+        if total <= max_total or size <= 11:
+            break
+        size -= 0.5
+    if total > max_total:                                   # bahut lambe naam: ellipsis
+        room = (max_total - (26 if len(toks) > 1 else 0)) / len(toks) - icon - gap
+        toks = [c.fit_text(t, f, room) for t in toks]
+    x = x0
+    for i, t in enumerate(toks):
+        if i:
+            x += 10
+            c.d.line([sp(x), sp(cy - 9), sp(x), sp(cy + 9)], fill=(190, 192, 200), width=SCALE)
+            x += 16
+        _plane(c, x, cy, icon, RED)
+        x += icon + gap
+        c.d.text((sp(x), sp(cy)), t, font=f, fill=NAVY, anchor="lm")
+        x += c.d.textlength(t, font=f) / SCALE
+
+
 # ------------------------------------------------------------------ art (right side)
 def _art_block(c: _Canvas, art, label: str):
     """red block + pink circle + character (RGBA png) ya cover card (RGB)"""
@@ -234,34 +276,149 @@ def build_schedule_image(items: list, day: str, date_str: str, brand: str, art=N
     _decorations(c)
     _art_block(c, art, art_label)
     _text_block(c, items, day, date_str)
+    _brand_row(c, brand)                                  # logo spot: 2 usernames side by side (chhote)
     img = c.img.resize((WIDTH, HEIGHT), Image.LANCZOS)
-    if brand:
-        img = chname.draw_brand(img, brand, 11)           # same logo spot as poster 11 (2 usernames -> stacked)
     return img.convert("RGB")
 
 
-# ------------------------------------------------------------------ art picking (AniList / fanart.tv)
+# ------------------------------------------------------------------ art picking (fanart.tv / AniList character)
+def _flood_cutout(img: Image.Image):
+    """Flat background wale AniList character portrait ka background hata do (corners se flood-fill).
+    Safe check fail ho to None (galat kata hua character nahi chahiye)."""
+    try:
+        im = img.convert("RGB")
+        w, h = im.size
+        if w < 60 or h < 60:
+            return None
+        work = im.filter(ImageFilter.GaussianBlur(1.2))
+        mark = (255, 0, 255)
+        for xy in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1), (w // 2, 0), (0, h // 2), (w - 1, h // 2)]:
+            if work.getpixel(xy) != mark:
+                ImageDraw.floodfill(work, xy, mark, thresh=34)
+        mask = Image.new("L", (w, h), 255)
+        px_w, px_m = work.load(), mask.load()
+        bg = 0
+        for yy in range(h):
+            for xx in range(w):
+                if px_w[xx, yy] == mark:
+                    px_m[xx, yy] = 0
+                    bg += 1
+        frac = bg / float(w * h)
+        if not (0.10 <= frac <= 0.72) or mask.getpixel((w // 2, int(h * 0.55))) < 200:
+            return None
+        mask = mask.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.GaussianBlur(1.1))
+        out = im.convert("RGBA")
+        out.putalpha(mask)
+        return out
+    except Exception as e:
+        LOGGER.warning(f"[SchedulePoster] flood cutout failed: {e!r}")
+        return None
+
+
+def _feathered(img: Image.Image) -> Image.Image:
+    """Cut-out na bane to character portrait ko upar/side se soft fade karo — cover card jaisa dabba nahi dikhega."""
+    im = img.convert("RGBA")
+    w, h = im.size
+    mask = Image.new("L", (w, h), 255)
+    px = mask.load()
+    fx, fy = max(4, int(w * 0.18)), max(4, int(h * 0.22))
+    for yy in range(h):
+        ay = min(1.0, yy / fy)
+        for xx in range(w):
+            ax = min(1.0, xx / fx, (w - 1 - xx) / fx)
+            px[xx, yy] = int(255 * max(0.0, min(ax, ay)) ** 1.3)
+    im.putalpha(mask)
+    return im
+
+
+async def _portrait_candidates(a) -> list:
+    """AniList ke main characters ki portrait images (RGB)."""
+    import httpx
+    from . import dataset
+    urls = [(((e.get("node") or {}).get("image") or {}).get("large"))
+            for e in ((a.raw.get("characters") or {}).get("edges") or [])]
+    urls = [u for u in urls if u][:3]
+    out = []
+    if not urls:
+        return out
+    async with httpx.AsyncClient(headers=dataset.HEADERS, timeout=20, follow_redirects=True) as client:
+        for u in urls:
+            try:
+                r = await client.get(u)
+                r.raise_for_status()
+                im = Image.open(io.BytesIO(r.content))
+                im.load()
+                out.append(im.convert("RGB"))
+            except Exception as e:
+                LOGGER.warning(f"[SchedulePoster] portrait fetch failed: {e!r}")
+    return out
+
+
+def _upscale(im: Image.Image, min_h: int = 900) -> Image.Image:
+    if im.height >= min_h:
+        return im
+    k = min_h / im.height
+    return im.resize((int(im.width * k), min_h), Image.LANCZOS)
+
+
 async def _pick_art(titles: list):
-    """(('char', RGBA) | ('cover', RGB) | None, anime title). Aaj ke anime mein se random ek."""
+    """(('char', RGBA) | None, anime title). Aaj ke anime mein se random ek ka CHARACTER (cover card kabhi nahi).
+    1) fanart.tv transparent PNG (saare anime try)  2) rembg cut-out (agar installed)  3) AniList portrait ka cut-out
+    4) portrait soft-fade."""
     from . import api, dataset
-    pool = [t for t in titles if t]
+    pool = [t for t in dict.fromkeys(titles) if t]
     random.shuffle(pool)
-    for t in pool[:4]:
+    pool = pool[:7]
+    sem = asyncio.Semaphore(3)
+
+    async def load(t):
+        async with sem:
+            try:
+                a = await api.find_anime(t)
+                if a is None:
+                    return None
+                await dataset._ensure_character(a)
+                return t, a
+            except Exception as e:
+                LOGGER.warning(f"[SchedulePoster] art for '{t}' failed: {e!r}")
+                return None
+
+    loaded = [x for x in await asyncio.gather(*[load(t) for t in pool]) if x]
+
+    # 1) transparent character PNGs
+    with_png = [(t, a) for t, a in loaded if a.characters]
+    if with_png:
+        t, a = random.choice(with_png)
+        _label, img = random.choice(a.characters)
+        return ("char", img), a.title or t
+
+    # 2/3/4) AniList character portrait -> cut-out (rembg > flood-fill > soft fade)
+    fallback = None
+    for t, a in loaded:
         try:
-            a = await api.find_anime(t)
-            if a is None:
-                continue
-            await api._prepare()
-            await dataset._ensure_character(a)
-            if a.characters:
-                _label, img = random.choice(a.characters)
-                return ("char", img), a.title or t
-            await dataset._need_image(a, "cover")
-            cov = a.cover
-            if cov is not None:
-                return ("cover", cov), a.title or t
+            portraits = await _portrait_candidates(a)
         except Exception as e:
-            LOGGER.warning(f"[SchedulePoster] art for '{t}' failed: {e!r}")
+            LOGGER.warning(f"[SchedulePoster] portraits for '{t}' failed: {e!r}")
+            continue
+        for im in portraits:
+            cut = None
+            try:
+                from rembg import new_session, remove          # optional (pip install rembg onnxruntime)
+                import os
+                sess = await asyncio.to_thread(new_session, os.environ.get("REMBG_MODEL", "isnet-anime"))
+                cut = await asyncio.to_thread(lambda: remove(im, session=sess).convert("RGBA"))
+            except Exception:
+                cut = None
+            if cut is None:
+                cut = await asyncio.to_thread(_flood_cutout, im)
+            if cut is not None:
+                return ("char", await asyncio.to_thread(_upscale, cut)), a.title or t
+            if fallback is None:
+                fallback = (im, a.title or t)
+    if fallback:
+        im, label = fallback
+        feathered = await asyncio.to_thread(lambda: _feathered(_upscale(im)))
+        return ("char", feathered), label
     return None, ""
 
 
