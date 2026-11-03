@@ -171,50 +171,57 @@ def _brand_row(c: _Canvas, brand: str):
 
 
 # ------------------------------------------------------------------ art (right side)
+def _grid_rows(n: int) -> list:
+    """Kitne character kis row mein. 4 => 2+2 (upar do, neeche do); 5+ => ek row mein 3."""
+    return {1: [1], 2: [2], 3: [2, 1], 4: [2, 2], 5: [3, 2], 6: [3, 3], 7: [3, 2, 2],
+            8: [3, 3, 2]}.get(n, [3, 3, 3])
+
+
 def _group_art(c: _Canvas, chars: list, bx0, by0, bx1, by1):
-    """Aaj ke har anime ka ek character — sab saath, right side mein. Jitne zyada character, utne chhote."""
+    """Aaj ke har anime ka ek character — poore right column mein grid (1:ek bada, 4:2x2, 5-6:3+3, 7-9:3 ki rows).
+    Jitne zyada character, utne chhote — sab aaram se fit."""
     imgs = []
     for im in chars:
         im = im.convert("RGBA")
         bb = im.getchannel("A").getbbox()
         imgs.append(im.crop(bb) if bb else im)
-    if not imgs:
-        return
     n = len(imgs)
-    area_l, area_r, bottom = 748, 1250, by1                 # character in hudood (red block ke andar chaudai)
-    avail_w = area_r - area_l
-    overlap = 0.0 if n == 1 else (0.28 if n <= 3 else 0.38)
-    h = {1: 640, 2: 600, 3: 560, 4: 520, 5: 480}.get(n, 450)
-    for _ in range(40):                                     # width fit hone tak chhota karo
-        ws = [im.width * h / im.height for im in imgs]
-        total = sum(ws) - overlap * sum(ws[1:])
-        if total <= avail_w or h <= 200:
-            break
-        h *= 0.95
-    ws = [max(1, int(im.width * h / im.height)) for im in imgs]
-    hs = [int(h)] * n
-    total = sum(ws) - int(overlap * sum(ws[1:]))
-    x = area_l + (avail_w - total) / 2
-    cx = x + total / 2
-    r = min(215, total * 0.5 + 20)
-    cy = bottom - h * 0.55
-    c.d.ellipse([sp(cx - r), sp(cy - r), sp(cx + r), sp(cy + r)], fill=PILL_FILL)
-    c.d.rectangle([sp(bx0), sp(by0), sp(bx1), sp(by1)], fill=RED)           # block halo ke neeche solid rahe
-    # draw order: kinare pehle, beech wala upar (center character sabse aage)
-    order = sorted(range(n), key=lambda i: -abs(i - (n - 1) / 2))
-    pos, xx = [], x
-    for i in range(n):
-        pos.append(xx)
-        xx += ws[i] * (1 - overlap)
+    if not n:
+        return
+    rows = _grid_rows(n)
+    L, R, T, B = 738, 1256, 22, 682                           # pura right column (upar se neeche tak)
+    W, H = R - L, B - T
+    if len(rows) == 1:
+        T = B - 640 if n == 1 else B - 600                    # 1-2 character: ek hi bada row
+        H = B - T
+    rh = H / len(rows)
+    cw = W / max(rows)
     base = c.img.convert("RGBA")
-    for i in order:
-        ch = imgs[i].resize((sp(ws[i]), sp(hs[i])), Image.LANCZOS)
-        px, py = sp(pos[i]), sp(bottom - hs[i])
-        sh = Image.new("RGBA", base.size, (0, 0, 0, 0))
-        sh.paste((0, 0, 0, 110), (px + sp(6), py + sp(6)), ch.getchannel("A"))
-        sh = sh.filter(ImageFilter.GaussianBlur(sp(8)))
-        base = Image.alpha_composite(base, sh)
-        base.alpha_composite(ch, (px, py))
+    # halo
+    cx, cy = (L + R) / 2, (T + B) / 2 + 40
+    r = 215
+    halo = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    ImageDraw.Draw(halo).ellipse([sp(cx - r), sp(cy - r), sp(cx + r), sp(cy + r)], fill=PILL_FILL + (255,))
+    base = Image.alpha_composite(base, halo)
+    rd = ImageDraw.Draw(base)
+    rd.rectangle([sp(730), sp(372), sp(1268), sp(676)], fill=RED)           # red block halo ke upar bhi solid
+    it = iter(imgs)
+    for ri, k in enumerate(rows):
+        row_bottom = T + rh * (ri + 1) - (4 if ri < len(rows) - 1 else 0)
+        if len(rows) > 1 and ri == len(rows) - 1:
+            row_bottom = min(B - 2, 676 + 4)
+        x0 = L + (W - k * cw) / 2
+        for ci in range(k):
+            im = next(it)
+            sc = min((rh - 6) / im.height, (cw * 1.12) / im.width)
+            w, h = max(1, int(im.width * sc)), max(1, int(im.height * sc))
+            ch = im.resize((sp(w), sp(h)), Image.LANCZOS)
+            px, py = sp(x0 + cw * (ci + 0.5) - w / 2), sp(row_bottom - h)
+            sh = Image.new("RGBA", base.size, (0, 0, 0, 0))
+            sh.paste((0, 0, 0, 110), (px + sp(5), py + sp(5)), ch.getchannel("A"))
+            sh = sh.filter(ImageFilter.GaussianBlur(sp(7)))
+            base = Image.alpha_composite(base, sh)
+            base.alpha_composite(ch, (px, py))
     c.img = base.convert("RGB")
     c.refresh()
 
@@ -319,7 +326,7 @@ def _art_block(c: _Canvas, art, label: str):
         c.img.paste(im, (sp(px), sp(py)), mask)
         c.refresh()
     # "FEATURING" label (small, on the red block)
-    if label:
+    if label and not label.startswith("TODAY"):
         f = _font("Poppins-Bold.ttf", 12.5)
         txt = c.fit_text(("" if label.startswith("TODAY") else "FEATURING · ") + label.upper(), f, 330)
         tw = c.spaced_w(txt, f, 1.2)
@@ -416,6 +423,41 @@ def _flood_cutout(img: Image.Image):
         return None
 
 
+def _grabcut_cutout(img: Image.Image):
+    """OpenCV GrabCut (optional: pip install opencv-python-headless). Safe check fail ho to None."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    try:
+        im = _upscale(img.convert("RGB"), 600)
+        arr = np.array(im)[:, :, ::-1].copy()
+        h, w = arr.shape[:2]
+        mask = np.zeros((h, w), np.uint8)
+        rect = (int(w * 0.03), int(h * 0.02), int(w * 0.94), int(h * 0.97))
+        bgd, fgd = np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64)
+        cv2.grabCut(arr, mask, rect, bgd, fgd, 5, cv2.GC_INIT_WITH_RECT)
+        fg = np.where((mask == 1) | (mask == 3), 255, 0).astype("uint8")
+        k = np.ones((5, 5), np.uint8)
+        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, k)
+        fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k)
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(fg)
+        if n > 1:                                          # sabse bada hissa hi character
+            big = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            fg = np.where(lab == big, 255, 0).astype("uint8")
+        frac = float((fg > 0).sum()) / float(w * h)
+        if not (0.18 <= frac <= 0.86):
+            return None
+        alpha = Image.fromarray(fg).filter(ImageFilter.GaussianBlur(1.3))
+        out = im.convert("RGBA")
+        out.putalpha(alpha)
+        return out
+    except Exception as e:
+        LOGGER.warning(f"[SchedulePoster] grabcut failed: {e!r}")
+        return None
+
+
 def _feathered(img: Image.Image) -> Image.Image:
     """Cut-out na bane to character portrait ko upar/side se soft fade karo — cover card jaisa dabba nahi dikhega."""
     im = img.convert("RGBA")
@@ -478,36 +520,52 @@ async def _fanart_character(a):
     return None
 
 
-async def _cutout_from_portraits(a):
-    """AniList character portrait -> ('cut', RGBA cut-out) (rembg > flood-fill) ya ('card', RGB portrait) ya None."""
-    ports = await _portrait_candidates(a)
-    for im in ports:
-        cut = None
+_REMBG = {"sess": None, "tried": False}
+_REMBG_LOCK = asyncio.Lock()
+
+
+async def _rembg_cut(im: Image.Image):
+    """rembg (optional: pip install rembg onnxruntime). Session ek baar load, ek waqt mein ek hi kaam (memory)."""
+    async with _REMBG_LOCK:
+        if not _REMBG["tried"]:
+            _REMBG["tried"] = True
+            try:
+                import os
+                from rembg import new_session
+                _REMBG["sess"] = await asyncio.to_thread(new_session, os.environ.get("REMBG_MODEL", "isnet-anime"))
+            except Exception as e:
+                LOGGER.info(f"[SchedulePoster] rembg nahi hai/load fail ({e!r}) — GrabCut/flood-fill use hoga")
+        if _REMBG["sess"] is None:
+            return None
         try:
-            import os
-            from rembg import new_session, remove              # optional (pip install rembg onnxruntime)
-            sess = await asyncio.to_thread(new_session, os.environ.get("REMBG_MODEL", "isnet-anime"))
-            cut = await asyncio.to_thread(lambda: remove(im, session=sess).convert("RGBA"))
-        except Exception:
-            cut = None
-        if cut is None:
-            cut = await asyncio.to_thread(_flood_cutout, im)
-        if cut is not None:
-            return "cut", await asyncio.to_thread(_upscale, cut)
-    if ports:
-        return "card", await asyncio.to_thread(_upscale, ports[0])
+            from rembg import remove
+            sess = _REMBG["sess"]
+            return await asyncio.to_thread(lambda: remove(im, session=sess).convert("RGBA"))
+        except Exception as e:
+            LOGGER.warning(f"[SchedulePoster] rembg cut failed: {e!r}")
+            return None
+
+
+async def _cutout_from_portraits(a):
+    """AniList character portrait -> saaf cut-out (rembg > GrabCut > flood-fill). Na bane to None (dabba/photo kabhi nahi)."""
+    for im in await _portrait_candidates(a):
+        for fn in (None, _grabcut_cutout, _flood_cutout):
+            cut = await _rembg_cut(im) if fn is None else await asyncio.to_thread(fn, im)
+            if cut is not None and cut.getchannel("A").getbbox():
+                return "cut", await asyncio.to_thread(_upscale, cut)
+    LOGGER.info(f"[SchedulePoster] '{a.title}': character cut-out nahi bana (fanart.tv mein bhi nahi) — skip")
     return None
 
 
-MAX_CHARS = 6
+MAX_CHARS = 9
 
 
 async def _pick_art(titles: list):
-    """(('chars', [RGBA, ...]) | None, label). Aaj ke HAR anime ka ek character (max 6), sab right side mein.
+    """(('chars', [RGBA, ...]) | None, label). Aaj ke HAR anime ka ek character (max 9), sab right side mein.
     Har anime: fanart.tv characterart -> AniList character cut-out. Cover / logo kabhi nahi."""
     from . import api
     pool = [t for t in dict.fromkeys(titles) if t]
-    if len(pool) > MAX_CHARS:                                   # zyada anime: random 6 (time ka order same)
+    if len(pool) > MAX_CHARS:                                   # zyada anime: random 9 (time ka order same)
         keep = set(random.sample(range(len(pool)), MAX_CHARS))
         pool = [t for i, t in enumerate(pool) if i in keep]
     sem = asyncio.Semaphore(3)
@@ -534,10 +592,7 @@ async def _pick_art(titles: list):
     if not got:
         return None, ""
     imgs = [im for _k, im in got]
-    label = "TODAY'S LINEUP" if len(imgs) > 1 else pool[0]
-    if all(k == "cut" for k, _ in got):                       # sab saaf cut-out => khade hue characters
-        return ("chars", imgs), label
-    return ("avatars", imgs), label                           # warna gol avatar (kata-phata/atakta nahi)
+    return ("chars", imgs), ("TODAY'S LINEUP" if len(imgs) > 1 else pool[0])
 
 
 async def render_schedule_to_file(items: list, day: str, date_str: str, brand: str, dest: str,
