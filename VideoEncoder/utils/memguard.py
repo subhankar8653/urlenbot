@@ -108,7 +108,11 @@ async def check_previous(app, owners):
            f"({d.get('used_mb', 0)}/{d.get('limit_mb', 0)} MB)\n"
            f"Peak: <b>{d.get('peak_pct', 0):.0f}%</b> | busy: {d.get('busy')}\n"
            f"Breakdown: <code>{d.get('breakdown', '-')}</code>\n\n"
-           f"Peak 90%+ ho to RAM hi wajah hai (Railway plan/limit dekho). Peak kam ho to Railway logs mein crash trace dekho.")
+           + ("Peak 90%+ ho to RAM hi wajah hai (plan/limit dekho)." if d.get("peak_pct", 0) >= 80 else
+              f"Peak sirf {d.get('peak_pct', 0):.0f}% tha => OOM NAHI. Wajah: docker/VPS restart, redeploy / "
+              f"<code>docker compose up</code>, ya manual kill (docker stop 10s mein na ruke to SIGKILL). "
+              f"<code>docker logs --tail 200 urlenbot</code> / <code>dmesg -T | grep -i kill</code> dekho.")
+           + "\n\n♻️ /database_rti crawl chal raha tha to wo khud resume ho jayega (DB_RTI_AUTORESUME=1).")
     for uid in owners[:1]:
         try:
             await app.send_message(uid, txt)

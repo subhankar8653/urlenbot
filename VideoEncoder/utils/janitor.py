@@ -316,10 +316,23 @@ def _live_session_paths() -> set:
     return live
 
 
+def _dbrti_running() -> bool:
+    """/database_rti crawl chal raha hai? (download -> queue -> LAMBA upload — beech mein na ffmpeg, na chrome,
+    na file activity hoti hai, isliye pehle janitor ise 'idle' samajh kar working folders delete kar deta tha
+    => 'does not represent an existing local file' upload error + beech mein restart.)"""
+    try:
+        from ..plugins import database_rti as _d
+        return bool(_d.ST.running)
+    except Exception:
+        return False
+
+
 def is_busy() -> bool:
     """Koi bhi kaam chal raha hai? (queue, auto-upload, Swift/Rti/Adh chrome
     downloads, ffmpeg, mega, ya recent file activity)"""
     if data:
+        return True
+    if _dbrti_running():                # /database_rti — kabhi idle nahi
         return True
     if _live_session_paths():           # user rename/options ka jawab de raha hai
         return True
@@ -362,10 +375,13 @@ def clean_dirs(min_idle: int, protect: bool = True) -> int:
     protect=True: jin files pe user ka rename/options session pending hai wo nahi hatengi."""
     freed, now = 0, time.time()
     prot = _live_session_paths() if protect else set()
+    dbrti = _dbrti_running()
     for base in (download_dir, encode_dir):
         if not base or not os.path.isdir(base):
             continue
         for name in os.listdir(base):
+            if dbrti and (name.startswith("dbrti_") or name.startswith("_rtifb")):
+                continue        # /database_rti ke download/upload folders — kabhi mat hatao
             path = os.path.join(base, name)
             ap = os.path.abspath(path)
             if prot and any(q == ap or q.startswith(ap + os.sep) for q in prot):
