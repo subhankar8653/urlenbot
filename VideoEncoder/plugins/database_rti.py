@@ -12,6 +12,10 @@ RareAnimes (RTI) ki poori site ko 2 Telegram "database" channels mein bharne ka 
   /database_rti file  <channel_id>     -> DB-2 channel (FILE/document format) set karo
   /database_rti reset                  -> saara progress (done list) saaf — dobara se shuru
   /database_rti retry                  -> jo items adhure reh gaye the unhe dobara try karne ke liye mark karo
+  /database_rti scan [from] [to]       -> POORI site ka FAST scan (sirf check, download nahi): kaunsi episode/quality
+                                          database mein upload nahi hui — txt report + count
+  /database_rti fix [all]              -> scan ke missing items hi dobara download+upload (all = "site pe nahi mili" bhi)
+  /database_rti missing                -> last scan ki report dobara bhejo
 
 Flow (har post / har episode / har movie ke liye):
   listing page -> post links -> discover_hindi() [SIRF Hindi] -> WatchMultQuality -> Argon -> Swift
@@ -26,12 +30,24 @@ ENV (optional — ya /database_rti video|file se runtime pe set karo):
   DB_RTI_BASE=https://www.rareanimes.fans          (site ka base)
   DB_RTI_FALLBACK_QUALITIES=720p,1080p             (kin qualities ke liye mirror server try ho)
   DB_RTI_MAX_BYTES=2040109465                      (isse badi file skip — bot upload limit ~2GB)
+
+SPEED / SAFETY ENV (VPS ke liye):
+  DB_RTI_DL_WORKERS=3      ek saath kitne episode/movie download+clean hon (har ek apna Chrome)
+  DB_RTI_UP_WORKERS=2      ek saath kitne episode upload hon
+  DB_RTI_POST_PAR=2        ek saath kitni posts aage badhen
+  DB_RTI_SCAN_WORKERS=20   scan ke parallel HTTP workers
+  DB_RTI_FAST_SCAN=1       Swift 360p-gate fast mode (fail ho to purane mode se ek baar auto-retry)
+  DB_RTI_MIN_FREE_GB=6     disk isse kam ho to naya download ruk jaata hai (upload khatam hone tak)
+  DB_RTI_UP_RETRIES=2      upload fail / file gayab -> kitni baar dobara download+upload
+  DB_RTI_AUTORESUME=1      bot restart/crash ke baad crawl khud wahin se resume
 """
 
 import asyncio
+import contextvars
 import hashlib
 import html
 import io
+import itertools
 import json
 import os
 import re
@@ -41,6 +57,7 @@ import threading
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -62,6 +79,16 @@ FB_QUALITIES = tuple(
     for q in os.getenv("DB_RTI_FALLBACK_QUALITIES", "720p,1080p").split(",")
     if q.strip()
 )
+
+# ── speed / safety tunables ──
+DL_WORKERS = max(1, int(os.getenv("DB_RTI_DL_WORKERS", "3") or 3))
+UP_WORKERS = max(1, int(os.getenv("DB_RTI_UP_WORKERS", "2") or 2))
+POST_PAR = max(1, int(os.getenv("DB_RTI_POST_PAR", "2") or 2))
+SCAN_WORKERS = max(4, int(os.getenv("DB_RTI_SCAN_WORKERS", "20") or 20))
+FAST_SCAN = os.getenv("DB_RTI_FAST_SCAN", "1") != "0"
+MIN_FREE_GB = float(os.getenv("DB_RTI_MIN_FREE_GB", "6") or 6)
+UP_RETRIES = max(0, int(os.getenv("DB_RTI_UP_RETRIES", "2") or 2))
+AUTORESUME = os.getenv("DB_RTI_AUTORESUME", "1") != "0"
 
 _HEADERS = {
     "User-Agent": (
@@ -154,6 +181,7 @@ async def _once(key: str) -> bool:
     return True
 
 
+
 # ─────────────────────────────────────────────
 #  Run state (in-memory)
 # ─────────────────────────────────────────────
@@ -174,22 +202,39 @@ class _State:
         self.notify_chat = None
         self.last_complete = ""
         self.resume_page = 1
-        # downloader side
-        self.dl_page = 0
-        self.dl_title = ""
-        self.dl_item = ""
+        self.dl_page = 0                     # listing page jo abhi crawl ho raha hai
         self.dl_step = ""
-        self.dl_dir = ""
-        self.dl_t0 = 0.0
-        # uploader side
-        self.up_page = 0
-        self.up_title = ""
-        self.up_item = ""
-        self.up_step = ""
-        self.up_prog = {}
+        # parallel workers ka live state (status mein har worker alag dikhta hai)
+        self.dl_slots = {}                   # id -> {page,title,item,need,got,step,prog,dir,t0}
+        self.up_slots = {}                   # id -> {page,title,item,qs,done,cur,prog,step,t0}
+        self.open_posts = {}                 # id(post) -> page (jo post abhi poori nahi hui)
+        self.pending_jobs = 0                # download ho chuke, upload baaki
+        self.item_sem = None
+        self.url_mode = False                # seedha post-link / fix run (resume_page na badle)
+        self.disk_wait = False
 
 
 ST = _State()
+
+# kaun sa worker (slot) abhi ka task hai — status mein "step" likhne ke liye
+_SLOT = contextvars.ContextVar("dbrti_slot", default=None)
+_SLOT_IDS = itertools.count(1)
+
+
+def _new_slot(kind: str, **kw) -> dict:
+    s = {"id": next(_SLOT_IDS), "t0": time.time(), "step": "", "prog": None, **kw}
+    (ST.dl_slots if kind == "dl" else ST.up_slots)[s["id"]] = s
+    return s
+
+
+def _drop_slot(kind: str, s: dict):
+    (ST.dl_slots if kind == "dl" else ST.up_slots).pop(s["id"], None)
+
+
+def _step(text: str):
+    s = _SLOT.get()
+    if s is not None:
+        s["step"] = text
 
 
 # ─────────────────────────────────────────────
@@ -732,12 +777,19 @@ def fetch_listing(url: str):
     return 200, posts, next_url
 
 
+
 # ─────────────────────────────────────────────
 #  Telegram upload helpers
 # ─────────────────────────────────────────────
-async def _retry(fn, tries: int = 4):
+class FileGone(Exception):
+    """Upload ke waqt local file gayab (kisi ne delete kar di / disk wipe)."""
+
+
+async def _retry(fn, tries: int = 4, path: str = None):
     last = None
     for n in range(tries):
+        if path and not os.path.isfile(path):
+            raise FileGone(path)
         try:
             return await fn()
         except FloodWait as fw:
@@ -746,6 +798,8 @@ async def _retry(fn, tries: int = 4):
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
+            if isinstance(e, (FileNotFoundError, FileGone)) or "existing local file" in str(e):
+                raise FileGone(str(e))        # retry bekaar — file hi nahi hai
             last = e
             if n == tries - 1:
                 break
@@ -753,32 +807,46 @@ async def _retry(fn, tries: int = 4):
     raise last
 
 
-def _prog_cb(key: str):
-    last = [0.0]
+def _prog_cb(slot: dict, key: str):
+    """Pyrogram progress -> slot['prog'][key] = {cur,total,sp(bytes/s)}."""
+    st = {"t": time.time(), "cur": 0}
+    slot.setdefault("prog", {})
+    if not isinstance(slot["prog"], dict):
+        slot["prog"] = {}
+    slot["prog"][key] = {"cur": 0, "total": 0, "sp": 0.0}
 
     async def _cb(cur, total):
         now = time.time()
-        if total and now - last[0] > 3:
-            last[0] = now
-            ST.up_prog[key] = cur * 100 // total
+        if cur < total and now - st["t"] < 2:
+            return
+        d = slot["prog"].setdefault(key, {"cur": 0, "total": 0, "sp": 0.0})
+        dt = now - st["t"]
+        inst = (cur - st["cur"]) / dt if dt > 0 else 0.0
+        d["sp"] = inst if not d["sp"] else d["sp"] * 0.6 + inst * 0.4
+        d["cur"], d["total"] = cur, total
+        st["t"], st["cur"] = now, cur
     return _cb
 
 
-async def upload_video_clean(client, chat_id, path, caption, name, thumb, meta):
+async def upload_video_clean(client, chat_id, path, caption, name, thumb, meta, slot=None):
+    slot = slot if slot is not None else {"prog": {}}
     fmt = meta.get("format", {})
     vs = next((s for s in meta.get("streams", []) if s.get("codec_type") == "video"), {})
     dur = int(float(fmt.get("duration") or 0))
+    if thumb and not os.path.isfile(thumb):
+        thumb = None
     return await _retry(lambda: client.send_video(
         chat_id=chat_id, video=path, caption=caption, parse_mode=ParseMode.DISABLED,
         duration=dur, width=int(vs.get("width") or 0), height=int(vs.get("height") or 0),
         thumb=thumb, file_name=name, supports_streaming=True,
-        progress=_prog_cb("video")))
+        progress=_prog_cb(slot, "video")), path=path)
 
 
-async def upload_file_clean(client, chat_id, path, caption, name):
+async def upload_file_clean(client, chat_id, path, caption, name, slot=None):
+    slot = slot if slot is not None else {"prog": {}}
     return await _retry(lambda: client.send_document(
         chat_id=chat_id, document=path, caption=caption, parse_mode=ParseMode.DISABLED,
-        file_name=name, force_document=True, progress=_prog_cb("file")))
+        file_name=name, force_document=True, progress=_prog_cb(slot, "file")), path=path)
 
 
 async def _notify(client, chat, text: str):
@@ -806,6 +874,25 @@ def _dir_mb(d: str) -> float:
     except Exception:
         pass
     return tot / (1024 * 1024)
+
+
+def _free_gb() -> float:
+    try:
+        return shutil.disk_usage(download_dir).free / 1024 ** 3
+    except Exception:
+        return 9999.0
+
+
+async def _wait_disk():
+    """Disk kam ho to naya download tab tak ruko jab tak koi upload/queue disk khali kar sakta hai."""
+    waited = 0
+    while _free_gb() < MIN_FREE_GB and not _cancelled() and waited < 180:
+        if not ST.up_slots and ST.pending_jobs <= 0:
+            break                       # koi khali karne wala nahi — rukna bekaar
+        ST.disk_wait = True
+        await asyncio.sleep(10)
+        waited += 1
+    ST.disk_wait = False
 
 
 # ─────────────────────────────────────────────
@@ -851,12 +938,15 @@ async def _mirror_fetch(item: dict, accept: set, dl_dir: str):
     tr = rm.Trace(os.path.join(download_dir, "_rtifb", uuid.uuid4().hex[:8]))
     tr._page = _synthetic_page(mirrors)
     prog = {"cancel": ST.cancel_ev, "dls": {}}
+    slot = _SLOT.get()
+    if slot is not None:
+        slot["prog"] = prog
     order = [k for k in fb.ordered_kinds() if k in mirrors]
     try:
         for n, kind in enumerate(order, 1):
             if _cancelled():
                 return None
-            ST.dl_step = f"🔁 Mirror {kind} ({n}/{len(order)})"
+            _step(f"🔁 Mirror {kind} ({n}/{len(order)})")
             try:
                 path = await fb._try_kind(kind, "synthetic://page", 1, "any", work, tr, prog)
                 if not path:
@@ -891,17 +981,24 @@ def _classify(files: list, need: list, got: dict):
                 pass
 
 
+def _slot_got(got: dict):
+    s = _SLOT.get()
+    if s is not None:
+        s["got"] = sorted(got)
+
+
 async def _gather_files(post_url: str, item: dict, need: list, dl_dir: str) -> dict:
     """{quality: filepath}.  Swift (WMQ) -> jo na mile wo mirrors se. WMQ na ho to seedha mirrors."""
     from .swift_downloader import _scrape_and_download
     loop = asyncio.get_event_loop()
     got: dict = {}
     wmq = item.get("wmq_link")
+    slot = _SLOT.get()
 
     if wmq:
-        ST.dl_step = "🔗 Link resolve"
+        _step("🔗 Link resolve")
         swift = None
-        for _ in range(2):
+        for _ in range(3):
             if _cancelled():
                 return got
             try:
@@ -910,21 +1007,34 @@ async def _gather_files(post_url: str, item: dict, need: list, dl_dir: str) -> d
                 LOGGER.warning(f"[DB-RTI] resolve error: {e!r}")
             if swift:
                 break
+            await asyncio.sleep(2)
         if swift:
             # sab 3 chahiye -> ek scan; kuch quality pehle se ho chuki ho -> sirf wahi (quality_filter)
             plans = [None] if len(need) == len(TARGET_QUALITIES) else list(need)
             for qf in plans:
                 if _cancelled():
                     break
-                ST.dl_step = "⬇️ Swift download" + (f" {qf}" if qf else "")
-                prog = {"phase": "scan", "dls": {}, "cancel": ST.cancel_ev}
-                try:
-                    res = await loop.run_in_executor(
-                        None, lambda qf=qf: _scrape_and_download(swift, dl_dir, None, qf, progress=prog))
-                except Exception as e:  # noqa: BLE001
-                    LOGGER.error(f"[DB-RTI] scrape crash: {e!r}")
-                    res = {"files": []}
+                _step("🔎 Swift scan" + (f" {qf}" if qf else ""))
+                res = {"files": []}
+                for fast in ((True, False) if FAST_SCAN else (False,)):
+                    prog = {"phase": "scan", "dls": {}, "cancel": ST.cancel_ev}
+                    if slot is not None:
+                        slot["prog"] = prog
+                    try:
+                        res = await loop.run_in_executor(
+                            None, lambda qf=qf, fast=fast, prog=prog:
+                            _scrape_and_download(swift, dl_dir, None, qf, fast=fast, progress=prog))
+                    except Exception as e:  # noqa: BLE001
+                        LOGGER.error(f"[DB-RTI] scrape crash: {e!r}")
+                        res = {"files": [], "error": str(e)}
+                    err = str(res.get("error") or "").lower()
+                    if (res.get("files") or _cancelled() or res.get("quality_missing")
+                            or res.get("nothing_new") or "cancel" in err):
+                        break
+                    if fast:
+                        LOGGER.warning(f"[DB-RTI] fast scan fail ({err[:80]}) — normal mode se dobara")
                 _classify(res.get("files"), need, got)
+                _slot_got(got)
 
     missing = [q for q in need if q not in got]
     if missing and item.get("mirrors") and not _cancelled():
@@ -933,6 +1043,7 @@ async def _gather_files(post_url: str, item: dict, need: list, dl_dir: str) -> d
         r = await _mirror_fetch(item, accept, dl_dir)
         if r:
             got[r[1]] = r[0]
+            _slot_got(got)
     return got
 
 
@@ -951,44 +1062,55 @@ async def _prepare_quality(post: dict, item: dict, q: str, src: str, dl_dir: str
             "name": f"{stem}.mp4", "langs": langs}
 
 
-async def prepare_item(post: dict, item: dict):
-    """Download + clean. Returns upload-job dict ya None."""
-    label, url = item["label"], post["url"]
-    ST.dl_item = label
-    st = await _item_state(url, label)
-    if st and st.get("settled"):                    # mirror-only item pehle hi nipta chuka
-        ST.skipped += 1
-        post["own_done"] += 1
-        return None
-    if post.get("monitor") and st and st.get("gaveup"):
-        return None                                 # monitor itni baar try kar chuka — ab nahi
+async def _need_for(post: dict, item: dict) -> list:
+    """Is item ki kaun si qualities (video ya file mein se kisi ek mein bhi) abhi baaki hain."""
+    url, label = post["url"], item["label"]
     need = []
     for q in TARGET_QUALITIES:
         ckv = _ckey(post["title"], post["season"], label, q, "video") if post["explicit"] else None
         ckf = _ckey(post["title"], post["season"], label, q, "file") if post["explicit"] else None
         if not (await _is_done(url, label, q, "video", ckv) and await _is_done(url, label, q, "file", ckf)):
             need.append(q)
-    if not need:
-        ST.skipped += 1
-        # is post ka apna kaam pehle ho chuka tha (sirf content-duplicate nahi)? -> finish_post ke liye note
-        own = True
-        for q in TARGET_QUALITIES:
-            for mode in ("video", "file"):
-                if not await _is_done(url, label, q, mode):
-                    own = False
-        if own:
+    return need
+
+
+async def prepare_item(post: dict, item: dict, redo: bool = False):
+    """Download + clean. Returns upload-job dict ya None. redo=True: upload fail ke baad dobara (sirf baaki qualities)."""
+    label, url = item["label"], post["url"]
+    st = await _item_state(url, label)
+    if not redo:
+        if st and st.get("settled"):                # mirror-only item pehle hi nipta chuka
+            ST.skipped += 1
             post["own_done"] += 1
+            return None
+        if post.get("monitor") and st and st.get("gaveup"):
+            return None                             # monitor itni baar try kar chuka — ab nahi
+    need = await _need_for(post, item)
+    if not need:
+        if not redo:
+            ST.skipped += 1
+            # is post ka apna kaam pehle ho chuka tha (sirf content-duplicate nahi)? -> finish_post ke liye note
+            own = True
+            for q in TARGET_QUALITIES:
+                for mode in ("video", "file"):
+                    if not await _is_done(url, label, q, mode):
+                        own = False
+            if own:
+                post["own_done"] += 1
         return None
 
     dl_dir = os.path.join(download_dir, f"dbrti_{int(time.time())}_{_h(url + label)[:6]}")
     os.makedirs(dl_dir, exist_ok=True)
-    ST.dl_dir, ST.dl_t0 = dl_dir, time.time()
+    slot = _new_slot("dl", page=post["page"], title=post_name(post), item=label,
+                     need=list(need), got=[], dir=dl_dir)
+    tok = _SLOT.set(slot)
     try:
         files = await _gather_files(url, item, need, dl_dir)
         if _cancelled():
             shutil.rmtree(dl_dir, ignore_errors=True)
             return None
-        ST.dl_step = "🧹 Metadata clean"
+        _step("🧹 Metadata clean")
+        slot["prog"] = None
         results = await asyncio.gather(*[
             _prepare_quality(post, item, q, files[q], dl_dir) for q in TARGET_QUALITIES if q in files
         ])
@@ -1037,20 +1159,55 @@ async def prepare_item(post: dict, item: dict):
     except BaseException:
         shutil.rmtree(dl_dir, ignore_errors=True)
         raise
+    finally:
+        _SLOT.reset(tok)
+        _drop_slot("dl", slot)
+
+
+async def _do_item(client, q: asyncio.Queue, post: dict, item: dict):
+    """Ek item: download slot lo -> prepare -> queue mein daalo (uploader busy ho to yahin ruko = backpressure)."""
+    async with ST.item_sem:
+        if _cancelled():
+            return
+        await _wait_disk()
+        page = post["page"]
+        try:
+            job = await prepare_item(post, item)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            ST.failed += 1
+            post["failed"].append(item["label"])
+            LOGGER.error(f"[DB-RTI] item error {post['url']} {item['label']}: {e!r}\n{traceback.format_exc()}")
+            await _notify(client_ref(), ST.notify_chat,
+                          f"❌ Download error • Page <code>{page}</code> • {html.escape(post_name(post))} "
+                          f"{item['label']}\n<code>{html.escape(str(e)[:150])}</code>\n"
+                          f"Baad mein: <code>/database_rti scan</code> → <code>/database_rti fix</code>")
+            await asyncio.sleep(2)
+            return
+        if job:
+            post["pending"] += 1
+            ST.pending_jobs += 1
+            await q.put(job)
 
 
 async def produce_post(client, q: asyncio.Queue, url: str, page: int, monitor: bool = False):
     loop = asyncio.get_event_loop()
-    ST.dl_page, ST.dl_title, ST.dl_item, ST.dl_dir = page, url.rstrip("/").split("/")[-1], "", ""
-    ST.dl_step = "📄 Post scan"
+    slot = _new_slot("dl", page=page, title=url.rstrip("/").split("/")[-1], item="", need=[], got=[], dir="")
+    tok = _SLOT.set(slot)
     data = None
-    for _ in range(2):
-        try:
-            data = await loop.run_in_executor(None, discover_hindi, url)
-            break
-        except Exception as e:  # noqa: BLE001
-            LOGGER.warning(f"[DB-RTI] discover fail {url}: {e!r}")
-            await asyncio.sleep(3)
+    try:
+        _step("📄 Post scan")
+        for _ in range(3):
+            try:
+                data = await loop.run_in_executor(None, discover_hindi, url)
+                break
+            except Exception as e:  # noqa: BLE001
+                LOGGER.warning(f"[DB-RTI] discover fail {url}: {e!r}")
+                await asyncio.sleep(3)
+    finally:
+        _SLOT.reset(tok)
+        _drop_slot("dl", slot)
     if data and not data.get("items") and data.get("skipped"):
         if await _once(f"nh|{url}"):
             ST.nonhindi += 1
@@ -1070,28 +1227,15 @@ async def produce_post(client, q: asyncio.Queue, url: str, page: int, monitor: b
         "hint": "hindi" if re.search(r"hindi", title, re.I) else "",
         "mode": data.get("mode", "episodes"), "missing": [], "failed": [], "uploaded": 0, "own_done": 0,
         "nonhindi": list(data.get("skipped") or []), "wrong": [], "monitor": monitor,
+        "pending": 0, "ended": False, "finished": False,
     }
-    ST.dl_title = post_name(post)
-    for item in data["items"]:
-        if _cancelled():
-            return
-        try:
-            job = await prepare_item(post, item)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            ST.failed += 1
-            post["failed"].append(item["label"])
-            LOGGER.error(f"[DB-RTI] item error {url} {item['label']}: {e!r}\n{traceback.format_exc()}")
-            await _notify(client_ref(), ST.notify_chat,
-                          f"❌ Download error • Page <code>{page}</code> • {html.escape(post_name(post))} "
-                          f"{item['label']}\nResume: <code>/database_rti start {page}</code>")
-            await asyncio.sleep(5)
-            continue
-        if job:
-            await q.put(job)          # uploader busy ho to yahin rukta hai (max 1 item aage)
-    if not _cancelled():
-        await q.put({"kind": "post_end", "post": post})
+    if not monitor:
+        ST.open_posts[id(post)] = page
+    await asyncio.gather(*[_do_item(client, q, post, item) for item in data["items"]])
+    if _cancelled():
+        return
+    post["ended"] = True
+    await _maybe_finish(client, post)
 
 
 def post_name(post: dict) -> str:
@@ -1109,60 +1253,99 @@ def client_ref():
 
 
 # ─────────────────────────────────────────────
-#  UPLOADER side (consumer)
+#  UPLOADER side (consumers — UP_WORKERS ek saath)
 # ─────────────────────────────────────────────
-async def upload_job(client, cfg: dict, job: dict):
+async def _do_uploads(client, cfg: dict, job: dict, slot: dict):
+    """Job ki saari qualities upload (video->DB-1, file->DB-2). Returns None (ok) ya Exception."""
     post, item = job["post"], job["item"]
     label, url = item["label"], post["url"]
-    ST.up_page, ST.up_title, ST.up_item = post["page"], post_name(post), label
-    if not post.get("monitor"):
-        ST.resume_page = post["page"]
     vch, fch = cfg["video"], cfg["file"]
     try:
         for f in job["files"]:
             q = f["q"]
-            ST.up_prog = {}
-            ST.up_step = q
+            slot["prog"] = {}
+            slot["cur"] = q
+            slot["step"] = f"⬆️ {q}"
+            if not os.path.isfile(f["path"]):
+                raise FileGone(f["path"])
             ckv = _ckey(post["title"], post["season"], label, q, "video") if post["explicit"] else None
             ckf = _ckey(post["title"], post["season"], label, q, "file") if post["explicit"] else None
 
             async def _v():
                 if not await _is_done(url, label, q, "video", ckv):
-                    await upload_video_clean(client, vch, f["path"], f["caption"], f["name"], f["thumb"], f["meta"])
+                    await upload_video_clean(client, vch, f["path"], f["caption"], f["name"], f["thumb"],
+                                             f["meta"], slot)
                     await _mark_done(url, label, q, "video", ckv)
 
             async def _f():
                 if not await _is_done(url, label, q, "file", ckf):
-                    await upload_file_clean(client, fch, f["path"], f["caption"], f["name"])
+                    await upload_file_clean(client, fch, f["path"], f["caption"], f["name"], slot)
                     await _mark_done(url, label, q, "file", ckf)
 
             res = await asyncio.gather(_v(), _f(), return_exceptions=True)
             errs = [r for r in res if isinstance(r, BaseException)]
             if errs:
-                raise errs[0]
+                for r in errs:
+                    if isinstance(r, asyncio.CancelledError):
+                        raise r
+                return errs[0]
             ST.uploaded += 1
             post["uploaded"] += 1
+            slot["done"].append(q)
             try:
                 os.remove(f["path"])
             except Exception:
                 pass
-        await _item_finish(url, label, [m.split()[-1] for m in post["missing"] if m.startswith(label + " ")],
-                           settled=bool(job.get("settle")))
-        if not post.get("monitor"):
-            await _cfg_set(resume_page=post["page"])
+        return None
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001
-        post["failed"].append(label)
-        ST.failed += 1
-        LOGGER.error(f"[DB-RTI] upload error {url} {label}: {e!r}\n{traceback.format_exc()}")
-        await _notify(client, ST.notify_chat,
-                      f"❌ Upload error • Page <code>{post['page']}</code> • {html.escape(post_name(post))} {label}\n"
-                      f"<code>{html.escape(str(e)[:200])}</code>\n"
-                      f"Resume: <code>/database_rti start {post['page']}</code>")
+        return e
+
+
+async def upload_job(client, cfg: dict, job: dict):
+    post, item = job["post"], job["item"]
+    label, url = item["label"], post["url"]
+    slot = _new_slot("up", page=post["page"], title=post_name(post), item=label,
+                     qs=[f["q"] for f in job["files"]], done=[], cur="", prog={})
+    tok = _SLOT.set(slot)
+    err = None
+    try:
+        for attempt in range(UP_RETRIES + 1):
+            err = await _do_uploads(client, cfg, job, slot)
+            if err is None:
+                break
+            LOGGER.error(f"[DB-RTI] upload error {url} {label} (try {attempt + 1}): {err!r}")
+            shutil.rmtree(job["dl_dir"], ignore_errors=True)
+            if attempt >= UP_RETRIES or _cancelled():
+                break
+            # file gayab / upload fail -> sirf baaki qualities dobara download karke phir upload
+            slot["step"] = f"🔄 Dobara download+upload (try {attempt + 2}/{UP_RETRIES + 1})"
+            await asyncio.sleep(3)
+            new = await prepare_item(post, item, redo=True)
+            if not new:
+                if not await _need_for(post, item):
+                    err = None                      # ab sab upload ho chuka
+                break
+            job = new
+            slot["qs"] = [f["q"] for f in job["files"]]
+            slot["done"] = []
+        if err is None:
+            await _item_finish(url, label, [m.split()[-1] for m in post["missing"] if m.startswith(label + " ")],
+                               settled=bool(job.get("settle")))
+        else:
+            post["failed"].append(label)
+            ST.failed += 1
+            kind = "File gayab ho gayi" if isinstance(err, FileGone) else "Upload fail"
+            await _notify(client, ST.notify_chat,
+                          f"❌ {kind} • Page <code>{post['page']}</code> • {html.escape(post_name(post))} {label}\n"
+                          f"<code>{html.escape(str(err)[:200])}</code>\n"
+                          f"{UP_RETRIES + 1} try ke baad bhi nahi hua — baad mein "
+                          f"<code>/database_rti scan</code> → <code>/database_rti fix</code>")
     finally:
         shutil.rmtree(job["dl_dir"], ignore_errors=True)
-        ST.up_item, ST.up_step, ST.up_prog = "", "", {}
+        _SLOT.reset(tok)
+        _drop_slot("up", slot)
 
 
 async def finish_post(client, post: dict):
@@ -1171,7 +1354,7 @@ async def finish_post(client, post: dict):
         await _notify(client, ST.notify_chat,
                       f"⚠️ <b>Incomplete:</b> {html.escape(name)}\nPage <code>{post['page']}</code> • "
                       f"failed: {html.escape(', '.join(post['failed']))}\n"
-                      f"Resume: <code>/database_rti start {post['page']}</code>")
+                      f"Fix: <code>/database_rti scan</code> → <code>/database_rti fix</code>")
         return
     existing = await _post_complete_doc(post["url"])
     if post["uploaded"] == 0 and (existing or post["own_done"] == 0):
@@ -1192,8 +1375,35 @@ async def finish_post(client, post: dict):
     if post["nonhindi"]:
         txt += f"\n🚫 Non-Hindi skipped: {html.escape(', '.join(post['nonhindi']))}"
     await _notify(client, ST.notify_chat, txt)
-    if not post.get("monitor"):
-        await _cfg_set(resume_page=post["page"])
+
+
+async def _update_resume(post: dict):
+    """Resume page = sabse chhota page jiski post abhi poori nahi hui (parallel posts ke saath bhi sahi)."""
+    if post.get("monitor") or ST.url_mode:
+        return
+    pages = list(ST.open_posts.values())
+    rp = min(pages) if pages else post["page"]
+    ST.resume_page = rp
+    await _cfg_set(resume_page=rp)
+
+
+async def _maybe_finish(client, post: dict):
+    """Post ke saare items upload ho chuke (ya fail) -> finish_post ek hi baar."""
+    if post.get("finished") or not post.get("ended") or post.get("pending", 0) > 0:
+        return
+    post["finished"] = True
+    try:
+        await finish_post(client, post)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        LOGGER.error(f"[DB-RTI] finish_post error: {e!r}\n{traceback.format_exc()}")
+    finally:
+        ST.open_posts.pop(id(post), None)
+        try:
+            await _update_resume(post)
+        except Exception:
+            pass
 
 
 async def _consumer(client, cfg: dict, q: asyncio.Queue):
@@ -1201,45 +1411,163 @@ async def _consumer(client, cfg: dict, q: asyncio.Queue):
         job = await q.get()
         if job is None:
             return
+        post = job["post"]
         try:
-            if job["kind"] == "item":
-                await upload_job(client, cfg, job)
-            else:
-                await finish_post(client, job["post"])
+            await upload_job(client, cfg, job)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
             LOGGER.error(f"[DB-RTI] consumer error: {e!r}\n{traceback.format_exc()}")
+        finally:
+            post["pending"] -= 1
+            ST.pending_jobs = max(0, ST.pending_jobs - 1)
+            await _maybe_finish(client, post)
 
 
 # ─────────────────────────────────────────────
-#  Live status
+#  Live status (har worker alag dikhta hai)
 # ─────────────────────────────────────────────
+def _fmt_size(b: float) -> str:
+    b = float(b or 0)
+    if b >= 1024 ** 3:
+        return f"{b / 1024 ** 3:.2f} GB"
+    return f"{b / 1024 ** 2:.0f} MB"
+
+
+def _fmt_bps(b: float) -> str:
+    b = float(b or 0)
+    if b >= 1024 ** 2:
+        return f"{b / 1024 ** 2:.1f} MB/s"
+    return f"{b / 1024:.0f} KB/s"
+
+
+def _fmt_dur(sec: float) -> str:
+    sec = int(max(sec, 0))
+    return f"{sec // 3600}h {sec % 3600 // 60}m" if sec >= 3600 else f"{sec // 60}:{sec % 60:02d}"
+
+
+def _bar(pct: float, n: int = 10) -> str:
+    pct = max(0, min(100, pct))
+    f = int(round(pct / 100 * n))
+    return "▰" * f + "▱" * (n - f)
+
+
+def _dl_info(d):
+    """SmartDL/TurboDL object -> (percent, bytes/s). Kuch bhi fail ho to (0, 0)."""
+    try:
+        p = float(d.get_progress())
+        pct = int(p * 100) if p <= 1.0 else int(p)
+    except Exception:
+        pct = 0
+    try:
+        sp = float(d.get_speed())
+    except Exception:
+        sp = 0.0
+    return max(0, min(100, pct)), sp
+
+
+def _dl_slot_text(i: int, s: dict) -> str:
+    e = html.escape
+    head = f"<b>{i}.</b> P<code>{s['page']}</code> • {e(str(s['title']))}"
+    if s.get("item"):
+        head += f" • <code>{e(s['item'])}</code>"
+    L = [head]
+    prog = s.get("prog") if isinstance(s.get("prog"), dict) else {}
+    dls = prog.get("dls") or {}
+    need, got = s.get("need") or [], set(s.get("got") or [])
+    tot_sp = 0.0
+    if need:
+        chips = []
+        for q in TARGET_QUALITIES:
+            if q in got:
+                chips.append(f"{q} ✅")
+            elif q in dls:
+                pct, sp = _dl_info(dls[q])
+                tot_sp += sp
+                chips.append(f"{q} ⏬{pct}%")
+            elif q in need:
+                chips.append(f"{q} ⏳")
+            else:
+                chips.append(f"{q} ☑️")          # pehle se upload ho chuki
+        L.append("   " + "  ".join(chips))
+    step = s.get("step") or "-"
+    if prog.get("phase") == "download" and step.startswith("🔎"):
+        step = "⬇️ Download chal raha hai"
+    line = f"   {e(step)} • ⏱ {_fmt_dur(time.time() - s['t0'])}"
+    if s.get("dir"):
+        mb = _dir_mb(s["dir"])
+        if mb >= 1:
+            line += f" • 📥 {_fmt_size(mb * 1024 ** 2)}"
+            if tot_sp:
+                line += f" • {_fmt_bps(tot_sp)}"
+    L.append(line)
+    return "\n".join(L)
+
+
+def _up_slot_text(i: int, s: dict) -> str:
+    e = html.escape
+    L = [f"<b>{i}.</b> P<code>{s['page']}</code> • {e(str(s['title']))} • <code>{e(s['item'])}</code>"]
+    chips = []
+    for q in s.get("qs") or []:
+        chips.append(f"{q} ✅" if q in s.get("done", []) else (f"{q} ⏫" if q == s.get("cur") else f"{q} ·"))
+    if chips:
+        L.append("   " + "  ".join(chips))
+    prog = s.get("prog") if isinstance(s.get("prog"), dict) else {}
+    shown = False
+    for key, lab in (("video", "🎞 Video"), ("file", "📁 File ")):
+        d = prog.get(key)
+        if d and d.get("total"):
+            pct = d["cur"] * 100 // d["total"]
+            L.append(f"   {lab} {_bar(pct)} {pct}% • {_fmt_size(d['cur'])}/{_fmt_size(d['total'])}"
+                     + (f" • {_fmt_bps(d['sp'])}" if d.get("sp") else ""))
+            shown = True
+    if not shown:
+        L.append(f"   {e(s.get('step') or 'shuru ho raha hai…')}")
+    return "\n".join(L)
+
+
+def _scan_text() -> str:
+    S = SCAN
+    L = ["<b>🔎 Database RTI — Scan</b>"]
+    L.append(f"{S['stage']} • ⏱ {_fmt_dur(time.time() - S['t0'])}")
+    L.append(f"📚 Pages: <code>{S['pages']}</code> • 📝 Posts: <code>{S['posts']}</code> • "
+             f"✔️ Checked: <code>{S['analyzed']}/{S['posts']}</code>")
+    L.append(f"🎬 Items: <code>{S['items']}</code> • ❗ Missing items: <code>{S['missing_items']}</code> "
+             f"(never {S['never']} • partial {S['partial']} • site-pe-nahi {S['notfound']})")
+    if S["errors"]:
+        L.append(f"⚠️ Fetch fail: <code>{S['errors']}</code>")
+    return "\n".join(L)
+
+
 def _status_text(cfg: dict) -> str:
     v, f = cfg.get("video"), cfg.get("file")
     L = ["<b>📦 Database RTI</b>"]
     if ST.running:
         el = int(time.time() - ST.started)
-        L.append(f"▶️ Running • {el // 3600}h {el % 3600 // 60}m")
+        L.append(f"▶️ Running • {el // 3600}h {el % 3600 // 60}m • ⚙️ {DL_WORKERS} DL / {UP_WORKERS} UP workers")
+        if ST.dl_step and ST.dl_step.startswith("📚"):
+            L.append(ST.dl_step)
         L.append("")
-        dl = f"⬇️ <b>Download</b> • Page <code>{ST.dl_page}</code>\n   {html.escape(ST.dl_title or '-')}"
-        if ST.dl_item:
-            dl += f" • <code>{html.escape(ST.dl_item)}</code>"
-        dl += f"\n   {html.escape(ST.dl_step or '-')}"
-        if ST.dl_dir and ST.dl_t0:
-            mb = _dir_mb(ST.dl_dir)
-            sp = mb / max(time.time() - ST.dl_t0, 1)
-            dl += f" • {mb:.0f} MB ({sp:.1f} MB/s)"
-        L.append(dl)
+        dls = sorted(ST.dl_slots.values(), key=lambda s: s["id"])
+        if dls:
+            L.append(f"⬇️ <b>Download / Scan</b> ({len(dls)} active)")
+            for i, s in enumerate(dls[:5], 1):
+                L.append(_dl_slot_text(i, s))
+            if len(dls) > 5:
+                L.append(f"   … +{len(dls) - 5} aur")
+        else:
+            L.append("⬇️ <b>Download</b> • idle" + (" (disk bhar raha — upload ka wait)" if ST.disk_wait else ""))
         L.append("")
-        if ST.up_item:
-            up = (f"⬆️ <b>Upload</b> • Page <code>{ST.up_page}</code>\n   {html.escape(ST.up_title)} • "
-                  f"<code>{html.escape(ST.up_item)}</code> • {html.escape(ST.up_step)}")
-            pv, pf = ST.up_prog.get("video"), ST.up_prog.get("file")
-            up += f"\n   🎞 Video {pv if pv is not None else 0}% • 📁 File {pf if pf is not None else 0}%"
-            L.append(up)
+        ups = sorted(ST.up_slots.values(), key=lambda s: s["id"])
+        if ups:
+            L.append(f"⬆️ <b>Upload</b> ({len(ups)} active)")
+            for i, s in enumerate(ups[:4], 1):
+                L.append(_up_slot_text(i, s))
         else:
             L.append("⬆️ <b>Upload</b> • idle")
+        waiting = max(0, ST.pending_jobs - len(ups))
+        if waiting:
+            L.append(f"📋 Upload ke wait mein ready: <code>{waiting}</code> item")
     else:
         L.append(f"⏸ Idle ({html.escape(ST.dl_step or '-')})")
     L.append("")
@@ -1249,9 +1577,14 @@ def _status_text(cfg: dict) -> str:
         L.append(f"Last complete: {html.escape(ST.last_complete)}")
     rp = ST.resume_page if ST.running or ST.uploaded or ST.posts_done else (cfg.get("resume_page") or 1)
     L.append(f"🔁 Resume page: <code>{rp}</code> → <code>/database_rti start {rp}</code>")
-    L.append(f"👁 Monitor (page 1): " + (f"ON • every {MON['interval'] // 60} min" if MON["on"] else "OFF"))
+    L.append(f"💾 Disk free: <code>{_free_gb():.1f} GB</code> • 👁 Monitor (page 1): "
+             + (f"ON • every {MON['interval'] // 60} min" if MON["on"] else "OFF"))
     L.append(f"DB-1: <code>{v or 'not set'}</code> • DB-2: <code>{f or 'not set'}</code>")
-    return "\n".join(L)
+    if SCAN["running"]:
+        L.append("")
+        L.append(_scan_text())
+    txt = "\n".join(L)
+    return txt if len(txt) <= 4000 else txt[:3990] + "…"
 
 
 async def _render(cfg: dict):
@@ -1269,8 +1602,249 @@ async def _render(cfg: dict):
 
 async def _status_loop(cfg: dict):
     while True:
-        await asyncio.sleep(6)
+        await asyncio.sleep(5)
         await _render(cfg)
+
+
+# ─────────────────────────────────────────────
+#  FAST SCAN — kaunsi episode/quality database mein nahi hai
+#  (sirf HTTP pages parse + Mongo ke done-records se match; koi download nahi)
+# ─────────────────────────────────────────────
+SCAN = {"running": False, "stage": "", "pages": 0, "posts": 0, "analyzed": 0, "items": 0,
+        "missing_items": 0, "never": 0, "partial": 0, "notfound": 0, "errors": 0,
+        "t0": 0.0, "cancel": False, "task": None}
+
+
+def _safe_listing(url: str):
+    """(code, posts, err) — thread mein chalta hai."""
+    err = None
+    for n in range(3):
+        try:
+            code, posts, _nx = fetch_listing(url)
+            return code, posts, None
+        except Exception as e:  # noqa: BLE001
+            err = repr(e)
+            time.sleep(1.5 * (n + 1))
+    return None, [], err
+
+
+def _discover_safe(url: str):
+    err = None
+    for n in range(3):
+        try:
+            return discover_hindi(url), None
+        except Exception as e:  # noqa: BLE001
+            err = repr(e)
+            time.sleep(1.5 * (n + 1))
+    return None, err
+
+
+def _analyze_post(url: str, data: dict, done_ids: set, istates: dict) -> list:
+    """Post ke items mein se jo database mein poore nahi: [{label, qs, cat}].
+    cat: never (kuch bhi upload nahi) / partial (kuch quality hui, baaki nahi) /
+         notfound (pehle try mein site/server pe mili hi nahi)."""
+    title = data["title"]
+    season, explicit = detect_season(title, url, data.get("season", 1))
+    out = []
+    for item in data.get("items") or []:
+        label = item["label"]
+        st = istates.get(f"i:{_h(f'{url}|{label}')}") or {}
+        if st.get("settled"):
+            continue                                   # mirror-only item: jo mila wahi final
+        miss_q, done_any = [], False
+        for q in TARGET_QUALITIES:
+            ok = True
+            for mode in ("video", "file"):
+                uid = f"u:{_h(f'{url}|{label}|{q}|{mode}')}"
+                ck = _ckey(title, season, label, q, mode) if explicit else None
+                if uid in done_ids or (ck and ck in done_ids):
+                    done_any = True
+                else:
+                    ok = False
+            if not ok:
+                miss_q.append(q)
+        if not miss_q:
+            continue
+        if st and set(miss_q) <= set(st.get("missing") or []):
+            cat = "notfound"
+        elif not done_any:
+            cat = "never"
+        else:
+            cat = "partial"
+        out.append({"label": label, "qs": miss_q, "cat": cat})
+    return out
+
+
+async def _load_done():
+    done_ids = set()
+    async for d in _col.find({"_id": {"$regex": "^[uc]:"}}, {"_id": 1}):
+        done_ids.add(d["_id"])
+    istates = {}
+    async for d in _col.find({"_id": {"$regex": "^i:"}}, {"missing": 1, "settled": 1}):
+        istates[d["_id"]] = d
+    return done_ids, istates
+
+
+async def _scan_listing(pool, start: int, end):
+    loop = asyncio.get_running_loop()
+    posts, failed_pages = {}, []
+    page = start
+    while not SCAN["cancel"]:
+        pages = [p for p in range(page, page + SCAN_WORKERS) if not end or p <= end]
+        if not pages:
+            break
+        res = await asyncio.gather(*[loop.run_in_executor(pool, _safe_listing, listing_url(p)) for p in pages])
+        stop = False
+        for p, (code, plist, err) in zip(pages, res):
+            if code is None:
+                failed_pages.append(p)
+                SCAN["errors"] += 1
+                continue
+            if code == 404 or not plist or not [u for u in plist if u not in posts]:
+                stop = True                            # last page ke aage
+                break
+            for u in plist:
+                posts.setdefault(u, p)
+            SCAN["pages"] = p
+            SCAN["posts"] = len(posts)
+        if stop or (end and pages[-1] >= end):
+            break
+        page += SCAN_WORKERS
+    return posts, failed_pages
+
+
+async def run_scan(client, chat_id, start: int = 1, end=None):
+    if SCAN["running"]:
+        return
+    SCAN.update(running=True, stage="📥 Records load", pages=0, posts=0, analyzed=0, items=0, missing_items=0,
+                never=0, partial=0, notfound=0, errors=0, t0=time.time(), cancel=False)
+    pool = ThreadPoolExecutor(max_workers=SCAN_WORKERS, thread_name_prefix="dbrti-scan")
+    loop = asyncio.get_running_loop()
+    msg, updater = None, None
+
+    async def _upd():
+        while True:
+            await asyncio.sleep(4)
+            try:
+                await msg.edit_text(_scan_text(), parse_mode=ParseMode.HTML)
+            except MessageNotModified:
+                pass
+            except FloodWait as fw:
+                await asyncio.sleep(int(getattr(fw, "value", 5)) + 1)
+            except Exception:
+                pass
+
+    try:
+        try:
+            msg = await client.send_message(chat_id, _scan_text(), parse_mode=ParseMode.HTML)
+            updater = asyncio.create_task(_upd())
+        except Exception:
+            msg = None
+        done_ids, istates = await _load_done()
+        SCAN["stage"] = "📚 Listing pages (parallel)"
+        posts, failed_pages = await _scan_listing(pool, start, end)
+        SCAN["stage"] = "🔎 Posts check (parallel)"
+        sem = asyncio.Semaphore(SCAN_WORKERS)
+        miss_posts, bad_posts, nolinks, nonhindi = [], [], 0, 0
+
+        async def one(url, page):
+            nonlocal nolinks, nonhindi
+            if SCAN["cancel"]:
+                return
+            async with sem:
+                data, err = await loop.run_in_executor(pool, _discover_safe, url)
+            SCAN["analyzed"] += 1
+            if err or not data:
+                SCAN["errors"] += 1
+                bad_posts.append({"url": url, "page": page, "err": err or "empty"})
+                return
+            if not data.get("items"):
+                if data.get("skipped"):
+                    nonhindi += 1
+                else:
+                    nolinks += 1
+                return
+            SCAN["items"] += len(data["items"])
+            miss = _analyze_post(url, data, done_ids, istates)
+            if miss:
+                for m in miss:
+                    SCAN["missing_items"] += 1
+                    SCAN[m["cat"]] += 1
+                season, _ = detect_season(data["title"], url, data.get("season", 1))
+                nm = post_name({"title": data["title"], "season": season, "mode": data.get("mode")})
+                miss_posts.append({"url": url, "page": page, "name": nm, "items": miss})
+
+        await asyncio.gather(*[one(u, p) for u, p in posts.items()])
+        miss_posts.sort(key=lambda x: (x["page"], x["name"]))
+        bad_posts.sort(key=lambda x: x["page"])
+
+        # ── report ──
+        names = {"never": "❌ KUCH BHI UPLOAD NAHI HUA", "partial": "⚠️ ADHURA (kuch quality hui, baaki nahi)",
+                 "notfound": "🔍 PEHLE TRY MEIN SITE/SERVER PE NAHI MILI"}
+        lines = [f"Database RTI scan — {time.strftime('%Y-%m-%d %H:%M')}",
+                 f"Pages: {SCAN['pages']} • Posts: {len(posts)} • Items: {SCAN['items']} • "
+                 f"Missing items: {SCAN['missing_items']} • Non-Hindi posts: {nonhindi} • No-links posts: {nolinks}",
+                 ""]
+        for cat in ("never", "partial", "notfound"):
+            rows = [(mp, m) for mp in miss_posts for m in mp["items"] if m["cat"] == cat]
+            if not rows:
+                continue
+            lines.append(f"== {names[cat]} ({len(rows)}) ==")
+            cur = None
+            for mp, m in rows:
+                if cur is not mp:
+                    cur = mp
+                    lines.append(f"[P{mp['page']}] {mp['name']}\n    {mp['url']}")
+                lines.append(f"    - {m['label']}: {', '.join(m['qs'])}")
+            lines.append("")
+        if bad_posts or failed_pages:
+            lines.append(f"== FETCH FAIL ({len(bad_posts)} posts, {len(failed_pages)} pages) — scan dobara chalao ==")
+            lines += [f"[P{b['page']}] {b['url']}  {b['err'][:80]}" for b in bad_posts]
+            lines += [f"[listing page {p}]" for p in failed_pages]
+        report = "\n".join(lines)
+
+        doc_posts = [{"url": mp["url"], "page": mp["page"], "name": mp["name"],
+                      "cats": sorted({m["cat"] for m in mp["items"]})} for mp in miss_posts]
+        doc_posts += [{"url": b["url"], "page": b["page"], "name": b["url"].rstrip("/").split("/")[-1],
+                       "cats": ["unscanned"]} for b in bad_posts]
+        await _col.replace_one({"_id": "scan"}, {
+            "_id": "scan", "ts": time.time(), "posts": doc_posts, "report": report[:3_000_000],
+            "stats": {"posts": len(posts), "items": SCAN["items"], "missing": SCAN["missing_items"],
+                      "never": SCAN["never"], "partial": SCAN["partial"], "notfound": SCAN["notfound"],
+                      "errors": SCAN["errors"]}}, upsert=True)
+        SCAN["stage"] = "✅ Scan complete"
+        if updater:
+            updater.cancel()
+        if msg:
+            try:
+                await msg.edit_text(_scan_text(), parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+        real = SCAN["never"] + SCAN["partial"]
+        summary = (f"🔎 <b>Scan complete</b> • {_fmt_dur(time.time() - SCAN['t0'])}\n"
+                   f"Posts: <code>{len(posts)}</code> • Items: <code>{SCAN['items']}</code>\n"
+                   f"❌ Kuch bhi upload nahi: <code>{SCAN['never']}</code>\n"
+                   f"⚠️ Adhura: <code>{SCAN['partial']}</code>\n"
+                   f"🔍 Site pe nahi mili: <code>{SCAN['notfound']}</code>\n"
+                   + (f"⚠️ Fetch fail: <code>{len(bad_posts)}</code> posts\n" if bad_posts else "")
+                   + (f"\n▶️ Recover: <code>/database_rti fix</code> ({real} items"
+                      + (f" + {len(bad_posts)} unscanned posts" if bad_posts else "") + ")\n"
+                      f"Site-pe-nahi-mili wale bhi: <code>/database_rti fix all</code>"
+                      if (real or bad_posts or SCAN["notfound"]) else "\n✅ Sab kuch database mein hai."))
+        bio = io.BytesIO(report.encode("utf-8"))
+        bio.name = "database_rti_scan_report.txt"
+        await client.send_document(chat_id, bio, caption=summary, parse_mode=ParseMode.HTML)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        LOGGER.error(f"[DB-RTI] scan crash: {e!r}\n{traceback.format_exc()}")
+        SCAN["stage"] = "❌ Scan fail"
+        await _notify(client, chat_id, f"❌ Scan fail: <code>{html.escape(str(e)[:300])}</code>")
+    finally:
+        SCAN["running"] = False
+        if updater:
+            updater.cancel()
+        pool.shutdown(wait=False)
 
 
 # ─────────────────────────────────────────────
@@ -1296,18 +1870,26 @@ async def _monitor_scan(client, q: asyncio.Queue):
     ST.dl_page = prev_page
 
 
+async def _run_clear():
+    await _col.update_one({"_id": "cfg"}, {"$unset": {"run": ""}})
+
+
 async def run_crawl(client, cfg: dict, start: int, end, single_url: str = None, monitor: bool = False,
-                    post_urls: list = None):
+                    post_urls: list = None, page_map: dict = None, resumes: int = 0):
     ST.running, ST.stop, ST.started = True, False, time.time()
     ST.cancel_ev.clear()
     ST.uploaded = ST.skipped = ST.failed = ST.posts_done = ST.nonhindi = 0
     ST.last_complete = ""
-    if not monitor:
+    ST.open_posts, ST.pending_jobs, ST.disk_wait = {}, 0, False
+    ST.dl_slots, ST.up_slots = {}, {}
+    ST.url_mode = bool(post_urls)
+    ST.item_sem = asyncio.Semaphore(DL_WORKERS)
+    if not monitor and not post_urls:
         ST.resume_page = start
     _CLIENT["c"] = client
     loop = asyncio.get_event_loop()
-    q: asyncio.Queue = asyncio.Queue(maxsize=1)
-    consumer = asyncio.create_task(_consumer(client, cfg, q))
+    q: asyncio.Queue = asyncio.Queue(maxsize=UP_WORKERS + 1)
+    consumers = [asyncio.create_task(_consumer(client, cfg, q)) for _ in range(UP_WORKERS)]
     updater = None
     ST.status_msg = None
     if not monitor:                                  # monitor pass chupchaap chalta hai (spam nahi)
@@ -1316,7 +1898,28 @@ async def run_crawl(client, cfg: dict, start: int, end, single_url: str = None, 
         except Exception:
             ST.status_msg = None
         updater = asyncio.create_task(_status_loop(cfg))
+        try:                                         # restart/crash ke baad auto-resume ke liye run yaad rakho
+            await _cfg_set(run={"start": start, "end": end, "single": single_url, "post_urls": post_urls,
+                                "pages": [(page_map or {}).get(u) for u in (post_urls or [])],
+                                "chat": ST.notify_chat, "resumes": resumes, "ts": time.time()})
+        except Exception as e:  # noqa: BLE001
+            LOGGER.warning(f"[DB-RTI] run-state save fail: {e!r}")
     seen_posts: set = set()
+    post_sem = asyncio.Semaphore(POST_PAR)
+    tasks: set = set()
+    cancelled = False
+
+    async def _run_post(p, pg):
+        try:
+            await produce_post(client, q, p, pg, monitor=monitor)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            ST.failed += 1
+            LOGGER.error(f"[DB-RTI] post crash {p}: {e!r}\n{traceback.format_exc()}")
+        finally:
+            post_sem.release()
+
     try:
         page = start
         url = single_url or listing_url(page)
@@ -1324,7 +1927,6 @@ async def run_crawl(client, cfg: dict, start: int, end, single_url: str = None, 
             if ST.stop or (end and page > end):
                 break
             ST.dl_page = page
-            ST.dl_title, ST.dl_item, ST.dl_dir = "", "", ""
             ST.dl_step = f"📚 Listing page {page}"
             code, posts, nxt = None, [], None
             if post_urls:                       # seedha post link(s) — listing fetch nahi
@@ -1354,39 +1956,56 @@ async def run_crawl(client, cfg: dict, start: int, end, single_url: str = None, 
                     await _monitor_scan(client, q)  # lamba crawl chal raha ho tab bhi page 1 ka naya content
                     ST.dl_page = page
                 seen_posts.add(p)
-                await produce_post(client, q, p, page, monitor=monitor)
+                await post_sem.acquire()
+                pg = (page_map or {}).get(p, page)
+                t = asyncio.create_task(_run_post(p, pg))
+                tasks.add(t)
+                t.add_done_callback(tasks.discard)
             if single_url or post_urls:
                 break
             page += 1
             url = nxt or listing_url(page)          # 'NEXT PAGE' button ka link, warna /home/page/N/
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     except Exception as e:  # noqa: BLE001
         LOGGER.error(f"[DB-RTI] crawl crash: {e!r}\n{traceback.format_exc()}")
         await _notify(client, ST.notify_chat,
                       f"❌ Crawl crash • Page <code>{ST.dl_page}</code>\n<code>{html.escape(str(e)[:200])}</code>\n"
                       f"Resume: <code>/database_rti start {ST.resume_page}</code>")
     finally:
-        await q.put(None)
-        await consumer
+        if not cancelled:
+            if tasks:
+                await asyncio.gather(*list(tasks), return_exceptions=True)
+            for _ in consumers:
+                await q.put(None)
+            await asyncio.gather(*consumers, return_exceptions=True)
         if updater:
             updater.cancel()
         ST.running = False
         ST.dl_step = "⏹ Stopped" if ST.stop else "✅ Finished"
-        ST.dl_dir = ""
-        if not monitor:
+        ST.dl_slots, ST.up_slots = {}, {}
+        if not monitor and not cancelled:
+            try:
+                await _run_clear()                   # normal khatam / stop — ab auto-resume nahi
+            except Exception:
+                pass
             if not post_urls:                 # seedha post link se resume page na bigde
                 await _cfg_set(resume_page=ST.resume_page)
             await _render(cfg)
-        if not monitor or ST.uploaded or ST.failed:
+        if (not monitor or ST.uploaded or ST.failed) and not cancelled:
             tag = "👁 Monitor pass" if monitor else ST.dl_step
             await _notify(client, ST.notify_chat,
                           f"{tag}\nComplete posts: {ST.posts_done} • Files: {ST.uploaded} • "
                           f"Skipped: {ST.skipped} • Failed: {ST.failed}"
-                          + ("" if monitor else f"\nResume page: <code>{ST.resume_page}</code>"))
+                          + ("" if monitor else f"\nResume page: <code>{ST.resume_page}</code>")
+                          + ("\n🔎 Failed/adhure ke liye: <code>/database_rti scan</code> → <code>/database_rti fix</code>"
+                             if (ST.failed and not monitor) else ""))
 
 
 # ─────────────────────────────────────────────
-#  Page-1 monitor (RSS-style auto upload)
+#  Page-1 monitor (RSS-style auto upload) + restart ke baad auto-resume
 # ─────────────────────────────────────────────
 async def _cfg_full() -> dict:
     cfg = await _cfg_get()
@@ -1427,14 +2046,51 @@ def stop_monitor():
         MON["task"] = None
 
 
+async def _autoresume(client, run: dict):
+    """Bot restart / crash ke waqt crawl chal raha tha -> khud wahin se dobara shuru."""
+    await asyncio.sleep(20)                          # pyrogram / channels ready hone do
+    try:
+        cfg = await _cfg_full()
+        if ST.running or not (cfg.get("video") and cfg.get("file")):
+            return
+        ST.notify_chat = run.get("chat") or ST.notify_chat
+        resumes = int(run.get("resumes", 0)) + 1
+        post_urls = run.get("post_urls") or None
+        page_map = None
+        if post_urls:
+            page_map = {u.rstrip("/") + "/": pg for u, pg in zip(post_urls, run.get("pages") or []) if pg}
+            start = int(run.get("start") or 1)
+        elif run.get("single"):
+            start = 1
+        else:
+            start = int(cfg.get("resume_page") or run.get("start") or 1)
+        await _notify(client, ST.notify_chat,
+                      f"♻️ <b>Restart ke baad auto-resume</b> (#{resumes})\n"
+                      + (f"{len(post_urls)} post wapas" if post_urls else f"Page <code>{start}</code> se aage")
+                      + " — jo upload ho chuka wo skip hoga.")
+        ST.task = asyncio.create_task(run_crawl(client, cfg, start, run.get("end"), run.get("single"),
+                                                post_urls=post_urls, page_map=page_map, resumes=resumes))
+    except Exception as e:  # noqa: BLE001
+        LOGGER.error(f"[DB-RTI] autoresume fail: {e!r}\n{traceback.format_exc()}")
+
+
 async def autostart_monitor(client):
-    """Bot start pe (__main__.py se) — agar pehle monitor ON tha to wapas chalu."""
+    """Bot start pe (__main__.py se) — monitor wapas chalu + adhura crawl auto-resume."""
     cfg = await _cfg_get()
     if cfg.get("mon_on"):
         ST.notify_chat = cfg.get("notify_chat") or ST.notify_chat
         start_monitor(client, cfg.get("mon_min"))
         LOGGER.info(f"[DB-RTI] monitor autostart (every {MON['interval'] // 60} min)")
-
+    run = cfg.get("run")
+    if run and AUTORESUME:
+        if int(run.get("resumes", 0)) >= 5 and time.time() - float(run.get("ts") or 0) < 3600:
+            await _run_clear()                       # crash-loop: baar-baar girta hai — ruk jao
+            await _notify(client, run.get("chat") or cfg.get("notify_chat"),
+                          "🛑 Crawl 1 ghante mein 5 baar restart ke baad girta raha — auto-resume band.\n"
+                          "Logs dekho, phir <code>/database_rti start resume</code>.")
+        else:
+            ST.notify_chat = run.get("chat") or ST.notify_chat
+            asyncio.create_task(_autoresume(client, run))
 
 # ─────────────────────────────────────────────
 #  Command
@@ -1449,6 +2105,9 @@ _HELP = (
     "<code>/database_rti start &lt;listing_url&gt;</code> — ek listing page\n"
     "<code>/database_rti monitor on [minutes]</code> / <code>off</code> — page 1 auto-upload (RSS jaisa)\n"
     "<code>/database_rti list</code> — complete hui saari seasons/movies ki list (txt)\n"
+    "<code>/database_rti scan [from] [to]</code> — poori site ka FAST scan: kya-kya database mein upload nahi hua (report)\n"
+    "<code>/database_rti fix</code> — scan ke missing items dobara download+upload (<code>fix all</code> = site-pe-nahi-mili bhi)\n"
+    "<code>/database_rti missing</code> — last scan ki report\n"
     "<code>/database_rti stop</code> • <code>status</code> • <code>reset</code> • <code>retry</code>"
 )
 
@@ -1516,6 +2175,53 @@ async def database_rti_cmd(client: Client, message):
         return await message.reply(f"👁 Monitor: {'ON • every ' + str(MON['interval'] // 60) + ' min' if MON['on'] else 'OFF'}\n"
                                    f"<code>/database_rti monitor on 10</code> / <code>off</code>", parse_mode=ParseMode.HTML)
 
+    if sub == "scan":
+        if len(args) > 1 and args[1].lower() == "stop":
+            SCAN["cancel"] = True
+            return await message.reply("🛑 Scan stop requested.")
+        if SCAN["running"]:
+            return await message.reply("Scan already chal raha hai — upar ka live message dekho.")
+        nums = [int(x) for x in args[1:] if x.isdigit()]
+        s_from = nums[0] if nums else 1
+        s_to = nums[1] if len(nums) > 1 else None
+        SCAN["task"] = asyncio.create_task(run_scan(client, message.chat.id, s_from, s_to))
+        return
+
+    if sub == "missing":
+        doc = await _col.find_one({"_id": "scan"})
+        if not doc:
+            return await message.reply("Abhi koi scan nahi hua — <code>/database_rti scan</code> chalao.",
+                                       parse_mode=ParseMode.HTML)
+        bio = io.BytesIO((doc.get("report") or "").encode("utf-8"))
+        bio.name = "database_rti_scan_report.txt"
+        st = doc.get("stats") or {}
+        return await message.reply_document(
+            bio, caption=f"🔎 Last scan • {time.strftime('%Y-%m-%d %H:%M', time.localtime(doc.get('ts', 0)))}\n"
+                         f"❌ never {st.get('never', 0)} • ⚠️ partial {st.get('partial', 0)} • "
+                         f"🔍 site-pe-nahi {st.get('notfound', 0)}")
+
+    if sub == "fix":
+        if ST.running:
+            return await message.reply("Already running. /database_rti status dekho (ya pehle stop karo).")
+        doc = await _col.find_one({"_id": "scan"})
+        if not doc:
+            return await message.reply("Pehle <code>/database_rti scan</code> chalao.", parse_mode=ParseMode.HTML)
+        if not cfg.get("video") or not cfg.get("file"):
+            return await message.reply("Pehle dono channel set karo (/database_rti video / file).")
+        allow = {"never", "partial", "unscanned"}
+        if len(args) > 1 and args[1].lower() == "all":
+            allow.add("notfound")
+        rows = sorted((p for p in doc.get("posts", []) if set(p.get("cats", [])) & allow),
+                      key=lambda p: (p["page"], p["name"]))
+        if not rows:
+            return await message.reply("✅ Fix karne layak kuch nahi mila (scan ke hisaab se sab database mein hai).")
+        urls = [p["url"].rstrip("/") + "/" for p in rows]
+        pmap = {u: p["page"] for u, p in zip(urls, rows)}
+        ST.notify_chat = message.chat.id
+        ST.task = asyncio.create_task(run_crawl(client, cfg, 1, None, None, post_urls=urls, page_map=pmap))
+        return await message.reply(f"🛠 Fix shuru: {len(urls)} post (sirf missing episode/quality — baaki skip). "
+                                   f"Live status neeche aayega.")
+
     if sub == "stop":
         if not ST.running:
             return await message.reply("Kuch chal hi nahi raha.")
@@ -1582,3 +2288,4 @@ async def database_rti_cmd(client: Client, message):
         return
 
     await message.reply(_HELP, parse_mode=ParseMode.HTML)
+
