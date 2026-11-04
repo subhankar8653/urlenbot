@@ -6,6 +6,7 @@ services:
     container_name: urlenbot
     restart: unless-stopped
     init: true                 # zombie chrome/ffmpeg processes khud reap
+    stop_grace_period: 90s     # redeploy/stop pe bot ko clean band hone ka time (10s mein SIGKILL = "unclean restart")
     shm_size: "2gb"            # chromium /dev/shm crash se bachne ke liye
     env_file: config.env       # saare secrets yahin se (API_ID, BOT_TOKEN, MONGO_URI ...)
     environment:
