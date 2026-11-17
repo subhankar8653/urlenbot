@@ -586,19 +586,40 @@ async def load_anime_links(link_idx: int = 0) -> list:
     return pairs
 
 
-async def resolve_link_idx(cfg: dict) -> int:
-    """Settings mein chuna hua update channel -> uska Link number (0-based). Multi mode OFF / kuch chuna nahi => 0."""
+async def link_info(cfg: dict) -> dict:
+    """Schedule channel ke hisaab se anime-links ka Link number kaise tay hoga.
+    kind:
+      'off'  — Multi mode OFF ya schedule channel set nahi => Link 1
+      'auto' — schedule channel khud ek Update Channel hai => usi channel ka link (AUTOMATIC)
+      'pick' — schedule channel Update Channels mein NAHI hai => user ko chuna padega (cfg['link_ch'])
+    """
+    out = {"kind": "off", "idx": 0, "label": "Link 1 (default)"}
     try:
         from ..utils.multi_mode import is_multi, ch_link_idx
-        if not await is_multi() or not cfg.get("link_ch"):
-            return 0
+        if not await is_multi() or not cfg.get("channel_id"):
+            return out
         from .update_channel import _get_update_channels
-        for pos, ch in enumerate(await _get_update_channels()):
-            if ch.get("channel_id") == cfg["link_ch"]:
-                return ch_link_idx(ch, pos)
+        chans = await _get_update_channels()
+        for pos, ch in enumerate(chans):
+            if ch.get("channel_id") == cfg["channel_id"]:
+                idx = ch_link_idx(ch, pos)
+                return {"kind": "auto", "idx": idx,
+                        "label": f"Auto → Channel {pos + 1:02d} (Link {idx + 1})"}
+        out["kind"] = "pick"                      # unknown channel — chuna hua link_ch dekho
+        for pos, ch in enumerate(chans):
+            if cfg.get("link_ch") and ch.get("channel_id") == cfg["link_ch"]:
+                idx = ch_link_idx(ch, pos)
+                out.update(idx=idx, label=f"Channel {pos + 1:02d} (Link {idx + 1}) — tumne chuna")
+                return out
+        out["label"] = "⚠️ Chuna nahi — abhi Link 1 lagega"
     except Exception as e:
         LOGGER.warning(f"[HindiSchedule] link channel resolve failed: {e}")
-    return 0
+    return out
+
+
+async def resolve_link_idx(cfg: dict) -> int:
+    """Link number (0-based). Schedule channel Update Channel hai to AUTO usi ka, warna user ka chuna hua, warna Link 1."""
+    return (await link_info(cfg))["idx"]
 
 
 def _ep_code_new(it) -> str:
@@ -903,7 +924,7 @@ async def cmd_status(client: Client, message: Message):
         await _save(cfg)
         await message.reply("🟢 Hindi schedule auto-post **ON**" if cfg["enabled"] else "🔴 Hindi schedule auto-post **OFF**")
         return
-    await message.reply(_status_text(cfg) + "\n\nCommands: `/hindi_schedule on|off`, `/hindi_schedule_time`, "
+    await message.reply(_status_text(cfg, (await link_info(cfg))["label"]) + "\n\nCommands: `/hindi_schedule on|off`, `/hindi_schedule_time`, "
                         "`/hindi_schedule_now`, `/hindi_schedule_style`, `/add_hindi_anime_schedule`")
 
 
@@ -969,7 +990,7 @@ async def _send_debug(client: Client, chat_id: int):
     await wait.delete()
 
 
-def _status_text(cfg: dict) -> str:
+def _status_text(cfg: dict, link_label: str = None) -> str:
     h, m = _hhmm(cfg.get("time"))
     ch = f"**{cfg.get('channel_title', 'Unknown')}**\n🆔 `{cfg['channel_id']}`" if cfg.get("channel_id") else "❌ Set nahi hai"
     today = DAY_FULL[datetime.now(IST).weekday()]
@@ -982,7 +1003,7 @@ def _status_text(cfg: dict) -> str:
         f"🎨 Style: **{'✨ NEW (image + links)' if style_of(cfg) == 'new' else '📜 OLD (classic list)'}**\n"
         f"🖼 Image: **{'🟢 ON' if cfg.get('image', True) else '🔴 OFF'}** _(NEW style)_\n"
         f"💜 Branding (links + community): **{'🟢 ON' if footer_on(cfg) else '🔴 OFF'}**\n"
-        f"🔗 Anime links: **{cfg.get('link_ch_title') or 'Link 1 (default)'}**\n"
+        f"🔗 Anime links: **{link_label or 'Link 1 (default)'}**\n"
         f"🗓 Aaj: {today}\n"
         f"📤 Last post: {cfg.get('last_date') or '—'}"
     )
@@ -1020,9 +1041,9 @@ async def render(client: Client, cb: CallbackQuery):
         [InlineKeyboardButton("💜 Branding: ON — OFF karo" if footer_on(cfg)
                               else "💜 Branding: OFF — ON karo", callback_data="cmz:hs:foot")],
     ]
-    if multi:       # Multi mode ON: anime ke naam pe kis update channel ka link lage — yahan chuno
-        rows.append([InlineKeyboardButton("🔗 Anime links: " + (cfg.get("link_ch_title") or "Link 1 (default)"),
-                                          callback_data="cmz:hs:lnk")])
+    li = await link_info(cfg)
+    if multi and li["kind"] == "pick":   # schedule channel Update Channels mein nahi => manual chuno
+        rows.append([InlineKeyboardButton("🔗 Anime links: " + li["label"], callback_data="cmz:hs:lnk")])
     rows += [
         [InlineKeyboardButton("📤 Aaj ka schedule abhi post karo", callback_data="cmz:hs:now")],
         [InlineKeyboardButton("🧪 Debug file", callback_data="cmz:hs:dbg")],
@@ -1030,7 +1051,7 @@ async def render(client: Client, cb: CallbackQuery):
     if cfg.get("channel_id"):
         rows.append([InlineKeyboardButton("🗑 Channel hatao", callback_data="cmz:hs:rm")])
     rows.append(_back_row())
-    await _edit(client, cb, _status_text(cfg), InlineKeyboardMarkup(rows))
+    await _edit(client, cb, _status_text(cfg, li["label"]), InlineKeyboardMarkup(rows))
 
 
 _PRESETS = ["0600", "0700", "0800", "0900", "1000", "1200", "1800", "2100"]
@@ -1053,6 +1074,13 @@ async def handle(client: Client, cb: CallbackQuery, args: list):
                         "Abhi har anime pe **Link 1** lagega.",
                         InlineKeyboardMarkup([_back()]))
             return
+        li = await link_info(cfg)
+        if li["kind"] == "auto":
+            await _edit(client, cb,
+                        "**🔗 Anime links**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"Schedule channel ek Update Channel hai, isliye link **automatic**: {li['label']}.\n"
+                        "Kuch chunne ki zarurat nahi.", InlineKeyboardMarkup([_back()]))
+            return
         cur = cfg.get("link_ch")
         rows = [[InlineKeyboardButton(("✅ " if not cur else "") + "Link 1 (default)", callback_data="cmz:hs:lset:0")]]
         for pos, ch in enumerate(chans):
@@ -1063,8 +1091,8 @@ async def handle(client: Client, cb: CallbackQuery, args: list):
         rows.append(_back())
         await _edit(client, cb,
                     "**🔗 Anime ke naam pe kaunsa link lage?**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "Multi mode mein har update channel ka alag Watch link hota hai. "
-                    "Schedule post mein anime ke naam pe jis channel ka link chahiye wo chuno.",
+                    "Ye schedule channel Update Channels mein nahi hai, isliye yahan chuno ki "
+                    "kis channel ka Watch link lage.",
                     InlineKeyboardMarkup(rows))
         return
 
@@ -1257,5 +1285,17 @@ async def hs_input(client: Client, message: Message):
         await message.reply(f"❌ {err}\n\nSahi karke ID dobara bhejo.")
         raise StopPropagation
     _SESS.pop(uid, None)
-    await message.reply(f"✅ **Schedule channel set!**\n\n📢 **{title}**\n🆔 `{cid}`", reply_markup=back_kb)
+    cfg = await _cfg()
+    cfg.pop("link_ch", None)              # channel badla => purana link-choice bekaar
+    cfg.pop("link_ch_title", None)
+    await _save(cfg)
+    li = await link_info(cfg)
+    extra, kb = "", back_kb
+    if li["kind"] == "auto":
+        extra = f"\n\n🔗 Anime links: **{li['label']}** (automatic)"
+    elif li["kind"] == "pick":
+        extra = ("\n\n🔗 Ye channel Update Channels mein nahi hai — "
+                 "neeche se chuno kis channel ka link lage 👇")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Link channel chuno", callback_data="cmz:hs:lnk")], _back()])
+    await message.reply(f"✅ **Schedule channel set!**\n\n📢 **{title}**\n🆔 `{cid}`{extra}", reply_markup=kb)
     raise StopPropagation
