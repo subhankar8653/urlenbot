@@ -69,10 +69,9 @@ _CATEGORIES = [
      ]),
     ("monitor", "🤖 Auto Monitor",
      "🤖 **Auto Monitor & Main Channel Post**",
-     "_Anime auto-detect, aur Main Channel Post (kaunsa anime post hoga, kahan post hoga)_",
+     "_Ek hi Anime List — monitor channel, naam, link, thumbnails, timing sab ek jagah. Aur Main Channel Post kahan jaayega_",
      [
-         ("🤖 Auto-Monitor Anime List", "auto_monitor"),
-         ("📋 Main Channel Post Anime List", "update_post_list"),
+         ("📚 Anime List (Monitor + Post)", "auto_monitor"),
          ("📢 Main Channel Post Channels", "update_channels"),
      ]),
     ("deco", "🎟 Border & Stickers",
@@ -393,36 +392,16 @@ async def _open_section(client: Client, cb: CallbackQuery, section: str):
         await render_main(client, cb)
         return
 
-    if section == "update_post_list":
-        from .update_channel import _get_post_map, _show_update_post_list_panel
-        post_map = await _get_post_map()
-        if not post_map:
-            text = (
-                "📋 **Main Channel Post — Anime List**\n\n"
-                "📭 Koi anime post entry save nahi hai.\n\n"
-                "Add karne ke liye: `/update_post`\n\n"
-                "⚠️ **Note:** Sirf yahan registered anime ka hi update "
-                "channel pe post jaayega!"
-            )
-            await _safe_edit(client, cb, text, InlineKeyboardMarkup([_back_row()]))
-            return
-        # Panel apni khud ki paginated keyboard bana ke edit karta hai
-        # (Customise Menu row + Close button ke saath, update_channel.py
-        # mein already add kiya gaya hai).
-        await _show_update_post_list_panel(cb.message, user_id, page=0, is_new=False)
+    # ── 📚 Unified Anime List (purani Auto-Monitor list + Main Channel Post list ab ek) ──
+    if section in ("auto_monitor", "update_post_list"):
+        from .anime_manager import show_list as _am_list
+        await cb.answer()
+        await _am_list(client, cb.message, 0, is_new=False)
         return
 
     if section == "update_channels":
         from .update_channels_panel import render_main as _uc_main
         await _uc_main(client, cb)
-        return
-
-    # ── 🤖 Auto-Monitor & Anime List ──
-    if section == "auto_monitor":
-        # Seedha anime list panel (har anime ek button → detail → delete)
-        from .auto_monitor import _show_list_anime_panel
-        await cb.answer()
-        await _show_list_anime_panel(client, cb.message, user_id, page=0, is_new=False)
         return
 
     # ── 📡 Auto Channel Upload ──

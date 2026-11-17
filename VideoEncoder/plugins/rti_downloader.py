@@ -98,27 +98,70 @@ async def _set_rti_channel_upload(user_id: int, enabled: bool):
 # ─────────────────────────────────────────────
 #  Audio detection helpers
 # ─────────────────────────────────────────────
-def _detect_audio(link_el, context_text: str) -> str:
-    prev = link_el.previous_sibling
-    if prev:
-        t = str(prev).strip().lower()
-        for kw, label in [("hindi","hindi"),("dual","dual"),("multi","multi"),
-                           ("english","english"),("japanese","japanese"),("sub","sub")]:
-            if kw in t:
-                return label
+# ── FIX: "Hindi Sub – [WatchMultiQuality]" ko pehle "hindi" maan liya jaata tha ──
+# Keyword loop mein "hindi" "sub" se pehle check hota tha, isliye Hindi-SUB wali row
+# bhi Hindi-DUB samajh ke download/upload ho jaati thi. Ab SUB sabse pehle check hota hai
+# aur har link ka label uski APNI line (<br> tak) se padha jaata hai.
+_SUB_WORD_RE = re.compile(r"\bsubs?\b|subbed|subtitles?|\besubs?\b", re.I)
+_OTHER_LANG_RE = re.compile(
+    r"\b(tamil|telugu|bengali|malayalam|kannada|marathi|punjabi|urdu|gujarati|"
+    r"bangla|odia|tagalog|indonesian|spanish|french|arabic|korean|chinese|thai|"
+    r"portuguese|russian|german)\b", re.I)
+_KW_LABELS = [("hindi", "hindi"), ("dual", "dual"), ("multi", "multi"),
+              ("english", "english"), ("japanese", "japanese")]
 
+
+def _kw_label(text: str):
+    """Text se audio label (SUB sabse pehle). Kuch nahi mila to None."""
+    t = (text or "").lower()
+    if not t.strip():
+        return None
+    if _SUB_WORD_RE.search(t):
+        return "sub"
+    for kw, label in _KW_LABELS:
+        if kw in t:
+            return label
+    if _OTHER_LANG_RE.search(t):
+        return "other"
+    return None
+
+
+def _label_before(a) -> str:
+    """Link se pehle ki apni line ka text (\"Hindi Sub – [\"). <br> par ruk jaata hai; link kisi
+    <span>/<strong> ke andar ho to 3 level upar tak jaata hai."""
+    node = a
+    for _ in range(4):
+        parts = []
+        for sib in node.previous_siblings:
+            if getattr(sib, "name", None) == "br":
+                return " ".join(reversed(parts)).strip().lower()
+            parts.append(sib.get_text(" ", strip=True) if hasattr(sib, "get_text") else str(sib))
+        txt = " ".join(reversed(parts)).strip().lower()
+        if txt:
+            return txt
+        node = node.parent
+        if node is None or getattr(node, "name", None) in (None, "[document]", "body", "html"):
+            break
+    return ""
+
+
+def _detect_audio(link_el, context_text: str) -> str:
+    # 1) Link ki apni line ka label — sabse bharosemand ("Hindi Sub –" => sub)
+    lab = _kw_label(_label_before(link_el))
+    if lab:
+        return lab
+
+    # 2) Purane fallbacks (ab SUB pehle check hota hai)
     parent = link_el.find_parent()
     if parent:
         pt = parent.get_text(" ", strip=True).lower()
         lt = link_el.get_text(strip=True).lower()
-        if lt in pt:
-            before = pt.split(lt)[0][-80:]
-            for kw, label in [("hindi","hindi"),("dual","dual"),("multi","multi"),
-                               ("english","english"),("japanese","japanese"),("sub","sub")]:
-                if kw in before:
-                    return label
+        if lt and lt in pt:
+            lab = _kw_label(pt.split(lt)[0][-80:])
+            if lab:
+                return lab
 
-    ct = context_text.lower()
+    ct = (context_text or "").lower()
     for pat, label in [
         (r"hindi\s*[-\u2013\u2014]\s*\[?watch", "hindi"),
         (r"english\s*[-\u2013\u2014]\s*\[?watch", "english"),
@@ -128,12 +171,7 @@ def _detect_audio(link_el, context_text: str) -> str:
         if re.search(pat, ct):
             return label
 
-    for kw, label in [("hindi","hindi"),("dual","dual"),("multi","multi"),
-                      ("english","english"),("japanese","japanese"),("sub","sub")]:
-        if kw in ct:
-            return label
-
-    return "unknown"
+    return _kw_label(ct) or "unknown"
 
 
 def _find_wmq_links(element) -> list:
@@ -615,6 +653,86 @@ def get_watchmult_link(page_url: str, episode_num: int):
     except Exception as e:
         LOGGER.error(f"[RTI] Page scrape error: {e}")
         return None, None
+
+
+# ─────────────────────────────────────────────
+#  AUTO-MONITOR ke liye STRICT finder
+#  Sirf Hindi DUB (env AM_AUDIO_ALLOWED, default: hindi,dual,multi) ka link deta hai.
+#  Page pe abhi sirf "Hindi Sub" / "Eng Sub" / koi aur language ho to link NAHI deta,
+#  status="wrong_audio" deta hai — caller 30s baad dobara check karta hai.
+#    status: ok | wrong_audio | no_link | no_episode | error
+# ─────────────────────────────────────────────
+AM_AUDIO_ALLOWED = [a.strip().lower() for a in
+                    os.getenv("AM_AUDIO_ALLOWED", "hindi,dual,multi").split(",") if a.strip()] \
+                   or ["hindi", "dual", "multi"]
+
+
+def _pick_allowed(links: list, title: str, allowed: list):
+    for pr in AUDIO_PRIORITY:
+        if pr not in allowed and not (pr == "unknown" and "unknown" in allowed):
+            continue
+        for lnk in links:
+            if lnk["audio"] == pr:
+                return lnk
+    # label-less link: sirf tab jab page title mein Sub na ho
+    if not _SUB_WORD_RE.search(title or ""):
+        for lnk in links:
+            if lnk["audio"] == "unknown":
+                return lnk
+    return None
+
+
+def get_watchmult_link_checked(page_url: str, episode_num: int, allowed: list = None) -> dict:
+    allowed = [a.lower() for a in (allowed or AM_AUDIO_ALLOWED)]
+    out = {"link": None, "title": None, "status": "no_episode", "audios": []}
+    try:
+        r = requests.get(page_url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.content, "html.parser")
+    except Exception as e:
+        LOGGER.error(f"[RTI] checked scrape error: {e}")
+        out["status"] = "error"
+        return out
+
+    title = _page_title(soup)
+    out["title"] = title
+    links, ep_seen = [], False
+
+    if episode_num == 0:                                   # movie mode
+        links = _find_wmq_links(soup)
+        ep_seen = bool(links)
+    else:
+        for p in soup.find_all("p"):
+            text = p.get_text(" ", strip=True)
+            m = re.search(r"Episode\s*\(?\s*(\d+)", text, re.IGNORECASE)
+            if not (m and int(m.group(1)) == episode_num):
+                continue
+            ep_seen = True
+            links.extend(_find_wmq_links(p))
+            for idx, sib in enumerate(p.find_next_siblings()):
+                if idx > 8:
+                    break
+                em = re.search(r"Episode\s*\(?\s*(\d+)", sib.get_text(" ", strip=True), re.IGNORECASE)
+                if em and int(em.group(1)) != episode_num:
+                    break
+                links.extend(_find_wmq_links(sib))
+        if not links:                                      # generic "S01E05 Fandub" pages
+            found, _ = _generic_items(soup)
+            g = found.get(("EP", episode_num), [])
+            if g:
+                ep_seen = True
+                links = g
+
+    out["audios"] = sorted({l["audio"] for l in links})
+    best = _pick_allowed(links, title, allowed)
+    if best:
+        out["link"], out["status"] = best["href"], "ok"
+    elif links:
+        out["status"] = "wrong_audio"
+    elif ep_seen:
+        out["status"] = "no_link"
+    LOGGER.info(f"[RTI] ep{episode_num} checked: status={out['status']} audios={out['audios']}")
+    return out
 
 
 # ─────────────────────────────────────────────

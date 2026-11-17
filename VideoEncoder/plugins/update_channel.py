@@ -1263,20 +1263,11 @@ async def cmd_remove_update_post_button(client: Client, message: Message):
 # ─────────────────────────────────────────────
 @Client.on_message(filters.command("update_post_list") & filters.private)
 async def cmd_update_post_list(client: Client, message: Message):
-    """Saare saved anime entries — interactive paginated panel."""
+    """Ab ek hi Anime List (Anime Manager) — monitor + post dono yahin se."""
     if not _is_auth(message.from_user.id):
         return
-
-    post_map = await _get_post_map()
-    if not post_map:
-        await message.reply(
-            "📭 Koi anime post entry save nahi hai.\n\n"
-            "Add karne ke liye: `/update_post`\n\n"
-            "⚠️ **Note:** Sirf yahan registered anime ka hi update channel pe post jaayega!"
-        )
-        return
-
-    await _show_update_post_list_panel(message, message.from_user.id, page=0, is_new=True)
+    from .anime_manager import show_list as _am_list
+    await _am_list(client, message, 0, is_new=True)
 
 
 async def _show_update_post_list_panel(event, user_id: int, page: int, is_new: bool):

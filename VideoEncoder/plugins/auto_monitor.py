@@ -102,6 +102,12 @@ def _get_upload_control_fns():
 POLL_WAITS = [15, 20, 30] + [35] * 15 + [120] * 10 + [300] * 2
 POLL_TOTAL_ATTEMPTS = 1 + len(POLL_WAITS)
 
+# Page pe episode ki row mili, par abhi sirf "Hindi Sub" / "Eng Sub" / koi aur language hai
+# (Hindi DUB abhi website pe update nahi hua) => 30s ruko, dobara check karo, 5 baar.
+# 5 baar ke baad bhi Hindi DUB nahi aaya => us episode ka process cancel.
+SUB_WAIT_ATTEMPTS = 5
+SUB_WAIT_SECS = 30
+
 # Channel pe dikhne wale AutoMonitor card mein SIRF progress bar (download / upload).
 # Source / link / scan / poll jaisi koi cheez nahi. Wait ke dauraan ek hi neutral line.
 _WAIT_TXT = "⏳ Please wait..."
@@ -1784,7 +1790,10 @@ async def _forward_to_anime_channel(client: Client, sent_msg, channel_id: int, a
 #  Episode ko RTI se Swift URL tak le jaao
 # ─────────────────────────────────────────────
 async def _get_swift_url_for_episode(page_url: str, episode_num: int, status_msg,
-                                     wmq_link: str = None, label: str = None) -> str | None:
+                                     wmq_link: str = None, label: str = None,
+                                     info: dict = None) -> str | None:
+    """info (optional dict) mein status aata hai: ok | wrong_audio | no_link | no_episode | error
+    + info["audios"] (page pe kaunse audio labels mile, jaise ['sub'])."""
     get_watchmult_link, get_argon_link, argon_to_swift = _get_rti_fns()
     loop = asyncio.get_event_loop()
 
@@ -1795,7 +1804,13 @@ async def _get_swift_url_for_episode(page_url: str, episode_num: int, status_msg
         except Exception:
             pass
 
-        wmq_link, _ = await job_ctl.run_in_thread(get_watchmult_link, page_url, episode_num)
+        # STRICT check: sirf Hindi DUB. "Hindi Sub" / "Eng Sub" / dusri language => link nahi.
+        from .rti_downloader import get_watchmult_link_checked
+        _chk = await job_ctl.run_in_thread(get_watchmult_link_checked, page_url, episode_num)
+        if info is not None:
+            info["status"] = _chk.get("status")
+            info["audios"] = _chk.get("audios") or []
+        wmq_link = _chk.get("link")
         if not wmq_link:
             return None
 
@@ -2443,6 +2458,7 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
             SWIFT_MAX_ATTEMPTS  = SWIFT_FAST_ATTEMPTS + SWIFT_SLOW_ATTEMPTS  # 30
 
             swift_url = None
+            sub_hits = 0                 # lagataar kitni baar page pe sirf Sub / galat language mili
             _rc_ev = asyncio.Event()
             if _jb is not None:                       # link dhundhte waqt bhi 🔄 Re-check kaam kare
                 _jb.recheck_ev = _rc_ev
@@ -2451,22 +2467,43 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
             try:
                 for swift_attempt in range(1, SWIFT_MAX_ATTEMPTS + 1):
                     _lbl = f"🔎 Ep {ep_num} • link try {swift_attempt}/{SWIFT_MAX_ATTEMPTS}"
-                    swift_url = await _get_swift_url_for_episode(url, ep_num, prep_msg, label=_lbl)
+                    _info = {}
+                    swift_url = await _get_swift_url_for_episode(
+                        url, ep_num, prep_msg, label=_lbl, info=_info)
                     if swift_url:
                         break
 
-                    # Last attempt ke baad fail → bahar niklo
-                    if swift_attempt == SWIFT_MAX_ATTEMPTS:
-                        await prep_msg.edit(
-                            f"❌ Ep `{ep_num}` — ~25 min ke baad bhi available nahi hua. Baad mein dobara check karna."
-                        )
-                        break
-
-                    # Phase decide karo
-                    is_fast   = swift_attempt <= SWIFT_FAST_ATTEMPTS
-                    interval  = 30 if is_fast else 60
-                    phase_lbl = "⚡ Fast" if is_fast else "🐢 Slow"
-                    remaining_attempts = SWIFT_MAX_ATTEMPTS - swift_attempt
+                    _wrong = (_info.get("status") == "wrong_audio")
+                    if _wrong:
+                        sub_hits += 1
+                        _aud = ", ".join(_info.get("audios") or ["sub"])
+                        if sub_hits >= SUB_WAIT_ATTEMPTS:
+                            LOGGER.warning(f"[AutoMonitor] Ep {ep_num}: {SUB_WAIT_ATTEMPTS} checks ke baad "
+                                           f"bhi sirf [{_aud}] — cancel")
+                            await prep_msg.edit(
+                                f"🛑 Ep `{ep_num}` — page pe {SUB_WAIT_ATTEMPTS} baar check kiya "
+                                f"(har {SUB_WAIT_SECS}s), par sirf `{_aud}` mila — Hindi DUB update nahi hua.\n"
+                                f"Process cancel kar diya. Hindi aane ke baad dobara bhejo."
+                            )
+                            swift_url = None
+                            break
+                        interval = SUB_WAIT_SECS
+                        phase_lbl = "🔤 Sub-wait"
+                        remaining_attempts = SUB_WAIT_ATTEMPTS - sub_hits
+                        _why = (f"⚠️ Page pe abhi sirf `{_aud}` hai (Hindi DUB nahi)\n")
+                    else:
+                        sub_hits = 0
+                        # Last attempt ke baad fail → bahar niklo
+                        if swift_attempt == SWIFT_MAX_ATTEMPTS:
+                            await prep_msg.edit(
+                                f"❌ Ep `{ep_num}` — ~25 min ke baad bhi available nahi hua. Baad mein dobara check karna."
+                            )
+                            break
+                        is_fast   = swift_attempt <= SWIFT_FAST_ATTEMPTS
+                        interval  = 30 if is_fast else 60
+                        phase_lbl = "⚡ Fast" if is_fast else "🐢 Slow"
+                        remaining_attempts = SWIFT_MAX_ATTEMPTS - swift_attempt
+                        _why = "❌ Download link abhi page pe nahi aaya\n"
 
                     # Countdown ke saath intezaar — 🔄 Re-check dabane par turant agla try
                     _end = time.time() + interval
@@ -2477,7 +2514,7 @@ async def _handle_channel_post_impl(client: Client, message: Message, edited: bo
                         try:
                             await prep_msg.edit(
                                 f"{_lbl}\n"
-                                f"❌ Download link abhi page pe nahi aaya\n"
+                                f"{_why}"
                                 f"⏳ Agla try **{int(_left)}s** mein ({phase_lbl}) • {remaining_attempts} baaki\n"
                                 f"🔄 Abhi try karna ho to Re-check dabao"
                             )
@@ -4168,11 +4205,9 @@ async def cmd_list_anime(client: Client, message: Message):
     if not _is_authorized(message.from_user.id):
         return
 
-    # NOTE: pehle yahan empty-list ke liye ek ALAG duplicate Markdown text
-    # tha (bina html.escape() / mc_text ke) — usi class ka crash risk tha.
-    # Ab _show_list_anime_panel() ko hi call karo, wo empty aur non-empty
-    # dono cases HTML-safe tarike se already handle karta hai.
-    await _show_list_anime_panel(client, message, message.from_user.id, page=0, is_new=True)
+    # Ab Auto-Monitor list + Main Channel Post list ek hi "Anime Manager" panel hai
+    from .anime_manager import show_list as _am_list
+    await _am_list(client, message, 0, is_new=True)
 
 
 # ─────────────────────────────────────────────
