@@ -266,35 +266,65 @@ def _normalize(text: str) -> str:
 
 
 def _find_matching_anime(text: str, anime_list: list) -> dict | None:
-    text_norm = _normalize(text)
+    """Post text se anime dhundo (sabse lamba naam jeetta hai).
+    Match sirf SHABD-SEEMA pe maana jaata hai — naam kisi shabd ke beech se shuru/khatam nahi hona chahiye.
+    Pehle ye normal substring match tha, isliye chhota naam doosre shabd ke andar ghus jaata tha
+    (jaise saved 'Ranma' ka 'Ranmaru no Kiseki' ki post pe match hoke galat channel mein upload).
+    'Re:Zero' = 'ReZero' = 'Re Zero' (space/symbol ignore) pehle jaisa hi chalta hai."""
+    toks = re.findall(r'[a-z0-9]+', (text or '').lower())
+    concat, starts, ends, pos = "", set(), set(), 0
+    for t in toks:
+        starts.add(pos)
+        pos += len(t)
+        ends.add(pos)
+        concat += t
     best, best_len = None, 0
     for entry in anime_list:
         name_norm = _normalize(entry.get('anime_name', ''))
-        if name_norm and name_norm in text_norm and len(name_norm) > best_len:
-            best, best_len = entry, len(name_norm)
+        if not name_norm or len(name_norm) <= best_len:
+            continue
+        i = concat.find(name_norm)
+        while i != -1:
+            if i in starts and (i + len(name_norm)) in ends:
+                best, best_len = entry, len(name_norm)
+                break
+            i = concat.find(name_norm, i + 1)
     return best
 
 
+_MAX_EP_RANGE = 60      # ek post mein itne se zyada episodes ka range galat parse hai (jaise "Episode 5 - 1080p")
+
+
+def _sane_range(a: int, b: int):
+    """Range tabhi maano jab start<=end aur range chhota ho; warna sirf pehla episode."""
+    if b < a or (b - a) >= _MAX_EP_RANGE:
+        return a, a
+    return a, b
+
+
 def _extract_episodes(text: str) -> tuple[int, int] | None:
+    # Pehle fix: "ep" ab sirf poora shabd (word boundary) — pehle "Step 2", "Deep 3" ko bhi episode maan leta tha.
+    # Dusra fix: "Episode 5 - 1080p" / "Ep 5 – 720p" ab range (5-1080) nahi maana jaata (quality hai).
+    # Teesra fix: ulta ya bahut bada range (jaise 5-1080) pe sirf pehla episode.
+    _num2 = r'(\d+)(?!\d*\s?[pPkK]\b)'            # second number ke baad "p"/"k" ho to wo quality hai
     # "EPISODE 4-13 + ZIP PACK ADDED!" / "Episode 34-36" / "Ep 34 - 36" / "EP 34-36"
-    m = re.search(r'episodes?\s*(\d+)\s*[-\u2013]\s*(\d+)', text, re.IGNORECASE)
+    m = re.search(r'\bepisodes?\s*(\d+)\s*[-\u2013]\s*' + _num2, text, re.IGNORECASE)
     if m:
-        return int(m.group(1)), int(m.group(2))
-    # Ep/Episode + to range (case-insensitive — handles all-caps "EP" / "EPISODE" too)
-    m = re.search(r'ep(?:isode)?\s*(\d+)\s*[-\u2013to]+\s*(\d+)', text, re.IGNORECASE)
+        return _sane_range(int(m.group(1)), int(m.group(2)))
+    # Ep/Episode + "to" ya dash range
+    m = re.search(r'\bep(?:isode)?s?\.?\s*(\d+)\s*(?:[-\u2013]|\bto\b)\s*' + _num2, text, re.IGNORECASE)
     if m:
-        return int(m.group(1)), int(m.group(2))
-    # Single "Episode 5" / "EP 2" / "ep 2" — grabs the FIRST ep mentioned
-    # (matches your convention of always listing Hindi ep first, e.g.
-    #  "EP 2 HINDI DUB + EP 4 HINDI SUB ADDED!" -> picks Ep 2)
-    m = re.search(r'ep(?:isode)?\s*(\d+)', text, re.IGNORECASE)
+        return _sane_range(int(m.group(1)), int(m.group(2)))
+    # Single "Episode 5" / "EP 2" / "ep 2" — pehla episode (Hindi ep pehle likhne ki convention:
+    #  "EP 2 HINDI DUB + EP 4 HINDI SUB ADDED!" -> Ep 2)
+    m = re.search(r'\bep(?:isode)?s?\.?\s*(\d+)', text, re.IGNORECASE)
     if m:
         ep = int(m.group(1))
         return ep, ep
     # "34-36 Added" / "34-36 + ZIP PACK ADDED"
     m = re.search(r'(\d+)\s*[-\u2013]\s*(\d+)[^\n]*added', text, re.IGNORECASE)
     if m:
-        return int(m.group(1)), int(m.group(2))
+        return _sane_range(int(m.group(1)), int(m.group(2)))
     return None
 
 
@@ -1503,6 +1533,31 @@ async def _episode_quality_poller_impl(
     LOGGER.info(f"[AutoMonitor] Ep {episode_num}: done in {poll_elapsed}m — {uploaded_qualities}")
     unmark_active(anime_name, episode_num)
     _real_up = (stats.get("uploaded", 0) > 0) if stats is not None else bool(uploaded_qualities)
+
+    # ── FIX: Update post sirf 360p/480p upload hone par jaata tha. 360p fail ya pehle se channel mein
+    #    (dup-skip) ho aur 720p/1080p upload ho jaye to update post kabhi nahi jaata tha.
+    #    Ab episode khatam hone par agar abhi tak nahi gaya (aur kuch upload hua) to yahan bhej do.
+    try:
+        if (_real_up and update_post_mode != "off" and update_post_sent is not None
+                and not update_post_sent[0] and start_ep is not None and episode_num == start_ep):
+            update_post_sent[0] = True
+            from ..utils import episode_guard as _egu2
+            if _egu2.once(("update_post", channel_id, episode_num, end_ep or episode_num)):
+                from .update_channel import send_update_post
+                _ups2 = await send_update_post(
+                    client, anime_name=anime_name, season=season_hint,
+                    episode_start=episode_num, episode_end=(end_ep if end_ep else episode_num),
+                    force=(update_post_mode == "force"),
+                )
+                for _p2 in (_ups2 or []):
+                    try:
+                        job_ctl.track_id(_p2["channel_id"], _p2["message_id"])
+                    except Exception:
+                        pass
+                LOGGER.info(f"[AutoMonitor] Ep {episode_num}: update post (fallback — 360p se nahi gaya tha) bhej diya")
+    except Exception as _ufe:
+        LOGGER.error(f"[AutoMonitor] Update post fallback error: {_ufe}")
+
     if _real_up and target_qualities is None:
         # Episode ki saari qualities ke baad border line (duplicate-skip pe nahi)
         # (Re-check run mein border dobara nahi — pehle hi ja chuka hota hai)
