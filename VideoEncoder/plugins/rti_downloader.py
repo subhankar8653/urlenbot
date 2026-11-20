@@ -174,15 +174,77 @@ def _detect_audio(link_el, context_text: str) -> str:
     return _kw_label(ct) or "unknown"
 
 
+# ── WatchMultiQuality / WatchMultQuality link pehchaan — "chhota-mota" naam badalne par bhi chale ──
+# Site kabhi "WatchMultiQuality" likhti hai, kabhi "WatchMultQuality" (ya space / alag spelling / chhupe
+# characters). Isliye ab exact naam nahi, FUZZY match: purana naam, naya naam, space ya symbol, chhoti
+# spelling galti, zero-width characters, homoglyph — sab chalte hain. Aur agar phir bhi naam na mile to
+# "line ka pehla anchor jo HubCloud/WatchNow/DLBeta/Mega nahi hai" ko WMQ maan liya jaata hai.
+import difflib as _difflib
+import unicodedata as _ud
+
+_INVIS_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff\u00ad]")
+_HOMOGLYPH = str.maketrans({"а": "a", "е": "e", "о": "o", "с": "c", "р": "p", "і": "i", "ѕ": "s",
+                            "ј": "j", "ԁ": "d", "һ": "h", "ɡ": "g", "ⅼ": "l", "ι": "i", "ο": "o"})
+_WMQ_REF = "watchmultiquality"
+_OTHER_SERVERS = ("hubcloud", "watchnow", "dlbeta", "dl-beta", "mega", "telegram", "download", "gdrive",
+                  "drive", "mediafire", "pixeldrain", "gofile", "buzzheavier", "join", "click")
+
+
+def _label_key(t: str) -> str:
+    t = _ud.normalize("NFKC", t or "")
+    t = _INVIS_RE.sub("", t).lower().translate(_HOMOGLYPH)
+    return re.sub(r"[^a-z]", "", t)
+
+
+def is_wmq(text: str, href: str = "") -> bool:
+    """True agar anchor WatchMultiQuality / WatchMultQuality (ya uska koi chhota-mota badla roop) hai."""
+    n = _label_key(text)
+    h = (href or "").lower()
+    if any(k in h for k in ("watchmult", "multiquality", "multquality", "watch-mult", "multi-quality")):
+        return True
+    if not n or any(o.replace("-", "") in n for o in _OTHER_SERVERS if o not in ("mega",)) and "mult" not in n:
+        return False
+    if "multiquality" in n or "multquality" in n or "watchmult" in n:
+        return True
+    if "watch" in n and ("mult" in n or "qual" in n):
+        return True
+    if n.endswith("quality") and len(n) <= 24 and "mult" in n:
+        return True
+    if len(n) >= 8 and _difflib.SequenceMatcher(None, n, _WMQ_REF).ratio() >= 0.74 and "now" not in n:
+        return True
+    return False
+
+
+def _first_in_line(a) -> bool:
+    """Is anchor se pehle (apni line mein, <br> tak) koi aur link nahi."""
+    for sib in a.previous_siblings:
+        nm = getattr(sib, "name", None)
+        if nm == "br":
+            return True
+        if nm == "a" or (nm and hasattr(sib, "find") and sib.find("a")):
+            return False
+    return True
+
+
 def _find_wmq_links(element) -> list:
     links = []
     ctx = element.get_text(" ", strip=True)
-    for a in element.find_all("a", href=True):
-        text = a.get_text(strip=True).lower()
-        href = a.get("href", "")
-        if "watchmultquality" in text or "watchmultquality" in href.lower() or "multiquality" in text:
-            audio = _detect_audio(a, ctx)
-            links.append({"href": href, "audio": audio})
+    anchors = element.find_all("a", href=True)
+    for a in anchors:
+        if is_wmq(a.get_text(strip=True), a.get("href", "")):
+            links.append({"href": a.get("href", ""), "audio": _detect_audio(a, ctx)})
+    if links:
+        return links
+    # Fallback: naam bilkul alag ho gaya — har language-line ka pehla "anjaana" link WMQ maano
+    for a in anchors:
+        key = _label_key(a.get_text(strip=True))
+        if not key or any(o.replace("-", "") in key for o in _OTHER_SERVERS):
+            continue
+        if _first_in_line(a) and _label_before(a):
+            links.append({"href": a.get("href", ""), "audio": _detect_audio(a, ctx)})
+    if links:
+        LOGGER.warning(f"[RTI] WMQ naam pehchana nahi gaya — position se {len(links)} link liye "
+                       f"(text: {[x for x in (a.get_text(strip=True) for a in anchors)][:4]})")
     return links
 
 

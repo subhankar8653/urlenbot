@@ -503,7 +503,11 @@ def _kind_of(a):
     """Anchor kis server ka hai: wmq / hubcloud / watchnow / dlbeta / mega ya None."""
     t = re.sub(r"[\s\[\]]", "", a.get_text(" ", strip=True).lower())
     h = (a.get("href") or "").lower()
-    if "multquality" in t or "multiquality" in t or "watchmultquality" in h:
+    try:
+        from .rti_downloader import is_wmq as _is_wmq        # fuzzy: WatchMultiQuality / WatchMultQuality / variants
+    except Exception:
+        _is_wmq = None
+    if (_is_wmq and _is_wmq(a.get_text(" ", strip=True), h)) or "multquality" in t or "multiquality" in t or "watchmultquality" in h:
         return "wmq"
     if "hubcloud" in t:
         return "hubcloud"
