@@ -248,6 +248,77 @@ def _find_wmq_links(element) -> list:
     return links
 
 
+# ── Episode ka block sirf <p> mein hi ho zaruri nahi (naye / edit kiye episode ka heading <h3>, <div>, <strong>,
+#    <span> mein bhi ho sakta hai) — isliye <p> wale tareeke ke baad ye "kisi bhi tag" wala tareeka bhi chalta hai ──
+_EP_NUM_RE = re.compile(r"Episode\s*\(?\s*0*(\d+)", re.IGNORECASE)
+
+
+def _ep_in(text: str):
+    m = _EP_NUM_RE.search(text or "")
+    return int(m.group(1)) if m else None
+
+
+def _episode_blocks(soup, episode_num: int) -> list:
+    """Wo sabse bade elements jinme SIRF is episode ka heading ho (doosre episode ka nahi)."""
+    blocks = []
+    for el in soup.find_all(True):
+        if el.name in ("html", "body", "head", "script", "style", "a"):
+            continue
+        txt = el.get_text(" ", strip=True)
+        if _ep_in(txt) != episode_num:
+            continue
+        # sabse chhota element jo khud heading rakhta ho (bachcha bhi match kare to bachche tak jao)
+        if any(_ep_in(c.get_text(" ", strip=True)) == episode_num for c in el.find_all(True, recursive=False)):
+            continue
+        blk = el
+        while blk.parent is not None and getattr(blk.parent, "name", None) not in (None, "[document]", "body", "html"):
+            ptxt = blk.parent.get_text(" ", strip=True)
+            others = {int(x) for x in _EP_NUM_RE.findall(ptxt)} - {episode_num}
+            if others:
+                break
+            blk = blk.parent
+        if blk not in blocks:
+            blocks.append(blk)
+    return blocks
+
+
+def _episode_links_any(soup, episode_num: int) -> tuple:
+    """(links, episode_block_mila) — kisi bhi tag mein episode ka block + uske baad ke siblings se WMQ links."""
+    links, seen = [], False
+    for blk in _episode_blocks(soup, episode_num):
+        seen = True
+        links.extend(_find_wmq_links(blk))
+        for idx, sib in enumerate(blk.find_next_siblings()):
+            if idx > 8:
+                break
+            n = _ep_in(sib.get_text(" ", strip=True))
+            if n is not None and n != episode_num:
+                break
+            links.extend(_find_wmq_links(sib))
+    return links, seen
+
+
+def diagnose_episode(page_url: str, episode_num: int) -> str:
+    """Fail hone par 1-2 line ki jaankari: page pe is episode ka block mila ya nahi, aur uske links kaunse the."""
+    try:
+        r = requests.get(page_url, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(r.content, "html.parser")
+        blocks = _episode_blocks(soup, episode_num)
+        if not blocks:
+            seen = sorted({int(x) for x in _EP_NUM_RE.findall(soup.get_text(" ", strip=True))})[-8:]
+            return f"page pe Episode {episode_num} ka block hi nahi mila (page pe episodes: {seen})"
+        anchors = []
+        for blk in blocks[:2]:
+            for a in blk.find_all("a", href=True)[:8]:
+                anchors.append(repr(a.get_text(strip=True))[:26])
+            for sib in list(blk.find_next_siblings())[:2]:
+                for a in sib.find_all("a", href=True)[:8]:
+                    anchors.append(repr(a.get_text(strip=True))[:26])
+        return f"Episode {episode_num} block mila ({blocks[0].name}), links: {', '.join(anchors[:10]) or 'koi link nahi'}"
+    except Exception as e:
+        return f"diagnose error: {e}"
+
+
 def _best_link(links: list):
     for priority in AUDIO_PRIORITY:
         for lnk in links:
@@ -705,6 +776,13 @@ def get_watchmult_link(page_url: str, episode_num: int):
                 if best:
                     return best["href"], anime_title
 
+        # Dusra tareeka: episode ka heading <p> ke bahar (h3 / div / strong / span ...) ho to
+        any_links, _seen = _episode_links_any(soup, episode_num)
+        best = _best_link(any_links)
+        if best:
+            LOGGER.info(f"[RTI] Ep {episode_num}: link <p> ke bahar ke block se mila")
+            return best["href"], anime_title
+
         # Generic fallback — "Anime S01E05 Fandub" jaise link-text wale pages
         found, _ = _generic_items(soup)
         best = _best_link(found.get(("EP", episode_num), []))
@@ -778,6 +856,11 @@ def get_watchmult_link_checked(page_url: str, episode_num: int, allowed: list = 
                 if em and int(em.group(1)) != episode_num:
                     break
                 links.extend(_find_wmq_links(sib))
+        if not links:                                      # episode ka heading <p> ke bahar (h3/div/strong...)
+            _al, _sn = _episode_links_any(soup, episode_num)
+            if _sn:
+                ep_seen = True
+            links = _al
         if not links:                                      # generic "S01E05 Fandub" pages
             found, _ = _generic_items(soup)
             g = found.get(("EP", episode_num), [])
@@ -1171,13 +1254,26 @@ async def _process_episode(client, message, page_url, episode_num, total_episode
                 if swift_url:
                     break  # ✅ Swift URL mil gaya — loop se bahar
 
-        # Yahan tak matlab kuch na kuch fail hua
+        # Yahan tak matlab kuch na kuch fail hua — kaunsa step? (user ko dikhao)
+        _why = "WatchMultQuality link page pe nahi mila"
+        if wmq_link:
+            _why = "WMQ link mil gaya par Argon link nahi nikla"
+            if argon_link:
+                _why = "Argon link mila par Swift code nahi ban paya"
+        if not wmq_link:
+            _dg = await job_ctl.run_in_thread(diagnose_episode, page_url, episode_num)
+            _dg = re.sub(r"[`*_\[\]]", "", str(_dg))[:330]          # Telegram markdown na toote
+            _why += f"\n🔎 {_dg}"
+            LOGGER.warning(f"[RTI] Ep {episode_num} attempt {attempt}: {_why}")
+        else:
+            LOGGER.warning(f"[RTI] Ep {episode_num} attempt {attempt}: {_why} ({wmq_link})")
         if attempt == SWIFT_MAX_ATTEMPTS:
             # Sabhi attempts khatam — HARD STOP signal bhejo
             try:
                 await status_msg.edit(
                     f"🛑 **{ep_label} — Complete Fail**\n\n"
                     f"❌ `{SWIFT_MAX_ATTEMPTS}` attempts ke baad bhi Swift URL nahi mila.\n"
+                    f"📌 Wajah: {_why[:420]}\n"
                     f"⛔ Agle episodes **band** kar diye gaye.\n"
                     f"RTI pe manually check karo."
                 )
@@ -1190,7 +1286,7 @@ async def _process_episode(client, message, page_url, episode_num, total_episode
         try:
             await status_msg.edit(
                 f"⏳ **{ep_label}/{total_episodes}**\n\n"
-                f"🔄 Attempt `{attempt}/{SWIFT_MAX_ATTEMPTS}` fail — link nahi mila\n"
+                f"🔄 Attempt `{attempt}/{SWIFT_MAX_ATTEMPTS}` fail — {_why[:420]}\n"
                 f"⏰ `{SWIFT_RETRY_INTERVAL}s` baad retry... (`{remaining}` attempts baki)"
             )
         except Exception:
@@ -1243,10 +1339,13 @@ async def _process_cached_item(client, message, item, status_msg, index, total, 
             pass
 
         argon_link = await job_ctl.run_in_thread(get_argon_link, wmq_link)
+        _why = "WMQ link mil gaya par Argon link nahi nikla"
         if argon_link:
             swift_url = argon_to_swift(argon_link)
             if swift_url:
                 break
+            _why = "Argon link mila par Swift code nahi ban paya"
+        LOGGER.warning(f"[RTI] {ep_label} attempt {attempt}: {_why} ({wmq_link})")
 
         if attempt == SWIFT_MAX_ATTEMPTS:
             try:
@@ -1264,7 +1363,7 @@ async def _process_cached_item(client, message, item, status_msg, index, total, 
         try:
             await status_msg.edit(
                 f"⏳ **{ep_label}** (`{index}/{total}`)\n\n"
-                f"🔄 Attempt `{attempt}/{SWIFT_MAX_ATTEMPTS}` fail — link nahi mila\n"
+                f"🔄 Attempt `{attempt}/{SWIFT_MAX_ATTEMPTS}` fail — {_why}\n"
                 f"⏰ `{SWIFT_RETRY_INTERVAL}s` baad retry... (`{remaining}` attempts baki)"
             )
         except Exception:
