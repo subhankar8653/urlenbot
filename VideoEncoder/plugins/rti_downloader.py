@@ -11,6 +11,7 @@ Commands:
 """
 
 import asyncio
+import base64
 import os
 import re
 import shutil
@@ -18,6 +19,7 @@ import time
 import uuid
 
 import requests
+from urllib.parse import unquote as _unquote, urljoin as _urljoin
 from bs4 import BeautifulSoup
 from pyrogram import Client, filters
 from pyrogram.types import (
@@ -172,6 +174,19 @@ def _detect_audio(link_el, context_text: str) -> str:
             return label
 
     return _kw_label(ct) or "unknown"
+
+
+def _absolutize(soup, base: str):
+    """Page ke saare <a href> ko poora URL bana do. Naye episode ka link relative ("/go/abc") ya
+    protocol-relative ("//site/abc") ho sakta hai — requests/Chrome ko poora URL chahiye, warna Argon step fail."""
+    try:
+        for a in soup.find_all("a", href=True):
+            h = (a.get("href") or "").strip()
+            if h and not h.lower().startswith(("http://", "https://", "javascript:", "mailto:", "#")):
+                a["href"] = _urljoin(base, h)
+    except Exception:
+        pass
+    return soup
 
 
 # ── WatchMultiQuality / WatchMultQuality link pehchaan — "chhota-mota" naam badalne par bhi chale ──
@@ -443,7 +458,7 @@ def discover_items(page_url: str):
     """
     r = requests.get(page_url, headers=HEADERS, timeout=15)
     r.raise_for_status()
-    soup = BeautifulSoup(r.content, "html.parser")
+    soup = _absolutize(BeautifulSoup(r.content, "html.parser"), page_url)
 
     title = _page_title(soup)
 
@@ -739,7 +754,7 @@ def get_watchmult_link(page_url: str, episode_num: int):
     try:
         r = requests.get(page_url, headers=HEADERS, timeout=15)
         r.raise_for_status()
-        soup = BeautifulSoup(r.content, "html.parser")
+        soup = _absolutize(BeautifulSoup(r.content, "html.parser"), page_url)
 
         anime_title = _page_title(soup)
 
@@ -828,7 +843,7 @@ def get_watchmult_link_checked(page_url: str, episode_num: int, allowed: list = 
     try:
         r = requests.get(page_url, headers=HEADERS, timeout=15)
         r.raise_for_status()
-        soup = BeautifulSoup(r.content, "html.parser")
+        soup = _absolutize(BeautifulSoup(r.content, "html.parser"), page_url)
     except Exception as e:
         LOGGER.error(f"[RTI] checked scrape error: {e}")
         out["status"] = "error"
@@ -965,25 +980,35 @@ def _kill_driver_tree(driver):
         shutil.rmtree(profile_dir, ignore_errors=True)
 
 
-def _extract_argon_from_iframes(driver):
+def _extract_argon_from_iframes(driver, _depth: int = 0):
+    """Page + (nested) iframes ke andar tak Argon embed dhundo."""
     try:
-        soup = BeautifulSoup(driver.page_source, "html.parser")
+        src_html = driver.page_source or ""
+        soup = BeautifulSoup(src_html, "html.parser")
         for iframe in soup.find_all("iframe"):
-            src = iframe.get("src", "")
-            if ARGON_DOMAIN in src:
-                return src
+            src = iframe.get("src", "") or iframe.get("data-src", "")
+            if ARGON_DOMAIN in src or "razorshell.space" in src:
+                return _find_argon(src) or src
 
-        matches = re.findall(
-            r'https?://argon\.razorshell\.space/embed/[A-Za-z0-9_-]+',
-            driver.page_source
-        )
-        if matches:
-            return matches[0]
+        hit = _find_argon(src_html)
+        if hit:
+            return hit
 
-        for iframe in driver.find_elements(By.TAG_NAME, "iframe"):
-            src = iframe.get_attribute("src") or ""
-            if ARGON_DOMAIN in src:
-                return src
+        if _depth < 2:                                     # wrapper iframe ke andar jaao
+            frames = driver.find_elements(By.TAG_NAME, "iframe")
+            for i in range(min(len(frames), 6)):
+                try:
+                    driver.switch_to.frame(i)
+                    found = _extract_argon_from_iframes(driver, _depth + 1)
+                    driver.switch_to.parent_frame()
+                    if found:
+                        return found
+                except Exception:
+                    try:
+                        driver.switch_to.default_content()
+                    except Exception:
+                        pass
+                    break
     except Exception as e:
         LOGGER.error(f"[RTI] Argon extract error: {e}")
     return None
@@ -1002,19 +1027,88 @@ def _close_popups(driver, main_window):
 
 
 _ARGON_RE = re.compile(r'https?://argon\.razorshell\.space/embed/[A-Za-z0-9_-]+')
+# FIX: Argon link ab sirf seedhe "https://argon.razorshell.space/embed/ID" text mein nahi, in roopon mein bhi pakda jaata hai:
+#   https:\/\/argon...\/embed\/ID (JS/JSON escaped) · https%3A%2F%2F... (URL-encoded) · &#x2F; (HTML entity) ·
+#   //argon.razorshell.space/embed/ID (protocol-relative) · atob("...") base64 mein chhupa · razorshell ka koi bhi subdomain
+_ARGON_ANY_RE = re.compile(r'(?:https?:)?//([a-z0-9.-]*razorshell\.space)/(?:embed|downlead|download|d|e)/([A-Za-z0-9_-]{5,})', re.I)
+_B64_RE = re.compile(r'[A-Za-z0-9+/_-]{28,}={0,2}')
+
+
+def _find_argon(text: str):
+    """Kisi bhi text/HTML mein se Argon embed URL nikalo (escaped / encoded / base64 roop mein bhi). Na mile to None."""
+    if not text:
+        return None
+    variants = [text]
+    t2 = text.replace("\\/", "/").replace("&#x2F;", "/").replace("&#47;", "/").replace("&amp;", "&")
+    variants.append(t2)
+    try:
+        variants.append(_unquote(t2))
+    except Exception:
+        pass
+    for v in variants:
+        m = _ARGON_ANY_RE.search(v)
+        if m:
+            return f"https://{m.group(1)}/embed/{m.group(2)}"
+    # base64 mein chhupa ho sakta hai (atob / data-attribute)
+    if "razorshell" not in text.lower():
+        for cand in _B64_RE.findall(text)[:40]:
+            try:
+                dec = base64.b64decode(cand + "=" * (-len(cand) % 4), altchars=b"-_", validate=False).decode("utf-8", "ignore")
+            except Exception:
+                continue
+            if "razorshell" in dec.lower():
+                m = _ARGON_ANY_RE.search(dec.replace("\\/", "/"))
+                if m:
+                    return f"https://{m.group(1)}/embed/{m.group(2)}"
+    return None
 
 
 def _argon_via_requests(watchmult_url: str):
-    """Chrome kholne se pehle (3-8s bachta hai) plain HTTP se argon embed dhundo."""
+    """Chrome kholne se pehle (3-8s bachta hai) plain HTTP se argon embed dhundo.
+    Seedha page mein na mile to uske iframe / link ke andar (1 level) bhi dekhta hai."""
     try:
-        r = requests.get(watchmult_url, headers=HEADERS, timeout=8)
-        if r.status_code == 200:
-            m = _ARGON_RE.search(r.text)
-            if m:
-                return m.group(0)
+        r = requests.get(watchmult_url, headers=HEADERS, timeout=10)
+        if r.status_code != 200:
+            return None
+        hit = _find_argon(r.text)
+        if hit:
+            return hit
+        soup = BeautifulSoup(r.content, "html.parser")
+        nxt = []
+        for tag, attr in (("iframe", "src"), ("iframe", "data-src"), ("embed", "src"), ("a", "href")):
+            for el in soup.find_all(tag):
+                u = (el.get(attr) or "").strip()
+                if u and not u.lower().startswith(("javascript:", "mailto:", "#")):
+                    u = _urljoin(watchmult_url, u)
+                    if u != watchmult_url and u not in nxt and not re.search(r"hubcloud|telegram|t\.me|facebook|twitter", u, re.I):
+                        nxt.append(u)
+        for u in nxt[:4]:
+            try:
+                r2 = requests.get(u, headers={**HEADERS, "Referer": watchmult_url}, timeout=8)
+                hit = _find_argon(r2.text) if r2.status_code == 200 else None
+                if hit:
+                    return hit
+            except Exception:
+                continue
     except Exception:
         pass
     return None
+
+
+def diagnose_wmq_page(watchmult_url: str) -> str:
+    """Argon link na milne par: WatchMultQuality page asal mein kaisa dikh raha hai (1 line)."""
+    try:
+        r = requests.get(watchmult_url, headers=HEADERS, timeout=10, allow_redirects=True)
+        soup = BeautifulSoup(r.content, "html.parser")
+        ifr = [(i.get("src") or i.get("data-src") or "")[:45] for i in soup.find_all("iframe")][:3]
+        low = r.text.lower()
+        flags = [k for k in ("cloudflare", "just a moment", "captcha", "not found", "expired", "processing", "please wait",
+                             "coming soon", "razorshell") if k in low]
+        title = (soup.title.get_text(strip=True) if soup.title else "")[:40]
+        return (f"WMQ page: HTTP {r.status_code}, {len(r.text)} chars, title={title!r}, "
+                f"iframes={ifr or 'nahi'}, scripts={len(soup.find_all('script'))}, flags={flags or '-'}")
+    except Exception as e:
+        return f"WMQ page open nahi hua: {type(e).__name__}"
 
 
 def get_argon_link(watchmult_url: str):
@@ -1030,11 +1124,10 @@ def get_argon_link(watchmult_url: str):
         main = driver.current_window_handle
         # Fixed 2s sleep ki jagah: iframe aate hi turant nikal lo (0.25s polling, max 4s)
         argon = None
-        for _ in range(16):
+        for _ in range(48):                                   # ~12s (naye episode ka iframe der se aata hai)
             try:
-                _m = _ARGON_RE.search(driver.page_source or "")
-                if _m:
-                    argon = _m.group(0)
+                argon = _find_argon(driver.page_source or "")
+                if argon:
                     break
             except Exception:
                 pass
@@ -1260,6 +1353,10 @@ async def _process_episode(client, message, page_url, episode_num, total_episode
             _why = "WMQ link mil gaya par Argon link nahi nikla"
             if argon_link:
                 _why = "Argon link mila par Swift code nahi ban paya"
+        if wmq_link and not argon_link:
+            _dg = await job_ctl.run_in_thread(diagnose_wmq_page, wmq_link)
+            _dg = re.sub(r"[`*_\[\]]", "", str(_dg))[:330]
+            _why += f"\n🔎 {_dg}"
         if not wmq_link:
             _dg = await job_ctl.run_in_thread(diagnose_episode, page_url, episode_num)
             _dg = re.sub(r"[`*_\[\]]", "", str(_dg))[:330]          # Telegram markdown na toote
@@ -1345,6 +1442,9 @@ async def _process_cached_item(client, message, item, status_msg, index, total, 
             if swift_url:
                 break
             _why = "Argon link mila par Swift code nahi ban paya"
+        else:
+            _dg = await job_ctl.run_in_thread(diagnose_wmq_page, wmq_link)
+            _why += "\n🔎 " + re.sub(r"[`*_\[\]]", "", str(_dg))[:330]
         LOGGER.warning(f"[RTI] {ep_label} attempt {attempt}: {_why} ({wmq_link})")
 
         if attempt == SWIFT_MAX_ATTEMPTS:
