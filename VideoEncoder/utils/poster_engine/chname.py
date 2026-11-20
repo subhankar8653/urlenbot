@@ -82,7 +82,7 @@ SPECS: dict[int, dict] = {
     12: dict(font="Kanit-ExtraBold.ttf", size=44, track=3.0, case="upper", at=(72, 78), ink=(255, 255, 255), accent=(150, 120, 255), maxw=700, ref=1920),
     14: dict(font="Lora-Italic-Variable.ttf", size=34, track=0.6, case="keep", at=(640, 668), ink=(17, 55, 69), accent=(178, 96, 70), maxw=420, ref=1280),
 }
-OWN_BRAND = (6, 8, 13)           # these three draw the branding themselves (template header / lockup)
+OWN_BRAND = (6, 8, 13, 15)           # these three draw the branding themselves (template header / lockup)
 
 
 def _font_path(name: str) -> Path | None:

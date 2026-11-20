@@ -6,7 +6,7 @@ Anime-Poster-Bot ke 14 styles ki GLOBAL (bot-wide) settings — do alag jagah ke
   "video" -> upload hone wali video ka auto-thumbnail (pehle TMDB poster + band lagta tha)
   "post"  -> Main Channel pe jaane wale update post ki image
 
-Har kind ka config:  {"style": 0 (OFF = purana tareeka) ya 1..14, "button": "WATCH NOW", "brand": "" (khali = community naam)}
+Har kind ka config:  {"style": 0 (OFF = purana tareeka) ya 1..15, "button": "WATCH NOW", "brand": "" (khali = community naam)}
 
 /customise -> Thumbnail se set hota hai (plugins/poster_panel.py). Hot-path (thumbnail banana / post bhejna) ke liye
 in-memory cache hai; bot start pe ek baar DB se load hota hai (__main__.py).
@@ -21,6 +21,15 @@ _cache: dict = {k: {} for k in KINDS}
 _loaded = False
 
 
+def _hex_or_empty(v) -> str:
+    """Style 15 accent colour: '#RRGGBB' ya '' (default blue)."""
+    import re as _re
+    t = str(v or "").strip().lstrip("#")
+    if _re.fullmatch(r"[0-9a-fA-F]{3}", t):
+        t = "".join(c * 2 for c in t)
+    return ("#" + t.upper()) if _re.fullmatch(r"[0-9a-fA-F]{6}", t) else ""
+
+
 def _norm(d) -> dict:
     d = d if isinstance(d, dict) else {}
     try:
@@ -28,9 +37,10 @@ def _norm(d) -> dict:
     except (TypeError, ValueError):
         style = 0
     return {
-        "style": style if 1 <= style <= 14 else 0,
+        "style": style if 1 <= style <= 15 else 0,
         "button": str(d.get("button") or "").strip()[:24],
         "brand": str(d.get("brand") or "").strip()[:48],
+        "accent": _hex_or_empty(d.get("accent")),
     }
 
 
@@ -67,7 +77,7 @@ def style_of(kind: str) -> int:
 
 def signature(kind: str) -> str:
     c = _cache.get(kind) or {}
-    return f"{c.get('style', 0)}|{c.get('button', '')}|{c.get('brand', '')}"
+    return f"{c.get('style', 0)}|{c.get('button', '')}|{c.get('brand', '')}|{c.get('accent', '')}"
 
 
 async def save(kind: str, **changes) -> dict:

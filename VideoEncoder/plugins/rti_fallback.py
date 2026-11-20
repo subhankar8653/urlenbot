@@ -193,6 +193,35 @@ def _probe_quality(path: str):
     return "360p"
 
 
+_MIN_VIDEO_BYTES = 3 * 1024 * 1024      # isse chhoti file episode nahi hoti (error page / redirect / adhoori)
+
+
+def _valid_video(path: str) -> bool:
+    """FIX: mirror kabhi HTML/error page ya 17KB ki kachra file deta tha ("downloaded file 1080p.mp4",
+    0:00, video nahi) aur wo bina check ke upload ho jaata tha. Ab asli video hona zaroori:
+    size >= 3MB, aur ffprobe (jab available ho) ko video stream + duration milni chahiye."""
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) < _MIN_VIDEO_BYTES:
+            return False
+        if shutil.which("ffprobe") is None:
+            return True                      # ffprobe nahi — sirf size check
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height:format=duration",
+             "-of", "default=nw=1", path],
+            capture_output=True, text=True, timeout=40,
+        )
+        txt = out.stdout or ""
+        m_w = re.search(r"width=(\d+)", txt)
+        m_h = re.search(r"height=(\d+)", txt)
+        m_d = re.search(r"duration=([\d.]+)", txt)
+        if not (m_w and m_h and int(m_w.group(1)) > 0 and int(m_h.group(1)) > 0):
+            return False
+        return bool(m_d and float(m_d.group(1)) > 1.0)
+    except Exception:
+        return True                          # check khud fail hua => file ko galat mat thehrao
+
+
 def _finalize_file(path: str, wanted: str, dest_dir: str) -> str:
     """Quality verify -> naam mein quality tag -> dest_dir mein le aao. Galat quality pe _WrongQuality."""
     got = _probe_quality(path)
@@ -316,6 +345,14 @@ async def _try_kind(kind: str, page_url: str, ep: int, quality: str, work: str, 
             raise
         except Exception as e:  # noqa: BLE001
             LOGGER.error(f"[RTI-FB] {kind} download error: {e!r}")
+            path = None
+        if path and not _valid_video(path):
+            LOGGER.warning(f"[RTI-FB] {kind}: download hui file video nahi hai "
+                           f"({os.path.getsize(path) // 1024} KB) — kachra, agla link/mirror try")
+            try:
+                os.remove(path)
+            except Exception:
+                pass
             path = None
         if path:
             _mark_ok(kind, t_resolve, time.time() - t1)

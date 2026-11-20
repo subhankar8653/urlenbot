@@ -171,7 +171,8 @@ async def _sess(uid: int, kind: str) -> dict:
     if s is None or s.get("kind") != kind:
         cfg = poster_cfg.get(kind)
         s = dict(kind=kind, style=cfg.get("style") or 1, anime=None, aid=None,
-                 opts=dict(button=cfg.get("button") or _api().BUTTON_PRESETS[0], pic=0, char=0),
+                 opts=dict(button=cfg.get("button") or _api().BUTTON_PRESETS[0], pic=0, char=0,
+                           accent=cfg.get("accent") or None),
                  brand=cfg.get("brand") or "", wait=None, panel=None)
         _S[uid] = s
     _LAST_TOUCH[uid] = time.time()
@@ -231,6 +232,8 @@ def _viewer_kb(s: dict) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🔘 " + (s["opts"].get("button") or "")[:18], callback_data=f"pz:bt:{kind}"),
                 InlineKeyboardButton("✏️ Custom", callback_data=f"pz:bc:{kind}"),
             ])
+        if getattr(st, "accent", False):
+            rows.append([InlineKeyboardButton("🎨 Colour: " + _accent_name(s), callback_data=f"pz:ac:{kind}")])
         rows.append([
             InlineKeyboardButton("🏷 Branding", callback_data=f"pz:br:{kind}"),
             InlineKeyboardButton("🔍 Other Anime", callback_data=f"pz:sr:{kind}"),
@@ -246,6 +249,35 @@ def _viewer_kb(s: dict) -> InlineKeyboardMarkup:
                                       callback_data=f"pz:off:{kind}")])
     rows.append([InlineKeyboardButton("🔙 Back", callback_data="cmz:cat:thumb"),
                  InlineKeyboardButton("🏠 Menu", callback_data="cmz:menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _accent_presets():
+    from ..utils.poster_engine.Templates import poster15 as _p15   # presets sirf data hain
+    return _p15.ACCENT_PRESETS, _p15.DEFAULT_ACCENT
+
+
+def _accent_name(s: dict) -> str:
+    try:
+        presets, default = _accent_presets()
+    except Exception:
+        return s["opts"].get("accent") or "Blue"
+    cur = (s["opts"].get("accent") or default).upper()
+    for label, hx in presets:
+        if hx.upper() == cur:
+            return label
+    return cur
+
+
+def _accent_kb(s: dict) -> InlineKeyboardMarkup:
+    kind, n = s["kind"], s["style"]
+    presets, _ = _accent_presets()
+    rows = []
+    for i in range(0, len(presets), 2):
+        rows.append([InlineKeyboardButton(label, callback_data=f"pz:acs:{kind}:{idx}")
+                     for idx, (label, _hex) in list(enumerate(presets))[i:i + 2]])
+    rows.append([InlineKeyboardButton("✏️ Custom hex (#RRGGBB)", callback_data=f"pz:acx:{kind}")])
+    rows.append([InlineKeyboardButton("🔙 Back to preview", callback_data=f"pz:v:{kind}:{n}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -290,6 +322,8 @@ async def _caption(s: dict) -> str:
     ]
     if st.button:
         lines.append(f"🔘 Button: <code>{html.escape(s['opts'].get('button') or '')}</code>")
+    if getattr(st, "accent", False):
+        lines.append(f"🎨 Colour: <code>{html.escape(_accent_name(s))}</code>")
     lines.append("<i>◀️ ▶️ se art badlo (sirf preview ke liye) • ✅ dabane par style save hota hai</i>")
     return "\n".join(lines)
 
@@ -368,7 +402,7 @@ async def _settle(pre):
 def _pkey(s: dict, brand: str, aid) -> tuple:
     o = s["opts"]
     return (s["style"], o.get("button") or "", brand, o.get("pic", 0), o.get("char", 0),
-            o.get("color") or "", aid or 0)
+            o.get("color") or "", aid or 0, o.get("accent") or "")
 
 
 async def _render_view(client: Client, cb_msg: Message, s: dict, uid: int, note: str = "", pre=None):
@@ -393,7 +427,8 @@ async def _render_view(client: Client, cb_msg: Message, s: dict, uid: int, note:
                     jpg = await _render_old(s, a)
                 else:
                     r = await api.render(a, s["style"], button=s["opts"].get("button"), brand=brand,
-                                         pic=s["opts"].get("pic", 0), char=s["opts"].get("char", 0))
+                                         pic=s["opts"].get("pic", 0), char=s["opts"].get("char", 0),
+                                         accent=s["opts"].get("accent"))
                     jpg = r.jpg
                 _pc_put(key, jpg)
         except api.NoArt as e:
@@ -534,6 +569,31 @@ async def poster_panel_cb(client: Client, cb: CallbackQuery):
                 LOGGER.warning(f"[PosterPanel] off caption failed: {e}")
         return
 
+    if act == "ac":                                      # style 15 ka accent colour picker
+        await cb.answer()
+        try:
+            await cb.message.edit_reply_markup(_accent_kb(s))
+        except Exception:
+            pass
+        return
+
+    if act == "acs":
+        presets, _d = _accent_presets()
+        idx = int(parts[3])
+        if 0 <= idx < len(presets):
+            s["opts"]["accent"] = presets[idx][1]
+        await cb.answer("⏳ Colour lagake preview ban raha hai...")
+        await _render_view(client, cb.message, s, uid)
+        return
+
+    if act == "acx":
+        s["wait"] = "accent"
+        s["panel"] = cb.message.id
+        await cb.answer()
+        await _ask(client, cb, "🎨 <b>Colour ka hex code bhejo</b>, jaise <code>#FF6A00</code> (orange) ya <code>#2F4BFF</code> (blue).\n"
+                               "Default wapas ke liye <code>reset</code> likho.")
+        return
+
     if act == "cl":                                      # purane style ka color picker
         await cb.answer()
         try:
@@ -577,7 +637,8 @@ async def poster_panel_cb(client: Client, cb: CallbackQuery):
             await cb.answer("✅ Apply ho gaya!", show_alert=False)
             note = f"✅ <b>Style {n} applied</b> — ab se video thumbnails pe ye purana band style lagega."
         else:
-            await poster_cfg.save(kind, style=n, button=s["opts"].get("button") or "", brand=s.get("brand") or "")
+            await poster_cfg.save(kind, style=n, button=s["opts"].get("button") or "", brand=s.get("brand") or "",
+                                  accent=(s["opts"].get("accent") or "") if getattr(api.POSTERS[n], "accent", False) else "")
             await cb.answer(f"✅ Style {n} apply ho gaya!", show_alert=False)
             where = ("ab se naye video thumbnails / covers is style mein banenge"
                      if kind == "video" else "ab se Main Channel update posts ki image is style mein banegi")
@@ -717,7 +778,20 @@ async def poster_panel_text(client: Client, message: Message):
     except Exception:
         pass
 
-    if mode == "button":
+    if mode == "accent":
+        import re as _re
+        t = text.strip().lstrip("#")
+        if text.lower() in ("reset", "default", "auto", "-"):
+            s["opts"]["accent"] = None
+        elif _re.fullmatch(r"[0-9a-fA-F]{3}|[0-9a-fA-F]{6}", t):
+            if len(t) == 3:
+                t = "".join(c * 2 for c in t)
+            s["opts"]["accent"] = "#" + t.upper()
+        else:
+            if pm:
+                await _view_error(client, pm, s, "😕 Hex code samajh nahi aaya. Aise bhejo: <code>#FF6A00</code>")
+            raise StopPropagation
+    elif mode == "button":
         s["opts"]["button"] = " ".join(text.split())[:20].upper()
     elif mode == "brand":
         from ..utils.poster_engine import chname

@@ -143,6 +143,7 @@ class PosterStyle:
     button: bool = False             # supports a custom button text
     brand: bool = False              # supports custom brand name (TOP + BOTTOM)
     character: bool = False          # uses transparent fanart.tv PNG (choose which in Options, next + back)
+    accent: bool = False             # supports an accent colour (preset list / custom hex)
 
 
 POSTERS: dict[int, PosterStyle] = {p.id: p for p in [
@@ -160,6 +161,7 @@ POSTERS: dict[int, PosterStyle] = {p.id: p for p in [
     PosterStyle(12, "Style 12", "Dark violet glow, AniList banner background"),
     PosterStyle(13, "Style 13", "Orange slash, AniList poster + rating cards", button=True, brand=True),
     PosterStyle(14, "Style 14", "Peach/teal, AniList poster in an arched panel", button=True),
+    PosterStyle(15, "Style 15", "Dark honeycomb + hex art collage, 2 buttons · colour option", button=True, brand=True, accent=True),
 ]}
 
 
@@ -277,6 +279,10 @@ class Anime:
     posters_listed: bool = False
     banners_listed: bool = False
     img_cache: dict = field(default_factory=dict)    # url -> bytes (already sized up)
+    char_art: list = field(default_factory=list)    # [bytes] AniList character portraits (style 15 collage)
+    pool_tried: bool = False
+    hd_banner: str | None = None                     # TMDB clean-16:9 HD backdrop url (banner styles ko pehle ye milta hai)
+    hd_tried: bool = False
     _cache: dict = field(default_factory=dict)
 
     @property
@@ -390,7 +396,7 @@ async def load_anime(anilist_id: int) -> Anime:
 #   8, 12                           AniList banner              (no banner -> AniList poster)
 # ----------------------------------------------------------------------
 PNG_STYLES = {1, 2, 4, 5}
-BANNER_STYLES = {8, 12}
+BANNER_STYLES = {8, 12, 15}
 
 
 def art_kind(style_id: int) -> str:
@@ -415,14 +421,43 @@ async def _need_image(a: Anime, which: str) -> None:
     setattr(a, f"{which}_bytes", data)
 
 
+async def _find_hd_backdrop(a: Anime) -> None:
+    """FIX (style 8 / 12 ki blurry, zoomed image): AniList banner ~4.75:1 ultra-wide hota hai, aur 16:9 poster mein
+    center-crop hoke ~2.7x zoom ho jaata tha => blur / sirf aadha chehra. TMDB ka clean 16:9 HD backdrop (jo bot
+    thumbnail ke liye pehle se use karta hai) ab banner styles ko PEHLE milta hai; AniList banner next/back mein rehta hai."""
+    if a.hd_tried:
+        return
+    a.hd_tried = True
+    try:
+        from ..anime_api import fetch_anime_details
+        d = await asyncio.wait_for(fetch_anime_details(a.title), 20)
+        url = (d or {}).get("image")
+        if not url:
+            return
+        async with httpx.AsyncClient(headers=HEADERS, timeout=25, follow_redirects=True) as client:
+            data = await _get_bytes(client, url)
+        img = _pil(data)
+        if img is None or img.width / max(img.height, 1) < 1.5:      # poster (portrait) fallback nahi chahiye
+            return
+        a.img_cache[url] = await asyncio.to_thread(_grow_bytes, data)
+        a.hd_banner = url
+        if a.banners_listed and all(u != url for _, u in a.banners):
+            a.banners.insert(0, ("TMDB HD backdrop", url))
+    except Exception as e:  # noqa: BLE001
+        log.info("HD backdrop lookup failed for %r: %s", a.title, e)
+
+
 def _base_items(a: Anime, kind: str) -> list:
     """What AniList itself has: one poster, one banner. Nothing else is touched until the user taps next / back."""
     if kind == "poster":
         ci = a.raw.get("coverImage") or {}
         u = ci.get("extraLarge") or ci.get("large")
         return [("AniList poster", u)] if u else []
+    items = [("TMDB HD backdrop", a.hd_banner)] if a.hd_banner else []
     u = a.raw.get("bannerImage")
-    return [("AniList banner", u)] if u else []
+    if u:
+        items.append(("AniList banner", u))
+    return items
 
 
 def _art_items(a: Anime, kind: str) -> list:
@@ -436,6 +471,8 @@ async def list_art(a: Anime, kind: str) -> None:
     banners: this anime's banner, then related entries' banners, the trailer thumbnail and episode thumbnails."""
     if getattr(a, f"{kind}s_listed"):
         return
+    if kind == "banner":
+        await _find_hd_backdrop(a)
     items = list(_base_items(a, kind))
     try:
         async with httpx.AsyncClient(headers=HEADERS, timeout=25, follow_redirects=True) as client:
@@ -493,9 +530,41 @@ async def _download_art(a: Anime, url: str) -> None:
     a.img_cache[url] = await asyncio.to_thread(_grow_bytes, data)     # small image -> medium size, same ratio
 
 
+async def _ensure_collage_pool(a: Anime) -> None:
+    """Style 15: extra tiles for the hexagon collage — the AniList poster + up to 4 character portraits (once)."""
+    if a.pool_tried:
+        return
+    a.pool_tried = True
+    try:
+        await _need_image(a, "cover")
+    except Exception as e:  # noqa: BLE001
+        log.info("collage poster load failed: %s", e)
+    edges = (a.raw.get("characters") or {}).get("edges") or []
+    urls = [((e.get("node") or {}).get("image") or {}).get("large") for e in edges][:4]
+    urls = [u for u in urls if u]
+    if not urls:
+        return
+    try:
+        async with httpx.AsyncClient(headers=HEADERS, timeout=25, follow_redirects=True) as client:
+            datas = await asyncio.gather(*[_get_bytes(client, u) for u in urls], return_exceptions=True)
+        a.char_art = [d for d in datas if isinstance(d, (bytes, bytearray)) and d]
+    except Exception as e:  # noqa: BLE001
+        log.info("collage character load failed: %s", e)
+
+
 async def ensure_art(a: Anime, style_id: int, opts: dict | None = None) -> None:
     """Load only the one image this style draws.  Raises NoArt when a banner / poster style has nothing to draw."""
     o = opts or {}
+    if style_id == 15:                                          # collage: HD backdrop + poster + character portraits
+        banner_ok = True
+        try:
+            await ensure_art(a, 8, o)                           # same banner logic (TMDB HD backdrop first)
+        except NoArt:
+            banner_ok = False
+        await _ensure_collage_pool(a)
+        if not banner_ok and not (a.cover_bytes or a.char_art):
+            raise NoArt("poster")
+        return
     kind = art_kind(style_id)
     if kind == "png":
         await _ensure_character(a)                              # fanart.tv only
@@ -503,6 +572,8 @@ async def ensure_art(a: Anime, style_id: int, opts: dict | None = None) -> None:
         if not (0 <= idx < len(a.characters)):                  # no PNG (or "cover card" picked) -> AniList poster
             await _need_image(a, "cover")
         return
+    if kind == "banner":
+        await _find_hd_backdrop(a)
     items = _art_items(a, kind)
     if not items and not getattr(a, f"{kind}s_listed"):         # e.g. AniList has no banner -> look further
         await list_art(a, kind)
@@ -984,8 +1055,28 @@ def _render_14(n, a, o):
         return mod.build(anime).convert("RGB")
 
 
+def _render_15(n, a, o):
+    """Style 15 = Templates/poster15.py: dark honeycomb, hex art collage (HD backdrop + poster + characters), 2 buttons, accent colour."""
+    mod = _template(15)
+    tiles = []
+    for im in (_pil(_art_bytes(a, 15, o)), a.cover):              # chosen backdrop / banner first, then the poster
+        if im is not None:
+            tiles.append(im)
+    for raw in a.char_art:
+        im = _pil(raw)
+        if im is not None:
+            tiles.append(im)
+    if not tiles:
+        raise NoArt("banner")
+    r = a.raw
+    meta = dict(title=a.title, genres=(r.get("genres") or [])[:3], synopsis=clean_text(r.get("description"), 420))
+    brand = o.get("brand_text") or f"{BRAND_TOP}{BRAND_BOTTOM}"
+    return mod.render_poster(meta, tiles, accent=o.get("accent") or mod.DEFAULT_ACCENT, brand=brand,
+                             button1=o.get("button") or "DOWNLOAD", button2=o.get("button2") or "JOIN NOW")
+
+
 _RENDERERS = {**{i: _render_1_7 for i in range(1, 8)}, 8: _render_8, 9: _render_aniraw, 10: _render_10,
-              11: _render_11, 12: _render_aniraw, 13: _render_13, 14: _render_14}
+              11: _render_11, 12: _render_aniraw, 13: _render_13, 14: _render_14, 15: _render_15}
 
 
 # ======================================================================
@@ -1013,6 +1104,8 @@ def _render_sync(style_id: int, a: Anime, opts: dict) -> Rendered:
     name = chname.clean(o.get("chname"))                 # the user's channel branding - on EVERY poster
     if name and style_id in (8, 13):                     # the template's brand lockup carries it
         o["brand"] = chname.split_brand(name)
+    if style_id == 15:                                   # the collage poster writes the brand text itself
+        o["brand_text"] = name or ""
     if name and style_id == 6:                           # the template's header text carries it
         mod = _template(6)
         with _BRAND6_LOCK:

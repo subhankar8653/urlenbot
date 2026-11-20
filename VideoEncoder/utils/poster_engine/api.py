@@ -127,15 +127,16 @@ async def _prepare():
 
 
 def default_options(**kw) -> dict:
-    o = dict(button=BUTTON_PRESETS[0], pic=0, char=0, chname="")
+    o = dict(button=BUTTON_PRESETS[0], pic=0, char=0, chname="", accent=None)
     o.update({k: v for k, v in kw.items() if v is not None})
     return o
 
 
-async def render(anime, style_id: int, button: str = None, brand: str = None, pic: int = 0, char: int = 0):
+async def render(anime, style_id: int, button: str = None, brand: str = None, pic: int = 0, char: int = 0,
+                 accent: str = None):
     """dataset.Rendered (jpg / png bytes + size). NoArt raise kar sakta hai (banner/poster nahi mila)."""
     await _prepare()
-    o = default_options(button=button, chname=brand or "", pic=pic, char=char)
+    o = default_options(button=button, chname=brand or "", pic=pic, char=char, accent=accent)
     return await dataset.make_poster(int(style_id), anime, o)
 
 
@@ -150,7 +151,8 @@ async def render_to_file(name: str, cfg: dict, dest: str, brand: str = None, tim
             a = await find_anime(name)
             if a is None:
                 return False
-            r = await render(a, style, button=(cfg or {}).get("button"), brand=brand)
+            r = await render(a, style, button=(cfg or {}).get("button"), brand=brand,
+                             accent=(cfg or {}).get("accent") or None)
             with open(dest, "wb") as fh:
                 fh.write(r.jpg)
             return True

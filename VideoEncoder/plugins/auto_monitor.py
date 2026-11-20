@@ -1226,6 +1226,14 @@ async def _episode_quality_poller_impl(
                 except Exception:
                     pass
                 return
+            # FIX: kachra file (error page / adhoori, <1MB) kabhi upload na ho — quality remaining rahegi, agla check dobara try karega
+            try:
+                if os.path.isfile(path) and os.path.getsize(path) < 1024 * 1024:
+                    LOGGER.warning(f"[AutoMonitor] {os.path.basename(path)} sirf {os.path.getsize(path)} bytes — video nahi, upload skip")
+                    os.remove(path)
+                    return
+            except Exception:
+                pass
             _gs, _is_dup = await _dup_check(q, path)
             if not _is_dup:
                 try:
