@@ -7,7 +7,8 @@ so the same design works in blue / orange / red / green ...
 
 render_poster(meta, tiles, accent="#2F4BFF", brand="ANIME FLICKER", button1="DOWNLOAD", button2="JOIN NOW") -> PIL.Image (1920x1080 RGB)
     meta  : dict(title, genres=[...], synopsis)
-    tiles : list of PIL images used inside the hexagons (backdrop / poster / characters ...). Any length >= 1.
+    tiles : list of PIL images; ISME SE EK artwork chuna jaata hai (proper backdrop > poster) jo saare hexagons ke
+            peeche ek hi bada picture ban kar dikhta hai (hexagon = us picture ki khidkiyan).
 """
 from __future__ import annotations
 
@@ -164,7 +165,7 @@ GAP = 3.2
 
 def _layout():
     """Exact flat-top honeycomb (columns 1.5R apart, odd columns half a row lower), grid units.
-    kind: 'img' | 'solid' | 'ghost' (empty outline)."""
+    kind: 'img' (ek hi bade artwork ka hissa) | 'solid' (accent colour hexagon)."""
     dy = math.sqrt(3) * R_TILE
     xs = [640.0 + 1.5 * R_TILE * k for k in range(4)]
 
@@ -172,69 +173,74 @@ def _layout():
         return xs[k], 120.0 + dy * (j + (0.5 if k % 2 else 0.0))
 
     cells = [
-        ((1, 0), "img"),      # main (centre of the cluster)
-        ((2, 0), "img"),
-        ((1, 1), "img"),
-        ((0, 0), "img"),
-        ((2, -1), "img"),
-        ((3, 1), "img"),
-        ((1, -1), "img"),
-        ((0, -1), "solid"),
-        ((3, 0), "solid"),
-        ((0, 1), "solid"),
-        ((3, 2), "solid"),
-        ((2, 1), "img"),
-        ((1, 2), "img"),
-        ((0, 2), "img"),
+        # column 0 (x=640)
+        ((0, -1), "solid"), ((0, 0), "img"), ((0, 1), "img"), ((0, 2), "solid"),
+        # column 1 (x=796)
+        ((1, -1), "img"), ((1, 0), "img"), ((1, 1), "img"), ((1, 2), "img"),
+        # column 2 (x=952)
+        ((2, -2), "img"), ((2, -1), "img"), ((2, 0), "img"), ((2, 1), "img"), ((2, 2), "img"),
+        # column 3 (x=1108)
+        ((3, -1), "solid"), ((3, 0), "img"), ((3, 1), "img"), ((3, 2), "solid"),
     ]
-    # pos(k, j): j counts rows; even columns start at y=120, odd at y=120+dy/2
     return [(*pos(k, j), kind) for (k, j), kind in cells]
 
 
-_VARIANTS = [
-    (0.50, 0.42, 1.00), (0.50, 0.30, 1.35), (0.38, 0.30, 1.55), (0.62, 0.34, 1.55),
-    (0.50, 0.26, 1.90), (0.30, 0.50, 1.25), (0.70, 0.45, 1.25), (0.55, 0.22, 1.50),
-    (0.45, 0.55, 1.70), (0.65, 0.60, 1.35),
-]
+# ----------------------------------------------------------------------------- one artwork behind all hexagons
+def _focus(img: Image.Image):
+    """Artwork ka 'dilchasp' hissa (edges + colour) — crop wahin center ho. Return (fx, fy) 0..1."""
+    sm = img.convert("RGB").resize((64, 64), Image.BILINEAR)
+    edges = sm.convert("L").filter(ImageFilter.FIND_EDGES)
+    sat = sm.convert("HSV").split()[1]
+    e, sa = list(edges.getdata()), list(sat.getdata())
+    sw = sx = sy = 0.0
+    for i in range(64 * 64):
+        w = (0.75 * e[i] + 0.25 * sa[i]) ** 2
+        sw += w
+        sx += w * (i % 64)
+        sy += w * (i // 64)
+    if sw <= 0:
+        return 0.5, 0.45
+    return min(0.7, max(0.3, sx / sw / 63.0)), min(0.65, max(0.3, sy / sw / 63.0))
 
 
-def _collage(canvas: Image.Image, tiles: list, accent):
+def _pick_art(tiles: list) -> Image.Image:
+    """Poore collage ke liye EK artwork: proper backdrop (aspect <= 2.3) sabse behtar; ultra-wide banner ho to poster."""
+    for t in tiles:
+        r = t.width / max(t.height, 1)
+        if 0.6 <= r <= 2.3 and min(t.size) >= 400:
+            return t
+    for t in tiles:
+        if t.width / max(t.height, 1) <= 2.3:
+            return t
+    return tiles[0]
+
+
+def _collage(canvas: Image.Image, art: Image.Image, accent):
+    """Ek hi artwork canvas ke right hisse pe bichhao; usko hexagon 'khidkiyon' se dikhao
+    (har hexagon us bade artwork ka hi tukda hai — alag-alag seen nahi)."""
     W, H = canvas.size
+    x0 = S(520)
+    rw, rh = W - x0, H
+    fx, fy = _focus(art)
+    big = _crop_fill(art, rw, rh, fx, fy, 1.0)
+
     acc_hi = mix(accent, (255, 255, 255), 0.22)
     acc_lo = mix(accent, (0, 0, 0), 0.30)
-    n_img = 0
     for cx, cy, kind in _layout():
         X, Y, R = cx * F, cy * F, (R_TILE - GAP) * F
         bb = (int(X - R), int(Y - R * math.sqrt(3) / 2), int(X + R) + 1, int(Y + R * math.sqrt(3) / 2) + 1)
         bw, bh = bb[2] - bb[0], bb[3] - bb[1]
         if bb[2] < 0 or bb[0] > W or bb[3] < 0 or bb[1] > H:
             continue
-        # hex mask, 3x supersampled for clean edges
-        m3 = _hex_mask((bw * 3, bh * 3), (X - bb[0]) * 3, (Y - bb[1]) * 3, R * 3)
+        m3 = _hex_mask((bw * 3, bh * 3), (X - bb[0]) * 3, (Y - bb[1]) * 3, R * 3)      # 3x supersampled edges
         mask = m3.resize((bw, bh), Image.LANCZOS)
-        if kind == "img" and tiles:
-            src = tiles[n_img % len(tiles)]
-            fx, fy, z = _VARIANTS[n_img % len(_VARIANTS)]
-            if src.height > src.width * 1.1:                    # portrait art (poster / character): look at the upper part
-                fy = min(fy, 0.34)
-            tile = _crop_fill(src, bw, bh, fx, fy, z)
-            n_img += 1
+        if kind == "img":
+            tile = big.crop((bb[0] - x0, bb[1], bb[2] - x0, bb[3]))
             canvas.paste(tile, (bb[0], bb[1]), mask)
-            # thin light rim
-            rim = Image.new("L", (bw, bh), 0)
-            ImageDraw.Draw(rim).polygon([(x - bb[0], y - bb[1]) for x, y in hex_pts(X, Y, R - S(0.6))],
-                                        outline=70, width=max(1, S(0.9)))
-            canvas.paste(Image.new("RGB", (bw, bh), (255, 255, 255)), (bb[0], bb[1]), rim)
-        elif kind == "solid":
-            grad = Image.linear_gradient("L").resize((bw, bh)).rotate(0)
-            top = Image.new("RGB", (bw, bh), acc_hi)
-            bot = Image.new("RGB", (bw, bh), acc_lo)
-            canvas.paste(Image.composite(bot, top, grad), (bb[0], bb[1]), mask)
-        elif kind == "ghost":
-            ghost = Image.new("L", (bw, bh), 0)
-            ImageDraw.Draw(ghost).polygon([(x - bb[0], y - bb[1]) for x, y in hex_pts(X, Y, R)],
-                                          outline=110, width=max(1, S(1.2)))
-            canvas.paste(Image.new("RGB", (bw, bh), mix(BG, accent, 0.45)), (bb[0], bb[1]), ghost)
+        else:
+            grad = Image.linear_gradient("L").resize((bw, bh))
+            canvas.paste(Image.composite(Image.new("RGB", (bw, bh), acc_lo), Image.new("RGB", (bw, bh), acc_hi), grad),
+                         (bb[0], bb[1]), mask)
     return canvas
 
 
@@ -295,7 +301,9 @@ def render_poster(meta: dict, tiles: list, accent: str = DEFAULT_ACCENT, brand: 
                   button1: str = "DOWNLOAD", button2: str = "JOIN NOW") -> Image.Image:
     acc = on_dark(parse_hex(accent))
     canvas = _background(acc)
-    canvas = _collage(canvas, [t for t in (tiles or []) if t is not None], acc)
+    tiles = [t for t in (tiles or []) if t is not None]
+    if tiles:
+        canvas = _collage(canvas, _pick_art(tiles), acc)
     d = ImageDraw.Draw(canvas)
 
     # ── brand row ──
