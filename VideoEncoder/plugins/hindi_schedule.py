@@ -14,6 +14,7 @@ Commands (owner/sudo):
   /hindi_schedule [on|off]                 — status / chalu / band
   /hindi_schedule_now [mon..sun]           — abhi post karo (aaj ka, ya koi din)
   /hindi_schedule_debug                    — page ka raw text file (parser tune karne ke liye)
+  /hindi_schedule_check                    — dono sites (hindianimeszone + deadtoons) ka comparison, post kiye bina
 
   /hindi_schedule_style [new|old]          — post ka style: NEW (image + clickable anime links) / OLD (purana list)
 
@@ -42,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from pyrogram import Client, filters, StopPropagation, ContinuePropagation
 from pyrogram.enums import ParseMode
 from pyrogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message,
 )
 
 from .. import LOGGER, owner, sudo_users
@@ -56,6 +57,9 @@ DEFAULT_TIME = "08:00"
 CATCHUP_MIN = 180          # bot restart ho gaya ho to post-time ke itne minute tak late post kar do
 RETRY_GAP_MIN = 20         # fail hone par dobara try karne se pehle gap
 MAX_MSG_LEN = 3800
+RECHECK_HOURS = float(os.getenv("HS_RECHECK_HOURS", "3"))     # post ke itne ghante baad dobara check (0 = band)
+RECHECK_RETRY_MIN = 30                                         # recheck fail ho to itne minute baad phir (max 3 baar)
+CROSSCHECK = os.getenv("HS_CROSSCHECK", "1") != "0"            # deadtoons.sbs se double-check
 
 BUSY = False               # janitor (auto-refresh) is flag ko dekhta hai
 _SESS: dict = {}           # user_id → {"mode": "channel" | "time"}
@@ -252,7 +256,7 @@ def _scrape_sync(day_idx):
 _LANGS = {"HINDI", "TAMIL", "TELUGU", "ENGLISH", "JAPANESE", "MALAYALAM", "KANNADA",
           "BENGALI", "KOREAN", "CHINESE", "MARATHI", "URDU", "PUNJABI", "SPANISH"}
 _SKIP_LINES = {"i", "DAILY", "WEEKLY", "NEXT RELEASE", "DAYS", "HOURS", "MINS", "SECS", "NEW",
-               "ONGOING", "WATCH NOW", "STARTING SOON..."}
+               "ONGOING", "WATCH NOW", "STARTING SOON...", "COMPLETE", "COMPLETED"}
 _MONTHS = {m: i for i, m in enumerate(
     ["january", "february", "march", "april", "may", "june", "july", "august",
      "september", "october", "november", "december"], 1)}
@@ -269,7 +273,7 @@ def parse_card(text: str) -> dict:
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
     d = {"title": "", "season": None, "langs": [], "freq": "", "time": None,
          "per_release": 1, "cur": None, "total": None, "next": None, "next_end": None,
-         "next_date": None, "next_time": None, "upcoming": False, "raw": text}
+         "next_date": None, "next_time": None, "upcoming": False, "complete": False, "raw": text}
     for l in lines:
         if l.upper() in _SKIP_LINES or re.fullmatch(r"\d{1,2}", l) or len(l) < 2:
             continue
@@ -315,6 +319,11 @@ def parse_card(text: str) -> dict:
                 pass
     if re.search(r"UPCOMING DUB|Starting soon", text or "", re.IGNORECASE):
         d["upcoming"] = True
+    # FIX: COMPLETE badge / "Complete Series! All 39 episodes aired." wala anime ab aane wala nahi hai —
+    # pehle (jaise JoJo Golden Wind) ye bhi "daily" maan ke roz schedule mein aa jaata tha.
+    if (re.search(r"(?im)^\W*COMPLETED?\W*$", text or "")
+            or re.search(r"complete\s+series|all\s+\d+\s+episodes?\s+(?:have\s+)?aired", text or "", re.IGNORECASE)):
+        d["complete"] = True
     return d
 
 
@@ -329,7 +338,8 @@ def _time_key(t):
 
 
 def filter_hindi(items: list) -> list:
-    out = [i for i in items if i["title"] and ("HINDI" in i["langs"] or not i["langs"])]
+    out = [i for i in items if i["title"] and not i.get("complete")
+           and ("HINDI" in i["langs"] or not i["langs"])]
     return sorted(out, key=lambda i: (_time_key(i["time"]), i["title"].lower()))
 
 
@@ -725,9 +735,8 @@ async def _owner_dm(client: Client, text: str):
             pass
 
 
-async def _post_new_style(client: Client, ch, cfg: dict, day_idx: int, now: datetime, items: list,
-                          link_idx: int = 0):
-    """NEW style: stylish image + caption (clickable anime names). Image fail/OFF => sirf text post."""
+async def _compose_new(cfg: dict, day_idx: int, now: datetime, items: list, link_idx: int = 0, make_image: bool = True):
+    """NEW style ka poora content banao: (msgs, img_path, rows). Post aur edit (recheck) dono yahin se."""
     from ..utils.community import get_community_tag
     try:
         handles_list = await get_community_tag(all_names=True)          # '@A @B' — community mein jitne set hain
@@ -742,7 +751,7 @@ async def _post_new_style(client: Client, ch, cfg: dict, day_idx: int, now: date
     msgs = build_new_posts(day_idx, now, rows, links, handles)
 
     img_path = None
-    if rows and cfg.get("image", True):
+    if make_image and rows and cfg.get("image", True):
         try:
             from ..utils.poster_engine import schedule_poster
             fd, img_path = tempfile.mkstemp(prefix="hs_img_", suffix=".jpg")
@@ -755,12 +764,23 @@ async def _post_new_style(client: Client, ch, cfg: dict, day_idx: int, now: date
         except Exception as e:
             LOGGER.warning(f"[HindiSchedule] schedule image fail (text post hoga): {e}")
             img_path = None
+    return msgs, img_path, rows
+
+
+async def _post_new_style(client: Client, ch, cfg: dict, day_idx: int, now: datetime, items: list,
+                          link_idx: int = 0) -> list:
+    """NEW style: stylish image + caption (clickable anime names). Image fail/OFF => sirf text post.
+    Return: bheje gaye messages [{"id", "photo"}] (3-ghante wale recheck mein edit karne ke liye)."""
+    msgs, img_path, _rows = await _compose_new(cfg, day_idx, now, items, link_idx)
+    sent = []
     try:
         for i, text in enumerate(msgs):
             if i == 0 and img_path:
-                await client.send_photo(ch, img_path, caption=text, parse_mode=ParseMode.HTML)
+                m = await client.send_photo(ch, img_path, caption=text, parse_mode=ParseMode.HTML)
+                sent.append({"id": m.id, "photo": True})
             else:
-                await client.send_message(ch, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                m = await client.send_message(ch, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                sent.append({"id": m.id, "photo": False})
             if i < len(msgs) - 1:
                 await asyncio.sleep(2)
     finally:
@@ -769,6 +789,64 @@ async def _post_new_style(client: Client, ch, cfg: dict, day_idx: int, now: date
                 os.remove(img_path)
             except OSError:
                 pass
+    return sent
+
+
+async def _footer_old(cfg: dict) -> str:
+    if style_of(cfg) == "new" or not footer_on(cfg):
+        return ""
+    try:
+        from ..utils.community import get_community_tag
+        from ..utils.caption_style import _handles_brackets
+        return _handles_brackets(await get_community_tag(all_names=True), spaced=True)
+    except Exception:
+        return ""
+
+
+def items_sig(items: list, now: datetime) -> list:
+    """Post mein jo dikhta hai uska signature (title, episode, time) — recheck mein change pakadne ke liye."""
+    return sorted(f"{r['title'].strip().lower()}|{r['ep']}|{r['time']}" for r in schedule_rows(items, now))
+
+
+async def collect_items(day_idx: int, now: datetime):
+    """
+    Dono sources se aaj ka final anime list.  Return (items, report_text, error)
+      1) hindianimeszone (Selenium) -> Hindi + NON-complete
+      2) (sirf aaj ke din) deadtoons.sbs/schedule -> match / naye add / complete wale skip
+    """
+    from ..utils import job_ctl
+    try:
+        data = await job_ctl.run_in_thread(_scrape_sync, day_idx)
+    except Exception as e:
+        LOGGER.error(f"[HindiSchedule] scrape failed: {e}")
+        return None, "", f"Page load/scrape fail: {type(e).__name__}: {e}"
+    if not data["cards"]:
+        return None, "", ("Page par koi anime card nahi mila (page badal gaya ya load nahi hua). "
+                          "/hindi_schedule_debug se raw text bhejo.")
+    if not data["clicked"]:
+        LOGGER.warning(f"[HindiSchedule] day tab '{DAYS[day_idx]}' click nahi hua — page ka default view use hua")
+
+    parsed = [parse_card(c) for c in data["cards"]]
+    items = filter_hindi(parsed)
+    done_names = [p["title"] for p in parsed if p.get("complete")]
+    report = ""
+    if done_names:
+        report += "🚫 Complete (hata diye): " + ", ".join(done_names[:6]) + "\n"
+
+    if CROSSCHECK and day_idx == now.weekday():
+        try:
+            from . import schedule_crosscheck as _cx
+            b = await asyncio.wait_for(job_ctl.run_in_thread(_cx.scrape_deadtoons_sync), 90)
+            items, rep = _cx.merge_items(parsed, items, b.get("items") or [], now.date(), _match_score)
+            if not b.get("ok") and b.get("error"):
+                LOGGER.warning(f"[HindiSchedule] deadtoons: {b['error']}")
+            report += _cx.report_text(rep)
+            items = sorted(items, key=lambda i: (_time_key(i.get("next_time") if i.get("next_date") == now.date() and i.get("next_time") else i["time"]),
+                                                 i["title"].lower()))
+        except Exception as e:
+            LOGGER.warning(f"[HindiSchedule] cross-check fail (sirf A use hua): {e}")
+            report += f"🔎 Double-check fail ({type(e).__name__}) — sirf hindianimeszone use hua."
+    return items, report.strip(), None
 
 
 async def post_schedule(client: Client, day_idx: int = None, manual: bool = False):
@@ -785,45 +863,28 @@ async def post_schedule(client: Client, day_idx: int = None, manual: bool = Fals
             if day_idx is None:
                 day_idx = now.weekday()
 
-            from ..utils import job_ctl
-            try:
-                data = await job_ctl.run_in_thread(_scrape_sync, day_idx)
-            except Exception as e:
-                LOGGER.error(f"[HindiSchedule] scrape failed: {e}")
-                return False, f"Page load/scrape fail: {type(e).__name__}: {e}"
+            items, report, err = await collect_items(day_idx, now)
+            if err:
+                return False, err
 
-            parsed = [parse_card(c) for c in data["cards"]]
-            items = filter_hindi(parsed)
-            if not data["cards"]:
-                return False, ("Page par koi anime card nahi mila (page badal gaya ya load nahi hua). "
-                               "/hindi_schedule_debug se raw text bhejo.")
-            if not data["clicked"]:
-                LOGGER.warning(f"[HindiSchedule] day tab '{DAYS[day_idx]}' click nahi hua — page ka default view use hua")
-
-            # Footer (OLD style) ek baar nikal lo
-            footer = ""
-            if style_of(cfg) != "new" and footer_on(cfg):
-                try:
-                    from ..utils.community import get_community_tag
-                    from ..utils.caption_style import _handles_brackets
-                    footer = _handles_brackets(await get_community_tag(all_names=True), spaced=True)
-                except Exception:
-                    footer = ""
-
-            ok_n, fails = 0, []
+            footer = await _footer_old(cfg)
+            ok_n, fails, rec_channels = 0, [], {}
             for c in chs:                       # har channel mein post — apne link ke saath
                 ch = c["id"]
                 try:
+                    li = await link_info(c)
                     if style_of(cfg) == "new":
-                        li = await link_info(c)
-                        await _post_new_style(client, ch, cfg, day_idx, now, items, li["idx"])
+                        sent = await _post_new_style(client, ch, cfg, day_idx, now, items, li["idx"])
                     else:
+                        sent = []
                         msgs = build_posts(day_idx, now, items, footer)
                         for i, text in enumerate(msgs):
-                            await client.send_message(ch, text, parse_mode=ParseMode.HTML,
-                                                      disable_web_page_preview=True)
+                            m = await client.send_message(ch, text, parse_mode=ParseMode.HTML,
+                                                          disable_web_page_preview=True)
+                            sent.append({"id": m.id, "photo": False})
                             if i < len(msgs) - 1:
                                 await asyncio.sleep(2)
+                    rec_channels[str(ch)] = {"msgs": sent, "link_idx": li["idx"]}
                     ok_n += 1
                     LOGGER.info(f"[HindiSchedule] posted {len(items)} anime ({DAYS[day_idx]}) to {ch}")
                 except Exception as e:
@@ -833,17 +894,170 @@ async def post_schedule(client: Client, day_idx: int = None, manual: bool = Fals
                     await asyncio.sleep(2)
             if not ok_n:
                 return False, "Post fail: " + " | ".join(fails)
+
+            cfg = await _cfg()
             if not manual:
-                cfg = await _cfg()
                 cfg["last_date"] = now.date().isoformat()
-                await _save(cfg)
+            # 3 ghante baad dobara check (sirf aaj ke din ki post ke liye)
+            if RECHECK_HOURS > 0 and day_idx == now.weekday():
+                cfg["recheck"] = {"date": now.date().isoformat(), "day_idx": day_idx, "tries": 0,
+                                  "due": (now + timedelta(hours=RECHECK_HOURS)).replace(tzinfo=None).isoformat(),
+                                  "sig": items_sig(items, now), "channels": rec_channels}
+            await _save(cfg)
             msg = f"{len(items)} Hindi anime ka {DAY_FULL[day_idx]} schedule {ok_n}/{len(chs)} channel mein post ho gaya."
             if fails:
                 msg += "\n⚠️ Fail: " + " | ".join(fails)
+            if report:
+                msg += "\n\n" + report
+            if cfg.get("recheck"):
+                msg += f"\n⏱ {RECHECK_HOURS:g} ghante baad dobara check hoga (kuch badla to post edit ho jayegi)."
             return True, msg
         except Exception as e:
             LOGGER.error(f"[HindiSchedule] post failed: {e}")
             return False, f"Post fail: {type(e).__name__}: {e}"
+        finally:
+            BUSY = False
+
+
+# ───────────────────────── 3-ghante baad recheck + post edit ─────────────────────────
+async def _edit_channel_posts(client: Client, ch: int, rec: dict, cfg: dict, day_idx: int, now: datetime, items: list):
+    """Pehle se bheji post(s) ko naye list ke hisaab se edit karo. Message kam/zyada ho to delete / naya bhejo."""
+    old = list(rec.get("msgs") or [])
+    link_idx = rec.get("link_idx", 0)
+    if style_of(cfg) == "new":
+        msgs, img_path, rows = await _compose_new(cfg, day_idx, now, items, link_idx)
+    else:
+        msgs, img_path, rows = build_posts(day_idx, now, items, await _footer_old(cfg)), None, []
+    new_sent = []
+    try:
+        for i, text in enumerate(msgs):
+            if i < len(old):
+                mid, is_photo = old[i]["id"], old[i].get("photo", False)
+                if is_photo:
+                    done = False
+                    if img_path:                                   # list badli => image bhi naya
+                        try:
+                            await client.edit_message_media(
+                                ch, mid, InputMediaPhoto(img_path, caption=text, parse_mode=ParseMode.HTML))
+                            done = True
+                        except Exception as e:
+                            if "MESSAGE_NOT_MODIFIED" in str(e).upper():
+                                done = True
+                            else:
+                                LOGGER.warning(f"[HindiSchedule] edit media fail ({e}) — caption edit try")
+                    if not done:
+                        try:
+                            await client.edit_message_caption(ch, mid, text, parse_mode=ParseMode.HTML)
+                        except Exception as e:
+                            if "MESSAGE_NOT_MODIFIED" not in str(e).upper():
+                                raise
+                    new_sent.append({"id": mid, "photo": True})
+                else:
+                    try:
+                        await client.edit_message_text(ch, mid, text, parse_mode=ParseMode.HTML,
+                                                       disable_web_page_preview=True)
+                    except Exception as e:
+                        if "MESSAGE_NOT_MODIFIED" not in str(e).upper():
+                            raise
+                    new_sent.append({"id": mid, "photo": False})
+            else:
+                m = await client.send_message(ch, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                new_sent.append({"id": m.id, "photo": False})
+            await asyncio.sleep(1)
+        extra = [o["id"] for o in old[len(msgs):]]
+        if extra:
+            try:
+                await client.delete_messages(ch, extra)
+            except Exception as e:
+                LOGGER.warning(f"[HindiSchedule] extra msg delete fail: {e}")
+    finally:
+        if img_path:
+            try:
+                os.remove(img_path)
+            except OSError:
+                pass
+    rec["msgs"] = new_sent
+
+
+def _sig_diff(old: list, new: list) -> str:
+    def titles(sig):
+        return {x.split("|")[0]: x for x in sig}
+    o, n = titles(old), titles(new)
+    out = []
+    for t in n:
+        if t not in o:
+            out.append(f"➕ {t.title()} ({n[t].split('|')[1]}, {n[t].split('|')[2]})")
+    for t in o:
+        if t not in n:
+            out.append(f"➖ {t.title()}")
+    for t in n:
+        if t in o and o[t] != n[t]:
+            out.append(f"✏️ {t.title()}: {o[t].split('|', 1)[1]} → {n[t].split('|', 1)[1]}")
+    return "\n".join(out) or "(chhota badlav)"
+
+
+async def maybe_recheck(client: Client):
+    """Loop se har ~45s: post ke RECHECK_HOURS baad dobara scrape (dono sources) — badla ho to post edit."""
+    cfg = await _cfg()
+    rc = cfg.get("recheck")
+    if not rc:
+        return
+    now = datetime.now(IST)
+    if rc.get("date") != now.date().isoformat():                # din badal gaya — purani post ko ab chhedna nahi
+        cfg.pop("recheck", None)
+        await _save(cfg)
+        return
+    try:
+        due = datetime.fromisoformat(rc["due"]).replace(tzinfo=IST)
+    except Exception:
+        cfg.pop("recheck", None)
+        await _save(cfg)
+        return
+    if now < due:
+        return
+    global BUSY
+    async with _LOCK:
+        BUSY = True
+        try:
+            day_idx = rc.get("day_idx", now.weekday())
+            items, report, err = await collect_items(day_idx, now)
+            cfg = await _cfg()
+            rc = cfg.get("recheck") or rc
+            if err:
+                rc["tries"] = rc.get("tries", 0) + 1
+                if rc["tries"] >= 3:
+                    cfg.pop("recheck", None)
+                    await _owner_dm(client, f"⚠️ Hindi schedule recheck 3 baar fail hua:\n{err}")
+                else:
+                    rc["due"] = (now + timedelta(minutes=RECHECK_RETRY_MIN)).replace(tzinfo=None).isoformat()
+                    cfg["recheck"] = rc
+                await _save(cfg)
+                return
+            new_sig = items_sig(items, now)
+            if new_sig == rc.get("sig"):
+                LOGGER.info("[HindiSchedule] recheck: koi badlav nahi")
+                cfg.pop("recheck", None)
+                await _save(cfg)
+                return
+            diff = _sig_diff(rc.get("sig") or [], new_sig)
+            ok_n, fails = 0, []
+            for chid, rec in (rc.get("channels") or {}).items():
+                try:
+                    await _edit_channel_posts(client, int(chid), rec, cfg, day_idx, now, items)
+                    ok_n += 1
+                except Exception as e:
+                    LOGGER.error(f"[HindiSchedule] recheck edit {chid} fail: {e}")
+                    fails.append(f"{chid}: {type(e).__name__}: {e}")
+            cfg.pop("recheck", None)
+            await _save(cfg)
+            txt = f"✏️ Hindi schedule update hua ({RECHECK_HOURS:g}h recheck) — {ok_n} channel mein post edit:\n{diff}"
+            if report:
+                txt += "\n\n" + report
+            if fails:
+                txt += "\n⚠️ Edit fail: " + " | ".join(fails)
+            await _owner_dm(client, txt)
+        except Exception as e:
+            LOGGER.error(f"[HindiSchedule] recheck error: {e}")
         finally:
             BUSY = False
 
@@ -863,6 +1077,8 @@ async def schedule_loop():
                 if not ok:
                     await _owner_dm(app, f"⚠️ Hindi schedule auto-post fail:\n{info}\n\n"
                                          f"{RETRY_GAP_MIN} min baad dobara try hoga.")
+            else:
+                await maybe_recheck(app)
         except Exception as e:
             LOGGER.error(f"[HindiSchedule] loop error: {e}")
         await asyncio.sleep(45)
@@ -1013,6 +1229,44 @@ async def cmd_debug(client: Client, message: Message):
     if not _is_auth(message.from_user.id):
         return
     await _send_debug(client, message.chat.id)
+
+
+@Client.on_message(filters.command("hindi_schedule_check") & filters.private)
+async def cmd_check(client: Client, message: Message):
+    """Dono sources (hindianimeszone + deadtoons) ka aaj ka comparison — post kiye bina. B ka raw text file mein."""
+    if not _is_auth(message.from_user.id):
+        return
+    wait = await message.reply("⏳ Dono sites check ho rahi hain (~1-2 min)...")
+    try:
+        from ..utils import job_ctl
+        from . import schedule_crosscheck as _cx
+        now = datetime.now(IST)
+        day_idx = now.weekday()
+        data = await job_ctl.run_in_thread(_scrape_sync, day_idx)
+        parsed = [parse_card(c) for c in data["cards"]]
+        a_items = filter_hindi(parsed)
+        b = await job_ctl.run_in_thread(_cx.scrape_deadtoons_sync)
+        merged, rep = _cx.merge_items(parsed, a_items, b.get("items") or [], now.date(), _match_score)
+        lines = [f"📅 {DAY_FULL[day_idx]} {now.date()}",
+                 f"A hindianimeszone: {len(parsed)} card • Hindi non-complete: {len(a_items)} • complete: "
+                 f"{sum(1 for p in parsed if p.get('complete'))}",
+                 f"B deadtoons: {'OK' if b.get('ok') else 'FAIL'} • {len(b.get('items') or [])} entries"
+                 + (f" • {b.get('error')}" if b.get("error") else ""), "",
+                 "A (final base):"]
+        lines += [f"  • {i['title']} — {_ep_code_new(i)} {_item_time(i, now.date())}" for i in a_items] or ["  (khali)"]
+        lines += ["", "B entries:"]
+        lines += [f"  • {e['title']} — S{e['season']}E{e['ep']} {e['time']}{' [kata]' if e['truncated'] else ''}"
+                  for e in (b.get("items") or [])] or ["  (khali)"]
+        lines += ["", "FINAL (post mein ye jayega):"]
+        lines += [f"  • {i['title']} — {_ep_code_new(i)} {_item_time(i, now.date())}{'  [B se]' if i.get('src') == 'B' else ''}"
+                  for i in merged if _is_today(i, now.date())] or ["  (khali)"]
+        lines += ["", _cx.report_text(rep)]
+        await wait.edit("\n".join(lines)[:4000], parse_mode=ParseMode.DISABLED)
+        buf = io.BytesIO((b.get("body") or "(khali)").encode("utf-8"))
+        buf.name = "deadtoons_raw.txt"
+        await client.send_document(message.chat.id, buf, caption="🧪 deadtoons raw page text (parser tune karne ke liye)")
+    except Exception as e:
+        await wait.edit(f"❌ Check fail: {type(e).__name__}: {e}", parse_mode=ParseMode.DISABLED)
 
 
 async def _send_debug(client: Client, chat_id: int):
