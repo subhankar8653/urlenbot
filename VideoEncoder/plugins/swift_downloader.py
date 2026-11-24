@@ -1343,8 +1343,9 @@ async def _upload_one_file(client, message, msg, filepath: str, dl_dir: str, enc
                         res = await _orig_save(path, *a, **kw)
                     if ent and ent[0] is not None:
                         _g, _q, _m, _pf, _ql = ent
-                        try:
-                            await _m.edit(f"{_pf}⏳ **`{_ql}` upload ho gaya — order ka wait...**")
+                        try:   # FIX: late "80%" progress-edit is text ko overwrite na kare
+                            from ..utils.display_progress import finish_progress_msg as _fpm
+                            await _fpm(_m, delete=False, text=f"{_pf}⏳ **`{_ql}` upload ho gaya — order ka wait...**")
                         except Exception:
                             pass
                         await _g.wait_turn(_q)
@@ -1581,10 +1582,11 @@ async def _pipeline_run(client, message, msg, prefix, swift_url, dl_dir, episode
             if gate is not None:
                 gate.done(q)
         try:
+            from ..utils.display_progress import finish_progress_msg as _fpm
             if success and sent_msg:
-                await dm.delete()
+                await _fpm(dm)
             else:
-                await dm.edit(f"❌ Upload failed: `{quality}`")
+                await _fpm(dm, delete=False, text=f"❌ Upload failed: `{quality}`")
         except Exception:
             pass
         return success, sent_msg, quality
@@ -2024,10 +2026,11 @@ async def _run_swift(client, message, swift_url: str, encode: bool, quality_filt
                 _gate.done(_gq)
         # sent_msg milne ke baad delete — user ko stuck na lage
         try:
+            from ..utils.display_progress import finish_progress_msg as _fpm
             if success and sent_msg:
-                await um.delete()
+                await _fpm(um)
             else:
-                await um.edit(f"❌ Upload failed: `{quality}`")
+                await _fpm(um, delete=False, text=f"❌ Upload failed: `{quality}`")
         except Exception:
             pass
         return success, sent_msg, quality

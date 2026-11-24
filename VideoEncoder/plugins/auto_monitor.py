@@ -1133,7 +1133,8 @@ async def _episode_quality_poller_impl(
                 except Exception:
                     pass
             try:
-                await um.delete()
+                from ..utils.display_progress import finish_progress_msg as _fpm
+                await _fpm(um)          # late progress-edit roko + delete (FloodWait retry) — bar atka nahi rahega
             except Exception:
                 pass
             if success and sent_msg is not None:
@@ -1234,6 +1235,29 @@ async def _episode_quality_poller_impl(
                     return
             except Exception:
                 pass
+            # FIX (ORDER): 360p -> 720p -> 1080p. Agar koi LOW target quality abhi bhi baaki hai (upload nahi hui) aur
+            # is page par abhi aayi hi nahi (jaise 720p ka link der se lagta hai), to ooncha quality (1080p) abhi nahi.
+            # File hata do (quality 'remaining' mein rehti hai) — agle check mein 720p ke saath aayegi aur gate order se bhejega.
+            # Aakhri attempt par rok nahi (720p kabhi na aaye to 1080p phir bhi jaaye).
+            try:
+                _qo = QUALITY_ORDER if isinstance(QUALITY_ORDER, dict) else {k: i for i, k in enumerate(QUALITY_ORDER)}
+                _exp_now = set(_poll_prog.get("expected") or [])
+                _lower_wait = [lq for lq in TARGET_QUALITIES
+                               if _qo.get(lq, 99) < _qo.get(q, 99)
+                               and lq in remaining and lq not in started_q
+                               and lq not in _exp_now
+                               and lq not in ((_st["dup"][1]) if _st.get("dup") else set())]
+                if _lower_wait and not _is_manual and not _is_retry_job and 0 < poll_attempt < POLL_TOTAL_ATTEMPTS:
+                    LOGGER.info(f"[AutoMonitor] ⏳ {q} ruka — {','.join(_lower_wait)} abhi page par nahi aayi "
+                                f"(order 360→720→1080), agle check mein")
+                    try:
+                        if os.path.isfile(path):
+                            os.remove(path)
+                    except Exception:
+                        pass
+                    return
+            except Exception as _oe:
+                LOGGER.warning(f"[AutoMonitor] order-hold check error (ignore): {_oe!r}")
             _gs, _is_dup = await _dup_check(q, path)
             if not _is_dup:
                 try:
