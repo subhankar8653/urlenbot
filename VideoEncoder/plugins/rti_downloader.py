@@ -1585,6 +1585,7 @@ async def _download_items(client, status_msg, orig_message, sess: "RTISelector",
                 season_intro=season_intro_state,
                 season_hint=sess.season,
                 fb_page_url=sess.page_url,                 # 1080p Swift pe na ho to mirror servers
+                only_qualities=({sess.quality_filter} if sess.quality_filter else None),   # Quality row: 360p chuna to SIRF 360p
             )
             if not ok:
                 state["last"] = "error"
@@ -1699,11 +1700,7 @@ async def rti_callback_handler(client: Client, cb: CallbackQuery):
             key = parts[3] if len(parts) > 3 else ""
             if key in _RTI_Q_KEYS:
                 sess.quality = key
-            if sess.channel_toggle and sess.quality != "all":
-                await cb.answer("ℹ️ Channel Upload ON hai — channel flow mein saari qualities upload hoti hain. "
-                                "Sirf ye quality chahiye to Channel Upload OFF karo.", show_alert=True)
-            else:
-                await cb.answer(f"Quality: {sess.quality_label}")
+            await cb.answer(f"Quality: {sess.quality_label}")
             await sess.render()
             return
 

@@ -615,6 +615,7 @@ async def _episode_quality_poller(
     target_qualities: set = None,
     source=None,
     fb_page_url: str = None,
+    only_qualities: set = None,
 ) -> bool:
     """Wrapper: card pe '🔄 Re-check' button lagata hai (poll chalte waqt), phir asli poller chalata hai."""
     _job = job_ctl.CURRENT.get()
@@ -631,7 +632,7 @@ async def _episode_quality_poller(
             update_post_sent=update_post_sent, update_post_mode=update_post_mode,
             season_intro=season_intro, season_hint=season_hint, stats=stats,
             page_url=page_url, target_qualities=target_qualities, _recheck_ev=ev, _live=_live,
-            source=source, fb_page_url=fb_page_url,
+            source=source, fb_page_url=fb_page_url, only_qualities=only_qualities,
         )
     finally:
         try:
@@ -708,8 +709,11 @@ async def _episode_quality_poller_impl(
     _live: "_ChannelLive" = None,
     source=None,
     fb_page_url: str = None,
+    only_qualities: set = None,
 ) -> bool:
     """
+    only_qualities: /rti selector ki Quality row (360p/720p/1080p) — diya ho to SIRF wahi quality
+                    download+upload hogi (baaki skip). None = purana behaviour (saari qualities).
     update_post_mode: "auto" (global /updatechannel toggle follow kare — /Rtic aur
                       auto-monitor), "force" (toggle ignore, hamesha bhejo — /rti
                       selector ka Update Post ON), "off" (kabhi na bhejo).
@@ -815,6 +819,8 @@ async def _episode_quality_poller_impl(
     #   15 × 45s (⚡ Fast) → 10 × 120s (🐢 Slow) → nahi mila to auto-cancel
     TARGET_QUALITIES_SET = (set(target_qualities) if target_qualities
                             else set(getattr(source, "qualities", None) or TARGET_QUALITIES))
+    if only_qualities:      # user ne ek quality chuni (jaise sirf 360p) — baaki sab ignore
+        TARGET_QUALITIES_SET = {str(q).lower() for q in only_qualities}
 
     remaining = set(TARGET_QUALITIES_SET)
     poll_start = time.time()
