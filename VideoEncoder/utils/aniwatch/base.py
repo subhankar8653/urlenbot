@@ -281,6 +281,10 @@ class Reporter:
     def error(self, text: str) -> None:
         self.put({"error": str(text)})
 
+    def note(self, text: str) -> None:
+        """User ko dikhane wali jaankari (jaise 'sirf 1080p mili') — status/progress ko overwrite nahi karti."""
+        self.put({"note": str(text)})
+
     def finished(self, filename, title: str) -> None:
         self.put({"finished": True, "filename": str(filename), "title": title})
 
@@ -427,7 +431,7 @@ def run_n_m3u8dl(url: str, save_name: str, task_dir, *, kind: str = "sub",
                  extra_headers: Iterable[str] = (), proxy: Optional[str] = None,
                  threads: int = 50, retries: int = 5,
                  binary: Optional[Path] = None,
-                 cancel_event=None) -> bool:
+                 cancel_event=None, strict: bool = False) -> bool:
     """Run N_m3u8DL-RE and mirror its progress into the reporter."""
     reporter = reporter or Reporter()
     binary = binary or get_binary_path()
@@ -452,7 +456,9 @@ def run_n_m3u8dl(url: str, save_name: str, task_dir, *, kind: str = "sub",
         "--tmp-dir", str(tmp_dir),
         "--no-log",
         "-H", f"User-Agent: {USER_AGENT}",
-        "--check-segments-count", "False",
+        # strict=True: ek bhi segment na mile to FAIL (retry hoga). Pehle hamesha False tha, isliye adhoori
+        # download (jaise aadhi video, baaki black screen) bhi chupchap "success" ban ke upload ho jaati thi.
+        "--check-segments-count", "True" if strict else "False",
         "-mt",
         "--thread-count", str(threads),
         "--download-retry-count", str(retries),
@@ -688,9 +694,58 @@ def _promote(src, dst) -> Path:
     return dst
 
 
+def probe_durations(path) -> Optional[dict]:
+    """ffprobe se {video, audio, format} durations (seconds). ffprobe na ho / fail to None."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "stream=codec_type,duration:format=duration",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        import json as _json
+        data = _json.loads(out.stdout or "{}")
+        res = {"video": None, "audio": None, "format": None}
+        for st in data.get("streams") or []:
+            try:
+                d = float(st.get("duration"))
+            except (TypeError, ValueError):
+                continue
+            k = st.get("codec_type")
+            if k in ("video", "audio") and (res[k] is None or d > res[k]):
+                res[k] = d
+        try:
+            res["format"] = float((data.get("format") or {}).get("duration"))
+        except (TypeError, ValueError):
+            pass
+        return res
+    except Exception:
+        return None
+
+
+def media_problem(path) -> Optional[str]:
+    """File adhoori / video-audio ka length alag ho (video khatam, audio chalta raha => baaki black screen)
+    to wajah ka text, warna None."""
+    d = probe_durations(path)
+    if not d:
+        return None
+    v, a, f = d["video"], d["audio"], d["format"]
+    if v is not None and a is not None:
+        tol = max(8.0, 0.04 * max(v, a))
+        if a - v > tol:
+            return f"video {v/60:.1f} min par khatam, audio {a/60:.1f} min (baaki black screen)"
+        if v - a > tol:
+            return f"audio {a/60:.1f} min par khatam, video {v/60:.1f} min"
+    if v is not None and v < 60 and (f or 0) > 0 and f - v > 30:
+        return f"video sirf {v:.0f}s ki hai"
+    return None
+
+
 def merge_tracks(video_path, final_path, *, dub_audio=None, subtitles=(),
                  audio_lang: str = "jpn", reporter: Optional[Reporter] = None,
-                 title: str = "") -> Optional[Path]:
+                 title: str = "", video_only: bool = False) -> Optional[Path]:
     """Mux video (+ second audio + subtitles) into the final file.
 
     Runs whenever ffmpeg is available, even for a plain single-audio episode:
@@ -728,7 +783,8 @@ def merge_tracks(video_path, final_path, *, dub_audio=None, subtitles=(),
         for sub_path, _ in sub_list:
             cmd += ["-i", str(sub_path)]
 
-        cmd += ["-map", "0:v", "-map", "0:a"]
+        # video_only: is video ki apni audio nahi chahiye (jaise Japanese video + sirf English dub audio)
+        cmd += ["-map", "0:v"] if video_only and dub_file else ["-map", "0:v", "-map", "0:a"]
         if dub_file:
             cmd += ["-map", "1:a:0"]
         offset = 2 if dub_file else 1
@@ -743,10 +799,13 @@ def merge_tracks(video_path, final_path, *, dub_audio=None, subtitles=(),
             cmd += ["-c:s", "mov_text"]
 
         primary_title = "Japanese" if audio_lang == "jpn" else "English"
-        cmd += ["-metadata:s:a:0", f"language={audio_lang}",
-                "-metadata:s:a:0", f"title={primary_title}"]
-        if dub_file:
-            cmd += ["-metadata:s:a:1", "language=eng", "-metadata:s:a:1", "title=English"]
+        if video_only and dub_file:
+            cmd += ["-metadata:s:a:0", "language=eng", "-metadata:s:a:0", "title=English"]
+        else:
+            cmd += ["-metadata:s:a:0", f"language={audio_lang}",
+                    "-metadata:s:a:0", f"title={primary_title}"]
+            if dub_file:
+                cmd += ["-metadata:s:a:1", "language=eng", "-metadata:s:a:1", "title=English"]
 
         for index, (_, tag) in enumerate(sub_list):
             iso, label = subtitle_meta(tag)
@@ -993,14 +1052,31 @@ class BaseScraper:
         # would otherwise be fetched three times under three different names.
         produced = set() if quality == "all" else None
         wanted = ("360", "720", "1080") if quality == "all" else (quality,)
+        self._bad_dub = {}                         # url -> True (English dub ki apni video adhoori nikli)
 
         overall = False
+        got = []
         for target in wanted:
             label = self._download_with_retry(url, target, name_override,
                                               season_override, ep_num_override,
                                               produced=produced)
             if label:
                 overall = True
+                got.append(label)
+
+        # FIX: "All" quality chuni thi par kuch qualities site pe hain hi nahi — ab user ko bataya jaata hai
+        try:
+            if overall and quality in ("360", "480", "720", "1080", "all"):
+                have = sorted(set(got), key=lambda x: int(re.sub(r"\D", "", x) or 0))
+                want_lbl = [f"{w}p" for w in wanted]
+                missing = [w for w in want_lbl if w not in have]
+                if missing:
+                    self.reporter.note(
+                        f"ℹ️ {', '.join(missing)} is episode ke liye site pe available nahi hai — "
+                        f"sirf {', '.join(have)} mili/upload hogi."
+                    )
+        except Exception:
+            pass
         return overall
 
     def download_all_episodes(self, url, quality="auto") -> bool:
@@ -1027,6 +1103,7 @@ class BaseScraper:
         for attempt in range(attempts):
             if self._cancelled():
                 return None
+            self._attempt = attempt           # 0: tez (50 threads, strict) · 1: 24 threads · 2: 12 threads, non-strict
             try:
                 label = self._download_single(url, quality, name_override,
                                               season_override, ep_num_override,
@@ -1040,15 +1117,31 @@ class BaseScraper:
                 time.sleep(5)
         return None
 
+    def _resolve_cached(self, url, fresh: bool = False):
+        """Ek episode ke 3 qualities ke liye resolve_episode (megaplay decrypt etc.) baar-baar na chale — speed.
+        Retry (fresh=True) par naya link (token expire ho gaya ho sakta hai)."""
+        cache = self.__dict__.setdefault("_recipe_cache", {})
+        hit = cache.get(url)
+        if hit and not fresh and time.time() - hit[0] < 420:
+            return hit[1]
+        recipe = self.resolve_episode(url)
+        if recipe:
+            cache[url] = (time.time(), recipe)
+        return recipe
+
     def _download_single(self, url, quality, name_override, season_override,
                          ep_num_override, produced: Optional[set] = None):
-        recipe = self.resolve_episode(url)
+        _attempt = getattr(self, "_attempt", 0)
+        _threads = (50, 24, 12)[min(_attempt, 2)]
+        _strict = _attempt < 2
+        recipe = self._resolve_cached(url, fresh=_attempt > 0)
         if not recipe:
             self.reporter.error("could not resolve this episode")
             return None
 
         sub = recipe.get("sub")
         dub = recipe.get("dub")
+        _hybrid = False
         if not sub and not dub:
             self.reporter.error("no video source found for this episode")
             return None
@@ -1064,7 +1157,11 @@ class BaseScraper:
             if not dub:
                 self.reporter.error("English (dub) audio is episode mein available nahi hai")
                 return None
-            sub = None
+            # English dub ki apni video adhoori/black nikli thi => Japanese video + English audio (hybrid)
+            if _attempt >= 1 and getattr(self, "_bad_dub", {}).get(url) and sub:
+                _hybrid = True
+            else:
+                sub = None
 
         series = name_override or recipe.get("series") or "Anime"
         season = str(season_override or recipe.get("season") or "1")
@@ -1083,7 +1180,8 @@ class BaseScraper:
             config_format(),
             season=season, episode=episode, title=series,
             quality=qual_label,
-            audio="Dual Audio" if (sub and dub) else ("English" if dub and not sub else "Japanese"),
+            audio=("English" if _hybrid else "Dual Audio" if (sub and dub)
+                   else ("English" if dub and not sub else "Japanese")),
         )
 
         if produced is not None and base_name in produced:
@@ -1117,6 +1215,7 @@ class BaseScraper:
                         proxy=self.proxy,
                         binary=self.binary_path,
                         cancel_event=self.cancel_event,
+                        threads=_threads, strict=_strict,
                     ):
                         found = collect_output(task_dir, f"{base_name}_dub")
                         if found:
@@ -1137,6 +1236,7 @@ class BaseScraper:
                 proxy=self.proxy,
                 binary=self.binary_path,
                 cancel_event=self.cancel_event,
+                threads=_threads, strict=_strict,
             )
 
             if dub_thread:
@@ -1153,9 +1253,20 @@ class BaseScraper:
                 self.reporter.error("downloader reported success but wrote no file")
                 return None
 
+            # ── FIX (adhoori video / baaki black screen): download poora hai ya nahi, ffprobe se jaanch ──
+            _prob = media_problem(video_path)
+            if _prob:
+                print(f"[media-check] {base_name}: {_prob}", flush=True)
+                if _mode == "eng" and not _hybrid and recipe.get("sub"):
+                    self._bad_dub[url] = True            # agli try mein Japanese video + English audio
+                if _attempt < 2:
+                    self.reporter.status(f"⚠️ **Download adhoori nikli** — {_prob}\nDobara try ho raha hai...")
+                    return None
+                self.reporter.note(f"⚠️ Is file mein problem reh gayi ho sakti hai: {_prob}")
+
             # ── subtitles (from the sub source; dub sources rarely carry any) ──
             sub_files = []
-            if self.session is not None:
+            if self.session is not None and not _hybrid:
                 sub_files = fetch_subtitles(
                     self.session, (primary.get("tracks") or []), task_dir, base_name,
                     referer=primary.get("referer") or referer,
@@ -1166,10 +1277,13 @@ class BaseScraper:
                 video_path, final_file,
                 dub_audio=dub_state["path"],
                 subtitles=sub_files,
-                audio_lang="jpn" if sub else "eng",
+                audio_lang="jpn" if sub and not _hybrid else "eng",
                 reporter=self.reporter,
                 title=ep_title,
+                video_only=_hybrid,
             )
+            if _hybrid:
+                self.reporter.note("ℹ️ English dub ki apni video adhoori thi — Japanese video + English audio se file banayi gayi.")
         finally:
             _cleanup(task_dir)
 

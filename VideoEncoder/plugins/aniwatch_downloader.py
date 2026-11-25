@@ -395,7 +395,7 @@ async def _send_update_post_if_enabled(client, sess: AniwSession, item: dict, up
 #  Ek episode: scrape + download (thread) -> files
 # ─────────────────────────────────────────────
 async def _download_episode_files(sess: AniwSession, item: dict, dl_dir: str, stage,
-                                  ep_label: str, index: int, total: int):
+                                  ep_label: str, index: int, total: int, on_file=None, notes=None):
     """
     Returns (files: list[str], error: str | None).
     Scraper blocking hai -> thread; progress queue har ~3s drain hoti hai aur
@@ -411,14 +411,20 @@ async def _download_episode_files(sess: AniwSession, item: dict, dl_dir: str, st
 
     box = {"files": [], "err": None, "status": "", "prog": None}
 
+    new_files = []
+
     def _drain():
         while True:
             try:
                 p = pq.get_nowait()
             except _queue.Empty:
                 return
-            if p.get("finished"):
+            if p.get("note"):
+                if notes is not None and p["note"] not in notes:
+                    notes.append(p["note"])
+            elif p.get("finished"):
                 box["files"].append(p.get("filename"))
+                new_files.append(p.get("filename"))
             elif p.get("error"):
                 box["err"] = p["error"]
             elif p.get("status"):
@@ -459,6 +465,11 @@ async def _download_episode_files(sess: AniwSession, item: dict, dl_dir: str, st
         while not fut.done():
             await asyncio.wait({fut}, timeout=3)
             _drain()
+            # SPEED: jaise hi ek quality ki file ban jaye, upload turant shuru (agli quality download hote hue)
+            while new_files and on_file is not None:
+                fp = new_files.pop(0)
+                if fp and os.path.isfile(fp):
+                    await on_file(fp)
             await stage.edit(_text())
         ok = bool(fut.result())
     except asyncio.CancelledError:
@@ -467,6 +478,10 @@ async def _download_episode_files(sess: AniwSession, item: dict, dl_dir: str, st
         box["err"] = box["err"] or f"{type(e).__name__}: {e}"
     finally:
         _drain()
+        while new_files and on_file is not None:        # aakhri file(s) jo loop ke baad aayi
+            fp = new_files.pop(0)
+            if fp and os.path.isfile(fp):
+                await on_file(fp)
 
     files = [f for f in box["files"] if f and os.path.isfile(f)]
     if not files:
@@ -486,21 +501,13 @@ async def _process_item(client, message, sess: AniwSession, item: dict, stage, i
     if job is not None:
         job.dirs.add(dl_dir)          # cancel / finish pe folder saaf
 
-    try:
-        files, err = await _download_episode_files(sess, item, dl_dir, stage, ep_label, index, total)
-        if not files:
-            await stage.edit(
-                f"🛑 **{ep_label} — Download Fail**\n"
-                f"❌ `{_clip(err or 'unknown', 150)}`\n"
-                f"⛔ Agle episodes **band** kar diye gaye."
-            )
-            return "error"
+    up_tasks: list = []
+    notes: list = []
+    uploaded: list = []
+    up_lock = asyncio.Lock()                 # uploads ek-ek karke, download ke saath-saath (360 → 720 → 1080)
 
-        files = _sort_by_size(files)     # chhoti quality pehle
-        await stage.edit(f"✅ **{ep_label}** (`{index}/{total}`) — download ho gaya\n📤 Upload shuru...")
-
-        uploaded = []
-        for fp in files:
+    async def _upload_file(fp: str):
+        async with up_lock:
             q = _quality_from(os.path.basename(fp))
             slot = await _new_status(message, f"📤 **Uploading `{q}`...**", q)
             success, sent_msg, quality = await _upload_one_file(
@@ -509,7 +516,8 @@ async def _process_item(client, message, sess: AniwSession, item: dict, stage, i
             if success:
                 uploaded.append((quality, sent_msg))
                 try:
-                    await slot.delete()
+                    from ..utils.display_progress import finish_progress_msg as _fpm
+                    await _fpm(slot)
                 except Exception:
                     pass
             else:
@@ -517,6 +525,33 @@ async def _process_item(client, message, sess: AniwSession, item: dict, stage, i
                     await slot.edit(f"❌ Upload failed: `{quality}`")
                 except Exception:
                     pass
+
+    async def _on_file(fp: str):
+        up_tasks.append(asyncio.ensure_future(_upload_file(fp)))
+
+    try:
+        files, err = await _download_episode_files(sess, item, dl_dir, stage, ep_label, index, total,
+                                                   on_file=_on_file, notes=notes)
+        if not files:
+            for t in up_tasks:
+                t.cancel()
+            await stage.edit(
+                f"🛑 **{ep_label} — Download Fail**\n"
+                f"❌ `{_clip(err or 'unknown', 150)}`\n"
+                f"⛔ Agle episodes **band** kar diye gaye."
+            )
+            return "error"
+
+        await stage.edit(f"✅ **{ep_label}** (`{index}/{total}`) — download ho gaya\n📤 Upload chal raha hai...")
+        if up_tasks:
+            await asyncio.gather(*up_tasks, return_exceptions=True)
+
+        if notes:     # jaise "360p/720p available nahi — sirf 1080p mili"
+            try:
+                from pyrogram.enums import ParseMode as _PM
+                await message.reply("\n".join(notes), parse_mode=_PM.DISABLED)
+            except Exception:
+                pass
 
         if not uploaded:
             await stage.edit(f"🛑 **{ep_label} — Upload Fail**\n⛔ Agle episodes **band** kar diye gaye.")
@@ -528,8 +563,12 @@ async def _process_item(client, message, sess: AniwSession, item: dict, stage, i
         return "ok"
 
     except asyncio.CancelledError:
+        for t in up_tasks:
+            t.cancel()
         raise
     except Exception as e:
+        for t in up_tasks:
+            t.cancel()
         LOGGER.error(f"[Aniwatch] {ep_label} error: {e}", exc_info=True)
         try:
             await stage.edit(
