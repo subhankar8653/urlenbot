@@ -754,7 +754,23 @@ def _scrape_and_download(swift_url: str, dl_dir: str, status_cb=None, quality_fi
                 download_links = sorted(known, key=lambda l: QUALITY_ORDER.get(l["quality"], 99))
 
         # ── STEP 3: Quality filter apply karo (agar diya gaya) ──
-        if quality_filter:
+        # FIX: 360p button dikhte hi links kabhi kabhi JS se baad mein bharte hain. Pehle yahan list
+        # khaali hote hi "360p missing / Page pe sirf: none" error aa jata tha (All mein khaali list
+        # XPATH-click fallback pe jaati thi, filter mein nahi). Ab pehle thoda re-collect, phir bhi
+        # khaali ho to filter skip -> neeche wala XPATH-click fallback (sirf chuni quality) chalega.
+        if quality_filter and not download_links:
+            for _rt in range(4):
+                time.sleep(1)
+                _close_popups(driver, main)
+                download_links = _collect_visible_links(driver)
+                if download_links:
+                    LOGGER.info(f"[Swift] filter re-collect OK (try {_rt + 1}): {len(download_links)} link(s)")
+                    break
+            if fast and download_links:
+                _known = [l for l in download_links if l["quality"] != "unknown"]
+                if _known:
+                    download_links = sorted(_known, key=lambda l: QUALITY_ORDER.get(l["quality"], 99))
+        if quality_filter and download_links:
             filtered = [l for l in download_links if l["quality"] == quality_filter]
             if filtered:
                 download_links = filtered
